@@ -59,7 +59,8 @@ Use these baseline settings:
 
 - `PORT=3002`
 - `USE_DB_AUTHENTICATION=false`
-- Non-default PostgreSQL database and user names
+- PostgreSQL database `postgres`, required by v2.11.0's `pg_cron` image
+- Non-default PostgreSQL user and strong generated password
 - Upstream default worker concurrency and resource limits
 - No OpenAI, proxy, Supabase, or cloud credentials
 
@@ -131,3 +132,8 @@ service.
 
 Firecrawl is licensed under AGPL-3.0. This local deployment retains upstream
 licensing and notices.
+
+Firecrawl v2.11.0 hardcodes `cron.database_name = 'postgres'` in
+`apps/nuq-postgres/Dockerfile`. Although the self-host guide suggests changing
+`POSTGRES_DB`, this deployment keeps `POSTGRES_DB=postgres` so the NuQ
+initialization script can install and use `pg_cron` successfully.
