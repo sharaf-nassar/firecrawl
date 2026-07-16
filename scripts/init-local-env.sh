@@ -14,6 +14,7 @@ bull_auth_key="$(openssl rand -hex 32)"
 
 umask 077
 {
+  printf '%s\n' 'COMPOSE_FILE=compose.yaml'
   printf '%s\n' 'PORT=3002'
   printf '%s\n' 'INTERNAL_PORT=3002'
   printf '%s\n' 'USE_DB_AUTHENTICATION=false'
@@ -24,6 +25,25 @@ umask 077
   printf '%s\n' 'LOGGING_LEVEL=INFO'
   printf '%s\n' 'ALLOW_LOCAL_WEBHOOKS=false'
   printf '%s\n' 'BLOCK_MEDIA=false'
+  printf '%s\n' 'AUTUMN_SECRET_KEY='
+  printf '%s\n' 'MODEL_EMBEDDING_NAME='
+  printf '%s\n' 'MODEL_NAME='
+  printf '%s\n' 'NUQ_BACKEND='
+  printf '%s\n' 'OLLAMA_BASE_URL='
+  printf '%s\n' 'OPENAI_API_KEY='
+  printf '%s\n' 'OPENAI_BASE_URL='
+  printf '%s\n' 'PROXY_PASSWORD='
+  printf '%s\n' 'PROXY_SERVER='
+  printf '%s\n' 'PROXY_USERNAME='
+  printf '%s\n' 'SEARXNG_CATEGORIES='
+  printf '%s\n' 'SEARXNG_ENDPOINT='
+  printf '%s\n' 'SEARXNG_ENGINES='
+  printf '%s\n' 'SELF_HOSTED_WEBHOOK_URL='
+  printf '%s\n' 'SLACK_WEBHOOK_URL='
+  printf '%s\n' 'SUPABASE_ANON_TOKEN='
+  printf '%s\n' 'SUPABASE_SERVICE_TOKEN='
+  printf '%s\n' 'SUPABASE_URL='
+  printf '%s\n' 'TEST_API_KEY='
 } > "${env_file}"
 
 printf 'Created %s with mode 0600 credentials.\n' "${env_file}"

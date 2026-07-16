@@ -3,6 +3,16 @@ services:
     ports: !override
       - "127.0.0.1:${PORT:-3002}:${INTERNAL_PORT:-3002}"
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3002/', { signal: AbortSignal.timeout(4000) }).then(r => process.exit(r.status < 500 ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     depends_on:
       redis:
         condition: service_healthy
