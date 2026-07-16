@@ -79,10 +79,12 @@ an agent should:
 5. Surface the remaining failure instead of looping or performing destructive
    Docker operations.
 
-The guidance also records the self-hosted feature boundary. Agents may use
-open-source scrape, crawl, map, search, and batch operations. They must not
-assume hosted Agent, Browser sandbox, Actions, managed proxy, or AI extraction
-features are available unless those dependencies are configured separately.
+The guidance also records the self-hosted feature boundary. Agents may use the
+MCP tools for open-source scrape, crawl, map, and search operations. Batch
+operations are supported through direct calls to the local Firecrawl API, not
+through a batch MCP tool. They must not assume hosted Agent, Browser sandbox,
+Actions, managed proxy, or AI extraction features are available unless those
+dependencies are configured separately.
 
 ## Error Handling
 

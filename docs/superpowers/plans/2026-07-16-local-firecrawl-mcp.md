@@ -239,9 +239,11 @@ existing instructions:
   then retry once. Surface any remaining failure instead of looping.
 - Never run `docker compose restart`, delete Firecrawl volumes, or use broad
   Docker prune/cleanup commands for recovery.
-- Supported self-hosted features: scrape, crawl, map, search, and batch.
-  Hosted Agent, Browser sandbox, Actions, managed proxy, and AI extraction
-  require separate services and must not be assumed available.
+- Supported self-hosted MCP tools: scrape, crawl, map, and search. Batch
+  operations are supported through direct calls to the local Firecrawl API,
+  not through a batch MCP tool. Hosted Agent, Browser sandbox, Actions,
+  managed proxy, and AI extraction require separate services and must not be
+  assumed available.
 ```
 
 - [ ] **Step 3: Verify the section is visible through both paths**
@@ -406,7 +408,7 @@ docker volume ls --filter label=com.docker.compose.project=firecrawl \
   --format '{{.Name}}' | sort
 ```
 
-Expected: the same three named volumes from Step 1 remain present.
+Expected: the same project volumes recorded in Step 1 remain present.
 
 - [ ] **Step 4: Initialize a fresh MCP process and list its tools**
 
