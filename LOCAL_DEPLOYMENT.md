@@ -104,11 +104,16 @@ docker compose ps
 docker compose logs --tail=200 api playwright-service nuq-postgres redis rabbitmq
 ```
 
-Restart running services:
+Restart all services with dependency health ordering:
 
 ```bash
-docker compose restart
+docker compose stop
+docker compose up -d --wait
 ```
+
+`docker compose restart` does not reapply dependency health ordering. Stopping
+first and starting with `up --wait` reapplies that ordering and waits for
+service health checks before returning.
 
 Stop services while preserving named volumes:
 
