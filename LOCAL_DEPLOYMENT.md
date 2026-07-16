@@ -97,23 +97,21 @@ curl --fail-with-body -sS http://127.0.0.1:3002/v2/crawl/CRAWL_ID
 
 ## Routine operation
 
-Inspect service state and recent project logs:
+Use the path-independent wrapper for routine startup, recovery, inspection,
+health checks, and bounded logs:
 
 ```bash
-docker compose ps
-docker compose logs --tail=200 api playwright-service nuq-postgres redis rabbitmq
+scripts/local-firecrawl start
+scripts/local-firecrawl restart
+scripts/local-firecrawl status
+scripts/local-firecrawl health
+scripts/local-firecrawl logs
 ```
 
-Restart all services with dependency health ordering:
-
-```bash
-docker compose stop
-docker compose up -d --wait
-```
-
-`docker compose restart` does not reapply dependency health ordering. Stopping
-first and starting with `up --wait` reapplies that ordering and waits for
-service health checks before returning.
+The wrapper's `restart` operation performs an ordered `stop` followed by
+`up -d --wait`, reapplying dependency health ordering and waiting for service
+health checks before returning. Its supported surface has no destructive
+operations: no `down`, volume deletion, pruning, or broad Docker commands.
 
 Stop services while preserving named volumes:
 

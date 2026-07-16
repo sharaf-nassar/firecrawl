@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+compose=(
+  docker compose
+  --project-name firecrawl
+  --project-directory "$repo_root"
+  -f "$repo_root/compose.yaml"
+)
+services=(api playwright-service nuq-postgres redis rabbitmq)
+
+usage() {
+  printf 'Usage: %s {start|restart|status|health|logs}\n' "${0##*/}" >&2
+}
+
+validate_compose() {
+  "${compose[@]}" config --quiet
+}
+
+if (( $# != 1 )); then
+  usage
+  exit 64
+fi
+
+case "$1" in
+  start)
+    validate_compose
+    "${compose[@]}" up -d --wait "${services[@]}"
+    ;;
+  restart)
+    validate_compose
+    "${compose[@]}" stop "${services[@]}"
+    "${compose[@]}" up -d --wait "${services[@]}"
+    ;;
+  status)
+    validate_compose
+    "${compose[@]}" ps --all
+    ;;
+  health)
+    validate_compose
+
+    redis_response="$("${compose[@]}" exec -T redis redis-cli ping)"
+    if [[ "$redis_response" != "PONG" ]]; then
+      printf 'Redis health check returned %q, expected PONG\n' \
+        "$redis_response" >&2
+      exit 1
+    fi
+
+    "${compose[@]}" exec -T rabbitmq \
+      rabbitmq-diagnostics -q check_running
+    "${compose[@]}" exec -T nuq-postgres sh -c \
+      'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+    "${compose[@]}" exec -T playwright-service node -e \
+      "fetch('http://127.0.0.1:3000/health', {
+          signal: AbortSignal.timeout(10000),
+        })
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('Playwright health check returned ' + response.status);
+          }
+        })
+        .catch(error => {
+          console.error(error);
+          process.exit(1);
+        })"
+    curl --fail --silent --show-error --max-time 10 \
+      --output /dev/null http://127.0.0.1:3002/
+
+    printf '%s\n' \
+      'Local Firecrawl is healthy at http://127.0.0.1:3002'
+    ;;
+  logs)
+    validate_compose
+    "${compose[@]}" logs --tail=200 "${services[@]}"
+    ;;
+  *)
+    usage
+    exit 64
+    ;;
+esac
