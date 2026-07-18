@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
 
 /* Codecs */
 const delimitedList = (separator = ",") => {
@@ -132,6 +133,21 @@ const configSchema = z.object({
   NUQ_FDB_TIME_BUCKETS: emptyStringAsDefault(
     z.coerce.number().int().positive().default(16),
   ),
+
+  // Local application persistence and artifact storage
+  LOCAL_PERSISTENCE_ENABLED: z.stringbool().default(false),
+  APPLICATION_DATABASE_URL: emptyStringAsUndefined(z.string().url()),
+  LOCAL_OWNER_ID: emptyStringAsUndefined(z.string().uuid()),
+  ARTIFACT_STORE_PROVIDER: emptyStringAsDefault(
+    z.enum(["none", "minio", "gcs"]).default("none"),
+  ),
+  ARTIFACT_MINIO_ENDPOINT: emptyStringAsUndefined(z.string().url()),
+  ARTIFACT_MINIO_ACCESS_KEY: emptyStringAsUndefined(z.string()),
+  ARTIFACT_MINIO_SECRET_KEY: emptyStringAsUndefined(z.string()),
+  ARTIFACT_MINIO_BUCKET: emptyStringAsUndefined(z.string()),
+  ARTIFACT_MINIO_REGION: emptyStringAsDefault(z.string().default("us-east-1")),
+  LOCAL_RECORD_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+  LOCAL_ARTIFACT_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
   // Google Cloud Storage
   GCS_BUCKET_NAME: z.string().optional(),
@@ -346,3 +362,4 @@ const configSchema = z.object({
 });
 
 export const config = configSchema.parse(process.env);
+resolveLocalRuntimeConfig(config);
