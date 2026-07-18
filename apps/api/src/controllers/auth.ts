@@ -5,6 +5,7 @@ import { config } from "../config";
 import { logger } from "../lib/logger";
 import { parseApi } from "../lib/parseApi";
 import { withAuth } from "../lib/withAuth";
+import { createLocalOwnerAuthenticator } from "../lib/local-owner";
 import { getAgentSponsorStatus } from "../services/agent-sponsor";
 import { getRedisConnection } from "../services/queue-service";
 import { getRateLimiter } from "../services/rate-limiter";
@@ -627,18 +628,19 @@ async function handleKeylessAuth(
   };
 }
 
+const authenticateUserWithLocalOwner = createLocalOwnerAuthenticator(
+  config,
+  withAuth,
+  supaAuthenticateUser,
+);
+
 export async function authenticateUser(
   req,
   res,
   mode?: RateLimiterMode,
   options?: { allowKeyless?: boolean },
 ): Promise<AuthResponse> {
-  return withAuth(supaAuthenticateUser, {
-    success: true,
-    chunk: null,
-    team_id: "bypass",
-    org_id: null,
-  })(req, res, mode, options);
+  return authenticateUserWithLocalOwner(req, res, mode, options);
 }
 
 /**

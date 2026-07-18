@@ -2,6 +2,10 @@ import { Pool } from "pg";
 import { drizzle, NodePgDatabase } from "drizzle-orm/node-postgres";
 import { config } from "../config";
 import { logger } from "../lib/logger";
+import {
+  isApplicationPersistenceEnabled,
+  resolveApplicationDatabaseConfig,
+} from "./application-config";
 
 type DB = NodePgDatabase;
 
@@ -65,15 +69,20 @@ function makeDb(
   return drizzle({ client: pool });
 }
 
-const useDbAuthentication = config.USE_DB_AUTHENTICATION;
-
-const mainDb = useDbAuthentication
-  ? makeDb(config.DATABASE_URL, "firecrawl-api")
-  : null;
-const replicaDb = useDbAuthentication
+const applicationDatabaseConfig = resolveApplicationDatabaseConfig(config);
+const applicationPersistenceEnabled = isApplicationPersistenceEnabled();
+const mainDb = applicationPersistenceEnabled
   ? makeDb(
-      config.DATABASE_REPLICA_URL ?? config.DATABASE_URL,
-      "firecrawl-api-rr",
+      applicationDatabaseConfig.writerUrl,
+      applicationDatabaseConfig.applicationName,
+    )
+  : null;
+const replicaDb = applicationPersistenceEnabled
+  ? makeDb(
+      applicationDatabaseConfig.readerUrl,
+      applicationDatabaseConfig.applicationName === "firecrawl-api-local"
+        ? "firecrawl-api-local"
+        : "firecrawl-api-rr",
     )
   : null;
 // The index pool was the sole consumer behind the 2026-06-11 pgbouncer
@@ -85,10 +94,16 @@ const indexDb = makeDb(config.INDEX_DATABASE_URL, "firecrawl-index", {
   min: 0,
 });
 
-if (useDbAuthentication && !mainDb) {
-  logger.error(
-    "DATABASE_URL is not configured. Drizzle client will not be initialized. Fix ENV configuration or disable DB authentication with USE_DB_AUTHENTICATION env variable",
-  );
+if (applicationPersistenceEnabled && !mainDb) {
+  if (config.LOCAL_PERSISTENCE_ENABLED) {
+    logger.error(
+      "APPLICATION_DATABASE_URL is not configured. Drizzle client will not be initialized. Fix ENV configuration or disable local persistence with LOCAL_PERSISTENCE_ENABLED.",
+    );
+  } else {
+    logger.error(
+      "DATABASE_URL is not configured. Drizzle client will not be initialized. Fix ENV configuration or disable DB authentication with USE_DB_AUTHENTICATION env variable",
+    );
+  }
 }
 
 function proxyDb(get: () => DB | null, name: string): DB {
