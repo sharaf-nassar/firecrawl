@@ -17,6 +17,7 @@ import { MinioArtifactStore } from "../lib/artifacts/minio";
 import { retentionDeadline } from "../lib/local-retention-deadline";
 import {
   createLocalRetentionService,
+  LocalArtifactRetentionError,
   PgLocalRetentionDatabase,
   runLocalRetentionIteration,
   runLocalRetentionLoop,
@@ -50,6 +51,7 @@ class FakeDatabase implements LocalRetentionDatabase {
   operationalResult = {
     requestsDeleted: 0,
     dependentRowsDeleted: 0,
+    requestIds: [] as string[],
   };
   artifactLimit: number | undefined;
   operationalLimit: number | undefined;
@@ -164,33 +166,83 @@ describe("runLocalRetentionIteration", () => {
     ]);
   });
 
-  it("keeps a manifest when object deletion fails", async () => {
+  it("keeps a manifest and bubbles a sanitized object deletion failure", async () => {
     const database = new FakeDatabase();
     database.manifests = manifests(1);
     const store = fakeStore(async () => {
       throw new Error("storage unavailable with secret=do-not-log");
     });
 
-    const result = await runLocalRetentionIteration({
+    const failure = runLocalRetentionIteration({
       database,
       artifactStore: store,
       now: new Date("2026-07-18T00:00:00.000Z"),
       logger: silentLogger,
     });
 
-    expect(result.artifactFailures).toBe(1);
+    await expect(failure).rejects.toBeInstanceOf(LocalArtifactRetentionError);
+    await expect(failure).rejects.toMatchObject({
+      name: "LocalArtifactRetentionError",
+      code: "artifact_delete_failed",
+    });
     expect(database.manifests).toHaveLength(1);
-    expect(database.events).toEqual(["release:artifact-0", "operational"]);
+    expect(database.events).toEqual(["release:artifact-0"]);
     expect(silentLogger.error).toHaveBeenCalledWith(
       "Local artifact retention delete failed",
       expect.objectContaining({
         objectKey: "artifact-0",
+        requestId: "request-0",
+        jobId: "job-0",
+        provider: "minio",
         errorName: "Error",
       }),
     );
     expect(
       JSON.stringify(vi.mocked(silentLogger.error).mock.calls),
     ).not.toContain("do-not-log");
+  });
+
+  it("preserves completed manifests before a later object deletion fails", async () => {
+    const database = new FakeDatabase();
+    database.manifests = manifests(2);
+    const store = fakeStore(async key => {
+      if (key === "artifact-1") throw new Error("storage unavailable");
+    });
+
+    await expect(
+      runLocalRetentionIteration({
+        database,
+        artifactStore: store,
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      }),
+    ).rejects.toBeInstanceOf(LocalArtifactRetentionError);
+
+    expect(database.manifests.map(item => item.objectKey)).toEqual([
+      "artifact-1",
+    ]);
+    expect(database.events).toEqual([
+      "manifest:artifact-0",
+      "release:artifact-0",
+      "release:artifact-1",
+    ]);
+  });
+
+  it("treats an already-missing object as successful manifest cleanup", async () => {
+    const database = new FakeDatabase();
+    database.manifests = manifests(1);
+    const deleteMissingObject = vi.fn().mockResolvedValue(undefined);
+
+    const result = await runLocalRetentionIteration({
+      database,
+      artifactStore: fakeStore(deleteMissingObject),
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    });
+
+    expect(deleteMissingObject).toHaveBeenCalledWith("artifact-0");
+    expect(result.artifactsDeleted).toBe(1);
+    expect(database.manifests).toHaveLength(0);
   });
 
   it("leaves a manifest retryable when interrupted after object deletion", async () => {
@@ -247,6 +299,7 @@ describe("runLocalRetentionIteration", () => {
     database.operationalResult = {
       requestsDeleted: 3,
       dependentRowsDeleted: 9,
+      requestIds: ["request-1", "request-2", "request-3"],
     };
     const now = new Date("2026-07-18T00:00:00.000Z");
 
@@ -262,7 +315,14 @@ describe("runLocalRetentionIteration", () => {
     expect(result).toMatchObject({
       requestsDeleted: 3,
       dependentRowsDeleted: 9,
+      requestIds: ["request-1", "request-2", "request-3"],
     });
+    expect(silentLogger.info).toHaveBeenCalledWith(
+      "Local retention iteration completed",
+      expect.objectContaining({
+        requestIds: ["request-1", "request-2", "request-3"],
+      }),
+    );
   });
 });
 
@@ -359,6 +419,40 @@ describe("runLocalRetentionLoop", () => {
       JSON.stringify(vi.mocked(silentLogger.error).mock.calls),
     ).not.toContain("do-not-log");
   });
+
+  it("logs a storage failure at loop level and retries its manifest", async () => {
+    const database = new FakeDatabase();
+    database.manifests = manifests(1);
+    let deleteAttempts = 0;
+    const store = fakeStore(async () => {
+      deleteAttempts += 1;
+      if (deleteAttempts === 1) throw new Error("temporary storage failure");
+    });
+    const controller = new AbortController();
+    let sleeps = 0;
+
+    await runLocalRetentionLoop({
+      configSource: localConfig,
+      database,
+      artifactStore: store,
+      signal: controller.signal,
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps === 2) controller.abort();
+      },
+      logger: silentLogger,
+    });
+
+    expect(deleteAttempts).toBe(2);
+    expect(database.manifests).toHaveLength(0);
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      "Local retention iteration failed",
+      {
+        errorName: "LocalArtifactRetentionError",
+        errorCode: "artifact_delete_failed",
+      },
+    );
+  });
 });
 
 describe("createLocalRetentionService", () => {
@@ -397,6 +491,22 @@ describe("createLocalRetentionService", () => {
 
 const integrationDatabaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
 const describeWithDatabase = integrationDatabaseUrl ? describe : describe.skip;
+const operationalTableNames = [
+  "scrapes",
+  "parses",
+  "crawls",
+  "batch_scrapes",
+  "searches",
+  "extracts",
+  "maps",
+  "llmstxts",
+  "deep_researches",
+  "research_paper_searches",
+  "research_paper_inspects",
+  "research_paper_reads",
+  "research_related_papers",
+  "research_github_searches",
+] as const;
 
 describeWithDatabase("PostgreSQL local retention", () => {
   const ownerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
@@ -414,13 +524,23 @@ describeWithDatabase("PostgreSQL local retention", () => {
   });
 
   afterAll(async () => {
+    await pool.query(
+      "DROP TRIGGER IF EXISTS retention_test_require_webhook_delete ON crawls",
+    );
+    await pool.query(
+      "DROP FUNCTION IF EXISTS retention_test_require_webhook_delete()",
+    );
+    await pool.query(
+      "DROP TRIGGER IF EXISTS retention_test_reject_delete ON scrapes",
+    );
+    await pool.query("DROP FUNCTION IF EXISTS retention_test_reject_delete()");
     const ids = [...fixtureIds];
     if (ids.length > 0) {
       await pool.query(
         "DELETE FROM webhook_logs WHERE crawl_id = ANY($1::uuid[])",
         [ids],
       );
-      for (const table of ["scrapes", "crawls"]) {
+      for (const table of operationalTableNames) {
         await pool.query(
           `DELETE FROM ${table} WHERE request_id = ANY($1::uuid[])`,
           [ids],
@@ -447,29 +567,105 @@ describeWithDatabase("PostgreSQL local retention", () => {
     );
   }
 
-  it("deletes expired dependencies before requests and preserves future data", async () => {
-    const expiredRequest = randomUUID();
-    const futureRequest = randomUUID();
-    const scrapeId = randomUUID();
-    const futureScrapeId = randomUUID();
-    const crawlId = randomUUID();
-    fixtureIds.add(crawlId);
-    await insertRequest(expiredRequest, new Date("2026-07-17T00:00:00.000Z"));
-    await insertRequest(futureRequest, new Date("2026-07-19T00:00:00.000Z"));
+  async function insertEveryOperationalDependent(
+    requestId: string,
+  ): Promise<string> {
+    const ids = Object.fromEntries(
+      operationalTableNames.map(table => [table, randomUUID()]),
+    ) as Record<(typeof operationalTableNames)[number], string>;
+
     await pool.query(
       `INSERT INTO scrapes (
          id, request_id, url, is_successful, time_taken, team_id,
          credits_cost
-       ) VALUES
-         ($1, $2, 'https://example.com/expired', true, 1, $5, 1),
-         ($3, $4, 'https://example.com/future', true, 1, $5, 1)`,
-      [scrapeId, expiredRequest, futureScrapeId, futureRequest, ownerId],
+       ) VALUES ($1, $2, 'https://example.com/scrape', true, 1, $3, 1)`,
+      [ids.scrapes, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO parses (
+         id, request_id, url, is_successful, time_taken, team_id,
+         credits_cost
+       ) VALUES ($1, $2, 'https://example.com/parse', true, 1, $3, 1)`,
+      [ids.parses, requestId, ownerId],
     );
     await pool.query(
       `INSERT INTO crawls (
          id, request_id, url, team_id, num_docs, credits_cost, cancelled
        ) VALUES ($1, $2, 'https://example.com/crawl', $3, 1, 1, false)`,
-      [crawlId, expiredRequest, ownerId],
+      [ids.crawls, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO batch_scrapes (
+         id, request_id, team_id, num_docs, credits_cost, cancelled
+       ) VALUES ($1, $2, $3, 1, 1, false)`,
+      [ids.batch_scrapes, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO searches (
+         id, request_id, query, team_id, time_taken, credits_cost,
+         is_successful, num_results
+       ) VALUES ($1, $2, 'retention', $3, 1, 1, true, 1)`,
+      [ids.searches, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO extracts (
+         id, request_id, urls, model_kind, team_id, is_successful,
+         credits_cost
+       ) VALUES ($1, $2, $3, 'fire-1', $4, true, 1)`,
+      [ids.extracts, requestId, ["https://example.com/extract"], ownerId],
+    );
+    await pool.query(
+      `INSERT INTO maps (
+         id, request_id, url, team_id, num_results, credits_cost
+       ) VALUES ($1, $2, 'https://example.com/map', $3, 1, 1)`,
+      [ids.maps, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO llmstxts (
+         id, request_id, url, team_id, num_urls, credits_cost
+       ) VALUES ($1, $2, 'https://example.com/llms', $3, 1, 1)`,
+      [ids.llmstxts, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO deep_researches (
+         id, request_id, query, team_id, time_taken, credits_cost
+       ) VALUES ($1, $2, 'retention', $3, 1, 1)`,
+      [ids.deep_researches, requestId, ownerId],
+    );
+
+    for (const table of [
+      "research_paper_searches",
+      "research_paper_inspects",
+      "research_paper_reads",
+      "research_related_papers",
+      "research_github_searches",
+    ] as const) {
+      await pool.query(
+        `INSERT INTO ${table} (
+           id, request_id, target, team_id, num_results, time_taken,
+           credits_cost, is_successful
+         ) VALUES ($1, $2, 'retention', $3, 1, 1, 1, true)`,
+        [ids[table], requestId, ownerId],
+      );
+    }
+
+    return ids.crawls;
+  }
+
+  it("deletes every expired dependency before requests and preserves future data", async () => {
+    const expiredRequest = randomUUID();
+    const futureRequest = randomUUID();
+    const futureScrapeId = randomUUID();
+    await insertRequest(expiredRequest, new Date("2026-07-17T00:00:00.000Z"));
+    await insertRequest(futureRequest, new Date("2026-07-19T00:00:00.000Z"));
+    const crawlId = await insertEveryOperationalDependent(expiredRequest);
+    fixtureIds.add(crawlId);
+    await pool.query(
+      `INSERT INTO scrapes (
+         id, request_id, url, is_successful, time_taken, team_id,
+         credits_cost
+       ) VALUES ($1, $2, 'https://example.com/future', true, 1, $3, 1)`,
+      [futureScrapeId, futureRequest, ownerId],
     );
     await pool.query(
       `INSERT INTO webhook_logs (
@@ -477,13 +673,63 @@ describeWithDatabase("PostgreSQL local retention", () => {
        ) VALUES (true, $1, $2, 'https://example.com/hook', 'completed')`,
       [ownerId, crawlId],
     );
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION retention_test_require_webhook_delete()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM webhook_logs WHERE crawl_id = OLD.id
+        ) THEN
+          RAISE EXCEPTION 'webhook must be deleted before crawl';
+        END IF;
+        RETURN OLD;
+      END
+      $$
+    `);
+    await pool.query(`
+      CREATE TRIGGER retention_test_require_webhook_delete
+      BEFORE DELETE ON crawls
+      FOR EACH ROW WHEN (OLD.id = '${crawlId}'::uuid)
+      EXECUTE FUNCTION retention_test_require_webhook_delete()
+    `);
 
-    const result = await database.deleteExpiredOperationalRows(
-      new Date("2026-07-18T00:00:00.000Z"),
-      50,
+    let result;
+    try {
+      result = await database.deleteExpiredOperationalRows(
+        new Date("2026-07-18T00:00:00.000Z"),
+        50,
+      );
+    } finally {
+      await pool.query(
+        "DROP TRIGGER IF EXISTS retention_test_require_webhook_delete ON crawls",
+      );
+      await pool.query(
+        "DROP FUNCTION IF EXISTS retention_test_require_webhook_delete()",
+      );
+    }
+
+    expect(result).toEqual({
+      requestsDeleted: 1,
+      dependentRowsDeleted: 15,
+      requestIds: [expiredRequest],
+    });
+    for (const table of operationalTableNames) {
+      const deleted = await pool.query(
+        `SELECT 1 FROM ${table} WHERE request_id = $1`,
+        [expiredRequest],
+      );
+      expect(deleted.rows, `${table} rows`).toHaveLength(0);
+    }
+    const deletedWebhook = await pool.query(
+      "SELECT 1 FROM webhook_logs WHERE crawl_id = $1",
+      [crawlId],
     );
-
-    expect(result).toEqual({ requestsDeleted: 1, dependentRowsDeleted: 3 });
+    expect(deletedWebhook.rows).toHaveLength(0);
+    const deletedRequest = await pool.query(
+      "SELECT 1 FROM requests WHERE id = $1",
+      [expiredRequest],
+    );
+    expect(deletedRequest.rows).toHaveLength(0);
     const retained = await pool.query<{ id: string }>(
       `SELECT id FROM requests WHERE id = $1
        UNION ALL

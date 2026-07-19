@@ -45,7 +45,17 @@ export type ArtifactManifestClaim = {
 export type OperationalCleanupResult = {
   requestsDeleted: number;
   dependentRowsDeleted: number;
+  requestIds: string[];
 };
+
+export class LocalArtifactRetentionError extends Error {
+  readonly code = "artifact_delete_failed";
+
+  constructor() {
+    super("Local artifact retention delete failed");
+    this.name = "LocalArtifactRetentionError";
+  }
+}
 
 export interface LocalRetentionDatabase {
   listExpiredArtifactManifests(
@@ -259,7 +269,11 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       const requestIds = expired.rows.map(row => row.id);
       if (requestIds.length === 0) {
         await client.query("COMMIT");
-        return { requestsDeleted: 0, dependentRowsDeleted: 0 };
+        return {
+          requestsDeleted: 0,
+          dependentRowsDeleted: 0,
+          requestIds: [],
+        };
       }
 
       let dependentRowsDeleted = 0;
@@ -288,6 +302,7 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       return {
         requestsDeleted: requests.rowCount ?? 0,
         dependentRowsDeleted,
+        requestIds,
       };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -327,6 +342,7 @@ export async function runLocalRetentionIteration(
     artifactFailures: 0,
     requestsDeleted: 0,
     dependentRowsDeleted: 0,
+    requestIds: [],
   };
 
   if (options.artifactStore && !options.signal?.aborted) {
@@ -354,7 +370,7 @@ export async function runLocalRetentionIteration(
             provider: options.artifactStore.provider,
             ...errorMetadata(error),
           });
-          continue;
+          throw new LocalArtifactRetentionError();
         }
         if (options.signal?.aborted) break;
         if (await claim.deleteManifest()) {
@@ -373,6 +389,7 @@ export async function runLocalRetentionIteration(
     );
     result.requestsDeleted = operational.requestsDeleted;
     result.dependentRowsDeleted = operational.dependentRowsDeleted;
+    result.requestIds = operational.requestIds;
   }
 
   const iterationMetadata = {

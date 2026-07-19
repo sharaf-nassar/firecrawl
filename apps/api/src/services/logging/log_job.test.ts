@@ -3,25 +3,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // vi.mock is hoisted; anything its factories reference must be created in
 // vi.hoisted() (also hoisted). Under Jest these worked because importing `jest`
 // from @jest/globals disables jest.mock hoisting.
-const { captureException, changeTrackingInsertScrape, logger, values, insert } =
-  vi.hoisted(() => {
-    const logger: any = {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-      child: vi.fn(() => logger),
-    };
-    const values = vi.fn<(data: any) => Promise<void>>();
-    const insert = vi.fn(() => ({ values }));
-    return {
-      captureException: vi.fn(),
-      changeTrackingInsertScrape: vi.fn(),
-      logger,
-      values,
-      insert,
-    };
-  });
+const {
+  artifactStoreConfigured,
+  captureException,
+  changeTrackingInsertScrape,
+  logger,
+  saveScrapeToGCS,
+  values,
+  insert,
+} = vi.hoisted(() => {
+  const logger: any = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    child: vi.fn(() => logger),
+  };
+  const values = vi.fn<(data: any) => Promise<void>>();
+  const insert = vi.fn(() => ({ values }));
+  return {
+    artifactStoreConfigured: { value: false },
+    captureException: vi.fn(),
+    changeTrackingInsertScrape: vi.fn(),
+    logger,
+    saveScrapeToGCS: vi.fn(),
+    values,
+    insert,
+  };
+});
 
 vi.mock("@sentry/node", () => ({
   captureException,
@@ -64,12 +73,12 @@ vi.mock("../../lib/gcs-jobs", () => ({
   saveExtractToGCS: vi.fn(),
   saveLlmsTxtToGCS: vi.fn(),
   saveMapToGCS: vi.fn(),
-  saveScrapeToGCS: vi.fn(),
+  saveScrapeToGCS,
   saveSearchToGCS: vi.fn(),
 }));
 
 vi.mock("../../lib/artifacts", () => ({
-  isArtifactStoreConfigured: () => false,
+  isArtifactStoreConfigured: () => artifactStoreConfigured.value,
 }));
 
 vi.mock("../../lib/extract/extract-redis", () => ({
@@ -132,6 +141,7 @@ beforeEach(() => {
   config.LOCAL_RECORD_RETENTION_DAYS = 30;
   config.LOCAL_ARTIFACT_RETENTION_DAYS = 30;
   config.ARTIFACT_STORE_PROVIDER = "none";
+  artifactStoreConfigured.value = false;
 });
 
 afterEach(() => {
@@ -187,6 +197,53 @@ describe("application persistence", () => {
         target_hint: "<redacted due to zero data retention>",
       }),
     );
+  });
+
+  it("keeps synchronous ZDR data redacted and out of artifact storage", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
+    enableLocalPersistence();
+    artifactStoreConfigured.value = true;
+
+    await logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: localOwnerId,
+      target_hint: "https://private.example/secret",
+      zeroDataRetention: true,
+    });
+    await logScrape({
+      id: scrapeId,
+      request_id: requestId,
+      url: "https://private.example/secret",
+      is_successful: true,
+      doc: { markdown: "private content" } as any,
+      time_taken: 10,
+      team_id: localOwnerId,
+      options: { formats: [{ type: "markdown" }] } as any,
+      cost_tracking: { private: true } as any,
+      credits_cost: 1,
+      skipNuq: true,
+      zeroDataRetention: true,
+    });
+
+    expect(values).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        target_hint: "<redacted due to zero data retention>",
+        dr_clean_by: new Date("2026-07-19T00:00:00.000Z"),
+      }),
+    );
+    expect(values).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        url: "<redacted due to zero data retention>",
+        options: null,
+        cost_tracking: null,
+      }),
+    );
+    expect(saveScrapeToGCS).not.toHaveBeenCalled();
   });
 
   const localLogCases: Array<{
