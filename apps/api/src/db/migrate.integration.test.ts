@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,16 @@ const describeWithDatabase = databaseUrl ? describe : describe.skip;
 const ownerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
 const requestId = "dbe8d700-f48f-4d2e-b51b-9a27e4859a8c";
 const scrapeId = "8f6bc812-3d2d-40ba-bb52-0ae0e38328a1";
+const integritySchema = "migration_integrity_test";
+const baselineFilename = "0001_persistence_foundation.sql";
+
+const integrityDatabaseUrl = databaseUrl
+  ? (() => {
+      const url = new URL(databaseUrl);
+      url.searchParams.set("options", `-c search_path=${integritySchema}`);
+      return url.toString();
+    })()
+  : undefined;
 
 const migrationConfig = {
   LOCAL_PERSISTENCE_ENABLED: true,
@@ -55,6 +65,8 @@ describeWithDatabase("application migrations", () => {
     await client.connect();
     await client.query("DROP SCHEMA public CASCADE");
     await client.query("CREATE SCHEMA public");
+    await client.query(`DROP SCHEMA IF EXISTS ${integritySchema} CASCADE`);
+    await client.query(`CREATE SCHEMA ${integritySchema}`);
     await runApplicationMigrations(migrationConfig);
     await runApplicationMigrations(migrationConfig);
   });
@@ -64,18 +76,132 @@ describeWithDatabase("application migrations", () => {
   });
 
   it("applies the baseline once and seeds the configured local owner", async () => {
-    const ledger = await client.query<{ filename: string }>(
-      "SELECT filename FROM application_schema_migrations ORDER BY filename",
+    const ledger = await client.query<{ filename: string; checksum: string }>(
+      `SELECT filename, checksum
+         FROM application_schema_migrations
+        ORDER BY filename`,
     );
-    expect(ledger.rows).toEqual([
-      { filename: "0001_persistence_foundation.sql" },
-    ]);
+    expect(ledger.rows).toHaveLength(1);
+    expect(ledger.rows[0]).toMatchObject({ filename: baselineFilename });
+    expect(ledger.rows[0]?.checksum).toMatch(/^[a-f0-9]{64}$/);
 
     const owners = await client.query<{ count: string }>(
       "SELECT count(*) FROM local_owners WHERE id = $1 AND label = 'local'",
       [ownerId],
     );
     expect(owners.rows[0]?.count).toBe("1");
+  });
+
+  it("rejects changed contents for an applied migration filename", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-migration-integrity-"),
+    );
+    const migrationPath = join(migrationsDirectory, baselineFilename);
+    const integrityClient = new Client({
+      connectionString: integrityDatabaseUrl,
+    });
+    const integrityConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: integrityDatabaseUrl,
+    };
+
+    try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        migrationPath,
+      );
+      await runApplicationMigrations(integrityConfig, {
+        migrationsDirectory,
+      });
+      await integrityClient.connect();
+
+      const schemaBefore = await integrityClient.query<{
+        tablename: string;
+      }>(
+        `SELECT tablename
+           FROM pg_tables
+          WHERE schemaname = $1
+          ORDER BY tablename`,
+        [integritySchema],
+      );
+      const ledgerBefore = await integrityClient.query<{ row: string }>(
+        `SELECT row_to_json(m)::text AS row
+           FROM application_schema_migrations AS m
+          ORDER BY filename`,
+      );
+
+      await appendFile(
+        migrationPath,
+        "\nCREATE TABLE migration_checksum_tamper (id integer);\n",
+      );
+
+      await expect(
+        runApplicationMigrations(integrityConfig, { migrationsDirectory }),
+      ).rejects.toMatchObject({
+        name: "ApplicationMigrationIntegrityError",
+        filename: baselineFilename,
+      });
+
+      const schemaAfter = await integrityClient.query<{
+        tablename: string;
+      }>(
+        `SELECT tablename
+           FROM pg_tables
+          WHERE schemaname = $1
+          ORDER BY tablename`,
+        [integritySchema],
+      );
+      const ledgerAfter = await integrityClient.query<{ row: string }>(
+        `SELECT row_to_json(m)::text AS row
+           FROM application_schema_migrations AS m
+          ORDER BY filename`,
+      );
+      expect(schemaAfter.rows).toEqual(schemaBefore.rows);
+      expect(ledgerAfter.rows).toEqual(ledgerBefore.rows);
+      expect(
+        await integrityClient.query(
+          "SELECT to_regclass('migration_checksum_tamper')",
+        ),
+      ).toMatchObject({ rows: [{ to_regclass: null }] });
+    } finally {
+      await integrityClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an applied migration with a null checksum", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-migration-null-checksum-"),
+    );
+    const integrityClient = new Client({
+      connectionString: integrityDatabaseUrl,
+    });
+    const integrityConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: integrityDatabaseUrl,
+    };
+
+    try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        join(migrationsDirectory, baselineFilename),
+      );
+      await integrityClient.connect();
+      await integrityClient.query(
+        `ALTER TABLE application_schema_migrations
+         DROP COLUMN checksum`,
+      );
+
+      await expect(
+        runApplicationMigrations(integrityConfig, { migrationsDirectory }),
+      ).rejects.toMatchObject({
+        name: "ApplicationMigrationIntegrityError",
+        filename: baselineFilename,
+      });
+    } finally {
+      await integrityClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
   });
 
   it("creates every foundation, operational, and direct-consumer table", async () => {
@@ -95,6 +221,20 @@ describeWithDatabase("application migrations", () => {
 
     expect(tables.rows.map(row => row.tablename)).toEqual(
       requiredTables.sort(),
+    );
+  });
+
+  it("indexes webhook lookups by crawl, event, and newest delivery", async () => {
+    const result = await client.query<{ indexdef: string }>(
+      `SELECT indexdef
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = 'webhook_logs_crawl_event_created_at_idx'`,
+    );
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]?.indexdef).toContain(
+      "(crawl_id, event, created_at DESC)",
     );
   });
 

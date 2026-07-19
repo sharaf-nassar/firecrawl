@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -25,6 +26,20 @@ export class ApplicationMigrationError extends Error {
   ) {
     super(`Application migration ${filename} ${message}`, { cause });
     this.name = "ApplicationMigrationError";
+  }
+}
+
+export class ApplicationMigrationIntegrityError extends Error {
+  constructor(
+    public readonly filename: string,
+    public readonly reason: "missing-checksum" | "checksum-mismatch",
+  ) {
+    super(
+      reason === "missing-checksum"
+        ? `Application migration integrity check failed for ${filename}: stored checksum is missing`
+        : `Application migration integrity check failed for ${filename}: file contents have changed`,
+    );
+    this.name = "ApplicationMigrationIntegrityError";
   }
 }
 
@@ -79,24 +94,28 @@ export async function runApplicationMigrations(
     await client.query(`
       CREATE TABLE IF NOT EXISTS application_schema_migrations (
         filename text PRIMARY KEY,
+        checksum text NOT NULL,
         applied_at timestamptz NOT NULL DEFAULT now()
       )
     `);
+    await client.query(`
+      ALTER TABLE application_schema_migrations
+      ADD COLUMN IF NOT EXISTS checksum text
+    `);
 
     const filenames = await migrationFilenames(migrationsDirectory);
-    const appliedResult = await client.query<{ filename: string }>(
-      "SELECT filename FROM application_schema_migrations",
+    const appliedResult = await client.query<{
+      filename: string;
+      checksum: string | null;
+    }>("SELECT filename, checksum FROM application_schema_migrations");
+    const applied = new Map(
+      appliedResult.rows.map(row => [row.filename, row.checksum]),
     );
-    const applied = new Set(appliedResult.rows.map(row => row.filename));
 
     for (const filename of filenames) {
-      if (applied.has(filename)) {
-        continue;
-      }
-
-      let sql: string;
+      let file: Buffer;
       try {
-        sql = await readFile(join(migrationsDirectory, filename), "utf8");
+        file = await readFile(join(migrationsDirectory, filename));
       } catch (error) {
         throw new ApplicationMigrationError(
           filename,
@@ -104,13 +123,32 @@ export async function runApplicationMigrations(
           error,
         );
       }
+      const checksum = createHash("sha256").update(file).digest("hex");
+
+      if (applied.has(filename)) {
+        const appliedChecksum = applied.get(filename);
+        if (appliedChecksum === null) {
+          throw new ApplicationMigrationIntegrityError(
+            filename,
+            "missing-checksum",
+          );
+        }
+        if (appliedChecksum !== checksum) {
+          throw new ApplicationMigrationIntegrityError(
+            filename,
+            "checksum-mismatch",
+          );
+        }
+        continue;
+      }
 
       await client.query("BEGIN");
       try {
-        await client.query(sql);
+        await client.query(file.toString("utf8"));
         await client.query(
-          "INSERT INTO application_schema_migrations(filename) VALUES ($1)",
-          [filename],
+          `INSERT INTO application_schema_migrations(filename, checksum)
+           VALUES ($1, $2)`,
+          [filename, checksum],
         );
         await client.query("COMMIT");
       } catch (error) {

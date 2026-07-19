@@ -273,6 +273,8 @@ CREATE INDEX local_artifacts_delete_after_idx
   WHERE delete_after IS NOT NULL;
 CREATE INDEX local_artifacts_owner_created_at_idx
   ON local_artifacts (owner_id, created_at DESC);
+CREATE INDEX webhook_logs_crawl_event_created_at_idx
+  ON webhook_logs (crawl_id, event, created_at DESC);
 
 CREATE INDEX scrapes_request_id_idx ON scrapes (request_id);
 CREATE INDEX scrapes_team_created_at_idx
