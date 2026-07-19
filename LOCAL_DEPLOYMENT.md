@@ -200,78 +200,209 @@ volume to silence them.
 
 ## Application database backup and restore
 
-PostgreSQL logical backups are consistent while the API is running. These
-commands use the database container's own user and database environment values;
-they never place credentials on the command line. Run them from anywhere inside
-this Git checkout:
+These commands use the database container's own user and database environment
+values; they never place credentials on the command line. Stop the API first
+so request handlers and the retention worker cannot write during maintenance.
+The dump is published atomically on the host only after `pg_dump` succeeds:
 
 ```bash
+set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 compose=(docker compose --project-name firecrawl \
   --project-directory "$repo_root" -f "$repo_root/compose.yaml")
 backup_dir="$repo_root/backups/local-firecrawl"
 mkdir -p "$backup_dir"
+dump_tmp="$(mktemp "$backup_dir/.app-postgres.dump.XXXXXX")"
+backup_complete=false
+cleanup_dump() {
+  rm -f -- "$dump_tmp"
+  if [[ "$backup_complete" != true ]]; then
+    "${compose[@]}" stop api >/dev/null || true
+  fi
+}
+trap cleanup_dump EXIT
+"${compose[@]}" stop api
 "${compose[@]}" exec -T app-postgres sh -ec \
   'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner' \
-  > "$backup_dir/app-postgres.dump"
+  > "$dump_tmp"
+test -s "$dump_tmp"
+mv -- "$dump_tmp" "$backup_dir/app-postgres.dump"
+"$repo_root/scripts/local-firecrawl" start
+backup_complete=true
+trap - EXIT
 ```
 
-Verify the dump is non-empty and copy it to independent storage. Restore only
-during a maintenance window. Stop the API first so workers and request handlers
-cannot write while objects are replaced:
+If any command fails, `set -e` prevents API startup and the trap removes an
+incomplete temporary dump. Verify the finished dump and copy it to independent
+storage. Restore only during a maintenance window:
 
 ```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+compose=(docker compose --project-name firecrawl \
+  --project-directory "$repo_root" -f "$repo_root/compose.yaml")
+dump_file="$repo_root/backups/local-firecrawl/app-postgres.dump"
+restore_complete=false
+keep_api_stopped() {
+  if [[ "$restore_complete" != true ]]; then
+    "${compose[@]}" stop api >/dev/null || true
+  fi
+}
+trap keep_api_stopped EXIT
+test -s "$dump_file"
 "${compose[@]}" stop api
 "${compose[@]}" exec -T app-postgres sh -ec \
   'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --exit-on-error --single-transaction' \
-  < "$backup_dir/app-postgres.dump"
-scripts/local-firecrawl restart
-scripts/local-firecrawl health
+  < "$dump_file"
+"$repo_root/scripts/local-firecrawl" start
+restore_complete=true
+trap - EXIT
 ```
 
-Keep the API stopped if restore fails. Save the error and bounded logs, then
-repair or select a known-good backup instead of starting writers against a
-partial state.
+`--exit-on-error` and `set -e` keep the API stopped if restore fails. Save the
+error and bounded logs, then repair or select a known-good backup instead of
+starting writers against a failed restore. Run `scripts/local-firecrawl health`
+only after the restore snippet completes.
 
 ## MinIO volume backup and restore
 
 MinIO's data directory is an internal storage format. Never edit, copy, or
-delete individual files inside it. Back up and restore only the complete named
-volume while the API and MinIO are stopped. The pinned PostgreSQL image supplies
-the verified GNU `tar`/`find` tools without joining any network.
+delete individual files inside it. The only supported filesystem operation is
+a controlled, complete, offline volume archive. The pinned PostgreSQL image
+supplies the verified GNU `tar`/`find` tools without joining any network.
+
+Create a backup with API writers and MinIO stopped. The API restarts only after
+archive creation and preflight both succeed:
 
 ```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+compose=(docker compose --project-name firecrawl \
+  --project-directory "$repo_root" -f "$repo_root/compose.yaml")
+backup_dir="$repo_root/backups/local-firecrawl"
+mkdir -p "$backup_dir"
+archive_tmp=""
+backup_complete=false
+fail_backup_closed() {
+  if [[ -n "$archive_tmp" ]]; then
+    rm -f -- "$archive_tmp"
+  fi
+  if [[ "$backup_complete" != true ]]; then
+    "${compose[@]}" stop api minio >/dev/null || true
+  fi
+}
+trap fail_backup_closed EXIT
 "${compose[@]}" stop api minio
 minio_volume="$(docker volume ls \
   --filter label=com.docker.compose.project=firecrawl \
   --filter label=com.docker.compose.volume=minio-data \
   --format '{{.Name}}')"
 test -n "$minio_volume"
+[[ "$minio_volume" != *$'\n'* ]]
+archive_tmp="$(mktemp "$backup_dir/.minio-data.XXXXXX")"
+archive_tmp_name="${archive_tmp##*/}"
 docker run --rm --network none --read-only \
   --volume "$minio_volume:/source:ro" \
   --volume "$backup_dir:/backup" \
   --entrypoint tar postgres:17.10-bookworm \
-  -C /source -czf /backup/minio-data.tar.gz .
-scripts/local-firecrawl restart
-scripts/local-firecrawl health
+  -C /source -czf "/backup/$archive_tmp_name" .
+test -s "$archive_tmp"
+docker run --rm --network none --read-only \
+  --volume "$backup_dir:/backup:ro" \
+  --entrypoint tar postgres:17.10-bookworm \
+  -tzf "/backup/$archive_tmp_name" >/dev/null
+mv -- "$archive_tmp" "$backup_dir/minio-data.tar.gz"
+"$repo_root/scripts/local-firecrawl" start
+backup_complete=true
+trap - EXIT
 ```
 
-Restore is destructive and not atomic. Verify the archive first, take a second
-offline snapshot of the current volume, and keep both until validation passes.
-All writers and MinIO must remain stopped for the entire restore. Extraction as
-root preserves numeric ownership recorded by the archive; changing owners or
-extracting only part of it can corrupt MinIO state.
+If backup fails, API and MinIO remain stopped and the incomplete archive is
+removed. A restore is not filesystem-atomic. It is service-level atomic: no API
+or MinIO consumer runs while the live volume could contain partial data. The
+procedure preflights the selected archive before stopping services, creates and
+validates a separate rollback archive, preserves numeric ownership, compares
+the restored tree with the archive, and validates MinIO before allowing API
+startup.
 
 ```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+compose=(docker compose --project-name firecrawl \
+  --project-directory "$repo_root" -f "$repo_root/compose.yaml")
+backup_dir="$repo_root/backups/local-firecrawl"
+restore_archive="$backup_dir/minio-data.tar.gz"
+restore_name="${restore_archive##*/}"
+recovery_complete=false
+fail_closed() {
+  if [[ "$recovery_complete" != true ]]; then
+    "${compose[@]}" stop api minio >/dev/null || true
+  fi
+}
+trap fail_closed EXIT
+test -s "$restore_archive"
+docker run --rm --network none --read-only \
+  --volume "$backup_dir:/backup:ro" \
+  --entrypoint tar postgres:17.10-bookworm \
+  -tzf "/backup/$restore_name" >/dev/null
+
 "${compose[@]}" stop api minio
+minio_volume="$(docker volume ls \
+  --filter label=com.docker.compose.project=firecrawl \
+  --filter label=com.docker.compose.volume=minio-data \
+  --format '{{.Name}}')"
+test -n "$minio_volume"
+[[ "$minio_volume" != *$'\n'* ]]
+rollback_archive="$(mktemp "$backup_dir/minio-data.rollback.XXXXXX")"
+rollback_name="${rollback_archive##*/}"
+docker run --rm --network none --read-only \
+  --volume "$minio_volume:/source:ro" \
+  --volume "$backup_dir:/backup" \
+  --entrypoint tar postgres:17.10-bookworm \
+  -C /source -czf "/backup/$rollback_name" .
+test -s "$rollback_archive"
+docker run --rm --network none --read-only \
+  --volume "$backup_dir:/backup:ro" \
+  --entrypoint tar postgres:17.10-bookworm \
+  -tzf "/backup/$rollback_name" >/dev/null
+printf 'Rollback archive: %s\n' "$rollback_archive"
+
 docker run --rm --network none --read-only \
   --volume "$minio_volume:/target" \
   --volume "$backup_dir:/backup:ro" \
   --entrypoint sh postgres:17.10-bookworm -ec \
-  'find /target -mindepth 1 -delete; tar -C /target -xzf /backup/minio-data.tar.gz'
-scripts/local-firecrawl restart
-scripts/local-firecrawl health
+  'find /target -mindepth 1 -delete
+   tar --extract --gzip --numeric-owner --same-owner \
+     --file "/backup/$1" --directory /target' sh "$restore_name"
+docker run --rm --network none --read-only \
+  --volume "$minio_volume:/target:ro" \
+  --volume "$backup_dir:/backup:ro" \
+  --entrypoint tar postgres:17.10-bookworm \
+  --compare --gzip --numeric-owner --file "/backup/$restore_name" \
+  --directory /target
+
+"${compose[@]}" up -d --wait minio
+"${compose[@]}" up --no-deps --force-recreate \
+  --abort-on-container-exit --exit-code-from minio-init minio-init
+test "$("${compose[@]}" ps --all \
+  --format '{{.State}} {{.ExitCode}}' minio-init)" = 'exited 0'
+"${compose[@]}" exec -T minio curl --fail --silent --show-error \
+  --max-time 10 --output /dev/null \
+  http://127.0.0.1:9000/minio/health/live
+"${compose[@]}" run --rm --no-deps -T api sh -ec \
+  'test -z "${MINIO_ROOT_USER+x}" && \
+   test -z "${MINIO_ROOT_PASSWORD+x}" && \
+   node dist/src/cli/artifact-health.js'
+"$repo_root/scripts/local-firecrawl" start
+recovery_complete=true
+trap - EXIT
 ```
+
+Any failure after restoration begins keeps API and MinIO stopped and leaves the
+validated rollback archive intact. An earlier failure leaves the live volume
+untouched. To recover, set `restore_archive` to the printed rollback path and
+repeat the same offline restore procedure. Never start either consumer against
+the failed or partially restored volume.
 
 MinIO server and client images are pinned to exact releases because upstream
 is archived and maintenance-sensitive. They never upgrade automatically.

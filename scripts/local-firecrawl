@@ -32,7 +32,9 @@ validate_compose() {
 run_one_shot() {
   local service="$1"
 
-  "${compose[@]}" up --no-deps --force-recreate "$service"
+  "${compose[@]}" up --no-deps --force-recreate \
+    --abort-on-container-exit --exit-code-from "$service" "$service"
+  require_completed_one_shot "$service"
 }
 
 start_runtime() {
