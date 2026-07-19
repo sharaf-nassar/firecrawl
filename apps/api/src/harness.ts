@@ -4,6 +4,7 @@ import { existsSync } from "fs";
 import * as net from "net";
 import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
+import { containerRemovalCommand } from "./harness-container";
 
 const childProcesses = new Set<ChildProcess>();
 const stopping = new WeakSet<ChildProcess>(); // processes we're intentionally stopping
@@ -546,6 +547,7 @@ async function isContainerRunning(
 async function stopAndRemoveContainer(
   runtime: string,
   containerName: string,
+  removeVolumes: boolean = false,
 ): Promise<void> {
   const isRunning = await isContainerRunning(runtime, containerName);
   if (isRunning) {
@@ -565,7 +567,7 @@ async function stopAndRemoveContainer(
   try {
     const remove = execForward(
       `${runtime}@rm`,
-      `${runtime} rm -f ${containerName}`,
+      containerRemovalCommand(runtime, containerName, removeVolumes),
     );
     await remove.promise;
   } catch (e) {
@@ -623,6 +625,15 @@ async function setupApplicationPostgres(): Promise<void> {
     const user = "firecrawl";
     const password = "firecrawl";
     const database = "firecrawl";
+    applicationPostgresContainer = {
+      containerName,
+      containerRuntime: runtime,
+    };
+    if (process.env.TEST_APPLICATION_DATABASE_FAIL_BEFORE_START === "true") {
+      throw new Error(
+        "Forced application database startup failure before container creation",
+      );
+    }
     const start = execForward(`${runtime}@app-db`, [
       runtime,
       "run",
@@ -640,10 +651,11 @@ async function setupApplicationPostgres(): Promise<void> {
       "postgres:17.10-bookworm",
     ]);
     await start.promise;
-    applicationPostgresContainer = {
-      containerName,
-      containerRuntime: runtime,
-    };
+    if (process.env.TEST_APPLICATION_DATABASE_FAIL_AFTER_START === "true") {
+      throw new Error(
+        "Forced application database startup failure after container creation",
+      );
+    }
     databaseUrl = `postgresql://${user}:${password}@127.0.0.1:${port}/${database}`;
   }
 
@@ -1436,6 +1448,7 @@ async function gracefulShutdown() {
     await stopAndRemoveContainer(
       applicationPostgresContainer.containerRuntime,
       applicationPostgresContainer.containerName,
+      true,
     );
     logger.success("Harness-owned application PostgreSQL container stopped");
     applicationPostgresContainer = null;
