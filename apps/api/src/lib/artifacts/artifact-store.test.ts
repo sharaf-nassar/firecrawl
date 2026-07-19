@@ -54,6 +54,29 @@ describe("artifact provider selection", () => {
       }),
     ).toThrowError(ArtifactStoreError);
   });
+
+  it.each(["http://[::1]:9000", "http://-bad:9000"])(
+    "normalizes SDK endpoint validation for %s",
+    endpoint => {
+      let failure: unknown;
+      try {
+        createArtifactStore({
+          ...minioConfig,
+          ARTIFACT_MINIO_ENDPOINT: endpoint,
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(ArtifactStoreError);
+      expect(failure).toMatchObject({
+        provider: "minio",
+        operation: "configure",
+      });
+      expect(String(failure)).not.toContain(
+        minioConfig.ARTIFACT_MINIO_SECRET_KEY,
+      );
+    },
+  );
 });
 
 describe("GCS compatibility adapter", () => {
@@ -208,6 +231,101 @@ describe("MinIO artifact contract", () => {
       client,
     );
     await expect(store.get("found")).resolves.toEqual(Buffer.from("onetwo"));
+  });
+
+  it("retries a transient stream failure with a fresh stream", async () => {
+    const client = makeClient();
+    const first = new Readable({
+      read() {
+        this.destroy(
+          Object.assign(new Error("read interrupted"), { code: "ECONNRESET" }),
+        );
+      },
+    });
+    client.getObject
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(Readable.from(["recovered"]));
+    const store = new MinioArtifactStore(
+      {
+        endpoint: "http://minio:9000",
+        accessKey: "app",
+        secretKey: "secret",
+        bucket: "firecrawl-artifacts",
+        region: "us-east-1",
+      },
+      client,
+      { retryDelayMs: 0 },
+    );
+
+    await expect(store.get("result")).resolves.toEqual(
+      Buffer.from("recovered"),
+    );
+    expect(client.getObject).toHaveBeenCalledTimes(2);
+  });
+
+  it("types terminal transient stream failures after three attempts", async () => {
+    const client = makeClient();
+    client.getObject.mockImplementation(async () =>
+      Readable.from(
+        (async function* () {
+          throw Object.assign(new Error("secret-value-that-must-not-leak"), {
+            code: "ECONNRESET",
+          });
+        })(),
+      ),
+    );
+    const store = new MinioArtifactStore(
+      {
+        endpoint: "http://minio:9000",
+        accessKey: "app",
+        secretKey: "secret-value-that-must-not-leak",
+        bucket: "firecrawl-artifacts",
+        region: "us-east-1",
+      },
+      client,
+      { retryDelayMs: 0 },
+    );
+
+    const failure = await store.get("result").catch(error => error);
+    expect(failure).toBeInstanceOf(ArtifactStoreError);
+    expect(failure).toMatchObject({
+      provider: "minio",
+      operation: "get",
+      errorCode: "ECONNRESET",
+    });
+    expect(String(failure)).not.toContain("secret-value-that-must-not-leak");
+    expect(client.getObject).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry nontransient stream validation failures", async () => {
+    const client = makeClient();
+    client.getObject.mockResolvedValue(
+      Readable.from(
+        (async function* () {
+          throw Object.assign(new Error("invalid stream"), {
+            code: "InvalidArgument",
+          });
+        })(),
+      ),
+    );
+    const store = new MinioArtifactStore(
+      {
+        endpoint: "http://minio:9000",
+        accessKey: "app",
+        secretKey: "secret",
+        bucket: "firecrawl-artifacts",
+        region: "us-east-1",
+      },
+      client,
+      { retryDelayMs: 0 },
+    );
+
+    await expect(store.get("result")).rejects.toMatchObject({
+      provider: "minio",
+      operation: "get",
+      errorCode: "InvalidArgument",
+    });
+    expect(client.getObject).toHaveBeenCalledTimes(1);
   });
 
   it("retries transient infrastructure errors at most three attempts", async () => {

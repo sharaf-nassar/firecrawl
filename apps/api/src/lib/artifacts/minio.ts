@@ -106,13 +106,18 @@ function createMinioClient(config: MinioArtifactConfig): Client {
   ) {
     throw new ArtifactStoreError("minio", "configure", "missing_configuration");
   }
-  return new Client({
-    ...parseEndpoint(config.endpoint),
-    accessKey: config.accessKey,
-    secretKey: config.secretKey,
-    region: config.region,
-    retryOptions: { disableRetry: true },
-  });
+  const endpoint = parseEndpoint(config.endpoint);
+  try {
+    return new Client({
+      ...endpoint,
+      accessKey: config.accessKey,
+      secretKey: config.secretKey,
+      region: config.region,
+      retryOptions: { disableRetry: true },
+    });
+  } catch {
+    throw new ArtifactStoreError("minio", "configure", "invalid_configuration");
+  }
 }
 
 export class MinioArtifactStore implements ArtifactStore {
@@ -188,14 +193,14 @@ export class MinioArtifactStore implements ArtifactStore {
   async get(key: string): Promise<Buffer | null> {
     if (!key) throw new ArtifactStoreError("minio", "get", "invalid_input");
     try {
-      const stream = await this.run("get", () =>
-        this.client.getObject(this.config.bucket, key),
-      );
-      const chunks: Buffer[] = [];
-      for await (const chunk of stream) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      return Buffer.concat(chunks);
+      return await this.run("get", async () => {
+        const stream = await this.client.getObject(this.config.bucket, key);
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        return Buffer.concat(chunks);
+      });
     } catch (error) {
       if (
         error instanceof ArtifactStoreError &&
