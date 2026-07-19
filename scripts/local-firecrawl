@@ -9,6 +9,9 @@ compose=(
   --project-directory "$repo_root"
   -f "$repo_root/compose.yaml"
 )
+runtime_lock_path="/tmp/firecrawl-local-firecrawl.${UID}.lock"
+lock_wait_seconds="${LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS:-30}"
+one_shot_timeout_seconds="${LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS:-300}"
 dependency_services=(
   playwright-service
   nuq-postgres
@@ -22,7 +25,37 @@ one_shot_services=(app-db-migrate minio-init)
 diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
 
 usage() {
-  printf 'Usage: %s {start|restart|status|health|logs}\n' "${0##*/}" >&2
+  printf 'Usage: %s {start|stop|restart|status|health|logs|lock-path}\n' \
+    "${0##*/}" >&2
+}
+
+validate_runtime_options() {
+  if [[ ! "$lock_wait_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' \
+      'LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS must be a positive integer' >&2
+    exit 64
+  fi
+  if [[ ! "$one_shot_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' \
+      'LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS must be a positive integer' >&2
+    exit 64
+  fi
+}
+
+acquire_runtime_lock() {
+  local mode="$1"
+  local -a lock_mode=(--exclusive)
+
+  if [[ "$mode" == shared ]]; then
+    lock_mode=(--shared)
+  fi
+  exec {runtime_lock_fd}> "$runtime_lock_path"
+  if ! flock "${lock_mode[@]}" --timeout "$lock_wait_seconds" \
+    --conflict-exit-code 75 "$runtime_lock_fd"; then
+    printf 'Local Firecrawl maintenance lock is busy: %s\n' \
+      "$runtime_lock_path" >&2
+    exit 75
+  fi
 }
 
 validate_compose() {
@@ -31,9 +64,20 @@ validate_compose() {
 
 run_one_shot() {
   local service="$1"
+  local status
 
-  "${compose[@]}" up --no-deps --force-recreate \
+  set +e
+  timeout --signal=TERM --kill-after=10s "${one_shot_timeout_seconds}s" \
+    "${compose[@]}" up --no-deps --force-recreate \
     --abort-on-container-exit --exit-code-from "$service" "$service"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    "${compose[@]}" stop --timeout 10 "$service" >/dev/null 2>&1 || true
+    "${compose[@]}" kill "$service" >/dev/null 2>&1 || true
+    printf '%s failed or timed out (status: %s)\n' "$service" "$status" >&2
+    return "$status"
+  fi
   require_completed_one_shot "$service"
 }
 
@@ -100,19 +144,35 @@ if (( $# != 1 )); then
 fi
 
 case "$1" in
+  lock-path)
+    printf '%s\n' "$runtime_lock_path"
+    ;;
   start)
+    validate_runtime_options
+    acquire_runtime_lock exclusive
     validate_compose
     # Writers stay stopped until storage initialization and migrations succeed.
     "${compose[@]}" stop api
     start_runtime
     ;;
+  stop)
+    validate_runtime_options
+    acquire_runtime_lock exclusive
+    validate_compose
+    "${compose[@]}" stop api
+    "${compose[@]}" stop "${dependency_services[@]}"
+    ;;
   restart)
+    validate_runtime_options
+    acquire_runtime_lock exclusive
     validate_compose
     "${compose[@]}" stop api
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
     ;;
   status)
+    validate_runtime_options
+    acquire_runtime_lock shared
     validate_compose
     printf '%s\n' 'Long-running services:'
     "${compose[@]}" ps --all "${long_running_services[@]}"
@@ -120,6 +180,8 @@ case "$1" in
     "${compose[@]}" ps --all "${one_shot_services[@]}"
     ;;
   health)
+    validate_runtime_options
+    acquire_runtime_lock shared
     validate_compose
 
     redis_response="$("${compose[@]}" exec -T redis redis-cli ping)"
@@ -146,14 +208,56 @@ case "$1" in
       printf '%s\n' 'No application migrations were found' >&2
       exit 1
     fi
-    latest_applied_migration="$(
+    migration_ledger_entry="$(
       "${compose[@]}" exec -T app-postgres sh -ec \
-        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT filename FROM application_schema_migrations ORDER BY filename DESC LIMIT 1"'
+        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT concat_ws('"'"'|'"'"', filename, checksum) FROM application_schema_migrations ORDER BY filename DESC LIMIT 1"'
     )"
+    IFS='|' read -r latest_applied_migration latest_applied_checksum \
+      <<< "$migration_ledger_entry"
     if [[ "$latest_applied_migration" != "$latest_checked_in_migration" ]]; then
       printf 'Application migration mismatch: expected %s, found %s\n' \
         "$latest_checked_in_migration" \
         "${latest_applied_migration:-none}" >&2
+      exit 1
+    fi
+    latest_checked_in_checksum="$(
+      sha256sum -- \
+        "$repo_root/apps/api/src/db/migrations/$latest_checked_in_migration"
+    )"
+    latest_checked_in_checksum="${latest_checked_in_checksum%% *}"
+    if [[ -z "$latest_applied_checksum" ]] ||
+      [[ "$latest_applied_checksum" != "$latest_checked_in_checksum" ]]; then
+      printf 'Application migration checksum mismatch: %s\n' \
+        "$latest_checked_in_migration" >&2
+      exit 1
+    fi
+
+    api_container_id="$("${compose[@]}" ps -q api)"
+    migrator_container_id="$(
+      "${compose[@]}" ps --all -q app-db-migrate
+    )"
+    if [[ -z "$api_container_id" || -z "$migrator_container_id" ]]; then
+      printf '%s\n' 'API or migration container provenance is unavailable' >&2
+      exit 1
+    fi
+    api_image_id="$(docker inspect --format '{{.Image}}' "$api_container_id")"
+    migrator_image_id="$(
+      docker inspect --format '{{.Image}}' "$migrator_container_id"
+    )"
+    api_compose_source="$(
+      docker inspect --format \
+        '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
+        "$api_container_id"
+    )"
+    migrator_compose_source="$(
+      docker inspect --format \
+        '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
+        "$migrator_container_id"
+    )"
+    if [[ "$api_image_id" != "$migrator_image_id" ]] ||
+      [[ "$api_compose_source" != "$repo_root/compose.yaml" ]] ||
+      [[ "$migrator_compose_source" != "$repo_root/compose.yaml" ]]; then
+      printf '%s\n' 'API and migration image provenance does not match' >&2
       exit 1
     fi
 
@@ -184,6 +288,8 @@ case "$1" in
       "Local Firecrawl is healthy at http://127.0.0.1:3002; migrations: $latest_applied_migration; artifacts: MinIO"
     ;;
   logs)
+    validate_runtime_options
+    acquire_runtime_lock shared
     validate_compose
     "${compose[@]}" logs --no-color --tail=200 \
       "${diagnostic_services[@]}"
