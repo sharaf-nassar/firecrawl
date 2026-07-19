@@ -170,6 +170,14 @@ export async function scrapeInteractController(
   }
   const replayContext = replay.context;
 
+  if (!config.BROWSER_SERVICE_URL) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "Browser feature is not configured (BROWSER_SERVICE_URL is missing).",
+    });
+  }
+
   logger = logger.child({
     replayTargetUrl: replayContext.targetUrl,
     replayWaitForMs: replayContext.waitForMs,
@@ -522,18 +530,6 @@ async function createSessionForScrape(
     {},
   );
   const integration = req.body?.integration ?? null;
-
-  if (!config.BROWSER_SERVICE_URL) {
-    return {
-      status: 503,
-      body: {
-        success: false,
-        error:
-          "Browser feature is not configured (BROWSER_SERVICE_URL is missing).",
-      },
-      error: true,
-    };
-  }
 
   logger.info("No browser session found for scrape. Creating one.", {
     scrapeId,

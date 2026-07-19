@@ -115,25 +115,27 @@ async function robustInsert(
       });
     } else {
       logger.error("Failed to insert into database", { attempts });
+      const failure =
+        attempts[attempts.length - 1]?.error ??
+        new Error("Database insert failed after 10 attempts");
       // Report to Sentry with context
-      Sentry.captureException(
-        attempts[attempts.length - 1]?.error ||
-          new Error("Database insert failed after 10 attempts"),
-        {
-          tags: {
-            table,
-            operation: "robustInsert",
-          },
-          extra: {
-            table,
-            data: JSON.stringify(data).substring(0, 500), // Limit size
-            attempts: 10,
-            lastError: attempts[attempts.length - 1]?.error
-              ? JSON.stringify(attempts[attempts.length - 1].error)
-              : null,
-          },
+      Sentry.captureException(failure, {
+        tags: {
+          table,
+          operation: "robustInsert",
         },
-      );
+        extra: {
+          table,
+          data: JSON.stringify(data).substring(0, 500), // Limit size
+          attempts: 10,
+          lastError: attempts[attempts.length - 1]?.error
+            ? JSON.stringify(attempts[attempts.length - 1].error)
+            : null,
+        },
+      });
+      if (config.LOCAL_PERSISTENCE_ENABLED) {
+        throw failure;
+      }
     }
   } else {
     const start = Date.now();

@@ -434,7 +434,42 @@ describe("application persistence", () => {
     );
   });
 
-  it("captures a force insert failure after all retries", async () => {
+  it("rejects a local force insert failure with the original error", async () => {
+    enableLocalPersistence();
+    vi.useFakeTimers();
+    const error = new Error("database unavailable");
+    values.mockRejectedValue(error);
+
+    const logging = logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: "bypass",
+      target_hint: "https://example.com",
+      zeroDataRetention: false,
+    });
+    await Promise.all([
+      vi.runAllTimersAsync(),
+      expect(logging).rejects.toBe(error),
+    ]);
+
+    expect(values).toHaveBeenCalledTimes(10);
+    expect(captureException).toHaveBeenCalledWith(error, expect.any(Object));
+    expect(logger.error).toHaveBeenCalledWith(
+      "Failed to insert into database",
+      expect.any(Object),
+    );
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      "Inserted into database successfully",
+      expect.any(Object),
+    );
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      "Inserted into database successfully with retries",
+      expect.any(Object),
+    );
+  });
+
+  it("preserves hosted force insert failure handling", async () => {
     vi.useFakeTimers();
     const error = new Error("database unavailable");
     values.mockRejectedValue(error);
@@ -447,19 +482,13 @@ describe("application persistence", () => {
       target_hint: "https://example.com",
       zeroDataRetention: false,
     });
-    await vi.runAllTimersAsync();
-    await expect(logging).resolves.toBeUndefined();
+    await Promise.all([
+      vi.runAllTimersAsync(),
+      expect(logging).resolves.toBeUndefined(),
+    ]);
 
     expect(values).toHaveBeenCalledTimes(10);
     expect(captureException).toHaveBeenCalledWith(error, expect.any(Object));
-    expect(logger.error).toHaveBeenCalledWith(
-      "Failed to insert into database",
-      expect.any(Object),
-    );
-    expect(logger.debug).not.toHaveBeenCalledWith(
-      "Inserted into database successfully",
-      expect.any(Object),
-    );
   });
 });
 

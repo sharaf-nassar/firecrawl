@@ -5,6 +5,7 @@ import * as net from "net";
 import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
+import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
 
 const childProcesses = new Set<ChildProcess>();
 const stopping = new WeakSet<ChildProcess>(); // processes we're intentionally stopping
@@ -309,6 +310,7 @@ async function configureLocalPersistenceHarness(
   if (!isLocalPersistenceCommand(command)) return;
 
   localPersistenceHarness = true;
+  clearLocalPersistenceExternalSettings(process.env, config);
   PORT = await availablePort();
   fixtureServerPort = await availablePort();
   const workerPortStart = await availablePortRange(config.NUQ_WORKER_COUNT + 4);
