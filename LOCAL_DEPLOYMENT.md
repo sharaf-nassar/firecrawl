@@ -158,16 +158,19 @@ order is:
 
 ```text
 0001_persistence_foundation.sql
+0002_async_request_placeholders.sql
 0002_preflight_orphan_webhooks.sql
 0002_retention_foreign_keys.sql
 ```
 
-The preflight filename intentionally sorts before the retention foreign-key
-migration. It removes legacy webhook orphans before constraints are validated.
-Some deployments may already have the retention migration ledgered from before
-the preflight file existed; the runner safely applies the missing preflight on
-the next run without replaying the ledgered retention migration. Do not rename
-either file to make the numeric prefixes unique.
+The async-placeholder filename sorts before both immutable retention files. It
+backfills a metadata-free request for every legacy child-first operational row
+and installs triggers on all 14 child tables. The preflight can then preserve
+resolved webhook logs, and the retention migration can validate its request
+foreign keys without deleting child-first job data. Some deployments may
+already have the retention migration ledgered from before the preflight file
+existed; the runner applies missing files without replaying ledgered files. Do
+not rename these files to make the numeric prefixes unique.
 
 `application_schema_migrations` records each filename and SHA-256 checksum.
 Startup fails if an applied file disappears, its checksum changes, a stored
@@ -191,6 +194,14 @@ latest ledger filename to exactly match the latest checked-in migration.
 worker continuously in batches. It removes expired MinIO objects and their
 manifests, then cleans expired operational rows. Failed artifact deletes keep
 their manifests retryable; later iterations retry them.
+
+An operational child may be logged before its request. Its insert creates a
+placeholder request containing no target URL or user payload and a deadline no
+later than 24 hours. The local request logger atomically replaces the
+placeholder with real metadata and the configured retention deadline. If the
+request log never arrives, normal retention removes the abandoned placeholder
+and its dependent rows after the bounded fallback window. Hosted request
+logging is unchanged.
 
 Zero-data-retention requests stay redacted, do not write durable artifacts,
 and receive a cleanup deadline no later than 24 hours even when normal

@@ -51,6 +51,7 @@ CLAUDE.local.md
 apps/python-sdk/.venv/
 
 /apps/api/running-docs/
+/backups/local-firecrawl/
 
 
 /apps/go-html-to-md-service/.gomodcache/

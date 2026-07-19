@@ -66,6 +66,10 @@ async function robustInsert(
   data: any,
   force: boolean,
   _logger: Logger,
+  conflictUpdate?: {
+    target: typeof schema.requests.id;
+    set: Record<string, unknown>;
+  },
 ) {
   const logger = _logger.child({
     module: "log_job",
@@ -89,7 +93,12 @@ async function robustInsert(
     for (let i = 0; i < 10; i++) {
       const start = Date.now();
       try {
-        await db.insert(target).values(data);
+        const insert = db.insert(target).values(data);
+        if (conflictUpdate) {
+          await insert.onConflictDoUpdate(conflictUpdate);
+        } else {
+          await insert;
+        }
         attempts.push({
           error: null,
           timeMs: Date.now() - start,
@@ -222,33 +231,35 @@ export async function logRequest(request: LoggedRequest) {
     ? "<redacted due to zero data retention>"
     : sanitizeString(request.target_hint);
 
-  await robustInsert(
-    "requests",
-    {
-      id: request.id,
-      kind: request.kind,
-      api_version: request.api_version,
-      team_id: resolveJobPersistenceOwner(request.team_id),
-      origin: sanitizedOrigin,
-      integration: sanitizedIntegration,
-      target_hint: sanitizedTargetHint,
-      dr_clean_by: request.zeroDataRetention
+  const requestData = {
+    id: request.id,
+    kind: request.kind,
+    api_version: request.api_version,
+    team_id: resolveJobPersistenceOwner(request.team_id),
+    origin: sanitizedOrigin,
+    integration: sanitizedIntegration,
+    target_hint: sanitizedTargetHint,
+    dr_clean_by: request.zeroDataRetention
+      ? retentionDeadline(new Date(), config.LOCAL_RECORD_RETENTION_DAYS, true)
+      : config.LOCAL_PERSISTENCE_ENABLED
         ? retentionDeadline(
             new Date(),
             config.LOCAL_RECORD_RETENTION_DAYS,
-            true,
+            false,
           )
-        : config.LOCAL_PERSISTENCE_ENABLED
-          ? retentionDeadline(
-              new Date(),
-              config.LOCAL_RECORD_RETENTION_DAYS,
-              false,
-            )
-          : null,
-      api_key_id: request.api_key_id ?? null,
-    },
+        : null,
+    api_key_id: request.api_key_id ?? null,
+  };
+  const { id: _requestId, ...requestUpdate } = requestData;
+
+  await robustInsert(
+    "requests",
+    requestData,
     true,
     logger,
+    config.LOCAL_PERSISTENCE_ENABLED
+      ? { target: schema.requests.id, set: requestUpdate }
+      : undefined,
   );
 }
 

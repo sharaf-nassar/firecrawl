@@ -330,6 +330,18 @@ each job table (team_id, created_at desc)
 Do not add foreign keys from job rows to `requests`: logging is asynchronous
 and completion may race the request insert. Do not create hosted RPCs.
 
+**Acceptance amendment (2026-07-18):** Preserve the requirement above as the
+original design history, but use request foreign keys safely. A lexically
+earlier migration creates bounded, metadata-free placeholder requests before
+the immutable foreign-key migrations run. It also installs `BEFORE INSERT`
+triggers on all 14 operational child tables so a child-first asynchronous log
+write creates its placeholder atomically. Local `logRequest` uses
+`ON CONFLICT DO UPDATE` to replace that placeholder with real request metadata
+and the configured deadline; hosted inserts keep their prior behavior.
+Abandoned placeholders expire within 24 hours, allowing normal retention to
+remove them and their dependent rows without deleting valid child-first data
+during migration.
+
 - [ ] **Step 4: Copy migrations into the runtime image**
 
 Add a Dockerfile copy after built application files:

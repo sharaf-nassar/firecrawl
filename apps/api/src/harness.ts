@@ -6,6 +6,7 @@ import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
 import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
+import { createSharedShutdown } from "./harness-shutdown";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
 import {
   createLocalRetentionService,
@@ -1418,8 +1419,7 @@ async function waitForTermination(services: Services): Promise<void> {
   });
 }
 
-async function gracefulShutdown() {
-  if (shuttingDown) return;
+const gracefulShutdown = createSharedShutdown(async () => {
   shuttingDown = true;
   restartSignal?.abort();
 
@@ -1483,7 +1483,7 @@ async function gracefulShutdown() {
   }
 
   logger.success("All processes terminated");
-}
+});
 
 function printUsage() {
   console.error(

@@ -1264,6 +1264,50 @@ describeWithDatabase("PostgreSQL local retention", () => {
     expect(owner.rows).toHaveLength(1);
   });
 
+  it("cleans an abandoned async placeholder after its fallback deadline", async () => {
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    fixtureIds.add(requestId);
+    await pool.query(
+      `INSERT INTO scrapes (
+         id, request_id, url, is_successful, time_taken, team_id, credits_cost
+       ) VALUES ($1, $2, 'https://example.com/abandoned', true, 1, $3, 1)`,
+      [scrapeId, requestId, ownerId],
+    );
+
+    const placeholder = await pool.query<{
+      kind: string;
+      created_at: Date;
+      dr_clean_by: Date;
+    }>(
+      `SELECT kind, created_at, dr_clean_by
+         FROM requests
+        WHERE id = $1`,
+      [requestId],
+    );
+    expect(placeholder.rows).toHaveLength(1);
+    expect(placeholder.rows[0]?.kind).toBe("async_placeholder");
+    expect(placeholder.rows[0]!.dr_clean_by.getTime()).toBeLessThanOrEqual(
+      placeholder.rows[0]!.created_at.getTime() + 24 * 60 * 60 * 1000,
+    );
+
+    const result = await database.deleteExpiredOperationalRows(
+      new Date(placeholder.rows[0]!.dr_clean_by.getTime() + 1),
+      50,
+    );
+
+    expect(result.requestsDeleted).toBeGreaterThanOrEqual(1);
+    expect(result.dependentRowsDeleted).toBeGreaterThanOrEqual(1);
+    expect(result.requestIds).toContain(requestId);
+    const retained = await pool.query(
+      `SELECT id FROM requests WHERE id = $1
+       UNION ALL
+       SELECT request_id AS id FROM scrapes WHERE id = $2`,
+      [requestId, scrapeId],
+    );
+    expect(retained.rows).toHaveLength(0);
+  });
+
   it("rolls back request cleanup when a dependent delete fails", async () => {
     const requestId = randomUUID();
     const scrapeId = randomUUID();

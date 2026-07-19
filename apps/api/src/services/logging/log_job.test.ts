@@ -9,6 +9,7 @@ const {
   changeTrackingInsertScrape,
   logger,
   saveScrapeToGCS,
+  onConflictDoUpdate,
   values,
   insert,
 } = vi.hoisted(() => {
@@ -19,7 +20,10 @@ const {
     debug: vi.fn(),
     child: vi.fn(() => logger),
   };
-  const values = vi.fn<(data: any) => Promise<void>>();
+  const onConflictDoUpdate = vi.fn<() => Promise<void>>();
+  const values = vi.fn<
+    (data: any) => { onConflictDoUpdate: typeof onConflictDoUpdate }
+  >(() => ({ onConflictDoUpdate }));
   const insert = vi.fn(() => ({ values }));
   return {
     artifactStoreConfigured: { value: false },
@@ -27,6 +31,7 @@ const {
     changeTrackingInsertScrape: vi.fn(),
     logger,
     saveScrapeToGCS: vi.fn(),
+    onConflictDoUpdate,
     values,
     insert,
   };
@@ -133,7 +138,8 @@ function makeSearch(overrides: Partial<LoggedSearch> = {}): LoggedSearch {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  values.mockResolvedValue(undefined);
+  values.mockReturnValue({ onConflictDoUpdate });
+  onConflictDoUpdate.mockResolvedValue(undefined);
   config.USE_DB_AUTHENTICATION = true;
   config.LOCAL_PERSISTENCE_ENABLED = false;
   config.APPLICATION_DATABASE_URL = undefined;
@@ -197,6 +203,44 @@ describe("application persistence", () => {
         target_hint: "<redacted due to zero data retention>",
       }),
     );
+  });
+
+  it("atomically replaces local async request placeholders", async () => {
+    enableLocalPersistence();
+
+    await logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: localOwnerId,
+      target_hint: "https://example.com/real-request",
+      zeroDataRetention: false,
+    });
+
+    expect(onConflictDoUpdate).toHaveBeenCalledOnce();
+    expect(onConflictDoUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: schema.requests.id,
+        set: expect.objectContaining({
+          kind: "scrape",
+          api_version: "v2",
+          target_hint: "https://example.com/real-request",
+        }),
+      }),
+    );
+  });
+
+  it("keeps hosted request inserts on their existing conflict behavior", async () => {
+    await logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: "hosted-team",
+      target_hint: "https://example.com/hosted",
+      zeroDataRetention: false,
+    });
+
+    expect(onConflictDoUpdate).not.toHaveBeenCalled();
   });
 
   it("keeps synchronous ZDR data redacted and out of artifact storage", async () => {
@@ -511,7 +555,8 @@ describe("application persistence", () => {
     expect(changeTrackingInsertScrape).toHaveBeenCalledOnce();
 
     vi.clearAllMocks();
-    values.mockResolvedValue(undefined);
+    values.mockReturnValue({ onConflictDoUpdate });
+    onConflictDoUpdate.mockResolvedValue(undefined);
     enableLocalPersistence();
     await logScrape({ ...scrape, team_id: "bypass" });
     expect(changeTrackingInsertScrape).not.toHaveBeenCalled();
@@ -538,7 +583,7 @@ describe("application persistence", () => {
     enableLocalPersistence();
     vi.useFakeTimers();
     const error = new Error("database unavailable");
-    values.mockRejectedValue(error);
+    onConflictDoUpdate.mockRejectedValue(error);
 
     const logging = logRequest({
       id: requestId,
@@ -554,6 +599,7 @@ describe("application persistence", () => {
     ]);
 
     expect(values).toHaveBeenCalledTimes(10);
+    expect(onConflictDoUpdate).toHaveBeenCalledTimes(10);
     expect(captureException).toHaveBeenCalledWith(error, expect.any(Object));
     expect(logger.error).toHaveBeenCalledWith(
       "Failed to insert into database",

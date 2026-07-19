@@ -1,4 +1,12 @@
-import { appendFile, copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  appendFile,
+  copyFile,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,7 +25,9 @@ const missingFileSchema = "migration_missing_file_test";
 const nullChecksumSchema = "migration_null_checksum_test";
 const retentionFkSchema = "migration_retention_fk_test";
 const preflightUpgradeSchema = "migration_preflight_upgrade_test";
+const asyncPlaceholderSchema = "migration_async_placeholder_test";
 const baselineFilename = "0001_persistence_foundation.sql";
+const asyncPlaceholderFilename = "0002_async_request_placeholders.sql";
 const preflightFilename = "0002_preflight_orphan_webhooks.sql";
 const retentionFkFilename = "0002_retention_foreign_keys.sql";
 
@@ -66,6 +76,64 @@ const directConsumerTables = [
   "webhook_logs",
 ];
 
+async function insertEveryOperationalChildBeforeParent(
+  client: Client,
+): Promise<string[]> {
+  const inserts = [
+    `INSERT INTO scrapes (
+       id, request_id, url, is_successful, time_taken, team_id, credits_cost
+     ) VALUES (gen_random_uuid(), $1, 'https://example.com/scrape',
+               true, 1, $2, 1)`,
+    `INSERT INTO parses (
+       id, request_id, url, is_successful, time_taken, team_id, credits_cost
+     ) VALUES (gen_random_uuid(), $1, 'https://example.com/parse',
+               true, 1, $2, 1)`,
+    `INSERT INTO crawls (
+       id, request_id, url, team_id, num_docs, credits_cost, cancelled
+     ) VALUES (gen_random_uuid(), $1, 'https://example.com/crawl',
+               $2, 1, 1, false)`,
+    `INSERT INTO batch_scrapes (
+       id, request_id, team_id, num_docs, credits_cost, cancelled
+     ) VALUES (gen_random_uuid(), $1, $2, 1, 1, false)`,
+    `INSERT INTO searches (
+       id, request_id, query, team_id, time_taken, credits_cost,
+       is_successful, num_results
+     ) VALUES (gen_random_uuid(), $1, 'query', $2, 1, 1, true, 1)`,
+    `INSERT INTO extracts (
+       id, request_id, urls, model_kind, team_id, is_successful, credits_cost
+     ) VALUES (gen_random_uuid(), $1, ARRAY['https://example.com'],
+               'fire-1', $2, true, 1)`,
+    `INSERT INTO maps (
+       id, request_id, url, team_id, num_results, credits_cost
+     ) VALUES (gen_random_uuid(), $1, 'https://example.com/map', $2, 1, 1)`,
+    `INSERT INTO llmstxts (
+       id, request_id, url, team_id, num_urls, credits_cost
+     ) VALUES (gen_random_uuid(), $1, 'https://example.com/llms', $2, 1, 1)`,
+    `INSERT INTO deep_researches (
+       id, request_id, query, team_id, time_taken, credits_cost
+     ) VALUES (gen_random_uuid(), $1, 'query', $2, 1, 1)`,
+    ...[
+      "research_paper_searches",
+      "research_paper_inspects",
+      "research_paper_reads",
+      "research_related_papers",
+      "research_github_searches",
+    ].map(
+      table => `INSERT INTO ${table} (
+         id, request_id, target, team_id, num_results, time_taken,
+         credits_cost, is_successful
+       ) VALUES (gen_random_uuid(), $1, 'target', $2, 1, 1, 1, true)`,
+    ),
+  ];
+  const requestIds: string[] = [];
+  for (const insert of inserts) {
+    const requestId = randomUUID();
+    await client.query(insert, [requestId, ownerId]);
+    requestIds.push(requestId);
+  }
+  return requestIds;
+}
+
 describeWithDatabase("application migrations", () => {
   const client = new Client({ connectionString: databaseUrl });
 
@@ -79,6 +147,7 @@ describeWithDatabase("application migrations", () => {
       nullChecksumSchema,
       retentionFkSchema,
       preflightUpgradeSchema,
+      asyncPlaceholderSchema,
     ]) {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.query(`CREATE SCHEMA ${schema}`);
@@ -99,6 +168,7 @@ describeWithDatabase("application migrations", () => {
     );
     expect(ledger.rows.map(row => row.filename)).toEqual([
       baselineFilename,
+      asyncPlaceholderFilename,
       preflightFilename,
       retentionFkFilename,
     ]);
@@ -368,6 +438,218 @@ describeWithDatabase("application migrations", () => {
     expect(result.rows).toEqual([{ request_id: requestId, owner_id: ownerId }]);
   });
 
+  it("preserves parentless async rows through immutable retention migrations", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-async-placeholder-migration-"),
+    );
+    const placeholderDatabaseUrl = databaseUrlForSchema(asyncPlaceholderSchema);
+    const placeholderClient = new Client({
+      connectionString: placeholderDatabaseUrl,
+    });
+    const placeholderConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: placeholderDatabaseUrl,
+    };
+    const parentlessRequestId = "12999c77-a8db-44f7-a727-2eab71ee5177";
+    const parentlessScrapeId = "f006bc79-269f-466f-bbaa-dd7869968d78";
+
+    try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        join(migrationsDirectory, baselineFilename),
+      );
+      await runApplicationMigrations(placeholderConfig, {
+        migrationsDirectory,
+      });
+      await placeholderClient.connect();
+      await placeholderClient.query(
+        `INSERT INTO scrapes (
+           id, request_id, url, is_successful, time_taken, team_id,
+           credits_cost, created_at
+         ) VALUES ($1, $2, 'https://example.com/legacy', true, 1, $3, 1,
+                   now() - interval '30 days')`,
+        [parentlessScrapeId, parentlessRequestId, ownerId],
+      );
+      await placeholderClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, url, event
+         ) VALUES (true, $1, $2, 'https://example.com/legacy', 'completed')`,
+        [ownerId, parentlessScrapeId],
+      );
+
+      const migrationStartedAt = new Date();
+      const migrationFilenames = [
+        asyncPlaceholderFilename,
+        preflightFilename,
+        retentionFkFilename,
+      ];
+      for (const filename of migrationFilenames) {
+        await copyFile(
+          join(__dirname, "migrations", filename),
+          join(migrationsDirectory, filename),
+        );
+      }
+      await runApplicationMigrations(placeholderConfig, {
+        migrationsDirectory,
+      });
+
+      const preserved = await placeholderClient.query(
+        `SELECT
+           (SELECT count(*) FROM scrapes WHERE id = $1)::text AS scrapes,
+           (SELECT count(*) FROM webhook_logs WHERE crawl_id = $1)::text
+             AS webhooks,
+           (SELECT count(*) FROM requests WHERE id = $2)::text AS requests`,
+        [parentlessScrapeId, parentlessRequestId],
+      );
+      expect(preserved.rows).toEqual([
+        { scrapes: "1", webhooks: "1", requests: "1" },
+      ]);
+
+      const legacyPlaceholder = await placeholderClient.query<{
+        kind: string;
+        dr_clean_by: Date;
+      }>(
+        `SELECT kind, dr_clean_by
+           FROM requests
+          WHERE id = $1`,
+        [parentlessRequestId],
+      );
+      expect(legacyPlaceholder.rows).toEqual([
+        {
+          kind: "async_placeholder",
+          dr_clean_by: expect.any(Date),
+        },
+      ]);
+      expect(
+        legacyPlaceholder.rows[0]!.dr_clean_by.getTime(),
+      ).toBeGreaterThanOrEqual(
+        migrationStartedAt.getTime() + 24 * 60 * 60 * 1000,
+      );
+
+      const asyncRequestIds =
+        await insertEveryOperationalChildBeforeParent(placeholderClient);
+      const placeholders = await placeholderClient.query<{
+        count: string;
+        bounded: boolean;
+      }>(
+        `SELECT count(*)::text AS count,
+                bool_and(kind = 'async_placeholder'
+                  AND dr_clean_by > now()
+                  AND dr_clean_by <= created_at + interval '24 hours')
+                  AS bounded
+           FROM requests
+          WHERE id = ANY($1::uuid[])`,
+        [asyncRequestIds],
+      );
+      expect(placeholders.rows).toEqual([{ count: "14", bounded: true }]);
+
+      const concurrentRequestId = randomUUID();
+      const firstConcurrentClient = new Client({
+        connectionString: placeholderDatabaseUrl,
+      });
+      const secondConcurrentClient = new Client({
+        connectionString: placeholderDatabaseUrl,
+      });
+      await Promise.all([
+        firstConcurrentClient.connect(),
+        secondConcurrentClient.connect(),
+      ]);
+      try {
+        await Promise.all([
+          firstConcurrentClient.query(
+            `INSERT INTO scrapes (
+               id, request_id, url, is_successful, time_taken, team_id,
+               credits_cost
+             ) VALUES (gen_random_uuid(), $1,
+                       'https://example.com/concurrent-scrape',
+                       true, 1, $2, 1)`,
+            [concurrentRequestId, ownerId],
+          ),
+          secondConcurrentClient.query(
+            `INSERT INTO parses (
+               id, request_id, url, is_successful, time_taken, team_id,
+               credits_cost
+             ) VALUES (gen_random_uuid(), $1,
+                       'https://example.com/concurrent-parse',
+                       true, 1, $2, 1)`,
+            [concurrentRequestId, ownerId],
+          ),
+        ]);
+      } finally {
+        await Promise.all([
+          firstConcurrentClient.end(),
+          secondConcurrentClient.end(),
+        ]);
+      }
+      const concurrentPlaceholder = await placeholderClient.query<{
+        count: string;
+      }>("SELECT count(*)::text AS count FROM requests WHERE id = $1", [
+        concurrentRequestId,
+      ]);
+      expect(concurrentPlaceholder.rows).toEqual([{ count: "1" }]);
+
+      const replacementRequestId = asyncRequestIds[0]!;
+      const replacementDeadline = new Date("2026-08-17T00:00:00.000Z");
+      await placeholderClient.query(
+        `INSERT INTO requests (
+           id, kind, api_version, team_id, origin, target_hint, dr_clean_by
+         ) VALUES ($1, 'scrape', 'v2', $2, 'api', 'real request', $3)
+         ON CONFLICT (id) DO UPDATE SET
+           kind = EXCLUDED.kind,
+           api_version = EXCLUDED.api_version,
+           team_id = EXCLUDED.team_id,
+           origin = EXCLUDED.origin,
+           target_hint = EXCLUDED.target_hint,
+           dr_clean_by = EXCLUDED.dr_clean_by`,
+        [replacementRequestId, ownerId, replacementDeadline],
+      );
+      const replacement = await placeholderClient.query<{
+        kind: string;
+        target_hint: string;
+        dr_clean_by: Date;
+      }>("SELECT kind, target_hint, dr_clean_by FROM requests WHERE id = $1", [
+        replacementRequestId,
+      ]);
+      expect(replacement.rows).toEqual([
+        {
+          kind: "scrape",
+          target_hint: "real request",
+          dr_clean_by: replacementDeadline,
+        },
+      ]);
+
+      await runApplicationMigrations(placeholderConfig, {
+        migrationsDirectory,
+      });
+      const ledger = await placeholderClient.query<{
+        filename: string;
+        checksum: string;
+      }>(
+        `SELECT filename, checksum
+           FROM application_schema_migrations
+          ORDER BY filename`,
+      );
+      expect(ledger.rows.map(row => row.filename)).toEqual([
+        baselineFilename,
+        asyncPlaceholderFilename,
+        preflightFilename,
+        retentionFkFilename,
+      ]);
+      for (const filename of migrationFilenames) {
+        const file = await readFile(join(__dirname, "migrations", filename));
+        const expectedChecksum = createHash("sha256")
+          .update(file)
+          .digest("hex");
+        expect(
+          ledger.rows.find(row => row.filename === filename)?.checksum,
+        ).toBe(expectedChecksum);
+      }
+    } finally {
+      await placeholderClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("rolls back a failed migration without recording its filename", async () => {
     const migrationsDirectory = await mkdtemp(
       join(tmpdir(), "firecrawl-migrations-"),
@@ -377,6 +659,10 @@ describeWithDatabase("application migrations", () => {
       await copyFile(
         join(__dirname, "migrations", baselineFilename),
         join(migrationsDirectory, baselineFilename),
+      );
+      await copyFile(
+        join(__dirname, "migrations", asyncPlaceholderFilename),
+        join(migrationsDirectory, asyncPlaceholderFilename),
       );
       await copyFile(
         join(__dirname, "migrations", preflightFilename),
@@ -912,6 +1198,31 @@ describeWithDatabase("application migrations", () => {
       expect(
         after.rows.filter(row => row.filename !== preflightFilename),
       ).toEqual(before.rows);
+
+      await copyFile(
+        join(__dirname, "migrations", asyncPlaceholderFilename),
+        join(migrationsDirectory, asyncPlaceholderFilename),
+      );
+      await runApplicationMigrations(upgradeConfig, { migrationsDirectory });
+      const afterPlaceholder = await upgradeClient.query<{
+        filename: string;
+        checksum: string;
+      }>(
+        `SELECT filename, checksum
+           FROM application_schema_migrations
+          ORDER BY filename`,
+      );
+      expect(afterPlaceholder.rows.map(row => row.filename)).toEqual([
+        baselineFilename,
+        asyncPlaceholderFilename,
+        preflightFilename,
+        retentionFkFilename,
+      ]);
+      expect(
+        afterPlaceholder.rows.filter(
+          row => row.filename !== asyncPlaceholderFilename,
+        ),
+      ).toEqual(after.rows);
     } finally {
       await upgradeClient.end().catch(() => undefined);
       await rm(migrationsDirectory, { recursive: true, force: true });
