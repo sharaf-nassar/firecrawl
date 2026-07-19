@@ -84,6 +84,28 @@ describe("resolveLocalRuntimeConfig", () => {
     });
   });
 
+  it("accepts complete MinIO configuration", () => {
+    expect(
+      resolveLocalRuntimeConfig({
+        ...validLocalSettings,
+        ARTIFACT_STORE_PROVIDER: "minio",
+        ARTIFACT_MINIO_ENDPOINT: "http://minio:9000",
+        ARTIFACT_MINIO_ACCESS_KEY: "firecrawl-app",
+        ARTIFACT_MINIO_SECRET_KEY: "secret",
+        ARTIFACT_MINIO_BUCKET: "firecrawl-artifacts",
+        ARTIFACT_MINIO_REGION: "us-east-1",
+      }),
+    ).toMatchObject({
+      enabled: true,
+      artifactProvider: "minio",
+      minioEndpoint: "http://minio:9000",
+      minioAccessKey: "firecrawl-app",
+      minioSecretKey: "secret",
+      minioBucket: "firecrawl-artifacts",
+      minioRegion: "us-east-1",
+    });
+  });
+
   it("requires a GCS bucket when provider is gcs", () => {
     expect(() =>
       resolveLocalRuntimeConfig({

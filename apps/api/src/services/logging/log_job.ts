@@ -26,6 +26,7 @@ import {
   resolveJobPersistenceOwner,
   resolveScrapePersistenceOwner,
 } from "../../lib/local-owner";
+import { isArtifactStoreConfigured } from "../../lib/artifacts";
 configDotenv();
 
 const nullByteRegex = /\u0000/g;
@@ -308,7 +309,7 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
   if (
     !scrape.is_parse &&
     scrape.doc &&
-    config.GCS_BUCKET_NAME &&
+    isArtifactStoreConfigured() &&
     !(scrape.skipNuq && scrape.zeroDataRetention)
   ) {
     await saveScrapeToGCS(scrape, logger);
@@ -598,7 +599,7 @@ export async function logExtract(
   );
 
   if (extract.result) {
-    if (config.GCS_BUCKET_NAME) {
+    if (isArtifactStoreConfigured()) {
       await saveExtractToGCS(extract, logger);
     } else {
       // Fallback: save result to Redis with 24h TTL when GCS is not configured

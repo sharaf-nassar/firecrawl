@@ -1,8 +1,7 @@
-import { ApiError } from "@google-cloud/storage";
 import { logger } from "./logger";
-import { config } from "../config";
 import crypto from "crypto";
-import { storage } from "./gcs-jobs";
+import { getArtifactStore } from "./artifacts";
+import type { ArtifactStore } from "./artifacts";
 
 type PdfCacheProvider = "runpod" | "firepdf";
 
@@ -30,47 +29,31 @@ export async function savePdfResultToCache(
   provider: PdfCacheProvider = "runpod",
   variant?: string,
 ): Promise<string | null> {
+  let store: ArtifactStore | null = null;
   try {
-    if (!config.GCS_BUCKET_NAME) {
+    store = getArtifactStore();
+    if (!store) {
       return null;
     }
 
     const prefix = PROVIDER_PREFIXES[provider];
     const cacheKey = createPdfCacheKey(pdfContent);
     const objectKey = variant ? `${cacheKey}-${variant}` : cacheKey;
-    const bucket = storage.bucket(config.GCS_BUCKET_NAME);
-    const blob = bucket.file(`${prefix}${objectKey}.json`);
+    await store.put({
+      key: `${prefix}${objectKey}.json`,
+      body: JSON.stringify(result),
+      contentType: "application/json",
+      metadata: {
+        source: `${provider}_pdf_conversion`,
+        cache_type: "pdf_markdown",
+        created_at: new Date().toISOString(),
+      },
+    });
 
-    for (let i = 0; i < 3; i++) {
-      try {
-        await blob.save(JSON.stringify(result), {
-          contentType: "application/json",
-          metadata: {
-            source: `${provider}_pdf_conversion`,
-            cache_type: "pdf_markdown",
-            created_at: new Date().toISOString(),
-          },
-        });
-
-        logger.info(`Saved PDF result to GCS cache`, {
-          cacheKey,
-          provider,
-        });
-
-        return cacheKey;
-      } catch (error) {
-        if (i === 2) {
-          throw error;
-        } else {
-          logger.error(`Error saving PDF result to GCS cache, retrying`, {
-            error,
-            cacheKey,
-            provider,
-            i,
-          });
-        }
-      }
-    }
+    logger.info(`Saved PDF result to GCS cache`, {
+      cacheKey,
+      provider,
+    });
 
     return cacheKey;
   } catch (error) {
@@ -78,6 +61,7 @@ export async function savePdfResultToCache(
       error,
       provider,
     });
+    if (store?.provider === "minio") throw error;
     return null;
   }
 }
@@ -87,18 +71,18 @@ export async function getPdfResultFromCache(
   provider: PdfCacheProvider = "runpod",
   variant?: string,
 ): Promise<CachedPdfResult | null> {
+  let store: ArtifactStore | null = null;
   try {
-    if (!config.GCS_BUCKET_NAME) {
+    store = getArtifactStore();
+    if (!store) {
       return null;
     }
 
     const prefix = PROVIDER_PREFIXES[provider];
     const cacheKey = createPdfCacheKey(pdfContent);
     const objectKey = variant ? `${cacheKey}-${variant}` : cacheKey;
-    const bucket = storage.bucket(config.GCS_BUCKET_NAME);
-    const blob = bucket.file(`${prefix}${objectKey}.json`);
-
-    const [content] = await blob.download();
+    const content = await store.get(`${prefix}${objectKey}.json`);
+    if (content === null) return null;
     const result = JSON.parse(content.toString());
 
     logger.info(`Retrieved PDF result from GCS cache`, {
@@ -110,18 +94,11 @@ export async function getPdfResultFromCache(
       ...result,
     };
   } catch (error) {
-    if (
-      error instanceof ApiError &&
-      error.code === 404 &&
-      error.message.includes("No such object:")
-    ) {
-      return null;
-    }
-
     logger.error(`Error retrieving PDF result from GCS cache`, {
       error,
       provider,
     });
+    if (store?.provider === "minio") throw error;
     return null;
   }
 }

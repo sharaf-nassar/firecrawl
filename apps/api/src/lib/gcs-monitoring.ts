@@ -1,5 +1,4 @@
-import { config } from "../config";
-import { storage } from "./gcs-jobs";
+import { getArtifactStore } from "./artifacts";
 
 type MonitorDiffArtifactBase = {
   url: string;
@@ -64,14 +63,14 @@ export async function saveMonitorDiffArtifact(
   artifact: MonitorDiffArtifact,
 ): Promise<{ textBytes: number; jsonBytes: number }> {
   const payload = JSON.stringify(artifact);
-  if (!config.GCS_BUCKET_NAME) {
+  const store = getArtifactStore();
+  if (!store) {
     return artifactBytes(artifact);
   }
-
-  const bucket = storage.bucket(config.GCS_BUCKET_NAME);
-  await bucket.file(key).save(payload, {
+  await store.put({
+    key,
+    body: payload,
     contentType,
-    resumable: false,
   });
 
   return artifactBytes(artifact);
@@ -80,11 +79,13 @@ export async function saveMonitorDiffArtifact(
 export async function getMonitorDiffArtifact(
   key: string | null | undefined,
 ): Promise<MonitorDiffArtifact | null> {
-  if (!key || !config.GCS_BUCKET_NAME) return null;
+  if (!key) return null;
 
-  const bucket = storage.bucket(config.GCS_BUCKET_NAME);
+  const store = getArtifactStore();
+  if (!store) return null;
   try {
-    const [contents] = await bucket.file(key).download();
+    const contents = await store.get(key);
+    if (contents === null) return null;
     let parsed: unknown;
     try {
       parsed = JSON.parse(contents.toString());
@@ -106,10 +107,6 @@ export async function getMonitorDiffArtifact(
     }
     return asPartial as MonitorDiffArtifact;
   } catch (error) {
-    const maybeGcsError = error as { code?: number; statusCode?: number };
-    if (maybeGcsError.code === 404 || maybeGcsError.statusCode === 404) {
-      return null;
-    }
     throw error;
   }
 }

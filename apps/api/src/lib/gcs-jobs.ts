@@ -1,4 +1,5 @@
 import { ApiError, Storage } from "@google-cloud/storage";
+import { sql } from "drizzle-orm";
 import { logger } from "./logger";
 import { Document } from "../controllers/v1/types";
 import { withSpan, setSpanAttributes } from "./otel-tracer";
@@ -11,31 +12,17 @@ import type {
   LoggedSearch,
 } from "../services/logging/log_job";
 import { config } from "../config";
-import crypto from "crypto";
 import { Logger } from "winston";
+import { db } from "../db/connection";
+import { getArtifactStore, jobArtifactKey } from "./artifacts";
+import { putArtifactWithManifest } from "./artifacts/manifest";
+import type { ArtifactManifestRecord } from "./artifacts/manifest";
+import { resolveJobPersistenceOwner } from "./local-owner";
 
 const credentials = config.GCS_CREDENTIALS
   ? JSON.parse(atob(config.GCS_CREDENTIALS))
   : undefined;
 export const storage = new Storage({ credentials });
-
-const storageManualRetries = new Storage({
-  credentials,
-  retryOptions: {
-    autoRetry: false,
-    maxRetries: 0,
-    retryableErrorFn: () => false,
-  },
-});
-
-const BACKOFF_PARAMS = [0, 250, 1000];
-const BACKOFF_SLOWDOWN_PARAMS = [0, 2000, 4000];
-
-type GCSOperationAttempt = {
-  error: any;
-  timeMs: number;
-  backoffMs: number;
-};
 
 /**
  * Converts a job ID to a GCS filename.
@@ -49,22 +36,40 @@ type GCSOperationAttempt = {
  * @param id Job ID to convert to a filename
  * @returns Filename for the job in GCS
  */
-function idToFilename(id: string): string {
-  if (
-    id.match(
-      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/,
+const idToFilename = jobArtifactKey;
+
+async function persistArtifactManifest(
+  record: ArtifactManifestRecord,
+): Promise<void> {
+  await db.execute(sql`
+    INSERT INTO local_artifacts (
+      object_key,
+      owner_id,
+      request_id,
+      job_id,
+      kind,
+      content_type,
+      byte_size,
+      delete_after
+    ) VALUES (
+      ${record.objectKey},
+      ${record.ownerId}::uuid,
+      ${record.requestId}::uuid,
+      ${record.jobId}::uuid,
+      ${record.kind},
+      ${record.contentType},
+      ${record.byteSize},
+      ${record.deleteAfter}
     )
-  ) {
-    const timestamp = parseInt(id.replace(/-/g, "").slice(0, 12), 16);
-    const cutover = Date.UTC(2026, 4, 26, 0, 0, 0, 0); // Cutover at 2026-05-26 00:00:00 UTC
-    if (timestamp < cutover) {
-      return `${id}.json`;
-    } else {
-      return `${crypto.createHash("sha256").update(id).digest("hex")}-${id}.json`;
-    }
-  } else {
-    return `${id}.json`;
-  }
+    ON CONFLICT (object_key) DO UPDATE SET
+      owner_id = EXCLUDED.owner_id,
+      request_id = EXCLUDED.request_id,
+      job_id = EXCLUDED.job_id,
+      kind = EXCLUDED.kind,
+      content_type = EXCLUDED.content_type,
+      byte_size = EXCLUDED.byte_size,
+      delete_after = EXCLUDED.delete_after
+  `);
 }
 
 async function saveJobToGCS(params: {
@@ -88,8 +93,6 @@ async function saveJobToGCS(params: {
     zeroDataRetention: params.zeroDataRetention,
   });
 
-  const attempts: GCSOperationAttempt[] = [];
-
   return await withSpan("firecrawl-gcs-save-job", async span => {
     setSpanAttributes(span, {
       "gcs.operation": "save_job",
@@ -101,88 +104,51 @@ async function saveJobToGCS(params: {
       "job.num_docs": params.num_docs,
     });
 
-    if (!config.GCS_BUCKET_NAME) {
+    const store = getArtifactStore();
+    if (!store) {
       setSpanAttributes(span, { "gcs.bucket_configured": false });
       return;
     }
 
-    const bucket = storageManualRetries.bucket(config.GCS_BUCKET_NAME);
-    const blob = bucket.file(filename);
-
-    let backoffUsed = BACKOFF_PARAMS;
-
-    const data = JSON.stringify(params.data);
-
-    // Save job docs with retry
-    // Due to retries and resumable uploads, this is:
-    //  if data is smaller than or exactly 3MB: best case 1 request, worst case 3 requests
-    //  if data is larger than 3MB: best case 2 requests, worst case 6 requests
-    for (let i = 0; i < backoffUsed.length; i++) {
-      const backoffMs = backoffUsed[i];
-      if (backoffMs > 0) {
-        await new Promise(resolve => setTimeout(resolve, backoffMs));
-      }
-
-      const saveStart = Date.now();
-      try {
-        await blob.save(data, {
-          metadata: {
-            contentType: "application/json",
-            metadata: params.metadata,
-          },
-          resumable: data.length > 3 * 1024 * 1024, // 3MB, 5MB official limit
-        });
-        attempts.push({
-          error: null,
-          timeMs: Date.now() - saveStart,
-          backoffMs,
-        });
-        break;
-      } catch (error) {
-        if (
-          error instanceof ApiError &&
-          (error.code === 429 || error.code === 503)
-        ) {
-          // switch to slower backoff parameters for rate limiting or server overloaded errors
-          backoffUsed = BACKOFF_SLOWDOWN_PARAMS;
-        }
-
-        attempts.push({ error, timeMs: Date.now() - saveStart, backoffMs });
-
-        if (i === BACKOFF_PARAMS.length - 1) {
-          setSpanAttributes(span, { "gcs.save_successful": false });
-          throw error;
-        }
-      }
+    const body = JSON.stringify(params.data);
+    const input = {
+      key: filename,
+      body,
+      contentType: "application/json",
+      metadata: params.metadata,
+    };
+    if (config.LOCAL_PERSISTENCE_ENABLED) {
+      const retentionDays = params.zeroDataRetention
+        ? 1
+        : config.LOCAL_ARTIFACT_RETENTION_DAYS;
+      await putArtifactWithManifest(
+        store,
+        {
+          ...input,
+          ownerId: resolveJobPersistenceOwner(params.team_id),
+          requestId: params.request_id,
+          jobId: params.id,
+          kind: params.mode,
+          deleteAfter: new Date(Date.now() + retentionDays * 86_400_000),
+        },
+        persistArtifactManifest,
+      );
+    } else {
+      await store.put(input);
     }
 
     setSpanAttributes(span, { "gcs.save_successful": true });
   })
     .then(x => {
-      if (attempts.length === 0) {
-        return x;
-      }
-
-      if (attempts.length === 1) {
-        logger.debug("Job saved to GCS", {
-          canonicalLog: "gcs-jobs/save",
-          attempts,
-          success: true,
-        });
-      } else {
-        logger.warn("Job saved to GCS with retries", {
-          canonicalLog: "gcs-jobs/save",
-          attempts,
-          success: true,
-        });
-      }
-
+      logger.debug("Job saved to artifact store", {
+        canonicalLog: "gcs-jobs/save",
+        success: true,
+      });
       return x;
     })
     .catch(error => {
-      logger.error(`Job save to GCS failed`, {
+      logger.error(`Job save to artifact store failed`, {
         canonicalLog: "gcs-jobs/save",
-        attempts,
         success: false,
         error,
       });
@@ -387,29 +353,22 @@ export async function getJobFromGCS(jobId: string): Promise<Document[] | null> {
       "job.id": jobId,
     });
 
-    if (!config.GCS_BUCKET_NAME) {
+    const store = getArtifactStore();
+    if (!store) {
       setSpanAttributes(span, { "gcs.bucket_configured": false });
       return null;
     }
 
-    const bucket = storage.bucket(config.GCS_BUCKET_NAME);
-    const blob = bucket.file(idToFilename(jobId));
-
     try {
-      const [content] = await blob.download();
+      const content = await store.get(idToFilename(jobId));
+      if (content === null) {
+        setSpanAttributes(span, { "gcs.job_found": false });
+        return null;
+      }
       const result = JSON.parse(content.toString());
       setSpanAttributes(span, { "gcs.job_found": true });
       return result;
     } catch (error) {
-      if (
-        error instanceof ApiError &&
-        error.code === 404 &&
-        error.message.includes("No such object:")
-      ) {
-        setSpanAttributes(span, { "gcs.job_found": false });
-        return null;
-      }
-
       logger.error(`Error getting job from GCS`, {
         error,
         jobId,
@@ -430,29 +389,16 @@ export async function removeJobFromGCS(
       "job.id": jobId,
     });
 
-    if (!config.GCS_BUCKET_NAME) {
+    const store = getArtifactStore();
+    if (!store) {
       setSpanAttributes(span, { "gcs.bucket_configured": false });
       return;
     }
 
-    const bucket = storage.bucket(config.GCS_BUCKET_NAME);
-    const blob = bucket.file(idToFilename(jobId));
-
     try {
-      await blob.delete({
-        ignoreNotFound: true,
-      });
+      await store.delete(idToFilename(jobId));
       setSpanAttributes(span, { "gcs.delete_successful": true });
     } catch (error) {
-      if (
-        error instanceof ApiError &&
-        error.code === 404 &&
-        error.message.includes("No such object:")
-      ) {
-        setSpanAttributes(span, { "gcs.job_not_found": true });
-        return;
-      }
-
       _logger.error(`Error removing job from GCS`, {
         error,
         jobId,

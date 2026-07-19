@@ -68,6 +68,10 @@ vi.mock("../../lib/gcs-jobs", () => ({
   saveSearchToGCS: vi.fn(),
 }));
 
+vi.mock("../../lib/artifacts", () => ({
+  isArtifactStoreConfigured: () => false,
+}));
+
 vi.mock("../../lib/extract/extract-redis", () => ({
   saveExtractResult: vi.fn(),
 }));

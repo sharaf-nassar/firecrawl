@@ -133,6 +133,34 @@ validate_phase_values() {
       fail_field "${key}"
     fi
   done
+
+  if [[ "${managed_values[MINIO_ROOT_USER]}" != firecrawl-root ]]; then
+    fail_field MINIO_ROOT_USER
+  fi
+  if [[ ! "${managed_values[MINIO_ROOT_PASSWORD]}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail_field MINIO_ROOT_PASSWORD
+  fi
+  if [[ "${managed_values[ARTIFACT_STORE_PROVIDER]}" != minio ]]; then
+    fail_field ARTIFACT_STORE_PROVIDER
+  fi
+  if [[ "${managed_values[ARTIFACT_MINIO_ENDPOINT]}" != http://minio:9000 ]]; then
+    fail_field ARTIFACT_MINIO_ENDPOINT
+  fi
+  if [[ "${managed_values[ARTIFACT_MINIO_ACCESS_KEY]}" != firecrawl-app ]]; then
+    fail_field ARTIFACT_MINIO_ACCESS_KEY
+  fi
+  if [[ ! "${managed_values[ARTIFACT_MINIO_SECRET_KEY]}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail_field ARTIFACT_MINIO_SECRET_KEY
+  fi
+  if [[ "${managed_values[MINIO_ROOT_PASSWORD]}" == "${managed_values[ARTIFACT_MINIO_SECRET_KEY]}" ]]; then
+    fail_field ARTIFACT_MINIO_SECRET_KEY
+  fi
+  if [[ "${managed_values[ARTIFACT_MINIO_BUCKET]}" != firecrawl-artifacts ]]; then
+    fail_field ARTIFACT_MINIO_BUCKET
+  fi
+  if [[ "${managed_values[ARTIFACT_MINIO_REGION]}" != us-east-1 ]]; then
+    fail_field ARTIFACT_MINIO_REGION
+  fi
 }
 
 while (( $# > 0 )); do
@@ -169,6 +197,14 @@ phase_keys=(
   LOCAL_OWNER_ID
   LOCAL_RECORD_RETENTION_DAYS
   LOCAL_ARTIFACT_RETENTION_DAYS
+  MINIO_ROOT_USER
+  MINIO_ROOT_PASSWORD
+  ARTIFACT_STORE_PROVIDER
+  ARTIFACT_MINIO_ENDPOINT
+  ARTIFACT_MINIO_ACCESS_KEY
+  ARTIFACT_MINIO_SECRET_KEY
+  ARTIFACT_MINIO_BUCKET
+  ARTIFACT_MINIO_REGION
 )
 
 if [[ "${check_only}" == true ]]; then
@@ -241,6 +277,23 @@ if [[ ! -v 'candidate_values[LOCAL_OWNER_ID]' ]]; then
 fi
 set_default LOCAL_RECORD_RETENTION_DAYS 30
 set_default LOCAL_ARTIFACT_RETENTION_DAYS 30
+set_default MINIO_ROOT_USER firecrawl-root
+if [[ ! -v 'candidate_values[MINIO_ROOT_PASSWORD]' ]]; then
+  candidate_values[MINIO_ROOT_PASSWORD]="$(openssl rand -hex 32)"
+  missing_keys+=(MINIO_ROOT_PASSWORD)
+fi
+set_default ARTIFACT_STORE_PROVIDER minio
+set_default ARTIFACT_MINIO_ENDPOINT http://minio:9000
+set_default ARTIFACT_MINIO_ACCESS_KEY firecrawl-app
+if [[ ! -v 'candidate_values[ARTIFACT_MINIO_SECRET_KEY]' ]]; then
+  candidate_values[ARTIFACT_MINIO_SECRET_KEY]="$(openssl rand -hex 32)"
+  while [[ "${candidate_values[ARTIFACT_MINIO_SECRET_KEY]}" == "${candidate_values[MINIO_ROOT_PASSWORD]}" ]]; do
+    candidate_values[ARTIFACT_MINIO_SECRET_KEY]="$(openssl rand -hex 32)"
+  done
+  missing_keys+=(ARTIFACT_MINIO_SECRET_KEY)
+fi
+set_default ARTIFACT_MINIO_BUCKET firecrawl-artifacts
+set_default ARTIFACT_MINIO_REGION us-east-1
 
 validate_phase_values candidate_values
 

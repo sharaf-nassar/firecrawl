@@ -15,6 +15,11 @@ while [[ "${app_postgres_password}" == "${postgres_password}" ]]; do
   app_postgres_password="$(openssl rand -hex 32)"
 done
 bull_auth_key="$(openssl rand -hex 32)"
+minio_root_password="$(openssl rand -hex 32)"
+minio_app_secret_key="$(openssl rand -hex 32)"
+while [[ "${minio_app_secret_key}" == "${minio_root_password}" ]]; do
+  minio_app_secret_key="$(openssl rand -hex 32)"
+done
 local_owner_id="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
 
 umask 077
@@ -40,6 +45,14 @@ trap cleanup EXIT HUP INT TERM PIPE XFSZ
   printf '%s\n' "LOCAL_OWNER_ID=${local_owner_id}"
   printf '%s\n' 'LOCAL_RECORD_RETENTION_DAYS=30'
   printf '%s\n' 'LOCAL_ARTIFACT_RETENTION_DAYS=30'
+  printf '%s\n' 'MINIO_ROOT_USER=firecrawl-root'
+  printf '%s\n' "MINIO_ROOT_PASSWORD=${minio_root_password}"
+  printf '%s\n' 'ARTIFACT_STORE_PROVIDER=minio'
+  printf '%s\n' 'ARTIFACT_MINIO_ENDPOINT=http://minio:9000'
+  printf '%s\n' 'ARTIFACT_MINIO_ACCESS_KEY=firecrawl-app'
+  printf '%s\n' "ARTIFACT_MINIO_SECRET_KEY=${minio_app_secret_key}"
+  printf '%s\n' 'ARTIFACT_MINIO_BUCKET=firecrawl-artifacts'
+  printf '%s\n' 'ARTIFACT_MINIO_REGION=us-east-1'
   printf '%s\n' "BULL_AUTH_KEY=${bull_auth_key}"
   printf '%s\n' 'LOGGING_LEVEL=INFO'
   printf '%s\n' 'ALLOW_LOCAL_WEBHOOKS=false'
