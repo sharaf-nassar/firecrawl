@@ -13,10 +13,11 @@ import {
 } from "../../lib/supabase-jobs";
 import { logger as _logger } from "../../lib/logger";
 import { getJobFromGCS } from "../../lib/gcs-jobs";
+import { isArtifactStoreConfigured } from "../../lib/artifacts";
 
 async function getExtractData(id: string): Promise<any> {
-  // Try GCS first if configured
-  if (config.GCS_BUCKET_NAME) {
+  // Try durable artifact storage first if configured
+  if (isArtifactStoreConfigured()) {
     const gcsData = await getJobFromGCS(id);
     if (gcsData) {
       return Array.isArray(gcsData) ? gcsData[0] : gcsData;

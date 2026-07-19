@@ -1,4 +1,6 @@
 import { getArtifactStore } from "./artifacts";
+import { config } from "../config";
+import { putLocalArtifactWithManifest } from "./artifacts/local-manifest";
 
 type MonitorDiffArtifactBase = {
   url: string;
@@ -67,11 +69,25 @@ export async function saveMonitorDiffArtifact(
   if (!store) {
     return artifactBytes(artifact);
   }
-  await store.put({
+  const input = {
     key,
     body: payload,
     contentType,
-  });
+  };
+  if (config.LOCAL_PERSISTENCE_ENABLED) {
+    await putLocalArtifactWithManifest(store, {
+      ...input,
+      ownerId: config.LOCAL_OWNER_ID!,
+      requestId: null,
+      jobId: null,
+      kind: "monitor-diff",
+      deleteAfter: new Date(
+        Date.now() + config.LOCAL_ARTIFACT_RETENTION_DAYS * 86_400_000,
+      ),
+    });
+  } else {
+    await store.put(input);
+  }
 
   return artifactBytes(artifact);
 }

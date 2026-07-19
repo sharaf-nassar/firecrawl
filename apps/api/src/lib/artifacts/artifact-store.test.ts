@@ -1,5 +1,10 @@
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
+
+const { cleanupLog } = vi.hoisted(() => ({ cleanupLog: vi.fn() }));
+
+vi.mock("../logger", () => ({ logger: { error: cleanupLog } }));
+
 import {
   ArtifactStoreError,
   createArtifactStore,
@@ -411,7 +416,7 @@ describe("MinIO artifact contract", () => {
 });
 
 describe("local artifact manifest coordination", () => {
-  it("persists manifest only after object storage succeeds", async () => {
+  it("persists manifest inside coordination after object storage succeeds", async () => {
     const order: string[] = [];
     const store = {
       provider: "minio" as const,
@@ -431,6 +436,18 @@ describe("local artifact manifest coordination", () => {
     const persist = vi.fn(async () => {
       order.push("manifest");
     });
+    const coordinate = vi.fn(
+      async (
+        _key: string,
+        work: (session: {
+          existed: boolean;
+          persist: typeof persist;
+        }) => Promise<void>,
+      ) => {
+        order.push("coordinate");
+        await work({ existed: false, persist });
+      },
+    );
 
     await putArtifactWithManifest(
       store,
@@ -444,10 +461,11 @@ describe("local artifact manifest coordination", () => {
         kind: "scrape",
         deleteAfter: new Date("2026-08-17T00:00:00Z"),
       },
-      persist,
+      coordinate as any,
     );
 
-    expect(order).toEqual(["put", "manifest"]);
+    expect(order).toEqual(["coordinate", "put", "manifest"]);
+    expect(coordinate).toHaveBeenCalledWith("job.json", expect.any(Function));
     expect(persist).toHaveBeenCalledWith({
       objectKey: "job.json",
       ownerId: "7c70fd9c-4b7f-4d5f-87a6-91af0588623c",
@@ -460,7 +478,7 @@ describe("local artifact manifest coordination", () => {
     });
   });
 
-  it("rolls back object and rethrows original manifest failure", async () => {
+  it("rolls back a new key and rethrows the original manifest failure", async () => {
     const manifestFailure = new Error("manifest unavailable");
     const store = {
       provider: "minio" as const,
@@ -474,6 +492,17 @@ describe("local artifact manifest coordination", () => {
       delete: vi.fn().mockRejectedValue(new Error("rollback unavailable")),
       health: vi.fn(),
     };
+    const coordinate = async (
+      _key: string,
+      work: (session: {
+        existed: boolean;
+        persist: () => Promise<void>;
+      }) => Promise<void>,
+    ) =>
+      work({
+        existed: false,
+        persist: vi.fn().mockRejectedValue(manifestFailure),
+      });
 
     await expect(
       putArtifactWithManifest(
@@ -488,9 +517,59 @@ describe("local artifact manifest coordination", () => {
           kind: "scrape",
           deleteAfter: null,
         },
-        vi.fn().mockRejectedValue(manifestFailure),
+        coordinate as any,
       ),
     ).rejects.toBe(manifestFailure);
     expect(store.delete).toHaveBeenCalledWith("job.json");
+    expect(cleanupLog).toHaveBeenCalledWith("Artifact rollback delete failed", {
+      provider: "minio",
+      objectKey: "job.json",
+      cleanupErrorName: "Error",
+    });
+  });
+
+  it("preserves an existing durable key when manifest persistence fails", async () => {
+    const manifestFailure = new Error("manifest unavailable");
+    const store = {
+      provider: "minio" as const,
+      put: vi.fn().mockResolvedValue({
+        key: "job.json",
+        contentType: "application/json",
+        byteSize: 2,
+        metadata: {},
+      }),
+      get: vi.fn(),
+      delete: vi.fn(),
+      health: vi.fn(),
+    };
+    const coordinate = async (
+      _key: string,
+      work: (session: {
+        existed: boolean;
+        persist: () => Promise<void>;
+      }) => Promise<void>,
+    ) =>
+      work({
+        existed: true,
+        persist: vi.fn().mockRejectedValue(manifestFailure),
+      });
+
+    await expect(
+      putArtifactWithManifest(
+        store,
+        {
+          key: "job.json",
+          body: "{}",
+          contentType: "application/json",
+          ownerId: "owner",
+          requestId: null,
+          jobId: null,
+          kind: "scrape",
+          deleteAfter: null,
+        },
+        coordinate as any,
+      ),
+    ).rejects.toBe(manifestFailure);
+    expect(store.delete).not.toHaveBeenCalled();
   });
 });

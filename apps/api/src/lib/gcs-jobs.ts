@@ -1,5 +1,4 @@
 import { ApiError, Storage } from "@google-cloud/storage";
-import { sql } from "drizzle-orm";
 import { logger } from "./logger";
 import { Document } from "../controllers/v1/types";
 import { withSpan, setSpanAttributes } from "./otel-tracer";
@@ -13,10 +12,8 @@ import type {
 } from "../services/logging/log_job";
 import { config } from "../config";
 import { Logger } from "winston";
-import { db } from "../db/connection";
 import { getArtifactStore, jobArtifactKey } from "./artifacts";
-import { putArtifactWithManifest } from "./artifacts/manifest";
-import type { ArtifactManifestRecord } from "./artifacts/manifest";
+import { putLocalArtifactWithManifest } from "./artifacts/local-manifest";
 import { resolveJobPersistenceOwner } from "./local-owner";
 
 const credentials = config.GCS_CREDENTIALS
@@ -37,40 +34,6 @@ export const storage = new Storage({ credentials });
  * @returns Filename for the job in GCS
  */
 const idToFilename = jobArtifactKey;
-
-async function persistArtifactManifest(
-  record: ArtifactManifestRecord,
-): Promise<void> {
-  await db.execute(sql`
-    INSERT INTO local_artifacts (
-      object_key,
-      owner_id,
-      request_id,
-      job_id,
-      kind,
-      content_type,
-      byte_size,
-      delete_after
-    ) VALUES (
-      ${record.objectKey},
-      ${record.ownerId}::uuid,
-      ${record.requestId}::uuid,
-      ${record.jobId}::uuid,
-      ${record.kind},
-      ${record.contentType},
-      ${record.byteSize},
-      ${record.deleteAfter}
-    )
-    ON CONFLICT (object_key) DO UPDATE SET
-      owner_id = EXCLUDED.owner_id,
-      request_id = EXCLUDED.request_id,
-      job_id = EXCLUDED.job_id,
-      kind = EXCLUDED.kind,
-      content_type = EXCLUDED.content_type,
-      byte_size = EXCLUDED.byte_size,
-      delete_after = EXCLUDED.delete_after
-  `);
-}
 
 async function saveJobToGCS(params: {
   mode: string;
@@ -121,18 +84,14 @@ async function saveJobToGCS(params: {
       const retentionDays = params.zeroDataRetention
         ? 1
         : config.LOCAL_ARTIFACT_RETENTION_DAYS;
-      await putArtifactWithManifest(
-        store,
-        {
-          ...input,
-          ownerId: resolveJobPersistenceOwner(params.team_id),
-          requestId: params.request_id,
-          jobId: params.id,
-          kind: params.mode,
-          deleteAfter: new Date(Date.now() + retentionDays * 86_400_000),
-        },
-        persistArtifactManifest,
-      );
+      await putLocalArtifactWithManifest(store, {
+        ...input,
+        ownerId: resolveJobPersistenceOwner(params.team_id),
+        requestId: params.request_id,
+        jobId: params.id,
+        kind: params.mode,
+        deleteAfter: new Date(Date.now() + retentionDays * 86_400_000),
+      });
     } else {
       await store.put(input);
     }

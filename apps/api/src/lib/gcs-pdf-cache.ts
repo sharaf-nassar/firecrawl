@@ -2,6 +2,8 @@ import { logger } from "./logger";
 import crypto from "crypto";
 import { getArtifactStore } from "./artifacts";
 import type { ArtifactStore } from "./artifacts";
+import { putLocalArtifactWithManifest } from "./artifacts/local-manifest";
+import { config } from "../config";
 
 type PdfCacheProvider = "runpod" | "firepdf";
 
@@ -39,7 +41,7 @@ export async function savePdfResultToCache(
     const prefix = PROVIDER_PREFIXES[provider];
     const cacheKey = createPdfCacheKey(pdfContent);
     const objectKey = variant ? `${cacheKey}-${variant}` : cacheKey;
-    await store.put({
+    const input = {
       key: `${prefix}${objectKey}.json`,
       body: JSON.stringify(result),
       contentType: "application/json",
@@ -48,7 +50,21 @@ export async function savePdfResultToCache(
         cache_type: "pdf_markdown",
         created_at: new Date().toISOString(),
       },
-    });
+    };
+    if (config.LOCAL_PERSISTENCE_ENABLED) {
+      await putLocalArtifactWithManifest(store, {
+        ...input,
+        ownerId: config.LOCAL_OWNER_ID!,
+        requestId: null,
+        jobId: null,
+        kind: "pdf-cache",
+        deleteAfter: new Date(
+          Date.now() + config.LOCAL_ARTIFACT_RETENTION_DAYS * 86_400_000,
+        ),
+      });
+    } else {
+      await store.put(input);
+    }
 
     logger.info(`Saved PDF result to GCS cache`, {
       cacheKey,
@@ -61,7 +77,9 @@ export async function savePdfResultToCache(
       error,
       provider,
     });
-    if (store?.provider === "minio") throw error;
+    if (config.LOCAL_PERSISTENCE_ENABLED || store?.provider === "minio") {
+      throw error;
+    }
     return null;
   }
 }
@@ -98,7 +116,9 @@ export async function getPdfResultFromCache(
       error,
       provider,
     });
-    if (store?.provider === "minio") throw error;
+    if (config.LOCAL_PERSISTENCE_ENABLED || store?.provider === "minio") {
+      throw error;
+    }
     return null;
   }
 }
