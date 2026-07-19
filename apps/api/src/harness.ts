@@ -23,6 +23,12 @@ let fdbContainer: {
   containerName: string;
   containerRuntime: string;
 } | null = null;
+let applicationPostgresContainer: {
+  containerName: string;
+  containerRuntime: string;
+} | null = null;
+let localPersistenceHarness = false;
+let fixtureServerPort: number | null = null;
 
 // Get the monorepo root for both tsx source execution and compiled dist execution.
 // __dirname is available in CommonJS (which this compiles to)
@@ -34,6 +40,7 @@ const MONOREPO_ROOT = existsSync(
   ? SOURCE_MONOREPO_ROOT
   : DIST_MONOREPO_ROOT;
 const NUQ_POSTGRES_PATH = join(MONOREPO_ROOT, "apps", "nuq-postgres");
+const TEST_SITE_PATH = join(MONOREPO_ROOT, "apps", "test-site");
 
 interface ProcessResult {
   promise: Promise<void>;
@@ -49,6 +56,7 @@ interface Services {
   extractWorker?: ProcessResult;
   indexWorker?: ProcessResult;
   command?: ProcessResult;
+  fixtureServer?: ProcessResult;
   nuqPostgres?: {
     containerName: string;
     containerRuntime: string;
@@ -111,13 +119,13 @@ function formatDuration(nanoseconds: bigint): string {
   return `${minutes}m ${remainingSeconds.toFixed(0)}s`;
 }
 
-const PORT = config.PORT;
-const WORKER_PORT = config.WORKER_PORT;
-const EXTRACT_WORKER_PORT = config.EXTRACT_WORKER_PORT;
-const NUQ_WORKER_START_PORT = config.NUQ_WORKER_START_PORT;
-const NUQ_WORKER_COUNT = config.NUQ_WORKER_COUNT;
-const NUQ_PREFETCH_WORKER_PORT = NUQ_WORKER_START_PORT + NUQ_WORKER_COUNT;
-const NUQ_RECONCILER_WORKER_PORT = NUQ_PREFETCH_WORKER_PORT + 1;
+let PORT = config.PORT;
+let WORKER_PORT = config.WORKER_PORT;
+let EXTRACT_WORKER_PORT = config.EXTRACT_WORKER_PORT;
+let NUQ_WORKER_START_PORT = config.NUQ_WORKER_START_PORT;
+let NUQ_WORKER_COUNT = config.NUQ_WORKER_COUNT;
+let NUQ_PREFETCH_WORKER_PORT = NUQ_WORKER_START_PORT + NUQ_WORKER_COUNT;
+let NUQ_RECONCILER_WORKER_PORT = NUQ_PREFETCH_WORKER_PORT + 1;
 
 // PostgreSQL credentials (with defaults for backward compatibility)
 const POSTGRES_USER = config.POSTGRES_USER;
@@ -240,10 +248,118 @@ function waitForPort(
   });
 }
 
+async function availablePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Unable to allocate an available host port"));
+        return;
+      }
+      const port = address.port;
+      server.close(error => (error ? reject(error) : resolve(port)));
+    });
+  });
+}
+
+async function availablePortRange(count: number): Promise<number> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const start = 31_000 + Math.floor(Math.random() * (8_000 - count));
+    const servers: net.Server[] = [];
+    try {
+      for (let offset = 0; offset < count; offset++) {
+        const server = net.createServer();
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(start + offset, "127.0.0.1", resolve);
+        });
+        servers.push(server);
+      }
+      await Promise.all(
+        servers.map(
+          server =>
+            new Promise<void>((resolve, reject) =>
+              server.close(error => (error ? reject(error) : resolve())),
+            ),
+        ),
+      );
+      return start;
+    } catch {
+      await Promise.all(
+        servers.map(
+          server => new Promise<void>(resolve => server.close(() => resolve())),
+        ),
+      );
+    }
+  }
+  throw new Error("Unable to allocate an available worker port range");
+}
+
+function isLocalPersistenceCommand(command: string[]): boolean {
+  return command[0] === "pnpm" && command[1] === "test:snips:local-persistence";
+}
+
+async function configureLocalPersistenceHarness(
+  command: string[],
+): Promise<void> {
+  if (!isLocalPersistenceCommand(command)) return;
+
+  localPersistenceHarness = true;
+  PORT = await availablePort();
+  fixtureServerPort = await availablePort();
+  const workerPortStart = await availablePortRange(config.NUQ_WORKER_COUNT + 4);
+  WORKER_PORT = workerPortStart;
+  EXTRACT_WORKER_PORT = workerPortStart + 1;
+  NUQ_WORKER_START_PORT = workerPortStart + 2;
+  NUQ_WORKER_COUNT = config.NUQ_WORKER_COUNT;
+  NUQ_PREFETCH_WORKER_PORT = NUQ_WORKER_START_PORT + NUQ_WORKER_COUNT;
+  NUQ_RECONCILER_WORKER_PORT = NUQ_PREFETCH_WORKER_PORT + 1;
+
+  const ownerId =
+    process.env.LOCAL_OWNER_ID ?? "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
+  const values: Record<string, string> = {
+    PORT: String(PORT),
+    TEST_API_URL: `http://127.0.0.1:${PORT}`,
+    TEST_SUITE_WEBSITE: `http://127.0.0.1:${fixtureServerPort}`,
+    TEST_SUITE_SELF_HOSTED: "true",
+    USE_DB_AUTHENTICATION: "false",
+    LOCAL_PERSISTENCE_ENABLED: "true",
+    LOCAL_OWNER_ID: ownerId,
+    LOCAL_RECORD_RETENTION_DAYS: "30",
+    LOCAL_ARTIFACT_RETENTION_DAYS: "30",
+    ARTIFACT_STORE_PROVIDER: "none",
+    ALLOW_LOCAL_WEBHOOKS: "true",
+    WORKER_PORT: String(WORKER_PORT),
+    EXTRACT_WORKER_PORT: String(EXTRACT_WORKER_PORT),
+    NUQ_WORKER_START_PORT: String(NUQ_WORKER_START_PORT),
+  };
+  Object.assign(process.env, values);
+  Object.assign(config, {
+    PORT,
+    TEST_API_URL: values.TEST_API_URL,
+    TEST_SUITE_WEBSITE: values.TEST_SUITE_WEBSITE,
+    TEST_SUITE_SELF_HOSTED: true,
+    USE_DB_AUTHENTICATION: false,
+    LOCAL_PERSISTENCE_ENABLED: true,
+    LOCAL_OWNER_ID: ownerId,
+    LOCAL_RECORD_RETENTION_DAYS: 30,
+    LOCAL_ARTIFACT_RETENTION_DAYS: 30,
+    ARTIFACT_STORE_PROVIDER: "none",
+    ALLOW_LOCAL_WEBHOOKS: true,
+    WORKER_PORT,
+    EXTRACT_WORKER_PORT,
+    NUQ_WORKER_START_PORT,
+  });
+}
+
 function execForward(
   name: string,
   command: string | string[],
   env: Record<string, string> = {},
+  cwd?: string,
 ): ProcessResult {
   let child: ChildProcess;
   let displayCommand = "";
@@ -257,12 +373,14 @@ function execForward(
     if (isWindows) {
       child = spawn("cmd", ["/c", command], {
         env: { ...process.env, ...env },
+        cwd,
         shell: false,
         detached: false,
       });
     } else {
       child = spawn("sh", ["-c", command], {
         env: { ...process.env, ...env },
+        cwd,
         shell: false,
         detached: true,
       });
@@ -272,6 +390,7 @@ function execForward(
     displayCommand = [cmd, ...args].join(" ");
     child = spawn(cmd, args, {
       env: { ...process.env, ...env },
+      cwd,
       shell: false,
       detached: !isWindows,
     });
@@ -452,6 +571,89 @@ async function stopAndRemoveContainer(
   } catch (e) {
     // Container might not exist, that's fine
   }
+}
+
+async function waitForApplicationPostgres(
+  databaseUrl: string,
+  timeoutMs: number = config.HARNESS_STARTUP_TIMEOUT_MS,
+): Promise<void> {
+  logger.info("Waiting for application PostgreSQL to be ready...");
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const { Client } = await import("pg");
+    const client = new Client({
+      connectionString: databaseUrl,
+      connectionTimeoutMillis: 2000,
+    });
+    try {
+      await client.connect();
+      await client.query("SELECT 1");
+      await client.end();
+      logger.success("Application PostgreSQL is ready");
+      return;
+    } catch {
+      await client.end().catch(() => undefined);
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  throw new Error(
+    `Application PostgreSQL did not become ready within ${timeoutMs}ms`,
+  );
+}
+
+async function setupApplicationPostgres(): Promise<void> {
+  if (!localPersistenceHarness) return;
+
+  logger.section("Setting up local application persistence");
+  let databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
+  if (databaseUrl) {
+    logger.info(
+      "TEST_APPLICATION_DATABASE_URL is set, skipping application database container management",
+    );
+  } else {
+    const runtime = await detectContainerRuntime();
+    if (!runtime) {
+      throw new Error(
+        "Neither Docker nor Podman found. Install Docker/Podman or set TEST_APPLICATION_DATABASE_URL.",
+      );
+    }
+
+    const port = await availablePort();
+    const containerName = `firecrawl-local-persistence-${process.pid}-${Date.now()}`;
+    const user = "firecrawl";
+    const password = "firecrawl";
+    const database = "firecrawl";
+    const start = execForward(`${runtime}@app-db`, [
+      runtime,
+      "run",
+      "-d",
+      "--name",
+      containerName,
+      "-p",
+      `127.0.0.1:${port}:5432`,
+      "-e",
+      `POSTGRES_USER=${user}`,
+      "-e",
+      `POSTGRES_PASSWORD=${password}`,
+      "-e",
+      `POSTGRES_DB=${database}`,
+      "postgres:17.10-bookworm",
+    ]);
+    await start.promise;
+    applicationPostgresContainer = {
+      containerName,
+      containerRuntime: runtime,
+    };
+    databaseUrl = `postgresql://${user}:${password}@127.0.0.1:${port}/${database}`;
+  }
+
+  await waitForApplicationPostgres(databaseUrl);
+  process.env.APPLICATION_DATABASE_URL = databaseUrl;
+  config.APPLICATION_DATABASE_URL = databaseUrl;
+
+  const migrate = execForward("app-db@migrate", ["pnpm", "db:migrate"]);
+  await migrate.promise;
+  logger.success("Application database migrations applied");
 }
 
 async function buildNuqPostgresImage(runtime: string): Promise<void> {
@@ -794,28 +996,54 @@ async function installDependencies() {
       }
     })(),
 
-    (async () => {
-      logger.info("Installing Go dependencies");
-      const install = execForward(
-        "go@install",
-        "cd sharedLibs/go-html-to-md && go mod tidy",
-      );
-      await install.promise;
+    ...(localPersistenceHarness
+      ? []
+      : [
+          (async () => {
+            logger.info("Installing Go dependencies");
+            const install = execForward(
+              "go@install",
+              "cd sharedLibs/go-html-to-md && go mod tidy",
+            );
+            await install.promise;
 
-      logger.info("Building Go module");
-      const build = execForward(
-        "go@build",
-        `cd sharedLibs/go-html-to-md && go build -o ${basename(HTML_TO_MARKDOWN_PATH)} -buildmode=c-shared html-to-markdown.go`,
-      );
-      await build.promise;
-    })(),
+            logger.info("Building Go module");
+            const build = execForward(
+              "go@build",
+              `cd sharedLibs/go-html-to-md && go build -o ${basename(HTML_TO_MARKDOWN_PATH)} -buildmode=c-shared html-to-markdown.go`,
+            );
+            await build.promise;
+          })(),
+        ]),
   ];
 
   await Promise.all(tasks);
+
+  if (localPersistenceHarness) {
+    logger.info("Installing controlled fixture dependencies");
+    const installFixture = execForward(
+      "fixture@install",
+      ["pnpm", "install", "--frozen-lockfile"],
+      { npm_config_inject_workspace_packages: "false" },
+      TEST_SITE_PATH,
+    );
+    await installFixture.promise;
+
+    logger.info("Building controlled fixture site");
+    const buildFixture = execForward(
+      "fixture@build",
+      ["pnpm", "build"],
+      { npm_config_inject_workspace_packages: "false" },
+      TEST_SITE_PATH,
+    );
+    await buildFixture.promise;
+  }
   logger.success("Dependencies installed");
 }
 
 async function startServices(command?: string[]): Promise<Services> {
+  await setupApplicationPostgres();
+
   // Setup NUQ PostgreSQL container if needed
   const nuqPostgres = await setupNuqPostgres();
 
@@ -826,6 +1054,27 @@ async function startServices(command?: string[]): Promise<Services> {
   const fdb = await setupFdb();
 
   logger.section("Starting services");
+
+  const fixtureServer =
+    localPersistenceHarness && fixtureServerPort
+      ? execForward(
+          "fixture",
+          [
+            "pnpm",
+            "preview",
+            "--port",
+            String(fixtureServerPort),
+            "--strictPort",
+            "--host",
+            "127.0.0.1",
+          ],
+          { npm_config_inject_workspace_packages: "false" },
+          TEST_SITE_PATH,
+        )
+      : undefined;
+  if (fixtureServer && fixtureServerPort) {
+    await waitForPort(fixtureServerPort, "127.0.0.1");
+  }
 
   const api = execForward(
     "api",
@@ -945,6 +1194,7 @@ async function startServices(command?: string[]): Promise<Services> {
     indexWorker,
     extractWorker,
     command: commandProcess,
+    fixtureServer,
     nuqPostgres,
     nuqRabbitMQ,
     fdb,
@@ -963,6 +1213,7 @@ async function stopDevelopmentServices(services: Services) {
     services.indexWorker?.process,
     services.extractWorker?.process,
     services.command?.process,
+    services.fixtureServer?.process,
   ].filter((p): p is ChildProcess => !!p);
 
   await Promise.race([
@@ -1117,6 +1368,7 @@ async function waitForTermination(services: Services): Promise<void> {
   ];
 
   if (services.command) promises.push(services.command.promise);
+  if (services.fixtureServer) promises.push(services.fixtureServer.promise);
   if (services.api) promises.push(services.api.promise);
   if (services.worker) promises.push(services.worker.promise);
   if (services.indexWorker) promises.push(services.indexWorker.promise);
@@ -1179,6 +1431,16 @@ async function gracefulShutdown() {
     fdbContainer = null;
   }
 
+  if (applicationPostgresContainer) {
+    logger.info("Stopping harness-owned application PostgreSQL container");
+    await stopAndRemoveContainer(
+      applicationPostgresContainer.containerRuntime,
+      applicationPostgresContainer.containerName,
+    );
+    logger.success("Harness-owned application PostgreSQL container stopped");
+    applicationPostgresContainer = null;
+  }
+
   logger.success("All processes terminated");
 }
 
@@ -1209,6 +1471,8 @@ async function main() {
     const command = process.argv.slice(2);
     IS_DEV = command[0] === "--start";
 
+    await configureLocalPersistenceHarness(command);
+
     if (command[0] !== "--start-docker") {
       await installDependencies();
     }
@@ -1221,7 +1485,7 @@ async function main() {
   } catch (error: any) {
     logger.error("Fatal error occurred");
     console.error(error?.stack || error?.message || error);
-    process.exit(1);
+    serviceError = true;
   } finally {
     await gracefulShutdown();
     logger.info("Goodbye!");

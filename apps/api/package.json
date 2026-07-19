@@ -22,6 +22,7 @@
     "test:full": "vitest run --exclude='**/__tests__/e2e_noAuth/**' --exclude='**/__tests__/e2e_withAuth/**'",
     "test:prod": "vitest run --exclude='**/__tests__/e2e_noAuth/**' --exclude='**/__tests__/e2e_full_withAuth/**' --exclude='**/scraper/scrapeURL/**'",
     "test:snips": "vitest run src/__tests__/snips/v1 src/__tests__/snips/v2",
+    "test:snips:local-persistence": "vitest run src/__tests__/snips/v2/local-persistence.test.ts",
     "harness": "tsx src/harness.ts",
     "workers": "tsc-watch --onSuccess \"node dist/src/services/queue-worker.js\"",
     "worker:production": "node dist/src/services/queue-worker.js",

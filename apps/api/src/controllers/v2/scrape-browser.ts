@@ -48,7 +48,6 @@ import { billTeam } from "../../services/billing/credit_billing";
 import {
   KEYLESS_CREDITS_MESSAGE,
   adjustKeylessCredits,
-  keylessTeamUuid,
   logKeylessCreditUsage,
   reserveKeylessCredits,
 } from "../../lib/keyless";
@@ -63,6 +62,7 @@ import {
 } from "../../lib/browser-billing";
 import { autumnService } from "../../services/autumn/autumn.service";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import { isScrapeOwnedBy } from "../../lib/local-owner";
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -153,9 +153,7 @@ export async function scrapeInteractController(
   // Keyless scrapes are persisted under a deterministic per-IP UUID (the
   // `scrapes.team_id` column is a UUID, so the raw `preview_keyless_<ip>` string
   // can't be stored). Compare against that derived UUID for keyless requests.
-  const expectedScrapeTeam =
-    keylessTeamUuid(req.auth.team_id) ?? req.auth.team_id;
-  if (scrape.team_id !== expectedScrapeTeam) {
+  if (!isScrapeOwnedBy(scrape.team_id, req.auth.team_id)) {
     return res.status(403).json({ success: false, error: "Forbidden." });
   }
 

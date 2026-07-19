@@ -16,15 +16,18 @@ import {
   saveSearchToGCS,
 } from "../../lib/gcs-jobs";
 import { hasFormatOfType } from "../../lib/format-utils";
-import { keylessTeamUuid } from "../../lib/keyless";
 import type { Document, ScrapeOptions } from "../../controllers/v2/types";
 import type { CostTracking } from "../../lib/cost-tracking";
 import type { Logger } from "winston";
 import { saveExtractResult } from "../../lib/extract/extract-redis";
 import { trackFirstSurfaceUse } from "../posthog";
+import { isApplicationPersistenceEnabled } from "../../db/application-config";
+import {
+  resolveJobPersistenceOwner,
+  resolveScrapePersistenceOwner,
+} from "../../lib/local-owner";
 configDotenv();
 
-const previewTeamId = "3adefd26-77ec-5968-8dcf-c94b5630d1de";
 const nullByteRegex = /\u0000/g;
 
 /**
@@ -69,9 +72,9 @@ async function robustInsert(
     canonicalLog: "log_job/robustInsert",
   });
 
-  if (config.USE_DB_AUTHENTICATION !== true) {
+  if (!isApplicationPersistenceEnabled()) {
     logger.info(
-      "Skipping database insertion due to USE_DB_AUTHENTICATION being off",
+      "Skipping database insertion because application persistence is disabled",
     );
     return;
   }
@@ -221,10 +224,7 @@ export async function logRequest(request: LoggedRequest) {
       id: request.id,
       kind: request.kind,
       api_version: request.api_version,
-      team_id:
-        request.team_id === "preview" || request.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : request.team_id,
+      team_id: resolveJobPersistenceOwner(request.team_id),
       origin: sanitizedOrigin,
       integration: sanitizedIntegration,
       target_hint: sanitizedTargetHint,
@@ -282,11 +282,7 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
       is_successful: scrape.is_successful,
       error: scrape.error ?? null,
       time_taken: scrape.time_taken,
-      team_id:
-        keylessTeamUuid(scrape.team_id) ??
-        (scrape.team_id === "preview" || scrape.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : scrape.team_id),
+      team_id: resolveScrapePersistenceOwner(scrape.team_id),
       options: scrape.zeroDataRetention ? null : scrape.options,
       cost_tracking: scrape.zeroDataRetention
         ? null
@@ -382,10 +378,7 @@ export async function logCrawl(crawl: LoggedCrawl, force: boolean = false) {
       url: crawl.zeroDataRetention
         ? "<redacted due to zero data retention>"
         : crawl.url,
-      team_id:
-        crawl.team_id === "preview" || crawl.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : crawl.team_id,
+      team_id: resolveJobPersistenceOwner(crawl.team_id),
       options: crawl.zeroDataRetention ? null : crawl.options,
       num_docs: crawl.num_docs,
       credits_cost: crawl.credits_cost,
@@ -426,11 +419,7 @@ export async function logBatchScrape(
     {
       id: batchScrape.id,
       request_id: batchScrape.request_id,
-      team_id:
-        batchScrape.team_id === "preview" ||
-        batchScrape.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : batchScrape.team_id,
+      team_id: resolveJobPersistenceOwner(batchScrape.team_id),
       num_docs: batchScrape.num_docs,
       credits_cost: batchScrape.credits_cost,
       cancelled: batchScrape.cancelled,
@@ -478,10 +467,7 @@ export async function logSearch(search: LoggedSearch, force: boolean = false) {
       query: search.zeroDataRetention
         ? "<redacted due to zero data retention>"
         : sanitizeString(search.query),
-      team_id:
-        search.team_id === "preview" || search.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : search.team_id,
+      team_id: resolveJobPersistenceOwner(search.team_id),
       options: search.zeroDataRetention
         ? { enterprise: search.options?.enterprise }
         : options,
@@ -551,12 +537,7 @@ export async function logResearchEndpoint(
       target: research.zeroDataRetention
         ? "<redacted due to zero data retention>"
         : (sanitizeString(research.target) ?? ""),
-      team_id:
-        keylessTeamUuid(research.team_id) ??
-        (research.team_id === "preview" ||
-        research.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : research.team_id),
+      team_id: resolveScrapePersistenceOwner(research.team_id),
       options: research.zeroDataRetention ? null : research.options,
       response: research.zeroDataRetention ? null : research.response,
       num_results: research.num_results,
@@ -602,10 +583,7 @@ export async function logExtract(
       id: extract.id,
       request_id: extract.request_id,
       urls: extract.urls,
-      team_id:
-        extract.team_id === "preview" || extract.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : extract.team_id,
+      team_id: resolveJobPersistenceOwner(extract.team_id),
       options: extract.options,
       model_kind: extract.model_kind,
       credits_cost: extract.credits_cost,
@@ -656,10 +634,7 @@ export async function logMap(map: LoggedMap, force: boolean = false) {
       url: map.zeroDataRetention
         ? "<redacted due to zero data retention>"
         : map.url,
-      team_id:
-        map.team_id === "preview" || map.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : map.team_id,
+      team_id: resolveJobPersistenceOwner(map.team_id),
       options: map.zeroDataRetention ? null : map.options,
       num_results: map.results.length,
       credits_cost: map.credits_cost,
@@ -703,10 +678,7 @@ export async function logLlmsTxt(
       id: llmsTxt.id,
       request_id: llmsTxt.request_id,
       url: llmsTxt.url,
-      team_id:
-        llmsTxt.team_id === "preview" || llmsTxt.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : llmsTxt.team_id,
+      team_id: resolveJobPersistenceOwner(llmsTxt.team_id),
       options: llmsTxt.options,
       num_urls: llmsTxt.num_urls,
       credits_cost: llmsTxt.credits_cost,
@@ -751,11 +723,7 @@ export async function logDeepResearch(
       id: deepResearch.id,
       request_id: deepResearch.request_id,
       query: deepResearch.query,
-      team_id:
-        deepResearch.team_id === "preview" ||
-        deepResearch.team_id?.startsWith("preview_")
-          ? previewTeamId
-          : deepResearch.team_id,
+      team_id: resolveJobPersistenceOwner(deepResearch.team_id),
       options: deepResearch.options,
       time_taken: deepResearch.time_taken,
       credits_cost: deepResearch.credits_cost,

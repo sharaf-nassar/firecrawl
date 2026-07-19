@@ -1,20 +1,27 @@
-import { vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // vi.mock is hoisted; anything its factories reference must be created in
 // vi.hoisted() (also hoisted). Under Jest these worked because importing `jest`
 // from @jest/globals disables jest.mock hoisting.
-const { captureException, logger, values, insert } = vi.hoisted(() => {
-  const logger: any = {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-    child: vi.fn(() => logger),
-  };
-  const values = vi.fn<(data: any) => Promise<void>>();
-  const insert = vi.fn(() => ({ values }));
-  return { captureException: vi.fn(), logger, values, insert };
-});
+const { captureException, changeTrackingInsertScrape, logger, values, insert } =
+  vi.hoisted(() => {
+    const logger: any = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      child: vi.fn(() => logger),
+    };
+    const values = vi.fn<(data: any) => Promise<void>>();
+    const insert = vi.fn(() => ({ values }));
+    return {
+      captureException: vi.fn(),
+      changeTrackingInsertScrape: vi.fn(),
+      logger,
+      values,
+      insert,
+    };
+  });
 
 vi.mock("@sentry/node", () => ({
   captureException,
@@ -24,6 +31,12 @@ vi.mock("../../config", () => ({
   config: {
     GCS_BUCKET_NAME: undefined,
     USE_DB_AUTHENTICATION: true,
+    LOCAL_PERSISTENCE_ENABLED: false,
+    APPLICATION_DATABASE_URL: undefined,
+    LOCAL_OWNER_ID: undefined,
+    LOCAL_RECORD_RETENTION_DAYS: 30,
+    LOCAL_ARTIFACT_RETENTION_DAYS: 30,
+    ARTIFACT_STORE_PROVIDER: "none",
   },
 }));
 
@@ -33,6 +46,17 @@ vi.mock("../../lib/logger", () => ({
 
 vi.mock("../../db/connection", () => ({
   db: { insert },
+}));
+
+vi.mock("../../db/rpc", () => ({
+  changeTrackingInsertScrape,
+}));
+
+vi.mock("../../lib/keyless", () => ({
+  keylessTeamUuid: (teamId: string) =>
+    teamId === "preview_keyless_127.0.0.1"
+      ? "e50fa284-91f8-5d60-b54a-e0a119a66a06"
+      : null,
 }));
 
 vi.mock("../../lib/gcs-jobs", () => ({
@@ -48,8 +72,31 @@ vi.mock("../../lib/extract/extract-redis", () => ({
   saveExtractResult: vi.fn(),
 }));
 
-import { logSearch, type LoggedSearch } from "./log_job";
+vi.mock("../posthog", () => ({
+  trackFirstSurfaceUse: vi.fn(),
+}));
+
+import {
+  logBatchScrape,
+  logCrawl,
+  logDeepResearch,
+  logExtract,
+  logLlmsTxt,
+  logMap,
+  logRequest,
+  logResearchEndpoint,
+  logScrape,
+  logSearch,
+  type LoggedSearch,
+} from "./log_job";
+import { config } from "../../config";
 import * as schema from "../../db/schema";
+import { keylessTeamUuid } from "../../lib/keyless";
+
+const localOwnerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
+const applicationDatabaseUrl =
+  "postgresql://firecrawl:password@localhost:5432/firecrawl";
+const previewTeamId = "3adefd26-77ec-5968-8dcf-c94b5630d1de";
 
 function makeSearch(overrides: Partial<LoggedSearch> = {}): LoggedSearch {
   return {
@@ -71,12 +118,352 @@ function makeSearch(overrides: Partial<LoggedSearch> = {}): LoggedSearch {
   };
 }
 
-describe("logSearch", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    values.mockResolvedValue(undefined);
+beforeEach(() => {
+  vi.clearAllMocks();
+  values.mockResolvedValue(undefined);
+  config.USE_DB_AUTHENTICATION = true;
+  config.LOCAL_PERSISTENCE_ENABLED = false;
+  config.APPLICATION_DATABASE_URL = undefined;
+  config.LOCAL_OWNER_ID = undefined;
+  config.LOCAL_RECORD_RETENTION_DAYS = 30;
+  config.LOCAL_ARTIFACT_RETENTION_DAYS = 30;
+  config.ARTIFACT_STORE_PROVIDER = "none";
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("application persistence", () => {
+  const requestId = "019e6f45-7778-727d-adf0-0abe9d5062b6";
+  const scrapeId = "019e6f45-7778-727d-adf0-0abe9d5062b7";
+  const keylessTeam = "preview_keyless_127.0.0.1";
+
+  function enableLocalPersistence() {
+    config.USE_DB_AUTHENTICATION = false;
+    config.LOCAL_PERSISTENCE_ENABLED = true;
+    config.APPLICATION_DATABASE_URL = applicationDatabaseUrl;
+    config.LOCAL_OWNER_ID = localOwnerId;
+  }
+
+  const localLogCases: Array<{
+    name: string;
+    table: unknown;
+    run: (teamId: string) => Promise<void>;
+  }> = [
+    {
+      name: "request",
+      table: schema.requests,
+      run: teamId =>
+        logRequest({
+          id: requestId,
+          kind: "scrape",
+          api_version: "v2",
+          team_id: teamId,
+          target_hint: "http://localhost:3000",
+          zeroDataRetention: false,
+        }),
+    },
+    {
+      name: "scrape",
+      table: schema.scrapes,
+      run: teamId =>
+        logScrape({
+          id: scrapeId,
+          request_id: requestId,
+          url: "http://localhost:3000",
+          is_successful: true,
+          time_taken: 10,
+          team_id: teamId,
+          options: { formats: [{ type: "html" }] } as any,
+          credits_cost: 1,
+          skipNuq: false,
+          zeroDataRetention: false,
+        }),
+    },
+    {
+      name: "parse",
+      table: schema.parses,
+      run: teamId =>
+        logScrape({
+          id: scrapeId,
+          request_id: requestId,
+          url: "http://localhost:3000/document.pdf",
+          is_successful: true,
+          time_taken: 10,
+          team_id: teamId,
+          options: { formats: [{ type: "markdown" }] } as any,
+          credits_cost: 1,
+          skipNuq: false,
+          zeroDataRetention: false,
+          is_parse: true,
+        }),
+    },
+    {
+      name: "crawl",
+      table: schema.crawls,
+      run: teamId =>
+        logCrawl({
+          id: scrapeId,
+          request_id: requestId,
+          url: "http://localhost:3000",
+          team_id: teamId,
+          options: {},
+          num_docs: 1,
+          credits_cost: 1,
+          zeroDataRetention: false,
+          cancelled: false,
+        }),
+    },
+    {
+      name: "batch scrape",
+      table: schema.batch_scrapes,
+      run: teamId =>
+        logBatchScrape({
+          id: scrapeId,
+          request_id: requestId,
+          team_id: teamId,
+          num_docs: 1,
+          credits_cost: 1,
+          zeroDataRetention: false,
+          cancelled: false,
+        }),
+    },
+    {
+      name: "search",
+      table: schema.searches,
+      run: teamId => logSearch(makeSearch({ team_id: teamId })),
+    },
+    {
+      name: "research endpoint",
+      table: schema.research_paper_searches,
+      run: teamId =>
+        logResearchEndpoint({
+          table: "research_paper_searches",
+          id: scrapeId,
+          request_id: requestId,
+          target: "firecrawl",
+          team_id: teamId,
+          options: {},
+          response: [],
+          num_results: 0,
+          time_taken: 10,
+          credits_cost: 1,
+          is_successful: true,
+          zeroDataRetention: false,
+        }),
+    },
+    {
+      name: "extract",
+      table: schema.extracts,
+      run: teamId =>
+        logExtract({
+          id: scrapeId,
+          request_id: requestId,
+          urls: ["http://localhost:3000"],
+          team_id: teamId,
+          options: {},
+          model_kind: "fire-1",
+          credits_cost: 1,
+          is_successful: true,
+        }),
+    },
+    {
+      name: "map",
+      table: schema.maps,
+      run: teamId =>
+        logMap({
+          id: scrapeId,
+          request_id: requestId,
+          url: "http://localhost:3000",
+          team_id: teamId,
+          options: {},
+          results: [],
+          credits_cost: 1,
+          zeroDataRetention: false,
+        }),
+    },
+    {
+      name: "llms.txt",
+      table: schema.llmstxts,
+      run: teamId =>
+        logLlmsTxt({
+          id: scrapeId,
+          request_id: requestId,
+          url: "http://localhost:3000",
+          team_id: teamId,
+          options: {},
+          num_urls: 1,
+          credits_cost: 1,
+          result: null as any,
+        }),
+    },
+    {
+      name: "deep research",
+      table: schema.deep_researches,
+      run: teamId =>
+        logDeepResearch({
+          id: scrapeId,
+          request_id: requestId,
+          query: "firecrawl",
+          team_id: teamId,
+          options: {},
+          time_taken: 10,
+          credits_cost: 1,
+          result: null as any,
+        }),
+    },
+  ];
+
+  it.each(localLogCases)(
+    "persists $name under the stable local owner",
+    async ({ table, run }) => {
+      enableLocalPersistence();
+
+      await run(keylessTeam);
+
+      expect(insert).toHaveBeenCalledWith(table);
+      expect(values).toHaveBeenCalledWith(
+        expect.objectContaining({ team_id: localOwnerId }),
+      );
+    },
+  );
+
+  it.each(["bypass", keylessTeam, keylessTeamUuid(keylessTeam)!])(
+    "never persists local operational rows under %s",
+    async teamId => {
+      enableLocalPersistence();
+
+      await logScrape({
+        id: scrapeId,
+        request_id: requestId,
+        url: "http://localhost:3000",
+        is_successful: true,
+        time_taken: 10,
+        team_id: teamId,
+        options: {} as any,
+        credits_cost: 1,
+        skipNuq: false,
+        zeroDataRetention: false,
+      });
+
+      expect(values).toHaveBeenCalledWith(
+        expect.objectContaining({ team_id: localOwnerId }),
+      );
+    },
+  );
+
+  it("still skips inserts when authentication and local persistence are off", async () => {
+    config.USE_DB_AUTHENTICATION = false;
+
+    await logSearch(makeSearch());
+
+    expect(insert).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      "Skipping database insertion because application persistence is disabled",
+    );
   });
 
+  it("preserves hosted preview, keyless, and raw team mappings", async () => {
+    await logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: "preview_abc",
+      target_hint: "https://example.com",
+      zeroDataRetention: false,
+    });
+    await logScrape({
+      id: scrapeId,
+      request_id: requestId,
+      url: "https://example.com",
+      is_successful: true,
+      time_taken: 10,
+      team_id: keylessTeam,
+      options: {} as any,
+      credits_cost: 1,
+      skipNuq: false,
+      zeroDataRetention: false,
+    });
+    await logSearch(makeSearch({ team_id: "hosted-team" }));
+
+    expect(values.mock.calls[0][0].team_id).toBe(previewTeamId);
+    expect(values.mock.calls[1][0].team_id).toBe(keylessTeamUuid(keylessTeam));
+    expect(values.mock.calls[2][0].team_id).toBe("hosted-team");
+  });
+
+  it("keeps hosted change tracking enabled but disables it locally", async () => {
+    const scrape = {
+      id: scrapeId,
+      request_id: requestId,
+      url: "https://example.com",
+      is_successful: true,
+      doc: {} as any,
+      time_taken: 10,
+      team_id: "hosted-team",
+      options: { formats: [{ type: "markdown" as const }] } as any,
+      credits_cost: 1,
+      skipNuq: false,
+      zeroDataRetention: false,
+    };
+
+    await logScrape(scrape);
+    expect(changeTrackingInsertScrape).toHaveBeenCalledOnce();
+
+    vi.clearAllMocks();
+    values.mockResolvedValue(undefined);
+    enableLocalPersistence();
+    await logScrape({ ...scrape, team_id: "bypass" });
+    expect(changeTrackingInsertScrape).not.toHaveBeenCalled();
+  });
+
+  it("captures a non-force insert failure without reporting success", async () => {
+    const error = new Error("database unavailable");
+    values.mockRejectedValueOnce(error);
+
+    await expect(logSearch(makeSearch())).resolves.toBeUndefined();
+
+    expect(captureException).toHaveBeenCalledWith(error, expect.any(Object));
+    expect(logger.error).toHaveBeenCalledWith(
+      "Failed to insert into database",
+      expect.any(Object),
+    );
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      "Inserted into database successfully",
+      expect.any(Object),
+    );
+  });
+
+  it("captures a force insert failure after all retries", async () => {
+    vi.useFakeTimers();
+    const error = new Error("database unavailable");
+    values.mockRejectedValue(error);
+
+    const logging = logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: "hosted-team",
+      target_hint: "https://example.com",
+      zeroDataRetention: false,
+    });
+    await vi.runAllTimersAsync();
+    await expect(logging).resolves.toBeUndefined();
+
+    expect(values).toHaveBeenCalledTimes(10);
+    expect(captureException).toHaveBeenCalledWith(error, expect.any(Object));
+    expect(logger.error).toHaveBeenCalledWith(
+      "Failed to insert into database",
+      expect.any(Object),
+    );
+    expect(logger.debug).not.toHaveBeenCalledWith(
+      "Inserted into database successfully",
+      expect.any(Object),
+    );
+  });
+});
+
+describe("logSearch", () => {
   it("removes null bytes from search query log fields", async () => {
     const search = makeSearch({
       query: "hello\u0000world",

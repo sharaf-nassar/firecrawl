@@ -2,9 +2,19 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createLocalOwnerAuthenticator,
+  isScrapeOwnedBy,
+  resolveJobPersistenceOwner,
+  resolveScrapePersistenceOwner,
   type AuthenticationWrapper,
 } from "./local-owner";
 import type { AuthResponse } from "../types";
+
+vi.mock("./keyless", () => ({
+  keylessTeamUuid: (teamId: string) =>
+    teamId === "preview_keyless_127.0.0.1"
+      ? "e50fa284-91f8-5d60-b54a-e0a119a66a06"
+      : null,
+}));
 
 const localOwnerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
 
@@ -82,5 +92,66 @@ describe("createLocalOwnerAuthenticator", () => {
       hostedResult,
     );
     expect(authenticateHosted).toHaveBeenCalledWith("request", "response");
+  });
+});
+
+describe("persistence owner normalization", () => {
+  const localSource = {
+    LOCAL_PERSISTENCE_ENABLED: true,
+    APPLICATION_DATABASE_URL:
+      "postgresql://firecrawl:password@localhost:5432/firecrawl",
+    LOCAL_OWNER_ID: localOwnerId,
+    LOCAL_RECORD_RETENTION_DAYS: 30,
+    LOCAL_ARTIFACT_RETENTION_DAYS: 30,
+    ARTIFACT_STORE_PROVIDER: "none" as const,
+    USE_DB_AUTHENTICATION: false,
+  };
+
+  it.each([
+    "bypass",
+    "preview",
+    "preview_keyless_127.0.0.1",
+    "f188154d-cbe3-5c40-aa61-fe52d24f8be2",
+  ])("uses the stable local owner for %s", teamId => {
+    expect(resolveJobPersistenceOwner(teamId, localSource)).toBe(localOwnerId);
+    expect(resolveScrapePersistenceOwner(teamId, localSource)).toBe(
+      localOwnerId,
+    );
+  });
+
+  it("preserves legacy preview and raw job mappings", () => {
+    const hostedSource = {
+      LOCAL_PERSISTENCE_ENABLED: false,
+      USE_DB_AUTHENTICATION: true,
+    };
+
+    expect(resolveJobPersistenceOwner("preview_abc", hostedSource)).toBe(
+      "3adefd26-77ec-5968-8dcf-c94b5630d1de",
+    );
+    expect(resolveJobPersistenceOwner("hosted-team", hostedSource)).toBe(
+      "hosted-team",
+    );
+  });
+
+  it("preserves deterministic keyless scrape ownership outside local mode", () => {
+    const hostedSource = {
+      LOCAL_PERSISTENCE_ENABLED: false,
+      USE_DB_AUTHENTICATION: true,
+    };
+
+    expect(
+      resolveScrapePersistenceOwner("preview_keyless_127.0.0.1", hostedSource),
+    ).toBe("e50fa284-91f8-5d60-b54a-e0a119a66a06");
+  });
+
+  it("accepts the configured local owner and rejects another persisted owner", () => {
+    expect(isScrapeOwnedBy(localOwnerId, "bypass", localSource)).toBe(true);
+    expect(
+      isScrapeOwnedBy(
+        "1f971a90-f4d2-4289-b7b7-5ae8b6367fc3",
+        "bypass",
+        localSource,
+      ),
+    ).toBe(false);
   });
 });
