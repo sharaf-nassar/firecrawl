@@ -27,6 +27,7 @@ import {
   resolveScrapePersistenceOwner,
 } from "../../lib/local-owner";
 import { isArtifactStoreConfigured } from "../../lib/artifacts";
+import { retentionDeadline } from "../../lib/local-retention-deadline";
 configDotenv();
 
 const nullByteRegex = /\u0000/g;
@@ -232,8 +233,18 @@ export async function logRequest(request: LoggedRequest) {
       integration: sanitizedIntegration,
       target_hint: sanitizedTargetHint,
       dr_clean_by: request.zeroDataRetention
-        ? new Date(Date.now() + 24 * 60 * 60 * 1000)
-        : null,
+        ? retentionDeadline(
+            new Date(),
+            config.LOCAL_RECORD_RETENTION_DAYS,
+            true,
+          )
+        : config.LOCAL_PERSISTENCE_ENABLED
+          ? retentionDeadline(
+              new Date(),
+              config.LOCAL_RECORD_RETENTION_DAYS,
+              false,
+            )
+          : null,
       api_key_id: request.api_key_id ?? null,
     },
     true,

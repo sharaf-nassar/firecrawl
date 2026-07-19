@@ -6,6 +6,11 @@ import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
 import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
+import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
+import {
+  createLocalRetentionService,
+  runLocalRetentionLoop,
+} from "./services/local-retention-worker";
 
 const childProcesses = new Set<ChildProcess>();
 const stopping = new WeakSet<ChildProcess>(); // processes we're intentionally stopping
@@ -31,6 +36,9 @@ let applicationPostgresContainer: {
 } | null = null;
 let localPersistenceHarness = false;
 let fixtureServerPort: number | null = null;
+const localRetentionService = createLocalRetentionService(signal =>
+  runLocalRetentionLoop({ signal }),
+);
 
 // Get the monorepo root for both tsx source execution and compiled dist execution.
 // __dirname is available in CommonJS (which this compiles to)
@@ -1057,6 +1065,16 @@ async function installDependencies() {
 
 async function startServices(command?: string[]): Promise<Services> {
   await setupApplicationPostgres();
+  const localRuntime = resolveLocalRuntimeConfig(config);
+  if (localRuntime.enabled) {
+    const retentionLoop = localRetentionService.start();
+    void retentionLoop.catch(error => {
+      logger.error("Local retention worker terminated unexpectedly", {
+        errorName: error instanceof Error ? error.name : "UnknownError",
+      });
+      serviceError = true;
+    });
+  }
 
   // Setup NUQ PostgreSQL container if needed
   const nuqPostgres = await setupNuqPostgres();
@@ -1406,6 +1424,14 @@ async function gracefulShutdown() {
   restartSignal?.abort();
 
   logger.section("Shutting down");
+  try {
+    await localRetentionService.stop();
+  } catch (error) {
+    logger.error("Local retention worker shutdown failed", {
+      errorName: error instanceof Error ? error.name : "UnknownError",
+    });
+    serviceError = true;
+  }
   const forceTerminate = IS_DEV;
   const terminationPromises = Array.from(childProcesses).map(proc =>
     terminateProcess(proc, forceTerminate),

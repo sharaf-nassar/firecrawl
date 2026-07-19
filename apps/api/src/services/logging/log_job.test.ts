@@ -150,6 +150,45 @@ describe("application persistence", () => {
     config.LOCAL_OWNER_ID = localOwnerId;
   }
 
+  it("sets configured expiry for local requests and caps ZDR at 24 hours", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
+    enableLocalPersistence();
+    config.LOCAL_RECORD_RETENTION_DAYS = 7;
+
+    await logRequest({
+      id: requestId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: localOwnerId,
+      target_hint: "https://example.com/retained",
+      zeroDataRetention: false,
+    });
+    await logRequest({
+      id: scrapeId,
+      kind: "scrape",
+      api_version: "v2",
+      team_id: localOwnerId,
+      target_hint: "https://example.com/private",
+      zeroDataRetention: true,
+    });
+
+    expect(values).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        dr_clean_by: new Date("2026-07-25T00:00:00.000Z"),
+        target_hint: "https://example.com/retained",
+      }),
+    );
+    expect(values).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        dr_clean_by: new Date("2026-07-19T00:00:00.000Z"),
+        target_hint: "<redacted due to zero data retention>",
+      }),
+    );
+  });
+
   const localLogCases: Array<{
     name: string;
     table: unknown;

@@ -15,6 +15,7 @@ import { Logger } from "winston";
 import { getArtifactStore, jobArtifactKey } from "./artifacts";
 import { putLocalArtifactWithManifest } from "./artifacts/local-manifest";
 import { resolveJobPersistenceOwner } from "./local-owner";
+import { retentionDeadline } from "./local-retention-deadline";
 
 const credentials = config.GCS_CREDENTIALS
   ? JSON.parse(atob(config.GCS_CREDENTIALS))
@@ -81,16 +82,17 @@ async function saveJobToGCS(params: {
       metadata: params.metadata,
     };
     if (config.LOCAL_PERSISTENCE_ENABLED) {
-      const retentionDays = params.zeroDataRetention
-        ? 1
-        : config.LOCAL_ARTIFACT_RETENTION_DAYS;
       await putLocalArtifactWithManifest(store, {
         ...input,
         ownerId: resolveJobPersistenceOwner(params.team_id),
         requestId: params.request_id,
         jobId: params.id,
         kind: params.mode,
-        deleteAfter: new Date(Date.now() + retentionDays * 86_400_000),
+        deleteAfter: retentionDeadline(
+          new Date(),
+          config.LOCAL_ARTIFACT_RETENTION_DAYS,
+          params.zeroDataRetention,
+        ),
       });
     } else {
       await store.put(input);
