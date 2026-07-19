@@ -84,6 +84,7 @@ WORKDIR /app
 # Copy built application
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/src/db/migrations ./dist/src/db/migrations
 COPY --from=build /app/native ./native
 
 # Copy Go shared library

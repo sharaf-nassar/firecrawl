@@ -15,6 +15,8 @@
     "build": "tsc",
     "branding:print": "node src/scraper/scrapeURL/engines/fire-engine/branding-script/print-script.js",
     "build:nosentry": "tsc",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate:production": "node dist/src/db/migrate.js",
     "test": "vitest run --exclude='**/__tests__/e2e_noAuth/**'",
     "test:local-no-auth": "vitest run --exclude='**/__tests__/e2e_withAuth/**'",
     "test:full": "vitest run --exclude='**/__tests__/e2e_noAuth/**' --exclude='**/__tests__/e2e_withAuth/**'",
