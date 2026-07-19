@@ -160,6 +160,26 @@ while (( $# > 0 )); do
   esac
 done
 
+phase_keys=(
+  APP_POSTGRES_USER
+  APP_POSTGRES_PASSWORD
+  APP_POSTGRES_DB
+  LOCAL_PERSISTENCE_ENABLED
+  APPLICATION_DATABASE_URL
+  LOCAL_OWNER_ID
+  LOCAL_RECORD_RETENTION_DAYS
+  LOCAL_ARTIFACT_RETENTION_DAYS
+)
+
+if [[ "${check_only}" == true ]]; then
+  validate_environment_file
+  declare -A check_values=()
+  parse_environment "${env_file}" check_values
+  validate_phase_values check_values
+  printf 'Phase 1 environment is valid: %s\n' "${env_file}"
+  exit 0
+fi
+
 if ! command -v flock >/dev/null 2>&1; then
   printf 'Required advisory locking facility is unavailable\n' >&2
   exit 1
@@ -186,7 +206,7 @@ flock -x "${lock_fd}"
 validate_environment_file
 
 trap cleanup EXIT HUP INT TERM
-snapshot_file="$(mktemp "${env_file}.phase1.snapshot.XXXXXX")"
+snapshot_file="$(mktemp "${env_file}.firecrawl-secret-tmp.snapshot.XXXXXX")"
 cp -- "${env_file}" "${snapshot_file}"
 chmod 0600 "${snapshot_file}"
 
@@ -194,23 +214,6 @@ declare -A original_values=()
 declare -A candidate_values=()
 parse_environment "${snapshot_file}" original_values
 copy_environment original_values candidate_values
-
-phase_keys=(
-  APP_POSTGRES_USER
-  APP_POSTGRES_PASSWORD
-  APP_POSTGRES_DB
-  LOCAL_PERSISTENCE_ENABLED
-  APPLICATION_DATABASE_URL
-  LOCAL_OWNER_ID
-  LOCAL_RECORD_RETENTION_DAYS
-  LOCAL_ARTIFACT_RETENTION_DAYS
-)
-
-if [[ "${check_only}" == true ]]; then
-  validate_phase_values candidate_values
-  printf 'Phase 1 environment is valid: %s\n' "${env_file}"
-  exit 0
-fi
 
 declare -a missing_keys=()
 
@@ -246,7 +249,7 @@ if (( ${#missing_keys[@]} == 0 )); then
   exit 0
 fi
 
-output_file="$(mktemp "${env_file}.phase1.output.XXXXXX")"
+output_file="$(mktemp "${env_file}.firecrawl-secret-tmp.output.XXXXXX")"
 cp -- "${snapshot_file}" "${output_file}"
 if [[ -s "${output_file}" ]]; then
   printf '\n' >> "${output_file}"

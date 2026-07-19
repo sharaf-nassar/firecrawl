@@ -2,7 +2,8 @@
 /node_modules/
 /dist/
 .env
-.env.phase1.lock
+*.phase1.lock
+*.firecrawl-secret-tmp.*
 *.csv
 dump.rdb
 /mongo-data

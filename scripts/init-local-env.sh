@@ -18,7 +18,7 @@ bull_auth_key="$(openssl rand -hex 32)"
 local_owner_id="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
 
 umask 077
-tmp_file="$(mktemp "${env_file}.init.XXXXXX")"
+tmp_file="$(mktemp "${env_file}.firecrawl-secret-tmp.init.XXXXXX")"
 cleanup() {
   rm -f -- "${tmp_file}"
 }
