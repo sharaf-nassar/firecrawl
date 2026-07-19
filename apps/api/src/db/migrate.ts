@@ -32,12 +32,17 @@ export class ApplicationMigrationError extends Error {
 export class ApplicationMigrationIntegrityError extends Error {
   constructor(
     public readonly filename: string,
-    public readonly reason: "missing-checksum" | "checksum-mismatch",
+    public readonly reason:
+      | "missing-file"
+      | "missing-checksum"
+      | "checksum-mismatch",
   ) {
     super(
       reason === "missing-checksum"
         ? `Application migration integrity check failed for ${filename}: stored checksum is missing`
-        : `Application migration integrity check failed for ${filename}: file contents have changed`,
+        : reason === "missing-file"
+          ? `Application migration integrity check failed for ${filename}: applied migration file is missing`
+          : `Application migration integrity check failed for ${filename}: file contents have changed`,
     );
     this.name = "ApplicationMigrationIntegrityError";
   }
@@ -107,10 +112,21 @@ export async function runApplicationMigrations(
     const appliedResult = await client.query<{
       filename: string;
       checksum: string | null;
-    }>("SELECT filename, checksum FROM application_schema_migrations");
+    }>(
+      `SELECT filename, checksum
+         FROM application_schema_migrations
+        ORDER BY filename`,
+    );
     const applied = new Map(
       appliedResult.rows.map(row => [row.filename, row.checksum]),
     );
+    const available = new Set(filenames);
+
+    for (const filename of applied.keys()) {
+      if (!available.has(filename)) {
+        throw new ApplicationMigrationIntegrityError(filename, "missing-file");
+      }
+    }
 
     for (const filename of filenames) {
       let file: Buffer;

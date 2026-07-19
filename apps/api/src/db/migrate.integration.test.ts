@@ -12,16 +12,20 @@ const describeWithDatabase = databaseUrl ? describe : describe.skip;
 const ownerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
 const requestId = "dbe8d700-f48f-4d2e-b51b-9a27e4859a8c";
 const scrapeId = "8f6bc812-3d2d-40ba-bb52-0ae0e38328a1";
-const integritySchema = "migration_integrity_test";
+const tamperSchema = "migration_tamper_test";
+const missingFileSchema = "migration_missing_file_test";
+const nullChecksumSchema = "migration_null_checksum_test";
 const baselineFilename = "0001_persistence_foundation.sql";
 
-const integrityDatabaseUrl = databaseUrl
-  ? (() => {
-      const url = new URL(databaseUrl);
-      url.searchParams.set("options", `-c search_path=${integritySchema}`);
-      return url.toString();
-    })()
-  : undefined;
+function databaseUrlForSchema(schema: string): string | undefined {
+  if (!databaseUrl) {
+    return undefined;
+  }
+
+  const url = new URL(databaseUrl);
+  url.searchParams.set("options", `-c search_path=${schema}`);
+  return url.toString();
+}
 
 const migrationConfig = {
   LOCAL_PERSISTENCE_ENABLED: true,
@@ -65,8 +69,14 @@ describeWithDatabase("application migrations", () => {
     await client.connect();
     await client.query("DROP SCHEMA public CASCADE");
     await client.query("CREATE SCHEMA public");
-    await client.query(`DROP SCHEMA IF EXISTS ${integritySchema} CASCADE`);
-    await client.query(`CREATE SCHEMA ${integritySchema}`);
+    for (const schema of [
+      tamperSchema,
+      missingFileSchema,
+      nullChecksumSchema,
+    ]) {
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.query(`CREATE SCHEMA ${schema}`);
+    }
     await runApplicationMigrations(migrationConfig);
     await runApplicationMigrations(migrationConfig);
   });
@@ -97,6 +107,7 @@ describeWithDatabase("application migrations", () => {
       join(tmpdir(), "firecrawl-migration-integrity-"),
     );
     const migrationPath = join(migrationsDirectory, baselineFilename);
+    const integrityDatabaseUrl = databaseUrlForSchema(tamperSchema);
     const integrityClient = new Client({
       connectionString: integrityDatabaseUrl,
     });
@@ -122,7 +133,7 @@ describeWithDatabase("application migrations", () => {
            FROM pg_tables
           WHERE schemaname = $1
           ORDER BY tablename`,
-        [integritySchema],
+        [tamperSchema],
       );
       const ledgerBefore = await integrityClient.query<{ row: string }>(
         `SELECT row_to_json(m)::text AS row
@@ -149,7 +160,7 @@ describeWithDatabase("application migrations", () => {
            FROM pg_tables
           WHERE schemaname = $1
           ORDER BY tablename`,
-        [integritySchema],
+        [tamperSchema],
       );
       const ledgerAfter = await integrityClient.query<{ row: string }>(
         `SELECT row_to_json(m)::text AS row
@@ -169,10 +180,82 @@ describeWithDatabase("application migrations", () => {
     }
   });
 
+  it("rejects an applied migration missing from the migration directory", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-migration-missing-file-"),
+    );
+    const migrationPath = join(migrationsDirectory, baselineFilename);
+    const integrityDatabaseUrl = databaseUrlForSchema(missingFileSchema);
+    const integrityClient = new Client({
+      connectionString: integrityDatabaseUrl,
+    });
+    const integrityConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: integrityDatabaseUrl,
+    };
+
+    try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        migrationPath,
+      );
+      await runApplicationMigrations(integrityConfig, {
+        migrationsDirectory,
+      });
+      await integrityClient.connect();
+
+      const schemaBefore = await integrityClient.query<{
+        tablename: string;
+      }>(
+        `SELECT tablename
+           FROM pg_tables
+          WHERE schemaname = $1
+          ORDER BY tablename`,
+        [missingFileSchema],
+      );
+      const ledgerBefore = await integrityClient.query<{ row: string }>(
+        `SELECT row_to_json(m)::text AS row
+           FROM application_schema_migrations AS m
+          ORDER BY filename`,
+      );
+
+      await rm(migrationPath);
+
+      await expect(
+        runApplicationMigrations(integrityConfig, { migrationsDirectory }),
+      ).rejects.toMatchObject({
+        name: "ApplicationMigrationIntegrityError",
+        filename: baselineFilename,
+        reason: "missing-file",
+      });
+
+      const schemaAfter = await integrityClient.query<{
+        tablename: string;
+      }>(
+        `SELECT tablename
+           FROM pg_tables
+          WHERE schemaname = $1
+          ORDER BY tablename`,
+        [missingFileSchema],
+      );
+      const ledgerAfter = await integrityClient.query<{ row: string }>(
+        `SELECT row_to_json(m)::text AS row
+           FROM application_schema_migrations AS m
+          ORDER BY filename`,
+      );
+      expect(schemaAfter.rows).toEqual(schemaBefore.rows);
+      expect(ledgerAfter.rows).toEqual(ledgerBefore.rows);
+    } finally {
+      await integrityClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an applied migration with a null checksum", async () => {
     const migrationsDirectory = await mkdtemp(
       join(tmpdir(), "firecrawl-migration-null-checksum-"),
     );
+    const integrityDatabaseUrl = databaseUrlForSchema(nullChecksumSchema);
     const integrityClient = new Client({
       connectionString: integrityDatabaseUrl,
     });
@@ -188,8 +271,15 @@ describeWithDatabase("application migrations", () => {
       );
       await integrityClient.connect();
       await integrityClient.query(
-        `ALTER TABLE application_schema_migrations
-         DROP COLUMN checksum`,
+        `CREATE TABLE application_schema_migrations (
+           filename text PRIMARY KEY,
+           applied_at timestamptz NOT NULL DEFAULT now()
+         )`,
+      );
+      await integrityClient.query(
+        `INSERT INTO application_schema_migrations(filename)
+         VALUES ($1)`,
+        [baselineFilename],
       );
 
       await expect(
@@ -197,6 +287,7 @@ describeWithDatabase("application migrations", () => {
       ).rejects.toMatchObject({
         name: "ApplicationMigrationIntegrityError",
         filename: baselineFilename,
+        reason: "missing-checksum",
       });
     } finally {
       await integrityClient.end().catch(() => undefined);
@@ -272,6 +363,10 @@ describeWithDatabase("application migrations", () => {
     );
 
     try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        join(migrationsDirectory, baselineFilename),
+      );
       await writeFile(
         join(migrationsDirectory, "0002_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
