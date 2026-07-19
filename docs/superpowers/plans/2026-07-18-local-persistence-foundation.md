@@ -342,6 +342,14 @@ Abandoned placeholders expire within 24 hours, allowing normal retention to
 remove them and their dependent rows without deleting valid child-first data
 during migration.
 
+**Acceptance amendment (2026-07-18, follow-up):** Restrict the local upsert to
+rows whose existing `kind` is `async_placeholder`; a duplicate real request
+therefore remains unchanged. A new forward-only migration propagates the real
+request deadline to resolved webhook logs only on the placeholder-to-real
+kind transition. Later updates to already-real requests do not rewrite webhook
+retention. The existing webhook assignment trigger resolves each propagated
+deadline from the newly updated request row.
+
 - [ ] **Step 4: Copy migrations into the runtime image**
 
 Add a Dockerfile copy after built application files:

@@ -7,6 +7,7 @@ import { logger as _logger } from "../../lib/logger";
 import { configDotenv } from "dotenv";
 import * as Sentry from "@sentry/node";
 import type { PgTable } from "drizzle-orm/pg-core";
+import { eq, type SQL } from "drizzle-orm";
 import {
   saveDeepResearchToGCS,
   saveExtractToGCS,
@@ -69,6 +70,7 @@ async function robustInsert(
   conflictUpdate?: {
     target: typeof schema.requests.id;
     set: Record<string, unknown>;
+    setWhere: SQL;
   },
 ) {
   const logger = _logger.child({
@@ -258,7 +260,11 @@ export async function logRequest(request: LoggedRequest) {
     true,
     logger,
     config.LOCAL_PERSISTENCE_ENABLED
-      ? { target: schema.requests.id, set: requestUpdate }
+      ? {
+          target: schema.requests.id,
+          set: requestUpdate,
+          setWhere: eq(schema.requests.kind, "async_placeholder"),
+        }
       : undefined,
   );
 }

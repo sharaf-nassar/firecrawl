@@ -30,6 +30,8 @@ const baselineFilename = "0001_persistence_foundation.sql";
 const asyncPlaceholderFilename = "0002_async_request_placeholders.sql";
 const preflightFilename = "0002_preflight_orphan_webhooks.sql";
 const retentionFkFilename = "0002_retention_foreign_keys.sql";
+const resolvedWebhookDeadlineFilename =
+  "0003_resolved_placeholder_webhook_deadlines.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -171,6 +173,7 @@ describeWithDatabase("application migrations", () => {
       asyncPlaceholderFilename,
       preflightFilename,
       retentionFkFilename,
+      resolvedWebhookDeadlineFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
       true,
@@ -650,6 +653,120 @@ describeWithDatabase("application migrations", () => {
     }
   });
 
+  it("extends resolved webhooks only when replacing an async placeholder", async () => {
+    const childFirstRequestId = randomUUID();
+    const childFirstScrapeId = randomUUID();
+    const configuredDeadline = new Date("2026-09-17T00:00:00.000Z");
+    const ignoredDeadline = new Date("2026-10-17T00:00:00.000Z");
+
+    await client.query(
+      `INSERT INTO scrapes (
+         id, request_id, url, is_successful, time_taken, team_id, credits_cost
+       ) VALUES ($1, $2, 'https://example.com/child-first', true, 1, $3, 1)`,
+      [childFirstScrapeId, childFirstRequestId, ownerId],
+    );
+    await client.query(
+      `INSERT INTO webhook_logs (
+         success, team_id, crawl_id, url, event
+       ) VALUES (true, $1, $2, 'https://example.com/webhook', 'completed')`,
+      [ownerId, childFirstScrapeId],
+    );
+
+    const placeholder = await client.query<{
+      request_deadline: Date;
+      webhook_deadline: Date;
+    }>(
+      `SELECT request.dr_clean_by AS request_deadline,
+              webhook.dr_clean_by AS webhook_deadline
+         FROM requests AS request
+         JOIN webhook_logs AS webhook ON webhook.request_id = request.id
+        WHERE request.id = $1`,
+      [childFirstRequestId],
+    );
+    expect(placeholder.rows[0]!.webhook_deadline).toEqual(
+      placeholder.rows[0]!.request_deadline,
+    );
+    expect(placeholder.rows[0]!.webhook_deadline.getTime()).toBeLessThanOrEqual(
+      Date.now() + 24 * 60 * 60 * 1000,
+    );
+
+    await client.query(
+      `INSERT INTO requests (
+         id, kind, api_version, team_id, origin, target_hint, dr_clean_by
+       ) VALUES ($1, 'scrape', 'v2', $2, 'api', 'real request', $3)
+       ON CONFLICT (id) DO UPDATE SET
+         kind = EXCLUDED.kind,
+         api_version = EXCLUDED.api_version,
+         team_id = EXCLUDED.team_id,
+         origin = EXCLUDED.origin,
+         target_hint = EXCLUDED.target_hint,
+         dr_clean_by = EXCLUDED.dr_clean_by
+       WHERE requests.kind = 'async_placeholder'`,
+      [childFirstRequestId, ownerId, configuredDeadline],
+    );
+
+    const replaced = await client.query<{
+      kind: string;
+      request_deadline: Date;
+      webhook_deadline: Date;
+    }>(
+      `SELECT request.kind,
+              request.dr_clean_by AS request_deadline,
+              webhook.dr_clean_by AS webhook_deadline
+         FROM requests AS request
+         JOIN webhook_logs AS webhook ON webhook.request_id = request.id
+        WHERE request.id = $1`,
+      [childFirstRequestId],
+    );
+    expect(replaced.rows).toEqual([
+      {
+        kind: "scrape",
+        request_deadline: configuredDeadline,
+        webhook_deadline: configuredDeadline,
+      },
+    ]);
+
+    await client.query(
+      `INSERT INTO requests (
+         id, kind, api_version, team_id, origin, target_hint, dr_clean_by
+       ) VALUES ($1, 'crawl', 'v2', $2, 'api', 'duplicate real', $3)
+       ON CONFLICT (id) DO UPDATE SET
+         kind = EXCLUDED.kind,
+         target_hint = EXCLUDED.target_hint,
+         dr_clean_by = EXCLUDED.dr_clean_by
+       WHERE requests.kind = 'async_placeholder'`,
+      [childFirstRequestId, ownerId, ignoredDeadline],
+    );
+    await client.query("UPDATE requests SET dr_clean_by = $2 WHERE id = $1", [
+      childFirstRequestId,
+      ignoredDeadline,
+    ]);
+
+    const alreadyReal = await client.query<{
+      kind: string;
+      target_hint: string;
+      request_deadline: Date;
+      webhook_deadline: Date;
+    }>(
+      `SELECT request.kind,
+              request.target_hint,
+              request.dr_clean_by AS request_deadline,
+              webhook.dr_clean_by AS webhook_deadline
+         FROM requests AS request
+         JOIN webhook_logs AS webhook ON webhook.request_id = request.id
+        WHERE request.id = $1`,
+      [childFirstRequestId],
+    );
+    expect(alreadyReal.rows).toEqual([
+      {
+        kind: "scrape",
+        target_hint: "real request",
+        request_deadline: ignoredDeadline,
+        webhook_deadline: configuredDeadline,
+      },
+    ]);
+  });
+
   it("rolls back a failed migration without recording its filename", async () => {
     const migrationsDirectory = await mkdtemp(
       join(tmpdir(), "firecrawl-migrations-"),
@@ -672,15 +789,19 @@ describeWithDatabase("application migrations", () => {
         join(__dirname, "migrations", retentionFkFilename),
         join(migrationsDirectory, retentionFkFilename),
       );
+      await copyFile(
+        join(__dirname, "migrations", resolvedWebhookDeadlineFilename),
+        join(migrationsDirectory, resolvedWebhookDeadlineFilename),
+      );
       await writeFile(
-        join(migrationsDirectory, "0003_failure.sql"),
+        join(migrationsDirectory, "0004_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
          SELECT missing_migration_function();`,
       );
 
       await expect(
         runApplicationMigrations(migrationConfig, { migrationsDirectory }),
-      ).rejects.toThrow(/0003_failure\.sql/);
+      ).rejects.toThrow(/0004_failure\.sql/);
 
       const result = await client.query<{
         table_name: string | null;
@@ -691,7 +812,7 @@ describeWithDatabase("application migrations", () => {
                 EXISTS (
                   SELECT 1
                     FROM application_schema_migrations
-                   WHERE filename = '0003_failure.sql'
+                   WHERE filename = '0004_failure.sql'
                 ) AS ledgered`,
       );
       expect(result.rows).toEqual([{ table_name: null, ledgered: false }]);

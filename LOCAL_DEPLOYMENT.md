@@ -161,6 +161,7 @@ order is:
 0002_async_request_placeholders.sql
 0002_preflight_orphan_webhooks.sql
 0002_retention_foreign_keys.sql
+0003_resolved_placeholder_webhook_deadlines.sql
 ```
 
 The async-placeholder filename sorts before both immutable retention files. It
@@ -171,6 +172,10 @@ foreign keys without deleting child-first job data. Some deployments may
 already have the retention migration ledgered from before the preflight file
 existed; the runner applies missing files without replaying ledgered files. Do
 not rename these files to make the numeric prefixes unique.
+
+The later webhook-deadline migration propagates the configured request
+deadline when a real request replaces an asynchronous placeholder. It does not
+rewrite webhook deadlines for later updates to already-real requests.
 
 `application_schema_migrations` records each filename and SHA-256 checksum.
 Startup fails if an applied file disappears, its checksum changes, a stored
@@ -201,7 +206,8 @@ later than 24 hours. The local request logger atomically replaces the
 placeholder with real metadata and the configured retention deadline. If the
 request log never arrives, normal retention removes the abandoned placeholder
 and its dependent rows after the bounded fallback window. Hosted request
-logging is unchanged.
+logging is unchanged. A conflicting real request is never overwritten by the
+local placeholder replacement path.
 
 Zero-data-retention requests stay redacted, do not write durable artifacts,
 and receive a cleanup deadline no later than 24 hours even when normal

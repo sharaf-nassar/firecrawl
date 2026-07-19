@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // vi.mock is hoisted; anything its factories reference must be created in
@@ -20,7 +21,7 @@ const {
     debug: vi.fn(),
     child: vi.fn(() => logger),
   };
-  const onConflictDoUpdate = vi.fn<() => Promise<void>>();
+  const onConflictDoUpdate = vi.fn<(options: any) => Promise<void>>();
   const values = vi.fn<
     (data: any) => { onConflictDoUpdate: typeof onConflictDoUpdate }
   >(() => ({ onConflictDoUpdate }));
@@ -218,9 +219,14 @@ describe("application persistence", () => {
     });
 
     expect(onConflictDoUpdate).toHaveBeenCalledOnce();
+    const conflictUpdate = onConflictDoUpdate.mock.calls[0]![0];
+    expect(conflictUpdate.setWhere).toEqual(
+      eq(schema.requests.kind, "async_placeholder"),
+    );
     expect(onConflictDoUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
         target: schema.requests.id,
+        setWhere: expect.anything(),
         set: expect.objectContaining({
           kind: "scrape",
           api_version: "v2",
