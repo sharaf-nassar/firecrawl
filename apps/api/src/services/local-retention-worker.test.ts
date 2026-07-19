@@ -19,6 +19,7 @@ import {
   createLocalRetentionService,
   LocalArtifactRetentionError,
   LocalOperationalRetentionError,
+  LocalRetentionShutdownTimeoutError,
   PgLocalRetentionDatabase,
   runLocalRetentionIteration,
   runLocalRetentionLoop,
@@ -199,7 +200,7 @@ describe("runLocalRetentionIteration", () => {
       provider: "minio",
     });
     expect(database.manifests).toHaveLength(1);
-    expect(database.events).toEqual(["release:artifact-0"]);
+    expect(database.events).toEqual(["release:artifact-0", "operational"]);
     expect(silentLogger.error).toHaveBeenCalledWith(
       "Local artifact retention delete failed",
       expect.objectContaining({
@@ -246,7 +247,172 @@ describe("runLocalRetentionIteration", () => {
       "manifest:artifact-0",
       "release:artifact-0",
       "release:artifact-1",
+      "operational",
     ]);
+  });
+
+  it("continues later artifacts and operational cleanup before aggregating failures", async () => {
+    const database = new FakeDatabase();
+    database.manifests = manifests(3);
+    database.operationalResult = {
+      requestsDeleted: 1,
+      dependentRowsDeleted: 2,
+      requestIds: ["expired-request"],
+    };
+    let firstAttempt = true;
+    const store = fakeStore(async key => {
+      if (key === "artifact-0" && firstAttempt) {
+        throw Object.assign(new Error("permanent secret=do-not-log"), {
+          code: "AccessDenied",
+        });
+      }
+    });
+
+    const failure = await runLocalRetentionIteration({
+      database,
+      artifactStore: store,
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    }).catch(error => error);
+
+    expect(failure).toBeInstanceOf(LocalArtifactRetentionError);
+    expect(failure).toMatchObject({
+      artifactCandidates: 3,
+      artifactsDeleted: 2,
+      artifactFailures: 1,
+      requestsDeleted: 1,
+      dependentRowsDeleted: 2,
+      requestIds: ["expired-request"],
+      failures: [
+        {
+          objectKey: "artifact-0",
+          requestId: "request-0",
+          jobId: "job-0",
+          provider: "minio",
+          errorName: "Error",
+          errorCode: "AccessDenied",
+        },
+      ],
+    });
+    expect(JSON.stringify(failure)).not.toContain("do-not-log");
+    expect(database.manifests.map(item => item.objectKey)).toEqual([
+      "artifact-0",
+    ]);
+    expect(database.events).toContain("operational");
+
+    firstAttempt = false;
+    const retry = await runLocalRetentionIteration({
+      database,
+      artifactStore: store,
+      now: new Date("2026-07-18T00:00:01.000Z"),
+      logger: silentLogger,
+    });
+    expect(retry.artifactsDeleted).toBe(1);
+    expect(database.manifests).toHaveLength(0);
+  });
+
+  it("preserves an object failure when releasing its claim also fails", async () => {
+    const database = new FakeDatabase();
+    database.manifests = manifests(1);
+    const claimManifest = database.tryClaimArtifactManifest.bind(database);
+    database.tryClaimArtifactManifest = vi.fn(async (candidate, now) => {
+      const claim = await claimManifest(candidate, now);
+      if (!claim) return null;
+      return {
+        ...claim,
+        release: async () => {
+          throw Object.assign(new Error("unlock secret=do-not-log"), {
+            code: "ECONNRESET",
+          });
+        },
+      };
+    });
+    const objectFailure = Object.assign(
+      new Error("storage secret=do-not-log"),
+      { code: "AccessDenied" },
+    );
+
+    const failure = await runLocalRetentionIteration({
+      database,
+      artifactStore: fakeStore(async () => {
+        throw objectFailure;
+      }),
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    }).catch(error => error);
+
+    expect(failure).toBeInstanceOf(LocalArtifactRetentionError);
+    expect(failure).toMatchObject({
+      artifactFailures: 1,
+      failures: [
+        {
+          objectKey: "artifact-0",
+          errorName: "Error",
+          errorCode: "AccessDenied",
+          cleanupError: {
+            errorName: "Error",
+            errorCode: "ECONNRESET",
+          },
+        },
+      ],
+    });
+    expect(failure.cause).toBeInstanceOf(AggregateError);
+    expect((failure.cause as AggregateError).errors).toEqual([
+      objectFailure,
+      expect.objectContaining({ code: "ECONNRESET" }),
+    ]);
+    expect(database.operationalRuns).toBe(1);
+    expect(JSON.stringify(failure)).not.toContain("do-not-log");
+  });
+
+  it("preserves artifact details when operational cleanup also fails", async () => {
+    const database = new FakeDatabase();
+    database.manifests = manifests(1);
+    const rollbackMetadata = {
+      errorName: "Error",
+      errorCode: "ECONNRESET",
+    };
+    const operationalCause = new Error("database secret=do-not-log");
+    database.deleteExpiredOperationalRows = vi.fn().mockRejectedValue(
+      new LocalOperationalRetentionError({
+        requestIds: ["request-claimed"],
+        cause: operationalCause,
+        cleanupError: rollbackMetadata,
+      }),
+    );
+    const objectFailure = Object.assign(
+      new Error("storage secret=do-not-log"),
+      { code: "AccessDenied" },
+    );
+
+    const failure = await runLocalRetentionIteration({
+      database,
+      artifactStore: fakeStore(async () => {
+        throw objectFailure;
+      }),
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    }).catch(error => error);
+
+    expect(failure).toBeInstanceOf(LocalOperationalRetentionError);
+    expect(failure).toMatchObject({
+      artifactFailures: 1,
+      requestIds: ["request-claimed"],
+      cleanupError: rollbackMetadata,
+      failures: [
+        {
+          objectKey: "artifact-0",
+          errorName: "Error",
+          errorCode: "AccessDenied",
+        },
+      ],
+    });
+    expect(failure.cause).toBeInstanceOf(AggregateError);
+    expect((failure.cause as AggregateError).errors).toEqual([
+      objectFailure,
+      operationalCause,
+    ]);
+    expect(JSON.stringify(failure)).not.toContain("do-not-log");
   });
 
   it("treats an already-missing object as successful manifest cleanup", async () => {
@@ -457,6 +623,7 @@ describe("runLocalRetentionLoop", () => {
         new LocalOperationalRetentionError({
           requestIds: ["request-claimed"],
           cause: new Error("database secret=do-not-log"),
+          cleanupError: { errorName: "Error", errorCode: "ECONNRESET" },
         }),
       )
       .mockImplementation(originalCleanup);
@@ -489,6 +656,7 @@ describe("runLocalRetentionLoop", () => {
         dependentRowsDeleted: 0,
         requestIds: ["request-claimed"],
         durationMs: expect.any(Number),
+        cleanupError: { errorName: "Error", errorCode: "ECONNRESET" },
       },
     );
     expect(
@@ -540,6 +708,15 @@ describe("runLocalRetentionLoop", () => {
         requestId: "request-1",
         jobId: "job-1",
         provider: "minio",
+        failures: [
+          {
+            objectKey: "artifact-1",
+            requestId: "request-1",
+            jobId: "job-1",
+            provider: "minio",
+            errorName: "Error",
+          },
+        ],
       },
     );
     expect(
@@ -579,6 +756,257 @@ describe("createLocalRetentionService", () => {
     await stop;
     expect(stopped).toBe(true);
     expect(service.start()).toBe(first);
+  });
+
+  it("aborts and rejects within a bounded deadline when the runner hangs", async () => {
+    vi.useFakeTimers();
+    const runner = vi.fn(
+      async (_signal: AbortSignal) =>
+        await new Promise<void>(() => {
+          // Intentionally never settles.
+        }),
+    );
+    const service = createLocalRetentionService(runner, {
+      stopTimeoutMs: 5_000,
+      logger: silentLogger,
+    });
+    service.start();
+
+    const stop = service.stop();
+    const stopped = expect(stop).rejects.toBeInstanceOf(
+      LocalRetentionShutdownTimeoutError,
+    );
+    expect(runner.mock.calls[0]?.[0].aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await stopped;
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      "Local retention worker shutdown timed out",
+      {
+        errorName: "LocalRetentionShutdownTimeoutError",
+        errorCode: "retention_shutdown_timeout",
+        timeoutMs: 5_000,
+      },
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("PgLocalRetentionDatabase resource safety", () => {
+  function fakePool(client: any) {
+    return {
+      connect: vi.fn().mockResolvedValue(client),
+      query: vi.fn(),
+      end: vi.fn().mockResolvedValue(undefined),
+      on: vi.fn(),
+    };
+  }
+
+  it("configures finite PostgreSQL connection and statement deadlines", async () => {
+    let poolConfig: Record<string, unknown> | undefined;
+    const pool = fakePool({});
+    const database = new PgLocalRetentionDatabase("postgresql://test", {
+      createPool: config => {
+        poolConfig = config as Record<string, unknown>;
+        return pool as any;
+      },
+    });
+
+    expect(poolConfig).toMatchObject({
+      connectionTimeoutMillis: 5_000,
+      statement_timeout: 30_000,
+      lock_timeout: 5_000,
+      idle_in_transaction_session_timeout: 30_000,
+    });
+    await database.close();
+    await database.close();
+    expect(pool.end).toHaveBeenCalledOnce();
+  });
+
+  it("destroys a claimed client exactly once when advisory unlock fails", async () => {
+    const release = vi.fn();
+    const client = {
+      release,
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("pg_try_advisory_lock")) {
+          return { rows: [{ acquired: true }] };
+        }
+        if (sql.includes("FROM local_artifacts")) {
+          return {
+            rows: [
+              {
+                object_key: "artifact-0",
+                request_id: "request-0",
+                job_id: "job-0",
+                delete_after: new Date("2026-07-17T00:00:00.000Z"),
+                delete_after_token: "2026-07-17 00:00:00+00",
+              },
+            ],
+          };
+        }
+        if (sql.includes("pg_advisory_unlock")) {
+          throw new Error("unlock secret=do-not-log");
+        }
+        throw new Error(`unexpected query: ${sql}`);
+      }),
+    };
+    const pool = fakePool(client);
+    const database = new PgLocalRetentionDatabase("postgresql://test", {
+      createPool: () => pool as any,
+    });
+    const candidate = manifests(1)[0]!;
+    const claim = await database.tryClaimArtifactManifest(
+      candidate,
+      new Date("2026-07-18T00:00:00.000Z"),
+    );
+
+    await expect(claim?.release()).rejects.toThrow("unlock secret");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys once when a manifest query times out", async () => {
+    const timeout = Object.assign(new Error("statement timed out"), {
+      code: "57014",
+    });
+    const release = vi.fn();
+    const client = {
+      release,
+      query: vi.fn().mockRejectedValue(timeout),
+    };
+    const pool = fakePool(client);
+    const database = new PgLocalRetentionDatabase("postgresql://test", {
+      createPool: () => pool as any,
+    });
+
+    await expect(
+      database.listExpiredArtifactManifests(
+        new Date("2026-07-18T00:00:00.000Z"),
+        50,
+      ),
+    ).rejects.toBe(timeout);
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys once when releasing a no-row claim fails", async () => {
+    const release = vi.fn();
+    const client = {
+      release,
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("pg_try_advisory_lock")) {
+          return { rows: [{ acquired: true }] };
+        }
+        if (sql.includes("FROM local_artifacts")) {
+          return { rows: [] };
+        }
+        if (sql.includes("pg_advisory_unlock")) {
+          throw new Error("unlock failed");
+        }
+        throw new Error(`unexpected query: ${sql}`);
+      }),
+    };
+    const pool = fakePool(client);
+    const database = new PgLocalRetentionDatabase("postgresql://test", {
+      createPool: () => pool as any,
+    });
+
+    await expect(
+      database.tryClaimArtifactManifest(
+        manifests(1)[0]!,
+        new Date("2026-07-18T00:00:00.000Z"),
+      ),
+    ).rejects.toThrow("unlock failed");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("preserves a claim query failure when advisory unlock also fails", async () => {
+    const queryFailure = new Error("query secret=do-not-log");
+    const release = vi.fn();
+    const client = {
+      release,
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("pg_try_advisory_lock")) {
+          return { rows: [{ acquired: true }] };
+        }
+        if (sql.includes("FROM local_artifacts")) {
+          throw queryFailure;
+        }
+        if (sql.includes("pg_advisory_unlock")) {
+          throw Object.assign(new Error("unlock secret=do-not-log"), {
+            code: "ECONNRESET",
+          });
+        }
+        throw new Error(`unexpected query: ${sql}`);
+      }),
+    };
+    const pool = fakePool(client);
+    const database = new PgLocalRetentionDatabase("postgresql://test", {
+      createPool: () => pool as any,
+    });
+
+    const failure = await database
+      .tryClaimArtifactManifest(
+        manifests(1)[0]!,
+        new Date("2026-07-18T00:00:00.000Z"),
+      )
+      .catch(error => error);
+    expect(failure).toMatchObject({
+      name: "LocalRetentionResourceError",
+      code: "retention_resource_cleanup_failed",
+      cause: queryFailure,
+      cleanupError: { errorName: "Error", errorCode: "ECONNRESET" },
+    });
+    expect(JSON.stringify(failure)).not.toContain("do-not-log");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys once on rollback failure and preserves both error contexts", async () => {
+    const transactionFailure = new Error("transaction secret=do-not-log");
+    const rollbackFailure = Object.assign(
+      new Error("rollback secret=do-not-log"),
+      { code: "ECONNRESET" },
+    );
+    const release = vi.fn();
+    const client = {
+      release,
+      query: vi.fn(async (sql: string) => {
+        if (sql === "BEGIN") return { rows: [] };
+        if (sql.includes("FROM requests")) {
+          return { rows: [{ id: "request-claimed" }] };
+        }
+        if (
+          sql.startsWith("DELETE FROM webhook_logs") &&
+          sql.includes("dr_clean_by")
+        ) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql.startsWith("DELETE FROM webhook_logs")) {
+          throw transactionFailure;
+        }
+        if (sql === "ROLLBACK") throw rollbackFailure;
+        throw new Error(`unexpected query: ${sql}`);
+      }),
+    };
+    const pool = fakePool(client);
+    const database = new PgLocalRetentionDatabase("postgresql://test", {
+      createPool: () => pool as any,
+    });
+
+    const failure = await database
+      .deleteExpiredOperationalRows(new Date("2026-07-18T00:00:00.000Z"), 50)
+      .catch(error => error);
+    expect(failure).toMatchObject({
+      name: "LocalOperationalRetentionError",
+      requestIds: ["request-claimed"],
+      cause: transactionFailure,
+      cleanupError: { errorName: "Error", errorCode: "ECONNRESET" },
+    });
+    expect(JSON.stringify(failure)).not.toContain("do-not-log");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(true);
   });
 });
 
@@ -888,7 +1316,38 @@ describeWithDatabase("PostgreSQL local retention", () => {
       await pool.query(
         "DROP FUNCTION IF EXISTS retention_test_reject_delete()",
       );
+      await pool.query("DELETE FROM requests WHERE id = $1", [requestId]);
     }
+  });
+
+  it("cleans an expired uncorrelated webhook on its independent deadline", async () => {
+    const unknownJobId = randomUUID();
+    fixtureIds.add(unknownJobId);
+    await pool.query(
+      `INSERT INTO webhook_logs (
+         success, team_id, crawl_id, url, event, dr_clean_by
+       ) VALUES (
+         true, $1, $2, 'https://example.com/unknown', 'completed',
+         '2026-07-17T00:00:00.000Z'
+       )`,
+      [ownerId, unknownJobId],
+    );
+
+    const result = await database.deleteExpiredOperationalRows(
+      new Date("2026-07-18T00:00:00.000Z"),
+      50,
+    );
+
+    expect(result).toEqual({
+      requestsDeleted: 0,
+      dependentRowsDeleted: 1,
+      requestIds: [],
+    });
+    const retained = await pool.query(
+      "SELECT 1 FROM webhook_logs WHERE crawl_id = $1",
+      [unknownJobId],
+    );
+    expect(retained.rows).toHaveLength(0);
   });
 });
 

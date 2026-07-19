@@ -620,6 +620,8 @@ export const webhook_logs = pgTable("webhook_logs", {
   team_id: uuid("team_id").notNull(),
   crawl_id: uuid("crawl_id").notNull(),
   scrape_id: uuid("scrape_id"),
+  request_id: uuid("request_id"),
+  dr_clean_by: ts("dr_clean_by").notNull(),
   created_at: ts("created_at").notNull().defaultNow(),
   url: text("url").notNull(),
   status_code: smallint("status_code"),

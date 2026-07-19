@@ -15,7 +15,9 @@ const scrapeId = "8f6bc812-3d2d-40ba-bb52-0ae0e38328a1";
 const tamperSchema = "migration_tamper_test";
 const missingFileSchema = "migration_missing_file_test";
 const nullChecksumSchema = "migration_null_checksum_test";
+const retentionFkSchema = "migration_retention_fk_test";
 const baselineFilename = "0001_persistence_foundation.sql";
+const retentionFkFilename = "0002_retention_foreign_keys.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -73,6 +75,7 @@ describeWithDatabase("application migrations", () => {
       tamperSchema,
       missingFileSchema,
       nullChecksumSchema,
+      retentionFkSchema,
     ]) {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.query(`CREATE SCHEMA ${schema}`);
@@ -91,9 +94,13 @@ describeWithDatabase("application migrations", () => {
          FROM application_schema_migrations
         ORDER BY filename`,
     );
-    expect(ledger.rows).toHaveLength(1);
-    expect(ledger.rows[0]).toMatchObject({ filename: baselineFilename });
-    expect(ledger.rows[0]?.checksum).toMatch(/^[a-f0-9]{64}$/);
+    expect(ledger.rows.map(row => row.filename)).toEqual([
+      baselineFilename,
+      retentionFkFilename,
+    ]);
+    expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
+      true,
+    );
 
     const owners = await client.query<{ count: string }>(
       "SELECT count(*) FROM local_owners WHERE id = $1 AND label = 'local'",
@@ -367,15 +374,19 @@ describeWithDatabase("application migrations", () => {
         join(__dirname, "migrations", baselineFilename),
         join(migrationsDirectory, baselineFilename),
       );
+      await copyFile(
+        join(__dirname, "migrations", retentionFkFilename),
+        join(migrationsDirectory, retentionFkFilename),
+      );
       await writeFile(
-        join(migrationsDirectory, "0002_failure.sql"),
+        join(migrationsDirectory, "0003_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
          SELECT missing_migration_function();`,
       );
 
       await expect(
         runApplicationMigrations(migrationConfig, { migrationsDirectory }),
-      ).rejects.toThrow(/0002_failure\.sql/);
+      ).rejects.toThrow(/0003_failure\.sql/);
 
       const result = await client.query<{
         table_name: string | null;
@@ -386,12 +397,348 @@ describeWithDatabase("application migrations", () => {
                 EXISTS (
                   SELECT 1
                     FROM application_schema_migrations
-                   WHERE filename = '0002_failure.sql'
+                   WHERE filename = '0003_failure.sql'
                 ) AS ledgered`,
       );
       expect(result.rows).toEqual([{ table_name: null, ledgered: false }]);
     } finally {
       await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans legacy orphans and enforces retention parent integrity", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-retention-fk-migration-"),
+    );
+    const retentionDatabaseUrl = databaseUrlForSchema(retentionFkSchema);
+    const retentionClient = new Client({
+      connectionString: retentionDatabaseUrl,
+    });
+    const retentionConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: retentionDatabaseUrl,
+    };
+    const orphanRequestId = "f737aa20-879f-48af-8137-b3b2b83ec5c5";
+    const orphanScrapeId = "c18eef36-3007-4acd-8cd9-03948cbcb471";
+    const orphanCrawlId = "7846a294-8111-482f-a268-6ba028780489";
+
+    try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        join(migrationsDirectory, baselineFilename),
+      );
+      await runApplicationMigrations(retentionConfig, { migrationsDirectory });
+      await retentionClient.connect();
+      await retentionClient.query(
+        `INSERT INTO scrapes (
+           id, request_id, url, is_successful, time_taken, team_id,
+           credits_cost
+         ) VALUES ($1, $2, 'https://example.com/orphan', true, 1, $3, 1)`,
+        [orphanScrapeId, orphanRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, created_at, url, event
+         ) VALUES (true, $1, $2, now() - interval '31 days',
+                   'https://example.com/orphan', 'completed')`,
+        [ownerId, orphanCrawlId],
+      );
+
+      await copyFile(
+        join(__dirname, "migrations", retentionFkFilename),
+        join(migrationsDirectory, retentionFkFilename),
+      );
+      await runApplicationMigrations(retentionConfig, { migrationsDirectory });
+
+      const orphanCounts = await retentionClient.query<{
+        scrapes: string;
+        webhooks: string;
+      }>(
+        `SELECT
+           (SELECT count(*) FROM scrapes WHERE id = $1) AS scrapes,
+           (SELECT count(*) FROM webhook_logs WHERE crawl_id = $2) AS webhooks`,
+        [orphanScrapeId, orphanCrawlId],
+      );
+      expect(orphanCounts.rows).toEqual([{ scrapes: "0", webhooks: "0" }]);
+
+      const constraints = await retentionClient.query<{
+        count: string;
+        validated: boolean;
+        cascading: boolean;
+      }>(
+        `SELECT count(*)::text AS count,
+                bool_and(convalidated) AS validated,
+                bool_and(confdeltype = 'c') AS cascading
+           FROM pg_constraint
+          WHERE connamespace = current_schema()::regnamespace
+            AND contype = 'f'
+            AND conname LIKE '%_request_id_requests_fk'
+            AND conname <> 'webhook_logs_request_id_requests_fk'`,
+      );
+      expect(constraints.rows).toEqual([
+        { count: "14", validated: true, cascading: true },
+      ]);
+      const webhookConstraint = await retentionClient.query<{
+        validated: boolean;
+        delete_action: string;
+      }>(
+        `SELECT convalidated AS validated, confdeltype AS delete_action
+           FROM pg_constraint
+          WHERE connamespace = current_schema()::regnamespace
+            AND conname = 'webhook_logs_request_id_requests_fk'`,
+      );
+      expect(webhookConstraint.rows).toEqual([
+        { validated: true, delete_action: "n" },
+      ]);
+
+      const correlatedRequestId = "ec2fef06-13ed-4908-8410-e098fa9fc27a";
+      const correlatedDeadline = new Date("2026-08-17T00:00:00.000Z");
+      const correlatedIds = {
+        crawl: "115a83aa-f7e1-4631-bf33-5986129a9fb1",
+        batch: "04eab30b-00cf-4d22-a4d1-af3dbacc425f",
+        extract: "3f0853da-23e8-46fe-bf60-dabb67572811",
+        scrape: "de5c36d4-0c65-47d7-a1d0-92aaacb58b10",
+      };
+      await retentionClient.query(
+        `INSERT INTO requests (
+           id, kind, api_version, team_id, origin, target_hint, dr_clean_by
+         ) VALUES ($1, 'scrape', 'v2', $2, 'test', 'webhook retention', $3)`,
+        [correlatedRequestId, ownerId, correlatedDeadline],
+      );
+      await retentionClient.query(
+        `INSERT INTO crawls (
+           id, request_id, url, team_id, num_docs, credits_cost, cancelled
+         ) VALUES ($1, $2, 'https://example.com/crawl', $3, 1, 1, false)`,
+        [correlatedIds.crawl, correlatedRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO batch_scrapes (
+           id, request_id, team_id, num_docs, credits_cost, cancelled
+         ) VALUES ($1, $2, $3, 1, 1, false)`,
+        [correlatedIds.batch, correlatedRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO extracts (
+           id, request_id, urls, model_kind, team_id, is_successful,
+           credits_cost
+         ) VALUES ($1, $2, $3, 'fire-1', $4, true, 1)`,
+        [
+          correlatedIds.extract,
+          correlatedRequestId,
+          ["https://example.com/extract"],
+          ownerId,
+        ],
+      );
+      await retentionClient.query(
+        `INSERT INTO scrapes (
+           id, request_id, url, is_successful, time_taken, team_id,
+           credits_cost
+         ) VALUES ($1, $2, 'https://example.com/scrape', true, 1, $3, 1)`,
+        [correlatedIds.scrape, correlatedRequestId, ownerId],
+      );
+      for (const jobId of Object.values(correlatedIds)) {
+        await retentionClient.query(
+          `INSERT INTO webhook_logs (
+             success, team_id, crawl_id, url, event
+           ) VALUES (true, $1, $2, 'https://example.com/known', 'completed')`,
+          [ownerId, jobId],
+        );
+      }
+      const correlatedWebhooks = await retentionClient.query<{
+        request_id: string;
+        dr_clean_by: Date;
+      }>(
+        `SELECT request_id, dr_clean_by
+           FROM webhook_logs
+          WHERE crawl_id = ANY($1::uuid[])
+          ORDER BY crawl_id`,
+        [Object.values(correlatedIds)],
+      );
+      expect(correlatedWebhooks.rows).toHaveLength(4);
+      expect(
+        correlatedWebhooks.rows.every(
+          row =>
+            row.request_id === correlatedRequestId &&
+            row.dr_clean_by.getTime() === correlatedDeadline.getTime(),
+        ),
+      ).toBe(true);
+
+      const zdrRequestId = "37bd43b6-a44b-47a5-899e-df25940734f2";
+      const zdrScrapeId = "a516ecfc-2d37-4caa-933c-f0f8808e7f08";
+      const zdrDeadline = new Date("2026-07-19T00:00:00.000Z");
+      await retentionClient.query(
+        `INSERT INTO requests (
+           id, kind, api_version, team_id, origin, target_hint, dr_clean_by
+         ) VALUES ($1, 'scrape', 'v2', $2, 'test', 'zdr webhook', $3)`,
+        [zdrRequestId, ownerId, zdrDeadline],
+      );
+      await retentionClient.query(
+        `INSERT INTO scrapes (
+           id, request_id, url, is_successful, time_taken, team_id,
+           credits_cost
+         ) VALUES ($1, $2, 'https://example.com/zdr', true, 1, $3, 1)`,
+        [zdrScrapeId, zdrRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, scrape_id, url, event
+         ) VALUES (true, $1, $2, $3,
+                   'https://example.com/zdr', 'completed')`,
+        [ownerId, orphanCrawlId, zdrScrapeId],
+      );
+      const zdrWebhook = await retentionClient.query<{
+        request_id: string;
+        dr_clean_by: Date;
+      }>(
+        `SELECT request_id, dr_clean_by
+           FROM webhook_logs
+          WHERE scrape_id = $1`,
+        [zdrScrapeId],
+      );
+      expect(zdrWebhook.rows).toEqual([
+        { request_id: zdrRequestId, dr_clean_by: zdrDeadline },
+      ]);
+      await retentionClient.query("DELETE FROM requests WHERE id = $1", [
+        zdrRequestId,
+      ]);
+      const detachedZdrWebhook = await retentionClient.query<{
+        request_id: string | null;
+        dr_clean_by: Date;
+        scrape_exists: boolean;
+      }>(
+        `SELECT webhook.request_id,
+                webhook.dr_clean_by,
+                EXISTS (
+                  SELECT 1 FROM scrapes WHERE id = $1
+                ) AS scrape_exists
+           FROM webhook_logs AS webhook
+          WHERE webhook.scrape_id = $1`,
+        [zdrScrapeId],
+      );
+      expect(detachedZdrWebhook.rows).toEqual([
+        {
+          request_id: null,
+          dr_clean_by: zdrDeadline,
+          scrape_exists: false,
+        },
+      ]);
+
+      await expect(
+        retentionClient.query(
+          `INSERT INTO scrapes (
+             id, request_id, url, is_successful, time_taken, team_id,
+             credits_cost
+           ) VALUES (gen_random_uuid(), $1, 'https://example.com/late',
+                     true, 1, $2, 1)`,
+          [orphanRequestId, ownerId],
+        ),
+      ).rejects.toMatchObject({ code: "23503" });
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, url, event
+         ) VALUES (true, $1, $2, 'https://example.com/late', 'completed')`,
+        [ownerId, orphanCrawlId],
+      );
+      const unknownWebhook = await retentionClient.query<{
+        request_id: string | null;
+        bounded: boolean;
+      }>(
+        `SELECT request_id,
+                dr_clean_by <= created_at + interval '24 hours'
+                  AND dr_clean_by <= now() + interval '24 hours' AS bounded
+           FROM webhook_logs
+          WHERE crawl_id = $1
+            AND scrape_id IS NULL`,
+        [orphanCrawlId],
+      );
+      expect(unknownWebhook.rows).toEqual([
+        { request_id: null, bounded: true },
+      ]);
+
+      const ledger = await retentionClient.query<{ filename: string }>(
+        `SELECT filename FROM application_schema_migrations
+         ORDER BY filename`,
+      );
+      expect(ledger.rows.map(row => row.filename)).toEqual([
+        baselineFilename,
+        retentionFkFilename,
+      ]);
+    } finally {
+      await retentionClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("prevents a child insert blocked behind parent cleanup from orphaning", async () => {
+    const retentionDatabaseUrl = databaseUrlForSchema(retentionFkSchema);
+    await runApplicationMigrations({
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: retentionDatabaseUrl,
+    });
+    const locker = new Client({ connectionString: retentionDatabaseUrl });
+    const applicationName = "firecrawl-retention-concurrency-test";
+    const inserter = new Client({
+      connectionString: retentionDatabaseUrl,
+      application_name: applicationName,
+    });
+    const concurrentRequestId = "df2e4598-c17b-4fc3-a49c-503c3fab0ba1";
+
+    await locker.connect();
+    await inserter.connect();
+    try {
+      await locker.query(
+        `INSERT INTO requests (
+           id, kind, api_version, team_id, origin, target_hint
+         ) VALUES ($1, 'scrape', 'v2', $2, 'test', 'concurrent retention')`,
+        [concurrentRequestId, ownerId],
+      );
+      await locker.query("BEGIN");
+      await locker.query("SELECT id FROM requests WHERE id = $1 FOR UPDATE", [
+        concurrentRequestId,
+      ]);
+
+      const insert = inserter.query(
+        `INSERT INTO scrapes (
+           id, request_id, url, is_successful, time_taken, team_id,
+           credits_cost
+         ) VALUES (gen_random_uuid(), $1, 'https://example.com/concurrent',
+                   true, 1, $2, 1)`,
+        [concurrentRequestId, ownerId],
+      );
+      const rejectedInsert = expect(insert).rejects.toMatchObject({
+        code: "23503",
+      });
+      let observedLockWait = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const activity = await locker.query<{ blocked: boolean }>(
+          `SELECT wait_event_type = 'Lock' AS blocked
+             FROM pg_stat_activity
+            WHERE application_name = $1
+              AND state = 'active'`,
+          [applicationName],
+        );
+        if (activity.rows.some(row => row.blocked)) {
+          observedLockWait = true;
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(observedLockWait).toBe(true);
+
+      await locker.query("DELETE FROM requests WHERE id = $1", [
+        concurrentRequestId,
+      ]);
+      await locker.query("COMMIT");
+      await rejectedInsert;
+      const orphan = await locker.query(
+        "SELECT 1 FROM scrapes WHERE request_id = $1",
+        [concurrentRequestId],
+      );
+      expect(orphan.rows).toHaveLength(0);
+    } finally {
+      await locker.query("ROLLBACK").catch(() => undefined);
+      await locker.end().catch(() => undefined);
+      await inserter.end().catch(() => undefined);
     }
   });
 });

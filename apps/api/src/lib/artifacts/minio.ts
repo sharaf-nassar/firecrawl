@@ -1,3 +1,6 @@
+import * as http from "node:http";
+import * as https from "node:https";
+
 import { Client } from "minio";
 import type {
   ArtifactOperation,
@@ -13,6 +16,42 @@ interface MinioArtifactConfig {
   secretKey: string;
   bucket: string;
   region: string;
+}
+
+type MinioArtifactOptions = {
+  retryDelayMs?: number;
+  deleteRequestTimeoutMs?: number;
+};
+
+type MinioTransport = Pick<typeof http, "request">;
+
+export function createMinioDeleteDeadlineTransport(
+  transport: MinioTransport,
+  timeoutMs: number,
+): MinioTransport {
+  return {
+    request: ((...args: any[]) => {
+      const request = (
+        transport.request as (...requestArgs: any[]) => http.ClientRequest
+      )(...args);
+      const requestOptions = args[0];
+      const method =
+        typeof requestOptions === "object" && requestOptions !== null
+          ? requestOptions.method
+          : undefined;
+      if (method === "DELETE") {
+        const timer = setTimeout(() => {
+          const error = Object.assign(
+            new Error("MinIO DELETE request timed out"),
+            { code: "ETIMEDOUT" },
+          );
+          request.destroy(error);
+        }, timeoutMs);
+        request.once("close", () => clearTimeout(timer));
+      }
+      return request;
+    }) as typeof http.request,
+  };
 }
 
 type MinioClient = Pick<
@@ -97,7 +136,10 @@ function parseEndpoint(endpoint: string): {
   };
 }
 
-function createMinioClient(config: MinioArtifactConfig): Client {
+function createMinioClient(
+  config: MinioArtifactConfig,
+  options: MinioArtifactOptions,
+): Client {
   if (
     !config.accessKey ||
     !config.secretKey ||
@@ -108,11 +150,16 @@ function createMinioClient(config: MinioArtifactConfig): Client {
   }
   const endpoint = parseEndpoint(config.endpoint);
   try {
+    const transport = endpoint.useSSL ? https : http;
     return new Client({
       ...endpoint,
       accessKey: config.accessKey,
       secretKey: config.secretKey,
       region: config.region,
+      transport: createMinioDeleteDeadlineTransport(
+        transport,
+        options.deleteRequestTimeoutMs ?? 10_000,
+      ),
       retryOptions: { disableRetry: true },
     });
   } catch {
@@ -127,9 +174,9 @@ export class MinioArtifactStore implements ArtifactStore {
   constructor(
     private readonly config: MinioArtifactConfig,
     client?: MinioClient,
-    private readonly options: { retryDelayMs?: number } = {},
+    private readonly options: MinioArtifactOptions = {},
   ) {
-    this.client = client ?? createMinioClient(config);
+    this.client = client ?? createMinioClient(config, options);
   }
 
   private async run<T>(

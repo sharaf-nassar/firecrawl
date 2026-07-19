@@ -1,5 +1,6 @@
+import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { cleanupLog } = vi.hoisted(() => ({ cleanupLog: vi.fn() }));
 
@@ -11,7 +12,10 @@ import {
   isArtifactStoreConfigured,
   jobArtifactKey,
 } from ".";
-import { MinioArtifactStore } from "./minio";
+import {
+  createMinioDeleteDeadlineTransport,
+  MinioArtifactStore,
+} from "./minio";
 import { putArtifactWithManifest } from "./manifest";
 
 const minioConfig = {
@@ -22,6 +26,10 @@ const minioConfig = {
   ARTIFACT_MINIO_BUCKET: "firecrawl-artifacts",
   ARTIFACT_MINIO_REGION: "us-east-1",
 };
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("artifact provider selection", () => {
   it("keeps explicit none disabled even when legacy GCS is configured", () => {
@@ -412,6 +420,70 @@ describe("MinIO artifact contract", () => {
     expect(failure).toMatchObject({ provider: "minio", operation: "put" });
     expect(String(failure)).not.toContain("secret-value-that-must-not-leak");
     expect(client.putObject).toHaveBeenCalledTimes(1);
+  });
+
+  it("destroys every hanging DELETE request and stops after three attempts", async () => {
+    vi.useFakeTimers();
+    const requests: Array<
+      EventEmitter & { destroy: ReturnType<typeof vi.fn> }
+    > = [];
+    const baseTransport = {
+      request: vi.fn(() => {
+        const request = Object.assign(new EventEmitter(), {
+          destroy: vi.fn((error: Error) => {
+            request.emit("error", error);
+            request.emit("close");
+            return request;
+          }),
+        });
+        requests.push(request);
+        return request;
+      }),
+    };
+    const transport = createMinioDeleteDeadlineTransport(
+      baseTransport as any,
+      100,
+    );
+    const client = makeClient();
+    client.removeObject.mockImplementation(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          const request = transport.request(
+            { method: "DELETE" },
+            () => undefined,
+          );
+          request.on("error", reject);
+        }),
+    );
+    const store = new MinioArtifactStore(
+      {
+        endpoint: "http://minio:9000",
+        accessKey: "app",
+        secretKey: "secret-value-that-must-not-leak",
+        bucket: "firecrawl-artifacts",
+        region: "us-east-1",
+      },
+      client,
+      { retryDelayMs: 0 },
+    );
+
+    const deletion = store.delete("hanging");
+    const failure = deletion.catch(error => error);
+    await vi.advanceTimersByTimeAsync(300);
+
+    await expect(deletion).rejects.toMatchObject({
+      name: "ArtifactStoreError",
+      provider: "minio",
+      operation: "delete",
+      errorCode: "ETIMEDOUT",
+    });
+    expect(requests).toHaveLength(3);
+    expect(
+      requests.every(request => request.destroy.mock.calls.length === 1),
+    ).toBe(true);
+    expect(JSON.stringify(await failure)).not.toContain(
+      "secret-value-that-must-not-leak",
+    );
   });
 });
 

@@ -1,4 +1,4 @@
-import { Pool, type PoolClient } from "pg";
+import { Pool, type PoolClient, type PoolConfig } from "pg";
 
 import { config } from "../config";
 import { getArtifactStore, type ArtifactStore } from "../lib/artifacts";
@@ -10,6 +10,10 @@ import {
 
 const RETENTION_BATCH_SIZE = 50;
 const IDLE_BACKOFF_MS = 1_000;
+const RETENTION_CONNECTION_TIMEOUT_MS = 5_000;
+const RETENTION_LOCK_TIMEOUT_MS = 5_000;
+const RETENTION_STATEMENT_TIMEOUT_MS = 30_000;
+const RETENTION_STOP_TIMEOUT_MS = 5_000;
 
 const operationalTables = [
   "scrapes",
@@ -91,7 +95,18 @@ type ArtifactRetentionFailureOptions = RetentionFailureProgress & {
   requestId: string | null;
   jobId: string | null;
   provider: ArtifactStore["provider"];
+  failures?: ArtifactRetentionFailure[];
   cause: unknown;
+};
+
+export type ArtifactRetentionFailure = {
+  objectKey: string;
+  requestId: string | null;
+  jobId: string | null;
+  provider: ArtifactStore["provider"];
+  errorName: string;
+  errorCode?: string;
+  cleanupError?: ReturnType<typeof errorMetadata>;
 };
 
 export class LocalArtifactRetentionError extends LocalRetentionFailure {
@@ -99,6 +114,7 @@ export class LocalArtifactRetentionError extends LocalRetentionFailure {
   readonly requestId: string | null;
   readonly jobId: string | null;
   readonly provider: ArtifactStore["provider"];
+  readonly failures: ArtifactRetentionFailure[];
 
   constructor(options: ArtifactRetentionFailureOptions) {
     super(
@@ -113,6 +129,19 @@ export class LocalArtifactRetentionError extends LocalRetentionFailure {
     this.requestId = options.requestId;
     this.jobId = options.jobId;
     this.provider = options.provider;
+    this.failures = options.failures
+      ? options.failures.slice(0, RETENTION_BATCH_SIZE).map(item => ({
+          ...item,
+        }))
+      : [
+          {
+            objectKey: options.objectKey,
+            requestId: options.requestId,
+            jobId: options.jobId,
+            provider: options.provider,
+            ...errorMetadata(options.cause),
+          },
+        ];
   }
 }
 
@@ -121,9 +150,14 @@ type OperationalRetentionFailureOptions = {
   cause: unknown;
   progress?: Omit<RetentionFailureProgress, "requestIds" | "durationMs">;
   durationMs?: number;
+  cleanupError?: ReturnType<typeof errorMetadata>;
+  failures?: ArtifactRetentionFailure[];
 };
 
 export class LocalOperationalRetentionError extends LocalRetentionFailure {
+  readonly cleanupError?: ReturnType<typeof errorMetadata>;
+  readonly failures: ArtifactRetentionFailure[];
+
   constructor(options: OperationalRetentionFailureOptions) {
     const requestIds = options.requestIds.slice(0, RETENTION_BATCH_SIZE);
     super(
@@ -142,6 +176,30 @@ export class LocalOperationalRetentionError extends LocalRetentionFailure {
       },
       options.cause,
     );
+    this.cleanupError = options.cleanupError;
+    this.failures = (options.failures ?? [])
+      .slice(0, RETENTION_BATCH_SIZE)
+      .map(failure => ({ ...failure }));
+  }
+}
+
+class LocalRetentionResourceError extends Error {
+  readonly code = "retention_resource_cleanup_failed";
+  readonly cleanupError: ReturnType<typeof errorMetadata>;
+
+  constructor(cause: unknown, cleanupError: unknown) {
+    super("Local retention resource cleanup failed", { cause });
+    this.name = "LocalRetentionResourceError";
+    this.cleanupError = errorMetadata(cleanupError);
+  }
+}
+
+export class LocalRetentionShutdownTimeoutError extends Error {
+  readonly code = "retention_shutdown_timeout";
+
+  constructor(readonly timeoutMs: number) {
+    super("Local retention worker shutdown timed out");
+    this.name = "LocalRetentionShutdownTimeoutError";
   }
 }
 
@@ -191,6 +249,11 @@ type LoopOptions = {
 };
 
 type LocalRetentionRunner = (signal: AbortSignal) => Promise<void>;
+
+type LocalRetentionServiceOptions = {
+  stopTimeoutMs?: number;
+  logger?: RetentionLogger;
+};
 
 export type LocalRetentionService = {
   start(): Promise<void>;
@@ -250,20 +313,39 @@ function retentionFailureMetadata(error: unknown): Record<string, unknown> {
     metadata.requestId = error.requestId;
     metadata.jobId = error.jobId;
     metadata.provider = error.provider;
+    metadata.failures = error.failures;
+  } else if (
+    error instanceof LocalOperationalRetentionError &&
+    (error.cleanupError || error.failures.length > 0)
+  ) {
+    if (error.cleanupError) metadata.cleanupError = error.cleanupError;
+    if (error.failures.length > 0) metadata.failures = error.failures;
   }
   return metadata;
 }
 
+type PgLocalRetentionDependencies = {
+  createPool?: (config: PoolConfig) => Pool;
+};
+
 export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
   private readonly pool: Pool;
+  private closePromise: Promise<void> | undefined;
 
-  constructor(connectionString: string) {
-    this.pool = new Pool({
+  constructor(
+    connectionString: string,
+    dependencies: PgLocalRetentionDependencies = {},
+  ) {
+    this.pool = (dependencies.createPool ?? (config => new Pool(config)))({
       connectionString,
       application_name: "firecrawl-local-retention",
       max: 2,
       min: 0,
       keepAlive: true,
+      connectionTimeoutMillis: RETENTION_CONNECTION_TIMEOUT_MS,
+      statement_timeout: RETENTION_STATEMENT_TIMEOUT_MS,
+      lock_timeout: RETENTION_LOCK_TIMEOUT_MS,
+      idle_in_transaction_session_timeout: RETENTION_STATEMENT_TIMEOUT_MS,
     });
     this.pool.on("error", error => {
       defaultLogger.error("Local retention PostgreSQL pool error", {
@@ -276,17 +358,27 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     now: Date,
     limit: number,
   ): Promise<ExpiredArtifactManifest[]> {
-    const result = await this.pool.query<ArtifactManifestRow>(
-      `SELECT object_key, request_id, job_id, delete_after,
-              delete_after::text AS delete_after_token
-         FROM local_artifacts
-        WHERE delete_after IS NOT NULL
-          AND delete_after <= $1
-        ORDER BY delete_after, object_key
-        LIMIT $2`,
-      [now, limit],
-    );
-    return result.rows.map(toManifest);
+    const client = await this.pool.connect();
+    let released = false;
+    try {
+      const result = await client.query<ArtifactManifestRow>(
+        `SELECT object_key, request_id, job_id, delete_after,
+                delete_after::text AS delete_after_token
+           FROM local_artifacts
+          WHERE delete_after IS NOT NULL
+            AND delete_after <= $1
+          ORDER BY delete_after, object_key
+          LIMIT $2`,
+        [now, limit],
+      );
+      return result.rows.map(toManifest);
+    } catch (error) {
+      released = true;
+      client.release(true);
+      throw error;
+    } finally {
+      if (!released) client.release();
+    }
   }
 
   async tryClaimArtifactManifest(
@@ -327,31 +419,43 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
 
       const manifest = toManifest(current.rows[0]);
       let released = false;
+      let destroyOnRelease = false;
       return {
         manifest,
         deleteManifest: async () => {
-          const result = await client.query(
-            `DELETE FROM local_artifacts
-              WHERE object_key = $1
-                AND delete_after = $2::timestamptz
-                AND delete_after <= $3`,
-            [manifest.objectKey, manifest.deleteAfterToken, now],
-          );
-          return result.rowCount === 1;
+          try {
+            const result = await client.query(
+              `DELETE FROM local_artifacts
+                WHERE object_key = $1
+                  AND delete_after = $2::timestamptz
+                  AND delete_after <= $3`,
+              [manifest.objectKey, manifest.deleteAfterToken, now],
+            );
+            return result.rowCount === 1;
+          } catch (error) {
+            destroyOnRelease = true;
+            throw error;
+          }
         },
         release: async () => {
           if (released) return;
           released = true;
-          await releaseArtifactLock(client, manifest.objectKey);
+          if (destroyOnRelease) {
+            client.release(true);
+          } else {
+            await releaseArtifactLock(client, manifest.objectKey);
+          }
         },
       };
     } catch (error) {
       if (clientReleased) {
         throw error;
       } else if (lockAcquired) {
-        await releaseArtifactLock(client, candidate.objectKey).catch(() => {
-          client.release(true);
-        });
+        try {
+          await releaseArtifactLock(client, candidate.objectKey);
+        } catch (cleanupError) {
+          throw new LocalRetentionResourceError(error, cleanupError);
+        }
       } else {
         client.release(true);
       }
@@ -366,8 +470,24 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     const client = await this.pool.connect();
     const startedAt = Date.now();
     let requestIds: string[] = [];
+    let released = false;
     try {
       await client.query("BEGIN");
+      let dependentRowsDeleted = 0;
+      const expiredWebhooks = await client.query(
+        `DELETE FROM webhook_logs
+          WHERE id IN (
+            SELECT id
+              FROM webhook_logs
+             WHERE dr_clean_by <= $1
+             ORDER BY dr_clean_by, id
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+          )`,
+        [now, limit],
+      );
+      dependentRowsDeleted += expiredWebhooks.rowCount ?? 0;
+
       const expired = await client.query<{ id: string }>(
         `SELECT id
            FROM requests
@@ -383,17 +503,31 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
         await client.query("COMMIT");
         return {
           requestsDeleted: 0,
-          dependentRowsDeleted: 0,
+          dependentRowsDeleted,
           requestIds: [],
         };
       }
 
-      let dependentRowsDeleted = 0;
       const webhooks = await client.query(
         `DELETE FROM webhook_logs
-          WHERE crawl_id IN (
-            SELECT id FROM crawls WHERE request_id = ANY($1::uuid[])
-          )`,
+          WHERE request_id = ANY($1::uuid[])
+             OR crawl_id IN (
+               SELECT id FROM crawls
+                WHERE request_id = ANY($1::uuid[])
+               UNION
+               SELECT id FROM batch_scrapes
+                WHERE request_id = ANY($1::uuid[])
+               UNION
+               SELECT id FROM extracts
+                WHERE request_id = ANY($1::uuid[])
+               UNION
+               SELECT id FROM scrapes
+                WHERE request_id = ANY($1::uuid[])
+             )
+             OR scrape_id IN (
+               SELECT id FROM scrapes
+                WHERE request_id = ANY($1::uuid[])
+             )`,
         [requestIds],
       );
       dependentRowsDeleted += webhooks.rowCount ?? 0;
@@ -417,19 +551,28 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
         requestIds,
       };
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      let cleanupError: ReturnType<typeof errorMetadata> | undefined;
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        cleanupError = errorMetadata(rollbackError);
+      }
+      released = true;
+      client.release(true);
       throw new LocalOperationalRetentionError({
         requestIds,
         cause: error,
         durationMs: Date.now() - startedAt,
+        cleanupError,
       });
     } finally {
-      client.release();
+      if (!released) client.release();
     }
   }
 
-  async close(): Promise<void> {
-    await this.pool.end();
+  close(): Promise<void> {
+    this.closePromise ??= this.pool.end();
+    return this.closePromise;
   }
 }
 
@@ -441,9 +584,11 @@ async function releaseArtifactLock(
     await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
       objectKey,
     ]);
-  } finally {
-    client.release();
+  } catch (error) {
+    client.release(true);
+    throw error;
   }
+  client.release();
 }
 
 export async function runLocalRetentionIteration(
@@ -460,6 +605,10 @@ export async function runLocalRetentionIteration(
     dependentRowsDeleted: 0,
     requestIds: [],
   };
+  const artifactFailureRecords: Array<{
+    failure: ArtifactRetentionFailure;
+    causes: unknown[];
+  }> = [];
 
   if (options.artifactStore && !options.signal?.aborted) {
     const candidates = await options.database.listExpiredArtifactManifests(
@@ -474,6 +623,11 @@ export async function runLocalRetentionIteration(
         now,
       );
       if (!claim) continue;
+      let failureRecord:
+        | { failure: ArtifactRetentionFailure; causes: unknown[] }
+        | undefined;
+      let primaryError: unknown;
+      let interrupted = false;
       try {
         try {
           await options.artifactStore.delete(claim.manifest.objectKey);
@@ -488,19 +642,93 @@ export async function runLocalRetentionIteration(
             provider: options.artifactStore.provider,
             cause: error,
           });
-          logger.error(
-            "Local artifact retention delete failed",
-            retentionFailureMetadata(failure),
-          );
-          throw failure;
+          failureRecord = {
+            failure: failure.failures[0]!,
+            causes: [error],
+          };
         }
-        if (options.signal?.aborted) break;
-        if (await claim.deleteManifest()) {
+        if (failureRecord) {
+          // Keep the manifest retryable while later candidates still progress.
+        } else if (options.signal?.aborted) {
+          interrupted = true;
+        } else if (await claim.deleteManifest()) {
           result.artifactsDeleted += 1;
         }
-      } finally {
-        await claim.release();
+      } catch (error) {
+        primaryError = error;
       }
+      let cleanupError: unknown;
+      try {
+        await claim.release();
+      } catch (error) {
+        cleanupError = error;
+      }
+      if (failureRecord) {
+        if (cleanupError) {
+          failureRecord.failure.cleanupError = errorMetadata(cleanupError);
+          failureRecord.causes.push(cleanupError);
+        }
+        artifactFailureRecords.push(failureRecord);
+        const failure = new LocalArtifactRetentionError({
+          ...result,
+          durationMs: Date.now() - startedAt,
+          ...failureRecord.failure,
+          failures: [failureRecord.failure],
+          cause:
+            failureRecord.causes.length === 1
+              ? failureRecord.causes[0]
+              : new AggregateError(
+                  failureRecord.causes,
+                  "Local artifact delete and claim cleanup failed",
+                ),
+        });
+        logger.error(
+          "Local artifact retention delete failed",
+          retentionFailureMetadata(failure),
+        );
+        continue;
+      }
+      if (primaryError) {
+        if (cleanupError) {
+          result.artifactFailures += 1;
+          throw new LocalArtifactRetentionError({
+            ...result,
+            durationMs: Date.now() - startedAt,
+            objectKey: claim.manifest.objectKey,
+            requestId: claim.manifest.requestId,
+            jobId: claim.manifest.jobId,
+            provider: options.artifactStore.provider,
+            failures: [
+              {
+                objectKey: claim.manifest.objectKey,
+                requestId: claim.manifest.requestId,
+                jobId: claim.manifest.jobId,
+                provider: options.artifactStore.provider,
+                ...errorMetadata(primaryError),
+                cleanupError: errorMetadata(cleanupError),
+              },
+            ],
+            cause: new AggregateError(
+              [primaryError, cleanupError],
+              "Local artifact operation and claim cleanup failed",
+            ),
+          });
+        }
+        throw primaryError;
+      }
+      if (cleanupError) {
+        result.artifactFailures += 1;
+        throw new LocalArtifactRetentionError({
+          ...result,
+          durationMs: Date.now() - startedAt,
+          objectKey: claim.manifest.objectKey,
+          requestId: claim.manifest.requestId,
+          jobId: claim.manifest.jobId,
+          provider: options.artifactStore.provider,
+          cause: cleanupError,
+        });
+      }
+      if (interrupted) break;
     }
   }
 
@@ -516,14 +744,46 @@ export async function runLocalRetentionIteration(
     } catch (error) {
       const requestIds =
         error instanceof LocalOperationalRetentionError ? error.requestIds : [];
+      const operationalCause =
+        error instanceof LocalOperationalRetentionError ? error.cause : error;
       throw new LocalOperationalRetentionError({
         requestIds,
         cause:
-          error instanceof LocalOperationalRetentionError ? error.cause : error,
+          artifactFailureRecords.length === 0
+            ? operationalCause
+            : new AggregateError(
+                [
+                  ...artifactFailureRecords.flatMap(record => record.causes),
+                  operationalCause,
+                ],
+                "Local artifact and operational retention failed",
+              ),
+        cleanupError:
+          error instanceof LocalOperationalRetentionError
+            ? error.cleanupError
+            : undefined,
+        failures: artifactFailureRecords.map(record => record.failure),
         progress: result,
         durationMs: Date.now() - startedAt,
       });
     }
+  }
+
+  if (artifactFailureRecords.length > 0) {
+    const first = artifactFailureRecords[0]!.failure;
+    throw new LocalArtifactRetentionError({
+      ...result,
+      durationMs: Date.now() - startedAt,
+      objectKey: first.objectKey,
+      requestId: first.requestId,
+      jobId: first.jobId,
+      provider: first.provider,
+      failures: artifactFailureRecords.map(record => record.failure),
+      cause: new AggregateError(
+        artifactFailureRecords.flatMap(record => record.causes),
+        "Local artifact retention deletes failed",
+      ),
+    });
   }
 
   const iterationMetadata = {
@@ -608,9 +868,13 @@ export async function runLocalRetentionLoop(
 
 export function createLocalRetentionService(
   runner: LocalRetentionRunner,
+  options: LocalRetentionServiceOptions = {},
 ): LocalRetentionService {
   let controller: AbortController | undefined;
   let loop: Promise<void> | undefined;
+  let stopPromise: Promise<void> | undefined;
+  const stopTimeoutMs = options.stopTimeoutMs ?? RETENTION_STOP_TIMEOUT_MS;
+  const logger = options.logger ?? defaultLogger;
 
   return {
     start() {
@@ -622,7 +886,30 @@ export function createLocalRetentionService(
     },
     async stop() {
       controller?.abort();
-      if (loop) await loop;
+      if (!loop) return;
+      if (!stopPromise) {
+        stopPromise = new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            const error = new LocalRetentionShutdownTimeoutError(stopTimeoutMs);
+            logger.error("Local retention worker shutdown timed out", {
+              ...errorMetadata(error),
+              timeoutMs: stopTimeoutMs,
+            });
+            reject(error);
+          }, stopTimeoutMs);
+          void loop!.then(
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            error => {
+              clearTimeout(timer);
+              reject(error);
+            },
+          );
+        });
+      }
+      await stopPromise;
     },
   };
 }
