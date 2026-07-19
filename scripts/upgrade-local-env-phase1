@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="${repo_root}/.env"
 check_only=false
+snapshot_file=""
+output_file=""
 
 usage() {
   printf 'Usage: %s [--check] [--env-file <path>]\n' "${0##*/}" >&2
@@ -12,6 +14,125 @@ usage() {
 fail_field() {
   printf 'Invalid Phase 1 environment field: %s\n' "$1" >&2
   exit 1
+}
+
+cleanup() {
+  if [[ -n "${snapshot_file}" ]]; then
+    rm -f -- "${snapshot_file}"
+  fi
+  if [[ -n "${output_file}" ]]; then
+    rm -f -- "${output_file}"
+  fi
+}
+
+validate_environment_file() {
+  if [[ -L "${env_file}" ]]; then
+    printf 'Refusing symbolic-link environment file\n' >&2
+    exit 1
+  fi
+  if [[ ! -f "${env_file}" ]]; then
+    printf 'Refusing non-regular environment file\n' >&2
+    exit 1
+  fi
+  if [[ "$(stat -c '%a' -- "${env_file}")" != 600 ]]; then
+    printf 'Refusing environment file without mode 0600\n' >&2
+    exit 1
+  fi
+}
+
+parse_environment() {
+  local source_file="$1"
+  local destination_name="$2"
+  local -n destination="${destination_name}"
+  local -A seen=()
+  local line key value candidate
+
+  destination=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*$ ]] ||
+      [[ "${line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+    else
+      candidate="${line%%=*}"
+      if [[ "${candidate}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        fail_field "${candidate}"
+      fi
+      fail_field unknown
+    fi
+
+    if [[ -v "seen[${key}]" ]]; then
+      fail_field "${key}"
+    fi
+    seen["${key}"]=1
+    destination["${key}"]="${value}"
+  done < "${source_file}"
+}
+
+copy_environment() {
+  local source_name="$1"
+  local destination_name="$2"
+  local -n source="${source_name}"
+  local -n destination="${destination_name}"
+  local key
+
+  destination=()
+  for key in "${!source[@]}"; do
+    destination["${key}"]="${source[${key}]}"
+  done
+}
+
+require_phase_keys() {
+  local values_name="$1"
+  local -n required_values="${values_name}"
+  local key
+
+  for key in "${phase_keys[@]}"; do
+    if [[ ! -v "required_values[${key}]" ]]; then
+      fail_field "${key}"
+    fi
+  done
+}
+
+validate_phase_values() {
+  local values_name="$1"
+  local -n managed_values="${values_name}"
+  local expected_database_url key
+
+  require_phase_keys "${values_name}"
+
+  for key in APP_POSTGRES_USER APP_POSTGRES_DB; do
+    if [[ ! "${managed_values[${key}]}" =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; then
+      fail_field "${key}"
+    fi
+  done
+
+  if [[ ! "${managed_values[APP_POSTGRES_PASSWORD]}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail_field APP_POSTGRES_PASSWORD
+  fi
+
+  if [[ "${managed_values[LOCAL_PERSISTENCE_ENABLED]}" != true ]]; then
+    fail_field LOCAL_PERSISTENCE_ENABLED
+  fi
+
+  expected_database_url="postgresql://${managed_values[APP_POSTGRES_USER]}:${managed_values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${managed_values[APP_POSTGRES_DB]}"
+  if [[ "${managed_values[APPLICATION_DATABASE_URL]}" != "${expected_database_url}" ]]; then
+    fail_field APPLICATION_DATABASE_URL
+  fi
+
+  if [[ ! "${managed_values[LOCAL_OWNER_ID]}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    fail_field LOCAL_OWNER_ID
+  fi
+
+  for key in LOCAL_RECORD_RETENTION_DAYS LOCAL_ARTIFACT_RETENTION_DAYS; do
+    if [[ ! "${managed_values[${key}]}" =~ ^[1-9][0-9]*$ ]]; then
+      fail_field "${key}"
+    fi
+  done
 }
 
 while (( $# > 0 )); do
@@ -39,45 +160,40 @@ while (( $# > 0 )); do
   esac
 done
 
-if [[ -L "${env_file}" ]]; then
-  printf 'Refusing symbolic-link environment file\n' >&2
-  exit 1
-fi
-if [[ ! -f "${env_file}" ]]; then
-  printf 'Refusing non-regular environment file\n' >&2
-  exit 1
-fi
-if [[ "$(stat -c '%a' -- "${env_file}")" != 600 ]]; then
-  printf 'Refusing environment file without mode 0600\n' >&2
+if ! command -v flock >/dev/null 2>&1; then
+  printf 'Required advisory locking facility is unavailable\n' >&2
   exit 1
 fi
 
-declare -A values=()
-declare -A seen=()
+validate_environment_file
 
-while IFS= read -r line || [[ -n "${line}" ]]; do
-  if [[ "${line}" =~ ^[[:space:]]*$ ]] ||
-    [[ "${line}" =~ ^[[:space:]]*# ]]; then
-    continue
-  fi
+umask 077
+lock_file="${env_file}.phase1.lock"
+if [[ ! -e "${lock_file}" && ! -L "${lock_file}" ]]; then
+  (set -o noclobber; : > "${lock_file}") 2>/dev/null || true
+fi
+if [[ -L "${lock_file}" || ! -f "${lock_file}" ]]; then
+  printf 'Refusing unsafe Phase 1 environment lock\n' >&2
+  exit 1
+fi
+if [[ "$(stat -c '%a' -- "${lock_file}")" != 600 ]]; then
+  printf 'Refusing Phase 1 environment lock without mode 0600\n' >&2
+  exit 1
+fi
 
-  if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-    key="${BASH_REMATCH[1]}"
-    value="${BASH_REMATCH[2]}"
-  else
-    candidate="${line%%=*}"
-    if [[ "${candidate}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      fail_field "${candidate}"
-    fi
-    fail_field unknown
-  fi
+exec {lock_fd}<> "${lock_file}"
+flock -x "${lock_fd}"
+validate_environment_file
 
-  if [[ -v "seen[${key}]" ]]; then
-    fail_field "${key}"
-  fi
-  seen["${key}"]=1
-  values["${key}"]="${value}"
-done < "${env_file}"
+trap cleanup EXIT HUP INT TERM
+snapshot_file="$(mktemp "${env_file}.phase1.snapshot.XXXXXX")"
+cp -- "${env_file}" "${snapshot_file}"
+chmod 0600 "${snapshot_file}"
+
+declare -A original_values=()
+declare -A candidate_values=()
+parse_environment "${snapshot_file}" original_values
+copy_environment original_values candidate_values
 
 phase_keys=(
   APP_POSTGRES_USER
@@ -91,11 +207,9 @@ phase_keys=(
 )
 
 if [[ "${check_only}" == true ]]; then
-  for key in "${phase_keys[@]}"; do
-    if [[ ! -v "values[${key}]" ]]; then
-      fail_field "${key}"
-    fi
-  done
+  validate_phase_values candidate_values
+  printf 'Phase 1 environment is valid: %s\n' "${env_file}"
+  exit 0
 fi
 
 declare -a missing_keys=()
@@ -103,101 +217,63 @@ declare -a missing_keys=()
 set_default() {
   local key="$1"
   local value="$2"
-  if [[ ! -v "values[${key}]" ]]; then
-    values["${key}"]="${value}"
+  if [[ ! -v "candidate_values[${key}]" ]]; then
+    candidate_values["${key}"]="${value}"
     missing_keys+=("${key}")
   fi
 }
 
 set_default APP_POSTGRES_USER firecrawl
-if [[ ! -v 'values[APP_POSTGRES_PASSWORD]' ]]; then
-  values[APP_POSTGRES_PASSWORD]="$(openssl rand -hex 32)"
+if [[ ! -v 'candidate_values[APP_POSTGRES_PASSWORD]' ]]; then
+  candidate_values[APP_POSTGRES_PASSWORD]="$(openssl rand -hex 32)"
   missing_keys+=(APP_POSTGRES_PASSWORD)
 fi
 set_default APP_POSTGRES_DB firecrawl
 set_default LOCAL_PERSISTENCE_ENABLED true
-
-expected_database_url="postgresql://${values[APP_POSTGRES_USER]}:${values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${values[APP_POSTGRES_DB]}"
-set_default APPLICATION_DATABASE_URL "${expected_database_url}"
-
-if [[ ! -v 'values[LOCAL_OWNER_ID]' ]]; then
-  values[LOCAL_OWNER_ID]="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
+set_default APPLICATION_DATABASE_URL \
+  "postgresql://${candidate_values[APP_POSTGRES_USER]}:${candidate_values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${candidate_values[APP_POSTGRES_DB]}"
+if [[ ! -v 'candidate_values[LOCAL_OWNER_ID]' ]]; then
+  candidate_values[LOCAL_OWNER_ID]="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
   missing_keys+=(LOCAL_OWNER_ID)
 fi
 set_default LOCAL_RECORD_RETENTION_DAYS 30
 set_default LOCAL_ARTIFACT_RETENTION_DAYS 30
 
-for key in APP_POSTGRES_USER APP_POSTGRES_PASSWORD APP_POSTGRES_DB; do
-  if [[ -z "${values[${key}]}" ]]; then
-    fail_field "${key}"
-  fi
-done
-
-if [[ "${values[LOCAL_PERSISTENCE_ENABLED]}" != true ]]; then
-  fail_field LOCAL_PERSISTENCE_ENABLED
-fi
-
-if [[ "${values[APPLICATION_DATABASE_URL]}" != "${expected_database_url}" ]]; then
-  fail_field APPLICATION_DATABASE_URL
-fi
-
-if ! APPLICATION_DATABASE_URL="${values[APPLICATION_DATABASE_URL]}" \
-  APP_POSTGRES_USER="${values[APP_POSTGRES_USER]}" \
-  APP_POSTGRES_PASSWORD="${values[APP_POSTGRES_PASSWORD]}" \
-  APP_POSTGRES_DB="${values[APP_POSTGRES_DB]}" \
-  node -e '
-    try {
-      const url = new URL(process.env.APPLICATION_DATABASE_URL);
-      const valid =
-        url.protocol === "postgresql:" &&
-        url.hostname === "app-postgres" &&
-        url.port === "5432" &&
-        decodeURIComponent(url.username) === process.env.APP_POSTGRES_USER &&
-        decodeURIComponent(url.password) === process.env.APP_POSTGRES_PASSWORD &&
-        decodeURIComponent(url.pathname.slice(1)) === process.env.APP_POSTGRES_DB;
-      process.exit(valid ? 0 : 1);
-    } catch {
-      process.exit(1);
-    }
-  '; then
-  fail_field APPLICATION_DATABASE_URL
-fi
-
-owner_id="${values[LOCAL_OWNER_ID]}"
-if [[ ! "${owner_id}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-[89aAbB][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$ ]] &&
-  [[ "${owner_id}" != 00000000-0000-0000-0000-000000000000 ]] &&
-  [[ "${owner_id}" != ffffffff-ffff-ffff-ffff-ffffffffffff ]]; then
-  fail_field LOCAL_OWNER_ID
-fi
-
-for key in LOCAL_RECORD_RETENTION_DAYS LOCAL_ARTIFACT_RETENTION_DAYS; do
-  if [[ ! "${values[${key}]}" =~ ^[1-9][0-9]*$ ]]; then
-    fail_field "${key}"
-  fi
-done
-
-if [[ "${check_only}" == true ]]; then
-  printf 'Phase 1 environment is valid: %s\n' "${env_file}"
-  exit 0
-fi
+validate_phase_values candidate_values
 
 if (( ${#missing_keys[@]} == 0 )); then
   printf 'Phase 1 environment is already configured: %s\n' "${env_file}"
   exit 0
 fi
 
-umask 077
-tmp_file="$(mktemp "${env_file}.phase1.XXXXXX")"
-trap 'rm -f -- "${tmp_file}"' EXIT
-cp -- "${env_file}" "${tmp_file}"
-if [[ -s "${tmp_file}" ]]; then
-  printf '\n' >> "${tmp_file}"
+output_file="$(mktemp "${env_file}.phase1.output.XXXXXX")"
+cp -- "${snapshot_file}" "${output_file}"
+if [[ -s "${output_file}" ]]; then
+  printf '\n' >> "${output_file}"
 fi
 for key in "${missing_keys[@]}"; do
-  printf '%s=%s\n' "${key}" "${values[${key}]}" >> "${tmp_file}"
+  printf '%s=%s\n' "${key}" "${candidate_values[${key}]}" >> "${output_file}"
 done
-chmod 0600 "${tmp_file}"
-mv -- "${tmp_file}" "${env_file}"
-trap - EXIT
+chmod 0600 "${output_file}"
+
+validate_environment_file
+declare -A current_values=()
+declare -A revalidated_values=()
+parse_environment "${env_file}" current_values
+if ! cmp -s "${snapshot_file}" "${env_file}"; then
+  printf 'Environment file changed during Phase 1 upgrade\n' >&2
+  exit 1
+fi
+copy_environment current_values revalidated_values
+for key in "${missing_keys[@]}"; do
+  revalidated_values["${key}"]="${candidate_values[${key}]}"
+done
+validate_phase_values revalidated_values
+
+mv -- "${output_file}" "${env_file}"
+output_file=""
+rm -f -- "${snapshot_file}"
+snapshot_file=""
+trap - EXIT HUP INT TERM
 
 printf 'Added Phase 1 environment fields: %s\n' "${env_file}"

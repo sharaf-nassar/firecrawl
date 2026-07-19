@@ -2,6 +2,7 @@
 /node_modules/
 /dist/
 .env
+.env.phase1.lock
 *.csv
 dump.rdb
 /mongo-data

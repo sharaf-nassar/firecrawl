@@ -18,7 +18,12 @@ bull_auth_key="$(openssl rand -hex 32)"
 local_owner_id="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
 
 umask 077
-set -o noclobber
+tmp_file="$(mktemp "${env_file}.init.XXXXXX")"
+cleanup() {
+  rm -f -- "${tmp_file}"
+}
+trap cleanup EXIT HUP INT TERM PIPE XFSZ
+
 {
   printf '%s\n' 'COMPOSE_FILE=compose.yaml'
   printf '%s\n' 'PORT=3002'
@@ -58,6 +63,14 @@ set -o noclobber
   printf '%s\n' 'SUPABASE_SERVICE_TOKEN='
   printf '%s\n' 'SUPABASE_URL='
   printf '%s\n' 'TEST_API_KEY='
-} > "${env_file}"
+} > "${tmp_file}"
+
+chmod 0600 "${tmp_file}"
+if ! ln -- "${tmp_file}" "${env_file}"; then
+  printf 'Refusing to overwrite existing %s\n' "${env_file}" >&2
+  exit 1
+fi
+rm -f -- "${tmp_file}"
+trap - EXIT HUP INT TERM PIPE XFSZ
 
 printf 'Created %s with mode 0600 credentials.\n' "${env_file}"
