@@ -22,6 +22,63 @@ services:
         condition: service_healthy
       nuq-postgres:
         condition: service_healthy
+      app-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      USE_DB_AUTHENTICATION: "false"
+      LOCAL_PERSISTENCE_ENABLED: ${LOCAL_PERSISTENCE_ENABLED}
+      APPLICATION_DATABASE_URL: "postgresql://${APP_POSTGRES_USER}:${APP_POSTGRES_PASSWORD}@app-postgres:5432/${APP_POSTGRES_DB}"
+      LOCAL_OWNER_ID: ${LOCAL_OWNER_ID}
+      LOCAL_RECORD_RETENTION_DAYS: ${LOCAL_RECORD_RETENTION_DAYS}
+      LOCAL_ARTIFACT_RETENTION_DAYS: ${LOCAL_ARTIFACT_RETENTION_DAYS}
+
+  app-postgres:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_USER: ${APP_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${APP_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${APP_POSTGRES_DB}
+    networks:
+      - backend
+    volumes:
+      - app-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  app-db-migrate:
+    build: apps/api
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    networks:
+      - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+    environment:
+      ENV: local
+      USE_DB_AUTHENTICATION: "false"
+      LOCAL_PERSISTENCE_ENABLED: ${LOCAL_PERSISTENCE_ENABLED}
+      APPLICATION_DATABASE_URL: "postgresql://${APP_POSTGRES_USER}:${APP_POSTGRES_PASSWORD}@app-postgres:5432/${APP_POSTGRES_DB}"
+      LOCAL_OWNER_ID: ${LOCAL_OWNER_ID}
+      LOCAL_RECORD_RETENTION_DAYS: ${LOCAL_RECORD_RETENTION_DAYS}
+      LOCAL_ARTIFACT_RETENTION_DAYS: ${LOCAL_ARTIFACT_RETENTION_DAYS}
+    command: node dist/src/db/migrate.js
+    restart: "no"
+    depends_on:
+      app-postgres:
+        condition: service_healthy
 
   playwright-service:
     restart: unless-stopped
@@ -73,3 +130,4 @@ volumes:
   redis-data:
   rabbitmq-data:
   nuq-postgres-data:
+  app-postgres-data:

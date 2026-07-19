@@ -4,15 +4,21 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="${repo_root}/.env"
 
-if [[ -e "${env_file}" ]]; then
+if [[ -e "${env_file}" || -L "${env_file}" ]]; then
   printf 'Refusing to overwrite existing %s\n' "${env_file}" >&2
   exit 1
 fi
 
 postgres_password="$(openssl rand -hex 32)"
+app_postgres_password="$(openssl rand -hex 32)"
+while [[ "${app_postgres_password}" == "${postgres_password}" ]]; do
+  app_postgres_password="$(openssl rand -hex 32)"
+done
 bull_auth_key="$(openssl rand -hex 32)"
+local_owner_id="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
 
 umask 077
+set -o noclobber
 {
   printf '%s\n' 'COMPOSE_FILE=compose.yaml'
   printf '%s\n' 'PORT=3002'
@@ -21,6 +27,14 @@ umask 077
   printf '%s\n' 'POSTGRES_USER=firecrawl'
   printf '%s\n' "POSTGRES_PASSWORD=${postgres_password}"
   printf '%s\n' 'POSTGRES_DB=postgres'
+  printf '%s\n' 'APP_POSTGRES_USER=firecrawl'
+  printf '%s\n' "APP_POSTGRES_PASSWORD=${app_postgres_password}"
+  printf '%s\n' 'APP_POSTGRES_DB=firecrawl'
+  printf '%s\n' 'LOCAL_PERSISTENCE_ENABLED=true'
+  printf '%s\n' "APPLICATION_DATABASE_URL=postgresql://firecrawl:${app_postgres_password}@app-postgres:5432/firecrawl"
+  printf '%s\n' "LOCAL_OWNER_ID=${local_owner_id}"
+  printf '%s\n' 'LOCAL_RECORD_RETENTION_DAYS=30'
+  printf '%s\n' 'LOCAL_ARTIFACT_RETENTION_DAYS=30'
   printf '%s\n' "BULL_AUTH_KEY=${bull_auth_key}"
   printf '%s\n' 'LOGGING_LEVEL=INFO'
   printf '%s\n' 'ALLOW_LOCAL_WEBHOOKS=false'
