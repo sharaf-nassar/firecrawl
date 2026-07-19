@@ -21,7 +21,9 @@ const migrationConfig = {
   USE_DB_AUTHENTICATION: false,
 };
 
-const loggingTables = [
+const foundationTables = ["local_owners", "local_artifacts"];
+
+const operationalTables = [
   "requests",
   "scrapes",
   "parses",
@@ -76,18 +78,23 @@ describeWithDatabase("application migrations", () => {
     expect(owners.rows[0]?.count).toBe("1");
   });
 
-  it("creates every logging and direct-consumer table", async () => {
+  it("creates every foundation, operational, and direct-consumer table", async () => {
+    const requiredTables = [
+      ...foundationTables,
+      ...operationalTables,
+      ...directConsumerTables,
+    ];
     const tables = await client.query<{ tablename: string }>(
       `SELECT tablename
          FROM pg_tables
         WHERE schemaname = 'public'
           AND tablename = ANY($1::text[])
         ORDER BY tablename`,
-      [[...loggingTables, ...directConsumerTables]],
+      [requiredTables],
     );
 
     expect(tables.rows.map(row => row.tablename)).toEqual(
-      [...loggingTables, ...directConsumerTables].sort(),
+      requiredTables.sort(),
     );
   });
 
