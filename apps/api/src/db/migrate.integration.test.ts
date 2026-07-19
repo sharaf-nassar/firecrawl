@@ -16,7 +16,9 @@ const tamperSchema = "migration_tamper_test";
 const missingFileSchema = "migration_missing_file_test";
 const nullChecksumSchema = "migration_null_checksum_test";
 const retentionFkSchema = "migration_retention_fk_test";
+const preflightUpgradeSchema = "migration_preflight_upgrade_test";
 const baselineFilename = "0001_persistence_foundation.sql";
+const preflightFilename = "0002_preflight_orphan_webhooks.sql";
 const retentionFkFilename = "0002_retention_foreign_keys.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
@@ -76,6 +78,7 @@ describeWithDatabase("application migrations", () => {
       missingFileSchema,
       nullChecksumSchema,
       retentionFkSchema,
+      preflightUpgradeSchema,
     ]) {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.query(`CREATE SCHEMA ${schema}`);
@@ -96,6 +99,7 @@ describeWithDatabase("application migrations", () => {
     );
     expect(ledger.rows.map(row => row.filename)).toEqual([
       baselineFilename,
+      preflightFilename,
       retentionFkFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
@@ -375,6 +379,10 @@ describeWithDatabase("application migrations", () => {
         join(migrationsDirectory, baselineFilename),
       );
       await copyFile(
+        join(__dirname, "migrations", preflightFilename),
+        join(migrationsDirectory, preflightFilename),
+      );
+      await copyFile(
         join(__dirname, "migrations", retentionFkFilename),
         join(migrationsDirectory, retentionFkFilename),
       );
@@ -420,7 +428,15 @@ describeWithDatabase("application migrations", () => {
     };
     const orphanRequestId = "f737aa20-879f-48af-8137-b3b2b83ec5c5";
     const orphanScrapeId = "c18eef36-3007-4acd-8cd9-03948cbcb471";
+    const orphanCrawlChildId = "f92435f9-cbb0-45c1-83cd-5a794d1de42e";
+    const orphanBatchId = "b6dac5df-1fc9-40c3-8d53-b76434179b5c";
+    const orphanExtractId = "7c64df38-6bb3-479c-940f-bbf8102b7165";
+    const orphanScrapeFallbackId = "8d49243f-7c4d-47b0-9adc-a962f6948e4f";
     const orphanCrawlId = "7846a294-8111-482f-a268-6ba028780489";
+    const validRequestId = "d34397c8-f9e4-489f-a448-bd286a5c28af";
+    const validScrapeId = "578f6029-81f9-43bc-b504-b921d445dcdb";
+    const validCrawlId = "3c3d83ac-640d-4781-b86a-42571eae413e";
+    const validDeadline = new Date("2026-08-17T00:00:00.000Z");
 
     try {
       await copyFile(
@@ -437,13 +453,110 @@ describeWithDatabase("application migrations", () => {
         [orphanScrapeId, orphanRequestId, ownerId],
       );
       await retentionClient.query(
+        `INSERT INTO crawls (
+           id, request_id, url, team_id, num_docs, credits_cost, cancelled
+         ) VALUES ($1, $2, 'https://example.com/orphan-crawl', $3,
+                   1, 1, false)`,
+        [orphanCrawlChildId, orphanRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO batch_scrapes (
+           id, request_id, team_id, num_docs, credits_cost, cancelled
+         ) VALUES ($1, $2, $3, 1, 1, false)`,
+        [orphanBatchId, orphanRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO extracts (
+           id, request_id, urls, model_kind, team_id, is_successful,
+           credits_cost
+         ) VALUES ($1, $2, $3, 'fire-1', $4, true, 1)`,
+        [
+          orphanExtractId,
+          orphanRequestId,
+          ["https://example.com/orphan-extract"],
+          ownerId,
+        ],
+      );
+      await retentionClient.query(
         `INSERT INTO webhook_logs (
-           success, team_id, crawl_id, created_at, url, event
-         ) VALUES (true, $1, $2, now() - interval '31 days',
+           success, team_id, crawl_id, url, event
+         ) VALUES (true, $1, $2,
                    'https://example.com/orphan', 'completed')`,
+        [ownerId, orphanScrapeId],
+      );
+      for (const crawlId of [
+        orphanCrawlChildId,
+        orphanBatchId,
+        orphanExtractId,
+      ]) {
+        await retentionClient.query(
+          `INSERT INTO webhook_logs (
+             success, team_id, crawl_id, url, event
+           ) VALUES (true, $1, $2,
+                     'https://example.com/orphan', 'completed')`,
+          [ownerId, crawlId],
+        );
+      }
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, scrape_id, url, event
+         ) VALUES (true, $1, $2, $3,
+                   'https://example.com/orphan', 'completed')`,
+        [ownerId, orphanScrapeFallbackId, orphanScrapeId],
+      );
+      await retentionClient.query(
+        `INSERT INTO requests (
+           id, kind, api_version, team_id, origin, target_hint, dr_clean_by
+         ) VALUES ($1, 'scrape', 'v2', $2, 'test', 'valid legacy', $3)`,
+        [validRequestId, ownerId, validDeadline],
+      );
+      await retentionClient.query(
+        `INSERT INTO scrapes (
+           id, request_id, url, is_successful, time_taken, team_id,
+           credits_cost
+         ) VALUES ($1, $2, 'https://example.com/valid', true, 1, $3, 1)`,
+        [validScrapeId, validRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO crawls (
+           id, request_id, url, team_id, num_docs, credits_cost, cancelled
+         ) VALUES ($1, $2, 'https://example.com/valid-crawl', $3,
+                   1, 1, false)`,
+        [validCrawlId, validRequestId, ownerId],
+      );
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, url, event
+         ) VALUES (true, $1, $2,
+                   'https://example.com/valid', 'completed')`,
+        [ownerId, validScrapeId],
+      );
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, url, event
+         ) VALUES (true, $1, $2,
+                   'https://example.com/unknown', 'completed')`,
         [ownerId, orphanCrawlId],
       );
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, scrape_id, url, event
+         ) VALUES (true, $1, $2, $3,
+                   'https://example.com/valid-priority', 'completed')`,
+        [ownerId, validCrawlId, orphanScrapeId],
+      );
+      await retentionClient.query(
+        `INSERT INTO webhook_logs (
+           success, team_id, crawl_id, scrape_id, url, event
+         ) VALUES (true, $1, $2, $3,
+                   'https://example.com/orphan-priority', 'completed')`,
+        [ownerId, orphanCrawlChildId, validScrapeId],
+      );
 
+      await copyFile(
+        join(__dirname, "migrations", preflightFilename),
+        join(migrationsDirectory, preflightFilename),
+      );
       await copyFile(
         join(__dirname, "migrations", retentionFkFilename),
         join(migrationsDirectory, retentionFkFilename),
@@ -452,14 +565,96 @@ describeWithDatabase("application migrations", () => {
 
       const orphanCounts = await retentionClient.query<{
         scrapes: string;
+        crawls: string;
+        batches: string;
+        extracts: string;
         webhooks: string;
+        valid_scrapes: string;
+        valid_webhooks: string;
+        valid_priority_webhooks: string;
+        unknown_webhooks: string;
       }>(
         `SELECT
            (SELECT count(*) FROM scrapes WHERE id = $1) AS scrapes,
-           (SELECT count(*) FROM webhook_logs WHERE crawl_id = $2) AS webhooks`,
-        [orphanScrapeId, orphanCrawlId],
+           (SELECT count(*) FROM crawls WHERE id = $2) AS crawls,
+           (SELECT count(*) FROM batch_scrapes WHERE id = $3) AS batches,
+           (SELECT count(*) FROM extracts WHERE id = $4) AS extracts,
+           (SELECT count(*) FROM webhook_logs
+             WHERE crawl_id = ANY($5::uuid[])) AS webhooks,
+           (SELECT count(*) FROM scrapes WHERE id = $6) AS valid_scrapes,
+           (SELECT count(*) FROM webhook_logs WHERE crawl_id = $6)
+             AS valid_webhooks,
+           (SELECT count(*) FROM webhook_logs
+             WHERE crawl_id = $7 AND scrape_id = $1)
+             AS valid_priority_webhooks,
+           (SELECT count(*) FROM webhook_logs WHERE crawl_id = $8)
+             AS unknown_webhooks`,
+        [
+          orphanScrapeId,
+          orphanCrawlChildId,
+          orphanBatchId,
+          orphanExtractId,
+          [
+            orphanScrapeId,
+            orphanCrawlChildId,
+            orphanBatchId,
+            orphanExtractId,
+            orphanScrapeFallbackId,
+          ],
+          validScrapeId,
+          validCrawlId,
+          orphanCrawlId,
+        ],
       );
-      expect(orphanCounts.rows).toEqual([{ scrapes: "0", webhooks: "0" }]);
+      expect(orphanCounts.rows).toEqual([
+        {
+          scrapes: "0",
+          crawls: "0",
+          batches: "0",
+          extracts: "0",
+          webhooks: "0",
+          valid_scrapes: "1",
+          valid_webhooks: "1",
+          valid_priority_webhooks: "1",
+          unknown_webhooks: "1",
+        },
+      ]);
+      const legacyWebhooks = await retentionClient.query<{
+        crawl_id: string;
+        request_id: string | null;
+        dr_clean_by: Date;
+        bounded: boolean;
+      }>(
+        `SELECT crawl_id, request_id, dr_clean_by,
+                dr_clean_by <= created_at + interval '24 hours'
+                  AND dr_clean_by <= now() + interval '24 hours' AS bounded
+           FROM webhook_logs
+          WHERE crawl_id = ANY($1::uuid[])
+          ORDER BY crawl_id`,
+        [[validScrapeId, validCrawlId, orphanCrawlId]],
+      );
+      expect(legacyWebhooks.rows).toEqual(
+        expect.arrayContaining([
+          {
+            crawl_id: validScrapeId,
+            request_id: validRequestId,
+            dr_clean_by: validDeadline,
+            bounded: false,
+          },
+          {
+            crawl_id: validCrawlId,
+            request_id: validRequestId,
+            dr_clean_by: validDeadline,
+            bounded: false,
+          },
+          {
+            crawl_id: orphanCrawlId,
+            request_id: null,
+            dr_clean_by: expect.any(Date),
+            bounded: true,
+          },
+        ]),
+      );
 
       const constraints = await retentionClient.query<{
         count: string;
@@ -633,12 +828,6 @@ describeWithDatabase("application migrations", () => {
           [orphanRequestId, ownerId],
         ),
       ).rejects.toMatchObject({ code: "23503" });
-      await retentionClient.query(
-        `INSERT INTO webhook_logs (
-           success, team_id, crawl_id, url, event
-         ) VALUES (true, $1, $2, 'https://example.com/late', 'completed')`,
-        [ownerId, orphanCrawlId],
-      );
       const unknownWebhook = await retentionClient.query<{
         request_id: string | null;
         bounded: boolean;
@@ -661,10 +850,70 @@ describeWithDatabase("application migrations", () => {
       );
       expect(ledger.rows.map(row => row.filename)).toEqual([
         baselineFilename,
+        preflightFilename,
         retentionFkFilename,
       ]);
     } finally {
       await retentionClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the orphan preflight after an already-ledgered retention migration", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-preflight-upgrade-"),
+    );
+    const upgradeDatabaseUrl = databaseUrlForSchema(preflightUpgradeSchema);
+    const upgradeClient = new Client({ connectionString: upgradeDatabaseUrl });
+    const upgradeConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: upgradeDatabaseUrl,
+    };
+
+    try {
+      await copyFile(
+        join(__dirname, "migrations", baselineFilename),
+        join(migrationsDirectory, baselineFilename),
+      );
+      await copyFile(
+        join(__dirname, "migrations", retentionFkFilename),
+        join(migrationsDirectory, retentionFkFilename),
+      );
+      await runApplicationMigrations(upgradeConfig, { migrationsDirectory });
+      await upgradeClient.connect();
+      const before = await upgradeClient.query<{
+        filename: string;
+        checksum: string;
+      }>(
+        `SELECT filename, checksum
+           FROM application_schema_migrations
+          ORDER BY filename`,
+      );
+
+      await copyFile(
+        join(__dirname, "migrations", preflightFilename),
+        join(migrationsDirectory, preflightFilename),
+      );
+      await runApplicationMigrations(upgradeConfig, { migrationsDirectory });
+      const after = await upgradeClient.query<{
+        filename: string;
+        checksum: string;
+      }>(
+        `SELECT filename, checksum
+           FROM application_schema_migrations
+          ORDER BY filename`,
+      );
+
+      expect(after.rows.map(row => row.filename)).toEqual([
+        baselineFilename,
+        preflightFilename,
+        retentionFkFilename,
+      ]);
+      expect(
+        after.rows.filter(row => row.filename !== preflightFilename),
+      ).toEqual(before.rows);
+    } finally {
+      await upgradeClient.end().catch(() => undefined);
       await rm(migrationsDirectory, { recursive: true, force: true });
     }
   });
