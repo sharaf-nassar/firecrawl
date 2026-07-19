@@ -18,6 +18,7 @@ import { retentionDeadline } from "../lib/local-retention-deadline";
 import {
   createLocalRetentionService,
   LocalArtifactRetentionError,
+  LocalOperationalRetentionError,
   PgLocalRetentionDatabase,
   runLocalRetentionIteration,
   runLocalRetentionLoop,
@@ -184,6 +185,18 @@ describe("runLocalRetentionIteration", () => {
     await expect(failure).rejects.toMatchObject({
       name: "LocalArtifactRetentionError",
       code: "artifact_delete_failed",
+      phase: "artifact-delete",
+      artifactCandidates: 1,
+      artifactsDeleted: 0,
+      artifactFailures: 1,
+      requestsDeleted: 0,
+      dependentRowsDeleted: 0,
+      requestIds: [],
+      durationMs: expect.any(Number),
+      objectKey: "artifact-0",
+      requestId: "request-0",
+      jobId: "job-0",
+      provider: "minio",
     });
     expect(database.manifests).toHaveLength(1);
     expect(database.events).toEqual(["release:artifact-0"]);
@@ -194,12 +207,20 @@ describe("runLocalRetentionIteration", () => {
         requestId: "request-0",
         jobId: "job-0",
         provider: "minio",
-        errorName: "Error",
+        errorName: "LocalArtifactRetentionError",
+        errorCode: "artifact_delete_failed",
+        phase: "artifact-delete",
+        artifactCandidates: 1,
+        artifactsDeleted: 0,
+        artifactFailures: 1,
+        durationMs: expect.any(Number),
       }),
     );
     expect(
       JSON.stringify(vi.mocked(silentLogger.error).mock.calls),
     ).not.toContain("do-not-log");
+    expect(silentLogger.info).not.toHaveBeenCalled();
+    expect(silentLogger.debug).not.toHaveBeenCalled();
   });
 
   it("preserves completed manifests before a later object deletion fails", async () => {
@@ -324,6 +345,44 @@ describe("runLocalRetentionIteration", () => {
       }),
     );
   });
+
+  it("bubbles a sanitized operational failure with its cause kept internal", async () => {
+    const database = new FakeDatabase();
+    const databaseFailure = new Error("database secret=do-not-log");
+    database.deleteExpiredOperationalRows = vi
+      .fn()
+      .mockRejectedValue(databaseFailure);
+
+    let failure: unknown;
+    try {
+      await runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(LocalOperationalRetentionError);
+    expect(failure).toMatchObject({
+      name: "LocalOperationalRetentionError",
+      code: "operational_cleanup_failed",
+      phase: "operational-cleanup",
+      artifactCandidates: 0,
+      artifactsDeleted: 0,
+      artifactFailures: 0,
+      requestsDeleted: 0,
+      dependentRowsDeleted: 0,
+      requestIds: [],
+      durationMs: expect.any(Number),
+      cause: databaseFailure,
+    });
+    expect(JSON.stringify(failure)).not.toContain("do-not-log");
+    expect(silentLogger.info).not.toHaveBeenCalled();
+    expect(silentLogger.debug).not.toHaveBeenCalled();
+  });
 });
 
 describe("runLocalRetentionLoop", () => {
@@ -389,11 +448,17 @@ describe("runLocalRetentionLoop", () => {
 
   it("logs an iteration failure and retries on the next loop", async () => {
     const database = new FakeDatabase();
+    database.manifests = manifests(1);
     const originalCleanup =
       database.deleteExpiredOperationalRows.bind(database);
     database.deleteExpiredOperationalRows = vi
       .fn()
-      .mockRejectedValueOnce(new Error("database secret=do-not-log"))
+      .mockRejectedValueOnce(
+        new LocalOperationalRetentionError({
+          requestIds: ["request-claimed"],
+          cause: new Error("database secret=do-not-log"),
+        }),
+      )
       .mockImplementation(originalCleanup);
     const controller = new AbortController();
     let sleeps = 0;
@@ -401,7 +466,7 @@ describe("runLocalRetentionLoop", () => {
     await runLocalRetentionLoop({
       configSource: localConfig,
       database,
-      artifactStore: null,
+      artifactStore: fakeStore(async () => undefined),
       signal: controller.signal,
       sleep: async () => {
         sleeps += 1;
@@ -413,7 +478,18 @@ describe("runLocalRetentionLoop", () => {
     expect(database.deleteExpiredOperationalRows).toHaveBeenCalledTimes(2);
     expect(silentLogger.error).toHaveBeenCalledWith(
       "Local retention iteration failed",
-      { errorName: "Error" },
+      {
+        errorName: "LocalOperationalRetentionError",
+        errorCode: "operational_cleanup_failed",
+        phase: "operational-cleanup",
+        artifactCandidates: 1,
+        artifactsDeleted: 1,
+        artifactFailures: 0,
+        requestsDeleted: 0,
+        dependentRowsDeleted: 0,
+        requestIds: ["request-claimed"],
+        durationMs: expect.any(Number),
+      },
     );
     expect(
       JSON.stringify(vi.mocked(silentLogger.error).mock.calls),
@@ -422,11 +498,13 @@ describe("runLocalRetentionLoop", () => {
 
   it("logs a storage failure at loop level and retries its manifest", async () => {
     const database = new FakeDatabase();
-    database.manifests = manifests(1);
+    database.manifests = manifests(2);
     let deleteAttempts = 0;
-    const store = fakeStore(async () => {
+    const store = fakeStore(async key => {
       deleteAttempts += 1;
-      if (deleteAttempts === 1) throw new Error("temporary storage failure");
+      if (key === "artifact-1" && deleteAttempts === 2) {
+        throw new Error("temporary storage failure secret=do-not-log");
+      }
     });
     const controller = new AbortController();
     let sleeps = 0;
@@ -443,15 +521,30 @@ describe("runLocalRetentionLoop", () => {
       logger: silentLogger,
     });
 
-    expect(deleteAttempts).toBe(2);
+    expect(deleteAttempts).toBe(3);
     expect(database.manifests).toHaveLength(0);
     expect(silentLogger.error).toHaveBeenCalledWith(
       "Local retention iteration failed",
       {
         errorName: "LocalArtifactRetentionError",
         errorCode: "artifact_delete_failed",
+        phase: "artifact-delete",
+        artifactCandidates: 2,
+        artifactsDeleted: 1,
+        artifactFailures: 1,
+        requestsDeleted: 0,
+        dependentRowsDeleted: 0,
+        requestIds: [],
+        durationMs: expect.any(Number),
+        objectKey: "artifact-1",
+        requestId: "request-1",
+        jobId: "job-1",
+        provider: "minio",
       },
     );
+    expect(
+      JSON.stringify(vi.mocked(silentLogger.error).mock.calls),
+    ).not.toContain("do-not-log");
   });
 });
 
@@ -775,7 +868,12 @@ describeWithDatabase("PostgreSQL local retention", () => {
           new Date("2026-07-18T00:00:00.000Z"),
           50,
         ),
-      ).rejects.toThrow("forced retention test failure");
+      ).rejects.toMatchObject({
+        name: "LocalOperationalRetentionError",
+        code: "operational_cleanup_failed",
+        phase: "operational-cleanup",
+        requestIds: [requestId],
+      });
       const retained = await pool.query(
         `SELECT id FROM requests WHERE id = $1
          UNION ALL

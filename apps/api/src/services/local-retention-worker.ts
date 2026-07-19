@@ -48,12 +48,100 @@ export type OperationalCleanupResult = {
   requestIds: string[];
 };
 
-export class LocalArtifactRetentionError extends Error {
-  readonly code = "artifact_delete_failed";
+type RetentionFailureProgress = OperationalCleanupResult & {
+  artifactCandidates: number;
+  artifactsDeleted: number;
+  artifactFailures: number;
+  durationMs: number;
+};
 
-  constructor() {
-    super("Local artifact retention delete failed");
-    this.name = "LocalArtifactRetentionError";
+type RetentionFailurePhase = "artifact-delete" | "operational-cleanup";
+
+abstract class LocalRetentionFailure extends Error {
+  readonly artifactCandidates: number;
+  readonly artifactsDeleted: number;
+  readonly artifactFailures: number;
+  readonly requestsDeleted: number;
+  readonly dependentRowsDeleted: number;
+  readonly requestIds: string[];
+  readonly durationMs: number;
+
+  protected constructor(
+    name: string,
+    message: string,
+    readonly code: string,
+    readonly phase: RetentionFailurePhase,
+    progress: RetentionFailureProgress,
+    cause: unknown,
+  ) {
+    super(message, { cause });
+    this.name = name;
+    this.artifactCandidates = progress.artifactCandidates;
+    this.artifactsDeleted = progress.artifactsDeleted;
+    this.artifactFailures = progress.artifactFailures;
+    this.requestsDeleted = progress.requestsDeleted;
+    this.dependentRowsDeleted = progress.dependentRowsDeleted;
+    this.requestIds = [...progress.requestIds];
+    this.durationMs = progress.durationMs;
+  }
+}
+
+type ArtifactRetentionFailureOptions = RetentionFailureProgress & {
+  objectKey: string;
+  requestId: string | null;
+  jobId: string | null;
+  provider: ArtifactStore["provider"];
+  cause: unknown;
+};
+
+export class LocalArtifactRetentionError extends LocalRetentionFailure {
+  readonly objectKey: string;
+  readonly requestId: string | null;
+  readonly jobId: string | null;
+  readonly provider: ArtifactStore["provider"];
+
+  constructor(options: ArtifactRetentionFailureOptions) {
+    super(
+      "LocalArtifactRetentionError",
+      "Local artifact retention delete failed",
+      "artifact_delete_failed",
+      "artifact-delete",
+      options,
+      options.cause,
+    );
+    this.objectKey = options.objectKey;
+    this.requestId = options.requestId;
+    this.jobId = options.jobId;
+    this.provider = options.provider;
+  }
+}
+
+type OperationalRetentionFailureOptions = {
+  requestIds: string[];
+  cause: unknown;
+  progress?: Omit<RetentionFailureProgress, "requestIds" | "durationMs">;
+  durationMs?: number;
+};
+
+export class LocalOperationalRetentionError extends LocalRetentionFailure {
+  constructor(options: OperationalRetentionFailureOptions) {
+    const requestIds = options.requestIds.slice(0, RETENTION_BATCH_SIZE);
+    super(
+      "LocalOperationalRetentionError",
+      "Local operational retention cleanup failed",
+      "operational_cleanup_failed",
+      "operational-cleanup",
+      {
+        artifactCandidates: options.progress?.artifactCandidates ?? 0,
+        artifactsDeleted: options.progress?.artifactsDeleted ?? 0,
+        artifactFailures: options.progress?.artifactFailures ?? 0,
+        requestsDeleted: options.progress?.requestsDeleted ?? 0,
+        dependentRowsDeleted: options.progress?.dependentRowsDeleted ?? 0,
+        requestIds,
+        durationMs: options.durationMs ?? 0,
+      },
+      options.cause,
+    );
   }
 }
 
@@ -142,6 +230,28 @@ function errorMetadata(error: unknown): {
     errorName: error instanceof Error ? error.name : "UnknownError",
     ...(errorCode ? { errorCode } : {}),
   };
+}
+
+function retentionFailureMetadata(error: unknown): Record<string, unknown> {
+  if (!(error instanceof LocalRetentionFailure)) return errorMetadata(error);
+  const metadata: Record<string, unknown> = {
+    ...errorMetadata(error),
+    phase: error.phase,
+    artifactCandidates: error.artifactCandidates,
+    artifactsDeleted: error.artifactsDeleted,
+    artifactFailures: error.artifactFailures,
+    requestsDeleted: error.requestsDeleted,
+    dependentRowsDeleted: error.dependentRowsDeleted,
+    requestIds: error.requestIds,
+    durationMs: error.durationMs,
+  };
+  if (error instanceof LocalArtifactRetentionError) {
+    metadata.objectKey = error.objectKey;
+    metadata.requestId = error.requestId;
+    metadata.jobId = error.jobId;
+    metadata.provider = error.provider;
+  }
+  return metadata;
 }
 
 export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
@@ -254,6 +364,8 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     limit: number,
   ): Promise<OperationalCleanupResult> {
     const client = await this.pool.connect();
+    const startedAt = Date.now();
+    let requestIds: string[] = [];
     try {
       await client.query("BEGIN");
       const expired = await client.query<{ id: string }>(
@@ -266,7 +378,7 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
           FOR UPDATE SKIP LOCKED`,
         [now, limit],
       );
-      const requestIds = expired.rows.map(row => row.id);
+      requestIds = expired.rows.map(row => row.id);
       if (requestIds.length === 0) {
         await client.query("COMMIT");
         return {
@@ -306,7 +418,11 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
+      throw new LocalOperationalRetentionError({
+        requestIds,
+        cause: error,
+        durationMs: Date.now() - startedAt,
+      });
     } finally {
       client.release();
     }
@@ -363,14 +479,20 @@ export async function runLocalRetentionIteration(
           await options.artifactStore.delete(claim.manifest.objectKey);
         } catch (error) {
           result.artifactFailures += 1;
-          logger.error("Local artifact retention delete failed", {
+          const failure = new LocalArtifactRetentionError({
+            ...result,
+            durationMs: Date.now() - startedAt,
             objectKey: claim.manifest.objectKey,
             requestId: claim.manifest.requestId,
             jobId: claim.manifest.jobId,
             provider: options.artifactStore.provider,
-            ...errorMetadata(error),
+            cause: error,
           });
-          throw new LocalArtifactRetentionError();
+          logger.error(
+            "Local artifact retention delete failed",
+            retentionFailureMetadata(failure),
+          );
+          throw failure;
         }
         if (options.signal?.aborted) break;
         if (await claim.deleteManifest()) {
@@ -383,13 +505,25 @@ export async function runLocalRetentionIteration(
   }
 
   if (!options.signal?.aborted) {
-    const operational = await options.database.deleteExpiredOperationalRows(
-      now,
-      RETENTION_BATCH_SIZE,
-    );
-    result.requestsDeleted = operational.requestsDeleted;
-    result.dependentRowsDeleted = operational.dependentRowsDeleted;
-    result.requestIds = operational.requestIds;
+    try {
+      const operational = await options.database.deleteExpiredOperationalRows(
+        now,
+        RETENTION_BATCH_SIZE,
+      );
+      result.requestsDeleted = operational.requestsDeleted;
+      result.dependentRowsDeleted = operational.dependentRowsDeleted;
+      result.requestIds = operational.requestIds;
+    } catch (error) {
+      const requestIds =
+        error instanceof LocalOperationalRetentionError ? error.requestIds : [];
+      throw new LocalOperationalRetentionError({
+        requestIds,
+        cause:
+          error instanceof LocalOperationalRetentionError ? error.cause : error,
+        progress: result,
+        durationMs: Date.now() - startedAt,
+      });
+    }
   }
 
   const iterationMetadata = {
@@ -457,7 +591,10 @@ export async function runLocalRetentionLoop(
           logger,
         });
       } catch (error) {
-        logger.error("Local retention iteration failed", errorMetadata(error));
+        logger.error(
+          "Local retention iteration failed",
+          retentionFailureMetadata(error),
+        );
       }
       if (!options.signal.aborted) {
         await sleep(IDLE_BACKOFF_MS, options.signal);
