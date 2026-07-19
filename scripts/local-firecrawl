@@ -9,7 +9,17 @@ compose=(
   --project-directory "$repo_root"
   -f "$repo_root/compose.yaml"
 )
-services=(api playwright-service nuq-postgres redis rabbitmq)
+dependency_services=(
+  playwright-service
+  nuq-postgres
+  redis
+  rabbitmq
+  app-postgres
+  minio
+)
+long_running_services=(api "${dependency_services[@]}")
+one_shot_services=(app-db-migrate minio-init)
+diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
 
 usage() {
   printf 'Usage: %s {start|restart|status|health|logs}\n' "${0##*/}" >&2
@@ -17,6 +27,69 @@ usage() {
 
 validate_compose() {
   "${compose[@]}" config --quiet
+}
+
+run_one_shot() {
+  local service="$1"
+
+  "${compose[@]}" up --no-deps --force-recreate "$service"
+}
+
+start_runtime() {
+  "${compose[@]}" up -d --wait "${dependency_services[@]}"
+  run_one_shot app-db-migrate
+  run_one_shot minio-init
+  "${compose[@]}" up -d --no-deps --wait api
+}
+
+require_completed_one_shot() {
+  local service="$1"
+  local state
+
+  state="$(
+    "${compose[@]}" ps --all --format '{{.State}} {{.ExitCode}}' "$service"
+  )"
+  if [[ "$state" != "exited 0" ]]; then
+    printf '%s did not complete successfully (state: %s)\n' \
+      "$service" "${state:-missing}" >&2
+    exit 1
+  fi
+}
+
+check_port_policy() {
+  local project_state
+
+  project_state="$("${compose[@]}" ps --all --format json)"
+  PROJECT_STATE="$project_state" node - <<'NODE'
+const input = process.env.PROJECT_STATE ?? "";
+try {
+  const containers = input
+    .split("\n")
+    .filter(Boolean)
+    .map(line => JSON.parse(line));
+  const published = containers.flatMap(container =>
+    (container.Publishers ?? [])
+      .filter(binding => Number(binding.PublishedPort) > 0)
+      .map(binding => ({ service: container.Service, ...binding })),
+  );
+  const valid =
+    published.length === 1 &&
+    published[0].service === "api" &&
+    published[0].URL === "127.0.0.1" &&
+    Number(published[0].TargetPort) === 3002 &&
+    Number(published[0].PublishedPort) === 3002 &&
+    published[0].Protocol === "tcp";
+  if (!valid) {
+    process.stderr.write(
+      "Port policy failed: only api may publish 127.0.0.1:3002\n",
+    );
+    process.exit(1);
+  }
+} catch {
+  process.stderr.write("Unable to validate Compose port policy\n");
+  process.exit(1);
+}
+NODE
 }
 
 if (( $# != 1 )); then
@@ -27,16 +100,22 @@ fi
 case "$1" in
   start)
     validate_compose
-    "${compose[@]}" up -d --wait "${services[@]}"
+    # Writers stay stopped until storage initialization and migrations succeed.
+    "${compose[@]}" stop api
+    start_runtime
     ;;
   restart)
     validate_compose
-    "${compose[@]}" stop "${services[@]}"
-    "${compose[@]}" up -d --wait "${services[@]}"
+    "${compose[@]}" stop api
+    "${compose[@]}" stop "${dependency_services[@]}"
+    start_runtime
     ;;
   status)
     validate_compose
-    "${compose[@]}" ps --all
+    printf '%s\n' 'Long-running services:'
+    "${compose[@]}" ps --all "${long_running_services[@]}"
+    printf '\n%s\n' 'Initialization and migration one-shots:'
+    "${compose[@]}" ps --all "${one_shot_services[@]}"
     ;;
   health)
     validate_compose
@@ -52,6 +131,36 @@ case "$1" in
       rabbitmq-diagnostics -q check_running
     "${compose[@]}" exec -T nuq-postgres sh -c \
       'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+    "${compose[@]}" exec -T app-postgres sh -c \
+      'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+    require_completed_one_shot app-db-migrate
+    latest_checked_in_migration="$(
+      find "$repo_root/apps/api/src/db/migrations" -maxdepth 1 -type f \
+        -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' |
+        LC_ALL=C sort | tail -n 1
+    )"
+    if [[ -z "$latest_checked_in_migration" ]]; then
+      printf '%s\n' 'No application migrations were found' >&2
+      exit 1
+    fi
+    latest_applied_migration="$(
+      "${compose[@]}" exec -T app-postgres sh -ec \
+        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT filename FROM application_schema_migrations ORDER BY filename DESC LIMIT 1"'
+    )"
+    if [[ "$latest_applied_migration" != "$latest_checked_in_migration" ]]; then
+      printf 'Application migration mismatch: expected %s, found %s\n' \
+        "$latest_checked_in_migration" \
+        "${latest_applied_migration:-none}" >&2
+      exit 1
+    fi
+
+    require_completed_one_shot minio-init
+    "${compose[@]}" exec -T minio curl --fail --silent --show-error \
+      --max-time 10 --output /dev/null \
+      http://127.0.0.1:9000/minio/health/live
+    "${compose[@]}" exec -T api sh -ec \
+      'test -z "${MINIO_ROOT_USER+x}" && test -z "${MINIO_ROOT_PASSWORD+x}" && node dist/src/cli/artifact-health.js'
     "${compose[@]}" exec -T playwright-service node -e \
       "fetch('http://127.0.0.1:3000/health', {
           signal: AbortSignal.timeout(10000),
@@ -67,13 +176,15 @@ case "$1" in
         })"
     curl --fail --silent --show-error --max-time 10 \
       --output /dev/null http://127.0.0.1:3002/
+    check_port_policy
 
     printf '%s\n' \
-      'Local Firecrawl is healthy at http://127.0.0.1:3002'
+      "Local Firecrawl is healthy at http://127.0.0.1:3002; migrations: $latest_applied_migration; artifacts: MinIO"
     ;;
   logs)
     validate_compose
-    "${compose[@]}" logs --tail=200 "${services[@]}"
+    "${compose[@]}" logs --no-color --tail=200 \
+      "${diagnostic_services[@]}"
     ;;
   *)
     usage
