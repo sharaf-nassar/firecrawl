@@ -23,6 +23,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
+    libpq-dev \
     pkg-config \
     python3 \
     && rm -rf /var/lib/apt/lists/*
