@@ -98,6 +98,19 @@ function wait(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+function sameProcessIdentity(left, right) {
+  return (
+    left != null &&
+    right != null &&
+    left.pid === right.pid &&
+    left.startTime === right.startTime &&
+    left.session === right.session &&
+    left.processGroup === right.processGroup &&
+    right.state !== "Z" &&
+    right.state !== "X"
+  );
+}
+
 async function waitForShutdown(shutdownComplete, timeoutMs, pollMs) {
   const deadline = Date.now() + timeoutMs;
   while (!shutdownComplete()) {
@@ -119,8 +132,19 @@ function superviseGateChild(
     snapshotProcessTree = snapshotLinuxProcessTree,
     readProcessIdentity = readLinuxProcessIdentity,
     killProcessGroup = killLinuxProcessGroup,
+    onCleanupStart = () => {},
   },
 ) {
+  let childIdentityAnchor;
+  let childIdentityCaptureFailure;
+  try {
+    childIdentityAnchor = readProcessIdentity(child.pid);
+    if (!childIdentityAnchor) {
+      childIdentityCaptureFailure = new Error("child identity missing");
+    }
+  } catch (error) {
+    childIdentityCaptureFailure = error;
+  }
   return new Promise((resolve, reject) => {
     const stdout = [];
     const stderr = [];
@@ -128,12 +152,12 @@ function superviseGateChild(
     let closed = false;
     let settling = false;
     let settled = false;
+    let recordSettlingChildError;
     let timer;
 
     const removeListeners = () => {
       child.stdout.off("data", onStdout);
       child.stderr.off("data", onStderr);
-      child.off("error", onError);
       child.off("close", onClose);
     };
     const finish = (error, value) => {
@@ -150,6 +174,7 @@ function superviseGateChild(
       clearTimeout(timer);
       const cleanupErrors = [];
       const unprobeableIdentities = new Set();
+      let rootReplacementRecorded = false;
       const cleanupError = (code, cause, detail) => {
         const error = new Error(detail ? `${code}: ${detail}` : code, {
           cause,
@@ -157,9 +182,33 @@ function superviseGateChild(
         error.code = code;
         cleanupErrors.push(error);
       };
+      recordSettlingChildError = error => {
+        cleanupError("gate_characterization_child_error", error);
+      };
+      if (childIdentityCaptureFailure) {
+        cleanupError(
+          "gate_characterization_child_identity_capture_failed",
+          childIdentityCaptureFailure,
+        );
+      }
+      try {
+        onCleanupStart();
+      } catch (error) {
+        cleanupError("gate_characterization_cleanup_start_failed", error);
+      }
+      const recordRootReplacement = cause => {
+        if (rootReplacementRecorded) return;
+        rootReplacementRecorded = true;
+        cleanupError("gate_characterization_root_replaced", cause);
+      };
       const snapshot = phase => {
         try {
-          return snapshotProcessTree(child.pid);
+          const tree = snapshotProcessTree(child.pid);
+          if (!sameProcessIdentity(childIdentityAnchor, tree.root)) {
+            recordRootReplacement();
+            return { root: null, descendants: [] };
+          }
+          return tree;
         } catch (error) {
           cleanupError(
             phase === "initial"
@@ -172,19 +221,15 @@ function superviseGateChild(
       };
       const identityKey = identity =>
         `${identity.pid}:${identity.startTime}:${identity.session}:${identity.processGroup}`;
-      const sameIdentity = (left, right) =>
-        right !== null &&
-        left.pid === right.pid &&
-        left.startTime === right.startTime &&
-        left.session === right.session &&
-        left.processGroup === right.processGroup &&
-        right.state !== "Z" &&
-        right.state !== "X";
       const probeIdentity = (identity, kind = "descendant") => {
+        if (!identity) return "unknown";
         const key = identityKey(identity);
         if (unprobeableIdentities.has(key)) return "unknown";
         try {
-          return sameIdentity(identity, readProcessIdentity(identity.pid))
+          return sameProcessIdentity(
+            identity,
+            readProcessIdentity(identity.pid),
+          )
             ? "alive"
             : "gone";
         } catch (error) {
@@ -200,9 +245,7 @@ function superviseGateChild(
         }
       };
       const descendants = new Map();
-      let directChildIdentity;
       const mergeSnapshot = tree => {
-        if (!directChildIdentity && tree.root) directChildIdentity = tree.root;
         for (const identity of tree.descendants) {
           descendants.set(identityKey(identity), identity);
         }
@@ -226,14 +269,21 @@ function superviseGateChild(
           identity => probeIdentity(identity) === "gone",
         );
       const signalChild = signal => {
-        if (
-          directChildIdentity &&
-          probeIdentity(directChildIdentity, "direct") !== "alive"
-        ) {
+        if (probeIdentity(childIdentityAnchor, "direct") !== "alive") {
+          recordRootReplacement();
           return;
         }
         try {
-          child.kill(signal);
+          const delivered = child.kill(signal);
+          if (delivered === false) {
+            cleanupError(
+              signal === "SIGTERM"
+                ? "gate_characterization_child_term_failed"
+                : "gate_characterization_child_kill_failed",
+              undefined,
+              "signal returned false",
+            );
+          }
         } catch (error) {
           cleanupError(
             signal === "SIGTERM"
@@ -322,7 +372,12 @@ function superviseGateChild(
     const onStdout = capture(stdout);
     const onStderr = capture(stderr);
     const onError = error => {
-      if (!settling) finish(error);
+      if (settled) return;
+      if (settling) {
+        recordSettlingChildError?.(error);
+        return;
+      }
+      finish(error);
     };
     const onClose = (code, signal) => {
       closed = true;
@@ -368,8 +423,7 @@ function fakeCharacterizationChild(onKill) {
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.kill = signal => {
-    onKill(signal, child);
-    return true;
+    return onKill(signal, child) ?? true;
   };
   return child;
 }
@@ -383,10 +437,18 @@ const processIdentity = ({
   state = "S",
 }) => ({ pid, parentPid, processGroup, session, startTime, state });
 
+const fakeRootIdentity = processIdentity({
+  pid: 800,
+  parentPid: process.pid,
+  processGroup: 800,
+  startTime: "fake-root",
+});
 const identityTree = identities => ({
-  root: null,
+  root: fakeRootIdentity,
   descendants: identities,
 });
+const fakeIdentityReader = readDescendant => pid =>
+  pid === fakeRootIdentity.pid ? fakeRootIdentity : readDescendant(pid);
 
 const timeoutEvents = [];
 const aliveDescendantGroups = new Set([901]);
@@ -408,10 +470,11 @@ await assert.rejects(
     killGraceMs: 20,
     pollMs: 1,
     snapshotProcessTree: () => identityTree([timeoutIdentity]),
-    readProcessIdentity: pid =>
+    readProcessIdentity: fakeIdentityReader(pid =>
       pid === timeoutIdentity.pid && aliveDescendantGroups.has(901)
         ? timeoutIdentity
         : null,
+    ),
     killProcessGroup(group, signal) {
       timeoutEvents.push(`group:${group}:${signal}`);
       if (signal === "SIGKILL") aliveDescendantGroups.delete(group);
@@ -442,7 +505,7 @@ const outputResult = superviseGateChild(outputChild, {
   killGraceMs: 20,
   pollMs: 1,
   snapshotProcessTree: () => identityTree([]),
-  readProcessIdentity: () => null,
+  readProcessIdentity: fakeIdentityReader(() => null),
   killProcessGroup() {},
 });
 outputChild.stdout.write(Buffer.alloc(5));
@@ -470,7 +533,7 @@ await assert.rejects(
     killGraceMs: 1,
     pollMs: 1,
     snapshotProcessTree: () => identityTree([]),
-    readProcessIdentity: () => null,
+    readProcessIdentity: fakeIdentityReader(() => null),
     killProcessGroup() {},
   }),
   error =>
@@ -493,7 +556,9 @@ await assert.rejects(
     killGraceMs: 1,
     pollMs: 1,
     snapshotProcessTree: () => identityTree([survivingIdentity]),
-    readProcessIdentity: () => survivingIdentity,
+    readProcessIdentity: fakeIdentityReader(pid =>
+      pid === survivingIdentity.pid ? survivingIdentity : null,
+    ),
     killProcessGroup() {},
   }),
   error =>
@@ -519,7 +584,7 @@ await assert.rejects(
       initialSnapshotCalls += 1;
       throw new Error("initial snapshot denied");
     },
-    readProcessIdentity: () => null,
+    readProcessIdentity: fakeIdentityReader(() => null),
     killProcessGroup() {},
   }),
   error =>
@@ -551,10 +616,11 @@ await assert.rejects(
       }
       throw new Error("escalation snapshot denied");
     },
-    readProcessIdentity: pid =>
+    readProcessIdentity: fakeIdentityReader(pid =>
       pid === escalationIdentity.pid && escalationAlive.has(921)
         ? escalationIdentity
         : null,
+    ),
     killProcessGroup(group) {
       escalationAlive.delete(group);
     },
@@ -584,9 +650,9 @@ await assert.rejects(
     pollMs: 1,
     snapshotProcessTree: () => identityTree([probeFailureIdentity]),
     killProcessGroup() {},
-    readProcessIdentity() {
+    readProcessIdentity: fakeIdentityReader(() => {
       throw new Error("probe denied");
-    },
+    }),
   }),
   error =>
     assertCleanupFailure(error, "gate_characterization_timeout", [
@@ -614,12 +680,12 @@ await assert.rejects(
     killGraceMs: 1,
     pollMs: 1,
     snapshotProcessTree: () => identityTree(killFailureIdentities),
-    readProcessIdentity(pid) {
+    readProcessIdentity: fakeIdentityReader(pid => {
       const identity = killFailureIdentities.find(item => item.pid === pid);
       return identity && killFailureAlive.has(identity.processGroup)
         ? identity
         : null;
-    },
+    }),
     killProcessGroup(group) {
       killFailureEvents.push(group);
       if (group === 941) throw new Error("kill denied");
@@ -633,35 +699,6 @@ await assert.rejects(
     ]),
 );
 assert.deepEqual(killFailureEvents, [941, 942]);
-
-let raceSettlements = 0;
-const raceChild = fakeCharacterizationChild((signal, child) => {
-  if (signal === "SIGTERM") {
-    queueMicrotask(() => child.emit("close", null, "SIGTERM"));
-  }
-});
-const raceResult = superviseGateChild(raceChild, {
-  timeoutMs: 0,
-  maxOutputBytes: 1,
-  termGraceMs: 10,
-  killGraceMs: 1,
-  pollMs: 1,
-  snapshotProcessTree: () => identityTree([]),
-  readProcessIdentity: () => null,
-  killProcessGroup() {},
-}).then(
-  () => {
-    raceSettlements += 1;
-  },
-  error => {
-    raceSettlements += 1;
-    throw error;
-  },
-);
-raceChild.stdout.write(Buffer.alloc(2));
-await assert.rejects(raceResult, /gate_characterization_output_limit/);
-await wait(5);
-assert.equal(raceSettlements, 1);
 
 const lateGroupSignals = [];
 const lateIdentity = processIdentity({ pid: 9811, processGroup: 981 });
@@ -749,6 +786,211 @@ await assert.rejects(
   /gate_characterization_timeout/,
 );
 assert.deepEqual(reusedGroupSignals, []);
+
+const anchoredRoot = processIdentity({
+  pid: 800,
+  parentPid: process.pid,
+  processGroup: 800,
+  startTime: "anchored-root",
+});
+const replacementRoot = {
+  ...anchoredRoot,
+  session: 1800,
+  processGroup: 1800,
+  startTime: "replacement-root",
+};
+const replacementDescendant = processIdentity({
+  pid: 18001,
+  parentPid: replacementRoot.pid,
+  processGroup: 1800,
+  session: 1800,
+  startTime: "replacement-descendant",
+});
+const replacementDirectSignals = [];
+const replacementGroupSignals = [];
+let replacementRootReads = 0;
+const replacementChild = fakeCharacterizationChild(signal => {
+  replacementDirectSignals.push(signal);
+});
+await assert.rejects(
+  superviseGateChild(replacementChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    snapshotProcessTree: () => ({
+      root: replacementRoot,
+      descendants: [replacementDescendant],
+    }),
+    readProcessIdentity(pid) {
+      if (pid === anchoredRoot.pid) {
+        replacementRootReads += 1;
+        return replacementRootReads === 1 ? anchoredRoot : replacementRoot;
+      }
+      return pid === replacementDescendant.pid ? replacementDescendant : null;
+    },
+    killProcessGroup(group, signal) {
+      replacementGroupSignals.push([group, signal]);
+    },
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_root_replaced",
+      "gate_characterization_child_close_timeout",
+    ]),
+);
+assert.deepEqual(replacementDirectSignals, []);
+assert.deepEqual(replacementGroupSignals, []);
+
+const directSignalCases = [
+  { phase: "term", mode: "false", expected: ["gate_characterization_child_term_failed"] },
+  { phase: "term", mode: "throw", expected: ["gate_characterization_child_term_failed"] },
+  { phase: "term", mode: "error", expected: ["gate_characterization_child_error"] },
+  {
+    phase: "kill",
+    mode: "false",
+    expected: [
+      "gate_characterization_child_kill_failed",
+      "gate_characterization_child_close_timeout",
+    ],
+  },
+  {
+    phase: "kill",
+    mode: "throw",
+    expected: [
+      "gate_characterization_child_kill_failed",
+      "gate_characterization_child_close_timeout",
+    ],
+  },
+  { phase: "kill", mode: "error", expected: ["gate_characterization_child_error"] },
+];
+
+for (const [index, testCase] of directSignalCases.entries()) {
+  const root = processIdentity({
+    pid: 800,
+    parentPid: process.pid,
+    processGroup: 800,
+    startTime: `signal-root-${index}`,
+  });
+  const descendant = processIdentity({
+    pid: 20001 + index,
+    processGroup: 2000 + index,
+    startTime: `signal-descendant-${index}`,
+  });
+  let descendantAlive = true;
+  let cleanupStarts = 0;
+  let snapshots = 0;
+  const directSignals = [];
+  const groupSignals = [];
+  const signalChild = fakeCharacterizationChild((signal, child) => {
+    directSignals.push(signal);
+    const activePhase = signal === "SIGTERM" ? "term" : "kill";
+    if (activePhase === testCase.phase) {
+      if (testCase.mode === "false") return false;
+      if (testCase.mode === "throw") throw new Error(`${activePhase} denied`);
+      child.emit("error", new Error(`${activePhase} emitted error`));
+    }
+    if (signal === "SIGKILL" && testCase.mode !== "false" && testCase.mode !== "throw") {
+      queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+    } else if (signal === "SIGKILL" && testCase.phase !== "kill") {
+      queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+    }
+    return true;
+  });
+  let reportedError;
+  await assert.rejects(
+    superviseGateChild(signalChild, {
+      timeoutMs: 1,
+      maxOutputBytes: 1024,
+      termGraceMs: 1,
+      killGraceMs: 2,
+      pollMs: 1,
+      onCleanupStart() {
+        cleanupStarts += 1;
+      },
+      snapshotProcessTree() {
+        snapshots += 1;
+        return { root, descendants: [descendant] };
+      },
+      readProcessIdentity(pid) {
+        if (pid === root.pid) return root;
+        return pid === descendant.pid && descendantAlive ? descendant : null;
+      },
+      killProcessGroup(group, signal) {
+        groupSignals.push([group, signal]);
+        descendantAlive = false;
+      },
+    }),
+    error => {
+      reportedError = error;
+      return assertCleanupFailure(
+        error,
+        "gate_characterization_timeout",
+        testCase.expected,
+      );
+    },
+  );
+  assert.equal(cleanupStarts, 1);
+  assert.equal(snapshots, 2);
+  assert.deepEqual(groupSignals, [[descendant.processGroup, "SIGKILL"]]);
+  assert.deepEqual(directSignals, ["SIGTERM", "SIGKILL"]);
+  const reportedCount = reportedError.errors.length;
+  assert.doesNotThrow(() => signalChild.emit("error", new Error("late error")));
+  assert.equal(reportedError.errors.length, reportedCount);
+}
+
+for (const primary of ["output", "timeout"]) {
+  const root = processIdentity({
+    pid: 800,
+    parentPid: process.pid,
+    processGroup: 800,
+    startTime: `race-root-${primary}`,
+  });
+  let cleanupStarts = 0;
+  let snapshots = 0;
+  let settlements = 0;
+  const signals = [];
+  const raceChild = fakeCharacterizationChild((signal, child) => {
+    signals.push(signal);
+    if (primary === "timeout") child.stdout.write(Buffer.alloc(2));
+    queueMicrotask(() => child.emit("close", null, signal));
+  });
+  const raceResult = superviseGateChild(raceChild, {
+    timeoutMs: primary === "timeout" ? 0 : 50,
+    maxOutputBytes: 1,
+    termGraceMs: 10,
+    killGraceMs: 1,
+    pollMs: 1,
+    onCleanupStart() {
+      cleanupStarts += 1;
+    },
+    snapshotProcessTree() {
+      snapshots += 1;
+      return { root, descendants: [] };
+    },
+    readProcessIdentity: () => root,
+    killProcessGroup() {},
+  }).then(
+    () => {
+      settlements += 1;
+    },
+    error => {
+      settlements += 1;
+      throw error;
+    },
+  );
+  if (primary === "output") raceChild.stdout.write(Buffer.alloc(2));
+  await assert.rejects(
+    raceResult,
+    new RegExp(`gate_characterization_${primary}`),
+  );
+  await wait(5);
+  assert.equal(cleanupStarts, 1);
+  assert.equal(snapshots, 1);
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.equal(settlements, 1);
+}
 
 const namedCases = [
   [
