@@ -125,9 +125,9 @@ public-egress and SSRF checks without entering the navigation set.
   denial.
 - Prompt mode pins Codex CLI/app-server 0.144.5 and the generated V2 protocol
   schema checksum. Every turn supplies the strict
-  `ModelDecisionEnvelopeV1` output schema and unwraps its validated
-  `ModelDecisionV1`; the command is experimental, so every upgrade must pass
-  Gate 0.
+  `ModelDecisionEnvelopeV1` output schema and normalizes its distinct
+  `ModelWireDecisionV1` into internal `ModelDecisionV1`; the command is
+  experimental, so every upgrade must pass Gate 0.
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
   requires a root object, forbids root `anyOf`, and supports the nested
   `anyOf` used under the required `decision` property and its action.
@@ -228,9 +228,9 @@ For every commit:
 
 - Prompt Interact uses one pinned app-server 0.144.5 process and one ephemeral
   `gpt-5.6-terra`/`medium` thread per request. Codex returns a strict root
-  `ModelDecisionEnvelopeV1`; the host validates and unwraps its unchanged
-  internal `ModelDecisionV1`. Codex receives bounded observations and has no
-  MCP, tools, or relay.
+  `ModelDecisionEnvelopeV1`; the host validates its distinct model-wire
+  operations and normalizes them into unchanged internal `ModelDecisionV1`.
+  Codex receives bounded observations and has no MCP, tools, or relay.
 - Every accepted prompt action is durably prepared before dispatch, executes
   at most once, and records a definite result or terminal unknown outcome.
 - Node, Python, and Bash run inside disposable fixed `runc` bundles.

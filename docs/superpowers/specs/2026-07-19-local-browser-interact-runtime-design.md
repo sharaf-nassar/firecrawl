@@ -144,17 +144,38 @@ The only accepted model wire output is a strict
 `ModelDecisionEnvelopeV1`. The envelope exists because OpenAI Structured
 Outputs requires the root schema to be an object and forbids a root
 `anyOf`; the supported discriminated unions remain nested under the required
-`decision` property. After strict envelope validation, the adapter unwraps
-`.decision` and every later boundary continues to use the unchanged
-`ModelDecisionV1`:
+`decision` property. Model-wire operations are deliberately distinct from
+trusted internal operations:
 
 ```ts
 export type ModelDecisionV1 =
   | { version: 1; type: "action"; action: BrowserOperation }
   | { version: 1; type: "final"; output: string };
 
+export type ModelWireBrowserOperationV1 =
+  | { kind: "snapshot" }
+  | { kind: "click"; ref: string }
+  | { kind: "fill"; ref: string; value: string }
+  | { kind: "type"; ref: string; value: string; delayMs: number }
+  | { kind: "press"; ref: string; key: string }
+  | { kind: "select"; ref: string; values: string[] }
+  | { kind: "scroll"; deltaX: number; deltaY: number }
+  | { kind: "wait"; milliseconds: number }
+  | { kind: "get_text"; ref: string | null }
+  | { kind: "get_url" }
+  | { kind: "navigate"; url: string }
+  | {
+      kind: "evaluate";
+      expression: string;
+      args: Record<string, never>;
+    };
+
+export type ModelWireDecisionV1 =
+  | { version: 1; type: "action"; action: ModelWireBrowserOperationV1 }
+  | { version: 1; type: "final"; output: string };
+
 export interface ModelDecisionEnvelopeV1 {
-  decision: ModelDecisionV1;
+  decision: ModelWireDecisionV1;
 }
 
 type BoundedPageState = {
@@ -185,15 +206,24 @@ type ObservationV1 =
 
 Every `turn/start.outputSchema` is a closed root object with exactly one
 required `decision` property. `decision` uses a nested `anyOf` for the closed
-action and final variants, and the action's `BrowserOperation` union uses a
-second nested `anyOf`. Every object sets `additionalProperties: false` and
-requires every declared field; semantically optional model-wire fields are
-required nullable fields and are normalized during strict validation. The two
-accepted wire shapes are exactly
+action and final variants, and the action's
+`ModelWireBrowserOperationV1` union uses a second nested `anyOf`. Every object
+sets `additionalProperties: false` and requires every declared field;
+semantically optional model-wire fields are required nullable fields and are
+normalized during strict validation.
+Representative examples of the two top-level decision variants are
 `{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}`
 and `{"decision":{"version":1,"type":"final","output":"done"}}`.
 [OpenAI's Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
 documents both the root-object constraint and supported nested `anyOf`.
+
+`normalizeModelDecisionEnvelopeV1(envelope): ModelDecisionV1` runs only after
+strict wire validation. It converts `get_text.ref === null` to an omitted
+internal `ref`, retains model-wire `evaluate.args` as the empty internal `{}`,
+and maps every other exact operation field unchanged. Hashing,
+classification, authorization, callbacks, the ledger, and Browser Service use
+only the resulting internal `ModelDecisionV1`. The wire parser never reuses
+the internal `BrowserOperation` or `ModelDecisionV1` schema.
 
 Unknown fields, malformed JSON, multiple decisions, envelope/schema/semantic
 mismatch, or any tool or approval event are `model_protocol_error` failures.
@@ -436,7 +466,8 @@ begin on partial reconstruction.
 
 Each operation has a strict input/output schema, effect classification,
 maximum payload, operation timeout, and redaction policy. The adapter accepts
-it only inside `ModelDecisionV1`; it is not exposed as a model tool.
+it only after strict model-wire validation and normalization into
+`ModelDecisionV1`; it is not exposed as a model tool.
 `evaluate` accepts a restricted page-context expression/program, not Node
 APIs, imports, filesystem access, sockets, or a Browser Service escape hatch.
 Snapshots expose stable element references and bounded text instead of
@@ -641,15 +672,16 @@ Browser Service provides bounded operations equivalent to:
 
 The Codex adapter accepts a prompt job with fixed model policy, original
 prompt, run identifier, deadline, and the server-controlled
-`ModelDecisionEnvelopeV1`/`ModelDecisionV1`/`ObservationV1` schema versions.
-It starts one app-server process and ephemeral thread, streams bounded protocol
-events, strictly validates and unwraps the model envelope, and returns only
-validated internal decisions plus sanitized usage/process metadata. For an
-action decision, it assigns action identity metadata and invokes an
-authenticated API callback; that callback records and authorizes the action,
-invokes Browser Service once, and returns only a bounded definite observation.
-The adapter contract accepts no MCP configuration, model tools, browser
-endpoint, or raw capability.
+`ModelDecisionEnvelopeV1`/`ModelWireDecisionV1`/`ModelDecisionV1`/
+`ObservationV1` schema versions. It starts one app-server process and ephemeral
+thread, streams bounded protocol events, strictly validates distinct model-wire
+types, normalizes them into an internal decision, and returns only validated
+internal decisions plus sanitized usage/process metadata. For an action
+decision, it assigns action identity metadata and invokes an authenticated API
+callback; that callback records and authorizes the action, invokes Browser
+Service once, and returns only a bounded definite observation. The adapter
+contract accepts no MCP configuration, model tools, browser endpoint, or raw
+capability.
 
 The code runner accepts language, source, session relay grant, deadline, and
 resource limits. It returns existing execution response fields. Neither
@@ -828,9 +860,9 @@ observable behavior and focused service/unit tests for isolation boundaries.
   recovery, and retention
 - Browser Service typed operation and live-view contracts
 - Fake app-server process/config construction, pinned V2 schema checksum,
-  strict `ModelDecisionEnvelopeV1` validation and `ModelDecisionV1` unwrapping,
-  bounded multi-turn observations, zero tool and approval events,
-  cancellation, limits, timeout, and orphan cleanup
+  strict `ModelDecisionEnvelopeV1` wire validation and normalization into
+  `ModelDecisionV1`, bounded multi-turn observations, zero tool and approval
+  events, cancellation, limits, timeout, and orphan cleanup
 - Node, Python, and Bash runner success/failure, resource limits, network
   isolation, output bounds, and process-tree termination
 - Broker schema/peer-credential enforcement, sealed descriptors, fixed-bundle
@@ -881,10 +913,10 @@ Phase 2 is complete when:
 9. Replay either reproduces every retained browser-affecting option or returns
    an explicit `replay_unsupported`/`replay_unavailable` error.
 10. Codex sees only the strict decision-envelope schema and bounded
-    observations. The host validates and unwraps the envelope before using the
-    unchanged internal decision type. Codex has no MCP servers, model tools,
-    browser relay, user config, host files, shell, Docker, plugins, hooks,
-    skills, or arbitrary network destinations.
+    observations. The host validates distinct model-wire types and normalizes
+    the envelope before using the unchanged internal decision type. Codex has
+    no MCP servers, model tools, browser relay, user config, host files, shell,
+    Docker, plugins, hooks, skills, or arbitrary network destinations.
 11. Hostile pages and code cannot escape Browser Service, Codex, or `runc`
     boundaries or access another owner/session/profile.
 12. No Browser/Interact path uses Gemini, Fireworks, Firecrawl Cloud, or an API

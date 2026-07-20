@@ -131,8 +131,8 @@ descriptor and use the existing page-oriented code contract.
 - Create `apps/browser-execution-adapter/src/app_server.rs` for JSON-RPC V2
   initialization, thread, turns, event bounds, and shutdown.
 - Create `apps/browser-execution-adapter/src/decision.rs` for strict
-  `ModelDecisionEnvelopeV1` validation, `ModelDecisionV1` unwrapping,
-  canonical proposal hashes, and duplicate checks.
+  `ModelDecisionEnvelopeV1` wire validation, explicit normalization into
+  internal `ModelDecisionV1`, canonical proposal hashes, and duplicate checks.
 - Create `apps/browser-execution-adapter/src/observations.rs` for bounded,
   explicitly untrusted turn inputs.
 - Create `apps/browser-execution-adapter/src/action_client.rs` for the
@@ -367,8 +367,12 @@ side-effect rejection.
 ```rust
 #[test]
 fn side_effect_hash_is_canonical_and_cannot_repeat() {
-    let first = parse_decision_envelope(r#"{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}"#).unwrap().decision;
-    let second = parse_decision_envelope(r#"{"decision":{"type":"action","action":{"ref":"@e7","kind":"click"},"version":1}}"#).unwrap().decision;
+    let first = normalize_model_decision_envelope(parse_decision_envelope(
+        r#"{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}"#,
+    ).unwrap());
+    let second = normalize_model_decision_envelope(parse_decision_envelope(
+        r#"{"decision":{"type":"action","action":{"ref":"@e7","kind":"click"},"version":1}}"#,
+    ).unwrap());
     assert_eq!(normalized_hash(&first), normalized_hash(&second));
     assert_eq!(classify(&first), Effect::SideEffecting);
 }
@@ -381,6 +385,38 @@ fn root_union_or_flattened_superset_is_rejected() {
     assert!(parse_decision_envelope(
         r#"{"decision":{"version":1,"type":"final","output":"done","action":null}}"#,
     ).is_err());
+    assert!(parse_decision_envelope(
+        r#"{"decision":{"version":1,"type":"action","action":{"kind":"get_text"}}}"#,
+    ).is_err());
+    assert!(parse_decision_envelope(
+        r#"{"decision":{"version":1,"type":"action","action":{"kind":"evaluate","expression":"1","args":{"x":1}}}}"#,
+    ).is_err());
+}
+
+#[test]
+fn nullable_wire_ref_normalizes_to_internal_omission() {
+    let envelope = parse_decision_envelope(
+        r#"{"decision":{"version":1,"type":"action","action":{"kind":"get_text","ref":null}}}"#,
+    ).unwrap();
+    assert!(matches!(
+        normalize_model_decision_envelope(envelope),
+        ModelDecisionV1::Action {
+            action: BrowserOperation::GetText { r#ref: None }, ..
+        }
+    ));
+}
+
+#[test]
+fn closed_wire_args_normalize_to_internal_empty_map() {
+    let envelope = parse_decision_envelope(
+        r#"{"decision":{"version":1,"type":"action","action":{"kind":"evaluate","expression":"1","args":{}}}}"#,
+    ).unwrap();
+    let ModelDecisionV1::Action {
+        action: BrowserOperation::Evaluate { args, .. }, ..
+    } = normalize_model_decision_envelope(envelope) else {
+        panic!("expected evaluate action");
+    };
+    assert!(args.is_empty());
 }
 ```
 
@@ -425,7 +461,7 @@ pub enum ModelDecisionV1 {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDecisionEnvelopeV1 {
-    pub decision: ModelDecisionV1,
+    pub decision: ModelWireDecisionV1,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -457,6 +493,86 @@ pub enum BrowserOperation {
         args: BTreeMap<String, serde_json::Value>,
     },
 }
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelWireDecisionV1 {
+    Action { version: VersionOne, action: ModelWireBrowserOperationV1 },
+    Final { version: VersionOne, output: String },
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct RequiredNullable<T>(pub Option<T>);
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyArgs {}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelWireBrowserOperationV1 {
+    Snapshot,
+    Click { r#ref: ElementRef },
+    Fill { r#ref: ElementRef, value: BoundedString<20_000> },
+    Type {
+        r#ref: ElementRef,
+        value: BoundedString<20_000>,
+        #[serde(rename = "delayMs")]
+        delay_ms: u16,
+    },
+    Press { r#ref: ElementRef, key: BoundedString<64> },
+    Select { r#ref: ElementRef, values: BoundedVec<BoundedString<512>, 20> },
+    Scroll {
+        #[serde(rename = "deltaX")]
+        delta_x: i32,
+        #[serde(rename = "deltaY")]
+        delta_y: i32,
+    },
+    Wait { milliseconds: u32 },
+    GetText { r#ref: RequiredNullable<ElementRef> },
+    GetUrl,
+    Navigate { url: BoundedString<8_192> },
+    Evaluate {
+        expression: BoundedString<20_000>,
+        args: EmptyArgs,
+    },
+}
+
+pub fn normalize_model_decision_envelope(
+    envelope: ModelDecisionEnvelopeV1,
+) -> ModelDecisionV1 {
+    match envelope.decision {
+        ModelWireDecisionV1::Final { version, output } =>
+            ModelDecisionV1::Final { version, output },
+        ModelWireDecisionV1::Action { version, action } => {
+            let action = match action {
+                ModelWireBrowserOperationV1::Snapshot => BrowserOperation::Snapshot,
+                ModelWireBrowserOperationV1::Click { r#ref } =>
+                    BrowserOperation::Click { r#ref },
+                ModelWireBrowserOperationV1::Fill { r#ref, value } =>
+                    BrowserOperation::Fill { r#ref, value },
+                ModelWireBrowserOperationV1::Type { r#ref, value, delay_ms } =>
+                    BrowserOperation::Type { r#ref, value, delay_ms },
+                ModelWireBrowserOperationV1::Press { r#ref, key } =>
+                    BrowserOperation::Press { r#ref, key },
+                ModelWireBrowserOperationV1::Select { r#ref, values } =>
+                    BrowserOperation::Select { r#ref, values },
+                ModelWireBrowserOperationV1::Scroll { delta_x, delta_y } =>
+                    BrowserOperation::Scroll { delta_x, delta_y },
+                ModelWireBrowserOperationV1::Wait { milliseconds } =>
+                    BrowserOperation::Wait { milliseconds },
+                ModelWireBrowserOperationV1::GetText { r#ref } =>
+                    BrowserOperation::GetText { r#ref: r#ref.0 },
+                ModelWireBrowserOperationV1::GetUrl => BrowserOperation::GetUrl,
+                ModelWireBrowserOperationV1::Navigate { url } =>
+                    BrowserOperation::Navigate { url },
+                ModelWireBrowserOperationV1::Evaluate { expression, args: _ } =>
+                    BrowserOperation::Evaluate { expression, args: BTreeMap::new() },
+            };
+            ModelDecisionV1::Action { version, action }
+        }
+    }
+}
 ```
 
 `delay_ms` is 0..250, each scroll delta is -10,000..10,000, and
@@ -469,26 +585,29 @@ Write the checked-in draft-07 model-wire schema as one closed root object with
 exactly the required `decision` property. Do not put `anyOf` or `oneOf` at the
 root. `decision` contains nested `anyOf` branches for the closed action and
 final objects; action's required `action` property contains a second nested
-`anyOf` with every closed `BrowserOperation` object above. Every object sets
-`additionalProperties:false`, and its `required` array contains every property
-it defines. Use `version.const=1`, the same operation limits, and final
-`output.maxLength=262144`. Represent semantic `get_text.ref` omission on the
-wire as a required nullable string and normalize `null` to omission during
-strict envelope validation. Keep model-wire `evaluate.args` a closed empty
-object; the unchanged internal operation type remains a `BTreeMap` for trusted
-non-model callers.
+`anyOf` with every closed `ModelWireBrowserOperationV1` object above. Every
+object sets `additionalProperties:false`, and its `required` array contains
+every property it defines. Use `version.const=1`, the same operation limits,
+and final `output.maxLength=262144`. Wire `get_text.ref` is required nullable;
+wire `evaluate.args` is a required closed empty object. Internal
+`BrowserOperation` still permits an omitted text ref and arbitrary trusted JSON
+arguments.
 
-The only accepted model wire values are exactly shaped as
+Representative examples of the two top-level model-wire decision variants are
 `{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}`
-or `{"decision":{"version":1,"type":"final","output":"done"}}`. Validate
-the complete envelope against
-`model-decision-envelope-v1.schema.json`, deserialize
-`ModelDecisionEnvelopeV1`, then unwrap `.decision`. From that boundary onward,
-hashing, classification, callbacks, and loop control use unchanged
-`ModelDecisionV1`. Reject envelope/schema/semantic mismatch as
-`model_protocol_error`; do not implement a flattened nullable action/output
-superset or plain-JSON fallback. Tests serialize wire envelopes, validate
-against the schema, unwrap them, and compare every variant/property name.
+and `{"decision":{"version":1,"type":"final","output":"done"}}`. Validate
+the complete envelope against `model-decision-envelope-v1.schema.json`, then
+deserialize distinct `ModelDecisionEnvelopeV1`, `ModelWireDecisionV1`, and
+`ModelWireBrowserOperationV1` types. Only
+`normalize_model_decision_envelope` may convert them into internal
+`ModelDecisionV1`. It maps a null wire ref to internal omission, maps closed
+empty wire args to an internal empty `BTreeMap`, and copies every other exact
+field. From that boundary onward, hashing, classification, callbacks, and loop
+control use unchanged `ModelDecisionV1`. Reject envelope/schema/semantic
+mismatch as `model_protocol_error`; do not implement a flattened nullable
+action/output superset, internal-schema reuse, or plain-JSON fallback. Tests
+serialize wire envelopes, validate against the schema, normalize them, and
+compare every variant/property name.
 
 - [ ] **Step 5: Bound observations and build untrusted turn text**
 
@@ -631,8 +750,9 @@ The implementation builds JSON values, never string-replaces IDs or text.
 Validate every response/notification against checked-in V2 schemas. Collect
 one completed `agentMessage`, require `turn/completed` status `completed`, then
 validate its text against the closed `ModelDecisionEnvelopeV1` schema,
-deserialize the envelope, normalize nullable model-wire fields, and unwrap
-`.decision` into unchanged `ModelDecisionV1`. Refusal, failed/interrupted turn,
+deserialize only the distinct wire types, and call
+`normalize_model_decision_envelope` to produce unchanged `ModelDecisionV1`.
+Refusal, failed/interrupted turn,
 unknown method, unknown field in a consumed type, envelope/schema/semantic
 mismatch, or any tool/approval event is `model_protocol_error`. No flattened
 nullable action/output superset or plain-JSON fallback exists. Cap stdout
@@ -1554,7 +1674,8 @@ Validate fresh public MCP clients with no provider fallback."
 - [ ] Focused API tests and TypeScript build pass.
 - [ ] One prompt request uses one app-server process and ephemeral thread.
 - [ ] Every turn uses closed root `ModelDecisionEnvelopeV1` `outputSchema`,
-  validates it, and unwraps unchanged `ModelDecisionV1`.
+  validates distinct wire types, and normalizes unchanged internal
+  `ModelDecisionV1`.
 - [ ] Original prompt appears only on initial turn; later turns contain only
   bounded definite observations.
 - [ ] Maximum 25 actions, 26 turns, 1 MiB observations, 300 seconds.

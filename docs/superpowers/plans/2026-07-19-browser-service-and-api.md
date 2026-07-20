@@ -103,8 +103,9 @@ Fireworks, Firecrawl Cloud, or an API key.
 - `apps/api/src/lib/scrape-interact/browser-service-client.ts` — typed,
   deadline-aware Browser Service client.
 - `apps/api/src/lib/browser-runtime/protocol.ts` — strict shared
-  `BrowserOperation`, `ModelDecisionV1`, `ModelDecisionEnvelopeV1`, and
-  `ObservationV1` schemas.
+  internal `BrowserOperation`/`ModelDecisionV1`, distinct
+  `ModelWireBrowserOperationV1`/`ModelWireDecisionV1` envelope, explicit
+  normalization, and `ObservationV1` schemas.
 - `apps/api/src/lib/browser-runtime/execution-adapter.ts` — one-job host adapter
   interface and fail-closed default.
 - `apps/api/src/lib/browser-runtime/orchestrator.ts` — durable session, replay,
@@ -908,6 +909,49 @@ it("stop elects one cleanup owner", async () => {
   expect(adapter.cancelExecutionRun).toHaveBeenCalledTimes(1);
   expect(browserClient.closeSession).toHaveBeenCalledTimes(1);
 });
+
+it("separates strict model wire operations from trusted internal operations", () => {
+  const missingRef = {
+    decision: {
+      version: 1, type: "action", action: { kind: "get_text" },
+    },
+  };
+  const nullableRef = {
+    decision: {
+      version: 1, type: "action",
+      action: { kind: "get_text", ref: null },
+    },
+  };
+  const nonemptyWireArgs = {
+    decision: {
+      version: 1, type: "action",
+      action: { kind: "evaluate", expression: "x", args: { x: 1 } },
+    },
+  };
+  const emptyWireArgs = {
+    decision: {
+      version: 1, type: "action",
+      action: { kind: "evaluate", expression: "1", args: {} },
+    },
+  };
+
+  expect(modelDecisionEnvelopeV1Schema.safeParse(missingRef).success).toBe(false);
+  expect(modelDecisionEnvelopeV1Schema.safeParse(nullableRef).success).toBe(true);
+  expect(modelDecisionEnvelopeV1Schema.safeParse(nonemptyWireArgs).success)
+    .toBe(false);
+  expect(normalizeModelDecisionEnvelopeV1(emptyWireArgs)).toEqual({
+    version: 1, type: "action",
+    action: { kind: "evaluate", expression: "1", args: {} },
+  });
+  expect(normalizeModelDecisionEnvelopeV1(nullableRef)).toEqual({
+    version: 1, type: "action", action: { kind: "get_text" },
+  });
+  expect(browserOperationSchema.safeParse({ kind: "get_text" }).success)
+    .toBe(true);
+  expect(browserOperationSchema.safeParse({
+    kind: "evaluate", expression: "x", args: { x: 1 },
+  }).success).toBe(true);
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
@@ -921,6 +965,59 @@ Expected: FAIL because execution boundary and orchestrator do not exist.
 - [ ] **Step 3: Define exact prompt/code adapter types**
 
 ```ts
+import { z } from "zod";
+import type { BrowserOperation } from "../browser-state/types";
+
+const internalRefSchema = z.string().min(1).max(128);
+const internalTextSchema = z.string().max(20_000);
+const internalJsonValueSchema: z.ZodType<unknown> = z.lazy(() => z.union([
+  z.string(), z.number().finite(), z.boolean(), z.null(),
+  z.array(internalJsonValueSchema),
+  z.record(z.string(), internalJsonValueSchema),
+]));
+
+export const browserOperationSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("snapshot") }).strict(),
+  z.object({ kind: z.literal("click"), ref: internalRefSchema }).strict(),
+  z.object({
+    kind: z.literal("fill"), ref: internalRefSchema,
+    value: internalTextSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("type"), ref: internalRefSchema,
+    value: internalTextSchema,
+    delayMs: z.number().int().min(0).max(250),
+  }).strict(),
+  z.object({
+    kind: z.literal("press"), ref: internalRefSchema,
+    key: z.string().min(1).max(64),
+  }).strict(),
+  z.object({
+    kind: z.literal("select"), ref: internalRefSchema,
+    values: z.array(z.string().max(512)).max(20),
+  }).strict(),
+  z.object({
+    kind: z.literal("scroll"),
+    deltaX: z.number().int().min(-10_000).max(10_000),
+    deltaY: z.number().int().min(-10_000).max(10_000),
+  }).strict(),
+  z.object({
+    kind: z.literal("wait"),
+    milliseconds: z.number().int().min(0).max(30_000),
+  }).strict(),
+  z.object({
+    kind: z.literal("get_text"), ref: internalRefSchema.optional(),
+  }).strict(),
+  z.object({ kind: z.literal("get_url") }).strict(),
+  z.object({
+    kind: z.literal("navigate"), url: z.string().url().max(8_192),
+  }).strict(),
+  z.object({
+    kind: z.literal("evaluate"), expression: internalTextSchema,
+    args: z.record(z.string(), internalJsonValueSchema),
+  }).strict(),
+]);
+
 export type BoundedPageState = {
   url: string;
   title: string;
@@ -950,10 +1047,33 @@ export type ModelDecisionV1 =
   | { version: 1; type: "action"; action: BrowserOperation }
   | { version: 1; type: "final"; output: string };
 
+export type ModelWireBrowserOperationV1 =
+  | { kind: "snapshot" }
+  | { kind: "click"; ref: string }
+  | { kind: "fill"; ref: string; value: string }
+  | { kind: "type"; ref: string; value: string; delayMs: number }
+  | { kind: "press"; ref: string; key: string }
+  | { kind: "select"; ref: string; values: string[] }
+  | { kind: "scroll"; deltaX: number; deltaY: number }
+  | { kind: "wait"; milliseconds: number }
+  | { kind: "get_text"; ref: string | null }
+  | { kind: "get_url" }
+  | { kind: "navigate"; url: string }
+  | {
+      kind: "evaluate";
+      expression: string;
+      args: Record<string, never>;
+    };
+
+export type ModelWireDecisionV1 =
+  | { version: 1; type: "action"; action: ModelWireBrowserOperationV1 }
+  | { version: 1; type: "final"; output: string };
+
 export interface ModelDecisionEnvelopeV1 {
-  decision: ModelDecisionV1;
+  decision: ModelWireDecisionV1;
 }
 
+// Internal API/Browser Service validation. Never use this for raw model output.
 export const modelDecisionV1Schema = z.discriminatedUnion("type", [
   z.object({
     version: z.literal(1),
@@ -967,9 +1087,128 @@ export const modelDecisionV1Schema = z.discriminatedUnion("type", [
   }).strict(),
 ]);
 
+const modelWireRefSchema = z.string().min(1).max(128);
+const modelWireTextSchema = z.string().max(20_000);
+const emptyModelWireArgsSchema = z.object({}).strict()
+  .transform((): Record<string, never> => ({}));
+
+export const modelWireBrowserOperationV1Schema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("snapshot") }).strict(),
+  z.object({ kind: z.literal("click"), ref: modelWireRefSchema }).strict(),
+  z.object({
+    kind: z.literal("fill"),
+    ref: modelWireRefSchema,
+    value: modelWireTextSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("type"),
+    ref: modelWireRefSchema,
+    value: modelWireTextSchema,
+    delayMs: z.number().int().min(0).max(250),
+  }).strict(),
+  z.object({
+    kind: z.literal("press"),
+    ref: modelWireRefSchema,
+    key: z.string().min(1).max(64),
+  }).strict(),
+  z.object({
+    kind: z.literal("select"),
+    ref: modelWireRefSchema,
+    values: z.array(z.string().max(512)).max(20),
+  }).strict(),
+  z.object({
+    kind: z.literal("scroll"),
+    deltaX: z.number().int().min(-10_000).max(10_000),
+    deltaY: z.number().int().min(-10_000).max(10_000),
+  }).strict(),
+  z.object({
+    kind: z.literal("wait"),
+    milliseconds: z.number().int().min(0).max(30_000),
+  }).strict(),
+  z.object({
+    kind: z.literal("get_text"),
+    ref: modelWireRefSchema.nullable(),
+  }).strict(),
+  z.object({ kind: z.literal("get_url") }).strict(),
+  z.object({
+    kind: z.literal("navigate"),
+    url: z.string().url().max(8_192),
+  }).strict(),
+  z.object({
+    kind: z.literal("evaluate"),
+    expression: modelWireTextSchema,
+    args: emptyModelWireArgsSchema,
+  }).strict(),
+]);
+
+export const modelWireDecisionV1Schema = z.discriminatedUnion("type", [
+  z.object({
+    version: z.literal(1),
+    type: z.literal("action"),
+    action: modelWireBrowserOperationV1Schema,
+  }).strict(),
+  z.object({
+    version: z.literal(1),
+    type: z.literal("final"),
+    output: z.string().max(256 * 1024),
+  }).strict(),
+]);
+
 export const modelDecisionEnvelopeV1Schema = z.object({
-  decision: modelDecisionV1Schema,
+  decision: modelWireDecisionV1Schema,
 }).strict();
+
+function normalizeModelWireBrowserOperationV1(
+  operation: ModelWireBrowserOperationV1,
+): BrowserOperation {
+  switch (operation.kind) {
+    case "snapshot": return { kind: "snapshot" };
+    case "click": return { kind: "click", ref: operation.ref };
+    case "fill": return {
+      kind: "fill", ref: operation.ref, value: operation.value,
+    };
+    case "type": return {
+      kind: "type", ref: operation.ref, value: operation.value,
+      delayMs: operation.delayMs,
+    };
+    case "press": return {
+      kind: "press", ref: operation.ref, key: operation.key,
+    };
+    case "select": return {
+      kind: "select", ref: operation.ref, values: [...operation.values],
+    };
+    case "scroll": return {
+      kind: "scroll", deltaX: operation.deltaX, deltaY: operation.deltaY,
+    };
+    case "wait": return {
+      kind: "wait", milliseconds: operation.milliseconds,
+    };
+    case "get_text": return operation.ref === null
+      ? { kind: "get_text" }
+      : { kind: "get_text", ref: operation.ref };
+    case "get_url": return { kind: "get_url" };
+    case "navigate": return { kind: "navigate", url: operation.url };
+    case "evaluate": return {
+      kind: "evaluate", expression: operation.expression, args: {},
+    };
+  }
+  const unreachableOperation: never = operation;
+  throw new TypeError(`unsupported model wire operation: ${unreachableOperation}`);
+}
+
+export function normalizeModelDecisionEnvelopeV1(
+  envelope: unknown,
+): ModelDecisionV1 {
+  const parsed = modelDecisionEnvelopeV1Schema.parse(envelope);
+  const decision: ModelWireDecisionV1 = parsed.decision;
+  return decision.type === "final"
+    ? { version: 1, type: "final", output: decision.output }
+    : {
+        version: 1,
+        type: "action",
+        action: normalizeModelWireBrowserOperationV1(decision.action),
+      };
+}
 
 export const PROMPT_LOOP_POLICY_V1 = {
   maxPromptCharacters: 10_000,
@@ -1010,16 +1249,27 @@ export type PromptRunResult = {
 };
 ```
 
-Implement strict Zod schemas for these types in `protocol.ts`. The model wire
-schema is always `ModelDecisionEnvelopeV1`; after strict validation, host code
-unwraps `.decision` and uses unchanged `ModelDecisionV1`. Reject unknown
-fields, a missing/extra envelope field, malformed unions, flattened nullable
-action/output supersets, both result and error, neither result nor error for
-its outcome, excerpt over 40,000 characters, encoded observation over 64 KiB,
-and final output over 256 KiB. Envelope/schema/semantic mismatches map to
-`model_protocol_error`. `protocol.test.ts` locks both wrapped variants,
-unwrapping, and every rejection. `PromptRunInput`, `PromptRunResult`, action
-callbacks, ledger rows, and observations retain their existing shapes.
+`protocol.ts` owns both internal and model-wire schemas; import the canonical
+`BrowserOperation` type from `../browser-state/types`. Internal
+`browserOperationSchema` and `modelDecisionV1Schema` remain the API/Browser
+Service validators. Raw model output uses only
+`modelWireBrowserOperationV1Schema`, `modelWireDecisionV1Schema`, and
+`modelDecisionEnvelopeV1Schema`; none may reuse an internal operation or
+decision schema.
+
+Reject unknown fields, omitted or non-nullable wire `get_text.ref`, nonempty
+wire `evaluate.args`, a missing/extra envelope field, malformed unions,
+flattened nullable action/output supersets, both result and error, neither
+result nor error for its outcome, excerpt over 40,000 characters, encoded
+observation over 64 KiB, and final output over 256 KiB.
+`normalizeModelDecisionEnvelopeV1` validates wire input first, maps a null text
+ref to internal omission, retains empty evaluate args as `{}`, and returns
+unchanged internal `ModelDecisionV1`. Envelope/schema/semantic mismatches map
+to `model_protocol_error`. `protocol.test.ts` locks every wire variant, both
+normalization special cases, all rejections, and proves internal evaluate args
+remain available to trusted API/Browser Service callers. `PromptRunInput`,
+`PromptRunResult`, action callbacks, ledger rows, and observations retain their
+existing shapes.
 
 Keep `CodeRunInput` restricted to run ID, language, source, deadline, and
 correlation ID. The public request cannot set model, effort, policy/schema

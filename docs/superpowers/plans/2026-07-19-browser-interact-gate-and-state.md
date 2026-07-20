@@ -4,7 +4,7 @@
 
 **Goal:** Prove installed Codex app-server can complete a deterministic two-turn structured-action loop, then add the disabled-by-default PostgreSQL action ledger, replay-envelope, checkpoint, ZDR, recovery, and retention foundation needed by local Browser Interact.
 
-**Architecture:** Gate zero drives one pinned Codex app-server 0.144.5 process and one ephemeral thread through two `turn/start` requests with strict `ModelDecisionEnvelopeV1` output schemas and no MCP or model tools. The host validates the closed root envelope, unwraps its unchanged `ModelDecisionV1`, executes the proposed side effect once, caches matching callback replay, and rejects mismatches before durable work begins. PostgreSQL then becomes authoritative for browser sessions, runs, execute-once actions, profiles, capabilities, proxy grants, replay envelopes, and checkpoint metadata. The existing stateless Playwright service exports a bounded post-scrape checkpoint before closing its context; the API stores sensitive state atomically on an owner-restricted volume and cleans it before request retention deletes database rows.
+**Architecture:** Gate zero drives one pinned Codex app-server 0.144.5 process and one ephemeral thread through two `turn/start` requests with a strict fill-only `ModelDecisionEnvelopeV1` output schema and no MCP or model tools. The host validates distinct model-wire types, normalizes them into unchanged internal `ModelDecisionV1`, executes the proposed side effect once, caches matching callback replay, and rejects mismatches before durable work begins. PostgreSQL then becomes authoritative for browser sessions, runs, execute-once actions, profiles, capabilities, proxy grants, replay envelopes, and checkpoint metadata. The existing stateless Playwright service exports a bounded post-scrape checkpoint before closing its context; the API stores sensitive state atomically on an owner-restricted volume and cleans it before request retention deletes database rows.
 
 **Tech Stack:** Codex CLI app-server 0.144.5 V2 JSON-RPC over stdio, JSON Schema Draft 7, TypeScript, Zod, Drizzle ORM, PostgreSQL 17, Playwright 1.58.1, Vitest, Docker Compose.
 
@@ -98,8 +98,30 @@ export type ModelDecisionV1 =
   | { version: 1; type: "action"; action: BrowserOperation }
   | { version: 1; type: "final"; output: string };
 
+export type ModelWireBrowserOperationV1 =
+  | { kind: "snapshot" }
+  | { kind: "click"; ref: string }
+  | { kind: "fill"; ref: string; value: string }
+  | { kind: "type"; ref: string; value: string; delayMs: number }
+  | { kind: "press"; ref: string; key: string }
+  | { kind: "select"; ref: string; values: string[] }
+  | { kind: "scroll"; deltaX: number; deltaY: number }
+  | { kind: "wait"; milliseconds: number }
+  | { kind: "get_text"; ref: string | null }
+  | { kind: "get_url" }
+  | { kind: "navigate"; url: string }
+  | {
+      kind: "evaluate";
+      expression: string;
+      args: Record<string, never>;
+    };
+
+export type ModelWireDecisionV1 =
+  | { version: 1; type: "action"; action: ModelWireBrowserOperationV1 }
+  | { version: 1; type: "final"; output: string };
+
 export interface ModelDecisionEnvelopeV1 {
-  decision: ModelDecisionV1;
+  decision: ModelWireDecisionV1;
 }
 
 export interface BoundedPageState {
@@ -500,68 +522,11 @@ const closed = properties => ({
   additionalProperties: false,
 });
 
-const browserOperationSchema = {
-  anyOf: [
-    closed({ kind: { const: "snapshot" } }),
-    closed({
-      kind: { const: "click" },
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-    }),
-    closed({
-      kind: { const: "fill" },
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      value: { type: "string", maxLength: 20000 },
-    }),
-    closed({
-      kind: { const: "type" },
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      value: { type: "string", maxLength: 20000 },
-      delayMs: { type: "integer", minimum: 0, maximum: 250 },
-    }),
-    closed({
-      kind: { const: "press" },
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      key: { type: "string", maxLength: 64 },
-    }),
-    closed({
-      kind: { const: "select" },
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      values: {
-        type: "array",
-        items: { type: "string", maxLength: 512 },
-        maxItems: 20,
-      },
-    }),
-    closed({
-      kind: { const: "scroll" },
-      deltaX: { type: "integer", minimum: -10000, maximum: 10000 },
-      deltaY: { type: "integer", minimum: -10000, maximum: 10000 },
-    }),
-    closed({
-      kind: { const: "wait" },
-      milliseconds: { type: "integer", minimum: 0, maximum: 30000 },
-    }),
-    closed({
-      kind: { const: "get_text" },
-      ref: {
-        anyOf: [
-          { type: "string", minLength: 1, maxLength: 128 },
-          { type: "null" },
-        ],
-      },
-    }),
-    closed({ kind: { const: "get_url" } }),
-    closed({
-      kind: { const: "navigate" },
-      url: { type: "string", maxLength: 8192 },
-    }),
-    closed({
-      kind: { const: "evaluate" },
-      expression: { type: "string", maxLength: 20000 },
-      args: closed({}),
-    }),
-  ],
-};
+const gateModelWireFillSchema = closed({
+  kind: { const: "fill" },
+  ref: { const: "gate-marker" },
+  value: { const: "approved" },
+});
 
 const modelDecisionEnvelopeSchema = closed({
   decision: {
@@ -569,7 +534,7 @@ const modelDecisionEnvelopeSchema = closed({
       closed({
         version: { const: 1 },
         type: { const: "action" },
-        action: browserOperationSchema,
+        action: gateModelWireFillSchema,
       }),
       closed({
         version: { const: 1 },
@@ -579,15 +544,33 @@ const modelDecisionEnvelopeSchema = closed({
     ],
   },
 });
+
+function normalizeModelDecisionEnvelopeV1(envelope) {
+  const decision = envelope.decision;
+  if (decision.type === "final") {
+    return { version: 1, type: "final", output: decision.output };
+  }
+  return {
+    version: 1,
+    type: "action",
+    action: {
+      kind: "fill",
+      ref: decision.action.ref,
+      value: decision.action.value,
+    },
+  };
+}
 ```
 
-The root is the closed object `{ decision: ... }`; it never contains
-`anyOf`. Both unions are nested. Every defined property is required. The
-nullable `get_text.ref` wire field normalizes from `null` to omitted before
-the validator returns `ModelDecisionEnvelopeV1`; `evaluate.args` is closed and
-empty on the model wire. Reject schema or semantic mismatches as
+The root is the closed object `{ decision: ... }`; it never contains `anyOf`.
+The decision union is nested and every defined property is required. This
+Gate-only schema deliberately accepts one exact fill operation. It does not
+reuse either the production `ModelWireBrowserOperationV1` schema or the trusted
+internal `browserOperationSchema`. Reject schema or semantic mismatches as
 `model_protocol_error`; do not flatten action/output fields or fall back to
-unconstrained JSON.
+unconstrained JSON. The Gate-local normalizer covers only its validated
+fill/final subset; the host plan implements exhaustive production wire
+normalization.
 
 Reject duplicate response IDs, unknown response IDs, malformed JSON, server
 requests, `error` notifications, multiple completed agent messages per turn,
@@ -610,8 +593,9 @@ Return exactly {"decision":{"version":1,"type":"action","action":{"kind":"fill",
 ```
 
 Require the completed `agentMessage.text` to parse as the exact wrapped action
-object. Strictly validate `ModelDecisionEnvelopeV1`, normalize nullable wire
-fields, unwrap `.decision`, and only then use unchanged `ModelDecisionV1`.
+object. Strictly validate the fill-only `ModelDecisionEnvelopeV1`, then call
+`normalizeModelDecisionEnvelopeV1` and only then use unchanged
+`ModelDecisionV1`.
 Lock the wire and internal boundaries with these exact assertions:
 
 ```js
@@ -622,7 +606,8 @@ assert.deepEqual(actionEnvelope, {
     action: { kind: "fill", ref: "gate-marker", value: "approved" },
   },
 });
-assert.deepEqual(actionEnvelope.decision, {
+const actionDecision = normalizeModelDecisionEnvelopeV1(actionEnvelope);
+assert.deepEqual(actionDecision, {
   version: 1,
   type: "action",
   action: { kind: "fill", ref: "gate-marker", value: "approved" },
@@ -648,14 +633,15 @@ const turnTwoText = [
 ].join("\n");
 ```
 
-Require exact wrapped final object, unwrap `.decision`, require the exact
-internal final decision, and require exactly two completed turns on one thread.
+Require exact wrapped final object, normalize it, require the exact internal
+final decision, and require exactly two completed turns on one thread.
 
 ```js
 assert.deepEqual(finalEnvelope, {
   decision: { version: 1, type: "final", output: "gate-complete" },
 });
-assert.deepEqual(finalEnvelope.decision, {
+const finalDecision = normalizeModelDecisionEnvelopeV1(finalEnvelope);
+assert.deepEqual(finalDecision, {
   version: 1,
   type: "final",
   output: "gate-complete",
