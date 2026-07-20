@@ -26,6 +26,8 @@ function readLinuxProcessTable() {
         state: fields[0],
         parentPid: Number(fields[1]),
         processGroup: Number(fields[2]),
+        session: Number(fields[3]),
+        startTime: fields[19],
       });
     } catch (error) {
       if (error?.code !== "ENOENT" && error?.code !== "ESRCH") throw error;
@@ -34,8 +36,29 @@ function readLinuxProcessTable() {
   return processes;
 }
 
-function snapshotLinuxDescendantProcessGroups(rootPid) {
-  if (process.platform !== "linux" || !Number.isInteger(rootPid)) return [];
+function readLinuxProcessIdentity(pid) {
+  if (process.platform !== "linux" || !Number.isInteger(pid)) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return {
+      pid,
+      state: fields[0],
+      parentPid: Number(fields[1]),
+      processGroup: Number(fields[2]),
+      session: Number(fields[3]),
+      startTime: fields[19],
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ESRCH") return null;
+    throw error;
+  }
+}
+
+function snapshotLinuxProcessTree(rootPid) {
+  if (process.platform !== "linux" || !Number.isInteger(rootPid)) {
+    return { root: null, descendants: [] };
+  }
   const processes = readLinuxProcessTable();
   const ownProcessGroup = processes.find(item => item.pid === process.pid)
     ?.processGroup;
@@ -51,28 +74,16 @@ function snapshotLinuxDescendantProcessGroups(rootPid) {
       changed = true;
     }
   }
-  return [
-    ...new Set(
-      processes
-        .filter(
-          item =>
-            item.pid !== rootPid &&
-            descendants.has(item.pid) &&
-            item.processGroup > 0 &&
-            item.processGroup !== ownProcessGroup,
-        )
-        .map(item => item.processGroup),
+  return {
+    root: processes.find(item => item.pid === rootPid) ?? null,
+    descendants: processes.filter(
+      item =>
+        item.pid !== rootPid &&
+        descendants.has(item.pid) &&
+        item.processGroup > 0 &&
+        item.processGroup !== ownProcessGroup,
     ),
-  ];
-}
-
-function linuxProcessGroupAlive(processGroup) {
-  return readLinuxProcessTable().some(
-    item =>
-      item.processGroup === processGroup &&
-      item.state !== "Z" &&
-      item.state !== "X",
-  );
+  };
 }
 
 function killLinuxProcessGroup(processGroup, signal) {
@@ -87,18 +98,9 @@ function wait(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
-async function waitForShutdown(
-  childClosed,
-  descendantGroups,
-  processGroupAlive,
-  timeoutMs,
-  pollMs,
-) {
+async function waitForShutdown(shutdownComplete, timeoutMs, pollMs) {
   const deadline = Date.now() + timeoutMs;
-  while (
-    !childClosed() ||
-    descendantGroups.some(processGroup => processGroupAlive(processGroup))
-  ) {
+  while (!shutdownComplete()) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) return false;
     await wait(Math.min(pollMs, remaining));
@@ -114,9 +116,9 @@ function superviseGateChild(
     termGraceMs,
     killGraceMs,
     pollMs,
-    snapshotDescendantProcessGroups = snapshotLinuxDescendantProcessGroups,
+    snapshotProcessTree = snapshotLinuxProcessTree,
+    readProcessIdentity = readLinuxProcessIdentity,
     killProcessGroup = killLinuxProcessGroup,
-    processGroupAlive = linuxProcessGroupAlive,
   },
 ) {
   return new Promise((resolve, reject) => {
@@ -146,34 +148,167 @@ function superviseGateChild(
       if (settling || settled) return;
       settling = true;
       clearTimeout(timer);
-      const descendantGroups = snapshotDescendantProcessGroups(child.pid);
-      if (!closed) child.kill("SIGTERM");
+      const cleanupErrors = [];
+      const unprobeableIdentities = new Set();
+      const cleanupError = (code, cause, detail) => {
+        const error = new Error(detail ? `${code}: ${detail}` : code, {
+          cause,
+        });
+        error.code = code;
+        cleanupErrors.push(error);
+      };
+      const snapshot = phase => {
+        try {
+          return snapshotProcessTree(child.pid);
+        } catch (error) {
+          cleanupError(
+            phase === "initial"
+              ? "gate_characterization_initial_snapshot_failed"
+              : "gate_characterization_escalation_snapshot_failed",
+            error,
+          );
+          return { root: null, descendants: [] };
+        }
+      };
+      const identityKey = identity =>
+        `${identity.pid}:${identity.startTime}:${identity.session}:${identity.processGroup}`;
+      const sameIdentity = (left, right) =>
+        right !== null &&
+        left.pid === right.pid &&
+        left.startTime === right.startTime &&
+        left.session === right.session &&
+        left.processGroup === right.processGroup &&
+        right.state !== "Z" &&
+        right.state !== "X";
+      const probeIdentity = (identity, kind = "descendant") => {
+        const key = identityKey(identity);
+        if (unprobeableIdentities.has(key)) return "unknown";
+        try {
+          return sameIdentity(identity, readProcessIdentity(identity.pid))
+            ? "alive"
+            : "gone";
+        } catch (error) {
+          unprobeableIdentities.add(key);
+          cleanupError(
+            kind === "direct"
+              ? "gate_characterization_child_probe_failed"
+              : "gate_characterization_descendant_probe_failed",
+            error,
+            String(identity.pid),
+          );
+          return "unknown";
+        }
+      };
+      const descendants = new Map();
+      let directChildIdentity;
+      const mergeSnapshot = tree => {
+        if (!directChildIdentity && tree.root) directChildIdentity = tree.root;
+        for (const identity of tree.descendants) {
+          descendants.set(identityKey(identity), identity);
+        }
+      };
+      const groupedDescendants = () => {
+        const groups = new Map();
+        for (const identity of descendants.values()) {
+          const group = groups.get(identity.processGroup) ?? [];
+          group.push(identity);
+          groups.set(identity.processGroup, group);
+        }
+        return [...groups]
+          .map(([processGroup, identities]) => [
+            processGroup,
+            identities.toSorted((left, right) => left.pid - right.pid),
+          ])
+          .toSorted(([left], [right]) => left - right);
+      };
+      const descendantsGone = () =>
+        [...descendants.values()].every(
+          identity => probeIdentity(identity) === "gone",
+        );
+      const signalChild = signal => {
+        if (
+          directChildIdentity &&
+          probeIdentity(directChildIdentity, "direct") !== "alive"
+        ) {
+          return;
+        }
+        try {
+          child.kill(signal);
+        } catch (error) {
+          cleanupError(
+            signal === "SIGTERM"
+              ? "gate_characterization_child_term_failed"
+              : "gate_characterization_child_kill_failed",
+            error,
+          );
+        }
+      };
+
+      mergeSnapshot(snapshot("initial"));
+      if (!closed) signalChild("SIGTERM");
+      const shutdownComplete = () => closed && descendantsGone();
       const terminated = await waitForShutdown(
-        () => closed,
-        descendantGroups,
-        processGroupAlive,
+        shutdownComplete,
         termGraceMs,
         pollMs,
       );
       if (!terminated) {
-        if (!closed) child.kill("SIGKILL");
-        for (const processGroup of descendantGroups) {
-          if (processGroupAlive(processGroup)) {
+        mergeSnapshot(snapshot("escalation"));
+        if (!closed) signalChild("SIGKILL");
+        for (const [processGroup, identities] of groupedDescendants()) {
+          if (!identities.some(identity => probeIdentity(identity) === "alive")) {
+            continue;
+          }
+          try {
             killProcessGroup(processGroup, "SIGKILL");
+          } catch (error) {
+            cleanupError(
+              "gate_characterization_descendant_kill_failed",
+              error,
+              String(processGroup),
+            );
           }
         }
-        await waitForShutdown(
-          () => closed,
-          descendantGroups,
-          processGroupAlive,
-          killGraceMs,
-          pollMs,
-        );
+        await waitForShutdown(shutdownComplete, killGraceMs, pollMs);
       }
-      finish(reason);
+      if (!closed) {
+        cleanupError("gate_characterization_child_close_timeout");
+      }
+      for (const [processGroup, identities] of groupedDescendants()) {
+        if (identities.some(identity => probeIdentity(identity) !== "gone")) {
+          cleanupError(
+            "gate_characterization_descendant_survived",
+            undefined,
+            String(processGroup),
+          );
+        }
+      }
+      if (cleanupErrors.length === 0) {
+        finish(reason);
+        return;
+      }
+      const aggregate = new AggregateError(
+        [reason, ...cleanupErrors],
+        `${reason.message}: gate_characterization_cleanup_failed`,
+      );
+      aggregate.code = "gate_characterization_cleanup_failed";
+      finish(aggregate);
     };
     const beginTermination = reason => {
-      void terminate(reason).catch(error => finish(error));
+      void terminate(reason).catch(error => {
+        const cleanupFailure = new Error(
+          "gate_characterization_unexpected_cleanup_failure",
+          { cause: error },
+        );
+        cleanupFailure.code =
+          "gate_characterization_unexpected_cleanup_failure";
+        const aggregate = new AggregateError(
+          [reason, cleanupFailure],
+          `${reason.message}: gate_characterization_cleanup_failed`,
+        );
+        aggregate.code = "gate_characterization_cleanup_failed";
+        finish(aggregate);
+      });
     };
     const capture = target => chunk => {
       if (settling || settled) return;
@@ -239,8 +374,23 @@ function fakeCharacterizationChild(onKill) {
   return child;
 }
 
+const processIdentity = ({
+  pid,
+  parentPid = 800,
+  processGroup,
+  session = processGroup,
+  startTime = String(pid * 10),
+  state = "S",
+}) => ({ pid, parentPid, processGroup, session, startTime, state });
+
+const identityTree = identities => ({
+  root: null,
+  descendants: identities,
+});
+
 const timeoutEvents = [];
 const aliveDescendantGroups = new Set([901]);
+const timeoutIdentity = processIdentity({ pid: 9011, processGroup: 901 });
 const timeoutChild = fakeCharacterizationChild((signal, child) => {
   timeoutEvents.push(signal);
   if (signal === "SIGKILL") {
@@ -257,12 +407,15 @@ await assert.rejects(
     termGraceMs: 1,
     killGraceMs: 20,
     pollMs: 1,
-    snapshotDescendantProcessGroups: () => [901],
+    snapshotProcessTree: () => identityTree([timeoutIdentity]),
+    readProcessIdentity: pid =>
+      pid === timeoutIdentity.pid && aliveDescendantGroups.has(901)
+        ? timeoutIdentity
+        : null,
     killProcessGroup(group, signal) {
       timeoutEvents.push(`group:${group}:${signal}`);
       if (signal === "SIGKILL") aliveDescendantGroups.delete(group);
     },
-    processGroupAlive: group => aliveDescendantGroups.has(group),
   }),
   /gate_characterization_timeout/,
 );
@@ -288,14 +441,314 @@ const outputResult = superviseGateChild(outputChild, {
   termGraceMs: 20,
   killGraceMs: 20,
   pollMs: 1,
-  snapshotDescendantProcessGroups: () => [],
+  snapshotProcessTree: () => identityTree([]),
+  readProcessIdentity: () => null,
   killProcessGroup() {},
-  processGroupAlive: () => false,
 });
 outputChild.stdout.write(Buffer.alloc(5));
 await assert.rejects(outputResult, /gate_characterization_output_limit/);
 outputEvents.push("rejected");
 assert.deepEqual(outputEvents, ["SIGTERM", "close", "rejected"]);
+
+function assertCleanupFailure(error, primaryMessage, cleanupCodes) {
+  assert(error instanceof AggregateError);
+  assert.equal(error.code, "gate_characterization_cleanup_failed");
+  assert.equal(error.errors[0].message, primaryMessage);
+  assert.deepEqual(
+    error.errors.slice(1).map(item => item.code),
+    cleanupCodes,
+  );
+  return true;
+}
+
+const neverCloseChild = fakeCharacterizationChild(() => {});
+await assert.rejects(
+  superviseGateChild(neverCloseChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    snapshotProcessTree: () => identityTree([]),
+    readProcessIdentity: () => null,
+    killProcessGroup() {},
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_child_close_timeout",
+    ]),
+);
+
+const survivingGroupChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGKILL") {
+    queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+  }
+});
+const survivingIdentity = processIdentity({ pid: 9111, processGroup: 911 });
+await assert.rejects(
+  superviseGateChild(survivingGroupChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    snapshotProcessTree: () => identityTree([survivingIdentity]),
+    readProcessIdentity: () => survivingIdentity,
+    killProcessGroup() {},
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_descendant_survived",
+    ]),
+);
+
+let initialSnapshotCalls = 0;
+const initialSnapshotChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGTERM") {
+    queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+  }
+});
+await assert.rejects(
+  superviseGateChild(initialSnapshotChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 10,
+    killGraceMs: 1,
+    pollMs: 1,
+    snapshotProcessTree() {
+      initialSnapshotCalls += 1;
+      throw new Error("initial snapshot denied");
+    },
+    readProcessIdentity: () => null,
+    killProcessGroup() {},
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_initial_snapshot_failed",
+    ]),
+);
+assert.equal(initialSnapshotCalls, 1);
+
+let escalationSnapshotCalls = 0;
+const escalationSnapshotChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGKILL") {
+    queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+  }
+});
+const escalationAlive = new Set([921]);
+const escalationIdentity = processIdentity({ pid: 9211, processGroup: 921 });
+await assert.rejects(
+  superviseGateChild(escalationSnapshotChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 10,
+    pollMs: 1,
+    snapshotProcessTree() {
+      escalationSnapshotCalls += 1;
+      if (escalationSnapshotCalls === 1) {
+        return identityTree([escalationIdentity]);
+      }
+      throw new Error("escalation snapshot denied");
+    },
+    readProcessIdentity: pid =>
+      pid === escalationIdentity.pid && escalationAlive.has(921)
+        ? escalationIdentity
+        : null,
+    killProcessGroup(group) {
+      escalationAlive.delete(group);
+    },
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_escalation_snapshot_failed",
+    ]),
+);
+assert.equal(escalationSnapshotCalls, 2);
+
+const probeFailureChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGKILL") {
+    queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+  }
+});
+const probeFailureIdentity = processIdentity({
+  pid: 9311,
+  processGroup: 931,
+});
+await assert.rejects(
+  superviseGateChild(probeFailureChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    snapshotProcessTree: () => identityTree([probeFailureIdentity]),
+    killProcessGroup() {},
+    readProcessIdentity() {
+      throw new Error("probe denied");
+    },
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_descendant_probe_failed",
+      "gate_characterization_descendant_survived",
+    ]),
+);
+
+const killFailureEvents = [];
+const killFailureAlive = new Set([941, 942]);
+const killFailureIdentities = [
+  processIdentity({ pid: 9411, processGroup: 941 }),
+  processIdentity({ pid: 9421, processGroup: 942 }),
+];
+const killFailureChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGKILL") {
+    queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+  }
+});
+await assert.rejects(
+  superviseGateChild(killFailureChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 1,
+    pollMs: 1,
+    snapshotProcessTree: () => identityTree(killFailureIdentities),
+    readProcessIdentity(pid) {
+      const identity = killFailureIdentities.find(item => item.pid === pid);
+      return identity && killFailureAlive.has(identity.processGroup)
+        ? identity
+        : null;
+    },
+    killProcessGroup(group) {
+      killFailureEvents.push(group);
+      if (group === 941) throw new Error("kill denied");
+      killFailureAlive.delete(group);
+    },
+  }),
+  error =>
+    assertCleanupFailure(error, "gate_characterization_timeout", [
+      "gate_characterization_descendant_kill_failed",
+      "gate_characterization_descendant_survived",
+    ]),
+);
+assert.deepEqual(killFailureEvents, [941, 942]);
+
+let raceSettlements = 0;
+const raceChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGTERM") {
+    queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+  }
+});
+const raceResult = superviseGateChild(raceChild, {
+  timeoutMs: 0,
+  maxOutputBytes: 1,
+  termGraceMs: 10,
+  killGraceMs: 1,
+  pollMs: 1,
+  snapshotProcessTree: () => identityTree([]),
+  readProcessIdentity: () => null,
+  killProcessGroup() {},
+}).then(
+  () => {
+    raceSettlements += 1;
+  },
+  error => {
+    raceSettlements += 1;
+    throw error;
+  },
+);
+raceChild.stdout.write(Buffer.alloc(2));
+await assert.rejects(raceResult, /gate_characterization_output_limit/);
+await wait(5);
+assert.equal(raceSettlements, 1);
+
+const lateGroupSignals = [];
+const lateIdentity = processIdentity({ pid: 9811, processGroup: 981 });
+const lateRootIdentity = processIdentity({
+  pid: 800,
+  parentPid: process.pid,
+  processGroup: 800,
+});
+let lateSnapshotCalls = 0;
+let lateIdentityAlive = true;
+const lateDescendantChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGKILL") {
+    queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+  }
+});
+await assert.rejects(
+  superviseGateChild(lateDescendantChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 10,
+    pollMs: 1,
+    snapshotProcessTree() {
+      lateSnapshotCalls += 1;
+      return {
+        root: lateRootIdentity,
+        descendants: lateSnapshotCalls === 1 ? [] : [lateIdentity],
+      };
+    },
+    readProcessIdentity(pid) {
+      if (pid === lateRootIdentity.pid) return lateRootIdentity;
+      return pid === lateIdentity.pid && lateIdentityAlive ? lateIdentity : null;
+    },
+    killProcessGroup(group, signal) {
+      lateGroupSignals.push([group, signal]);
+      lateIdentityAlive = false;
+    },
+  }),
+  /gate_characterization_timeout/,
+);
+assert.equal(lateSnapshotCalls, 2);
+assert.deepEqual(lateGroupSignals, [[981, "SIGKILL"]]);
+
+const reusedGroupSignals = [];
+const capturedIdentity = processIdentity({
+  pid: 9911,
+  processGroup: 991,
+  session: 991,
+  startTime: "captured-start",
+});
+const reusedIdentity = {
+  ...capturedIdentity,
+  session: 1991,
+  startTime: "reused-start",
+};
+const reusedRootIdentity = processIdentity({
+  pid: 800,
+  parentPid: process.pid,
+  processGroup: 800,
+});
+const reusedGroupChild = fakeCharacterizationChild((signal, child) => {
+  if (signal === "SIGKILL") {
+    queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+  }
+});
+await assert.rejects(
+  superviseGateChild(reusedGroupChild, {
+    timeoutMs: 1,
+    maxOutputBytes: 1024,
+    termGraceMs: 1,
+    killGraceMs: 10,
+    pollMs: 1,
+    snapshotProcessTree: () => ({
+      root: reusedRootIdentity,
+      descendants: [capturedIdentity],
+    }),
+    readProcessIdentity(pid) {
+      if (pid === reusedRootIdentity.pid) return reusedRootIdentity;
+      return pid === capturedIdentity.pid ? reusedIdentity : null;
+    },
+    killProcessGroup(group, signal) {
+      reusedGroupSignals.push([group, signal]);
+    },
+  }),
+  /gate_characterization_timeout/,
+);
+assert.deepEqual(reusedGroupSignals, []);
 
 const namedCases = [
   [
@@ -478,17 +931,41 @@ assert.deepEqual([...contract.ALLOWED_ITEM_TYPES], [
   "agentMessage",
   "reasoning",
 ]);
+assert.equal(
+  contract.TOOL_SURFACE_PATTERN.source,
+  "tool|browser|computer|code_mode|image|app|plugin|shell|web_search|skill|mcp|artifact",
+);
+assert.equal(contract.TOOL_SURFACE_PATTERN.flags, "");
+assert.equal(
+  contract.FORBIDDEN_EVENT_PATTERN.source,
+  "command|file|mcp|dynamic.?tool|browser|computer|code.?mode|web.?search|image|app|plugin|shell|approval|collab",
+);
+assert.equal(contract.FORBIDDEN_EVENT_PATTERN.flags, "i");
+for (const pattern of [
+  contract.TOOL_SURFACE_PATTERN,
+  contract.FORBIDDEN_EVENT_PATTERN,
+]) {
+  assert.equal(Object.isFrozen(pattern), true);
+  assert.throws(() => {
+    pattern.test = () => false;
+  });
+  assert.throws(() => {
+    pattern.lastIndex = 1;
+  });
+  assert.throws(() => pattern.compile("never-match", ""));
+  assert.throws(() => RegExp.prototype.compile.call(pattern, "never-match"));
+}
 for (const name of ["browser_use", "shell_tool", "artifact"]) {
-  assert.match(name, contract.TOOL_SURFACE_PATTERN);
+  assert.equal(contract.TOOL_SURFACE_PATTERN.test(name), true);
 }
 for (const name of ["remote_compaction_v2", "telemetry"]) {
-  assert.doesNotMatch(name, contract.TOOL_SURFACE_PATTERN);
+  assert.equal(contract.TOOL_SURFACE_PATTERN.test(name), false);
 }
 for (const eventName of ["command/started", "dynamic-tool", "collab/event"]) {
-  assert.match(eventName, contract.FORBIDDEN_EVENT_PATTERN);
+  assert.equal(contract.FORBIDDEN_EVENT_PATTERN.test(eventName), true);
 }
 for (const eventName of ["turn/started", "agentMessage", "reasoning"]) {
-  assert.doesNotMatch(eventName, contract.FORBIDDEN_EVENT_PATTERN);
+  assert.equal(contract.FORBIDDEN_EVENT_PATTERN.test(eventName), false);
 }
 
 assert.equal(Object.isFrozen(contract.REQUIRED_SCHEMA_DEFINITIONS), true);

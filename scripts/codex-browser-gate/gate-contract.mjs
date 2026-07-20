@@ -170,18 +170,59 @@ function readonlySet(source) {
   return Object.freeze(facade);
 }
 
+function readonlyRegExp(pattern) {
+  const source = pattern.source;
+  const flags = pattern.flags;
+  const create = () => new RegExp(source, flags);
+  return Object.freeze({
+    source,
+    flags,
+    global: pattern.global,
+    ignoreCase: pattern.ignoreCase,
+    multiline: pattern.multiline,
+    dotAll: pattern.dotAll,
+    unicode: pattern.unicode,
+    sticky: pattern.sticky,
+    hasIndices: pattern.hasIndices,
+    unicodeSets: pattern.unicodeSets,
+    lastIndex: 0,
+    test(value) {
+      return create().test(value);
+    },
+    exec(value) {
+      return create().exec(value);
+    },
+    toString() {
+      return pattern.toString();
+    },
+    [Symbol.match](value) {
+      return create()[Symbol.match](value);
+    },
+    [Symbol.matchAll](value) {
+      return create()[Symbol.matchAll](value);
+    },
+    [Symbol.replace](value, replacement) {
+      return create()[Symbol.replace](value, replacement);
+    },
+    [Symbol.search](value) {
+      return create()[Symbol.search](value);
+    },
+    [Symbol.split](value, limit) {
+      return create()[Symbol.split](value, limit);
+    },
+  });
+}
+
 export const REVIEWED_ENABLED_NON_TOOL_FEATURES = readonlyMap(
   reviewedEnabledNonToolFeatures,
 );
 
 const toolSurfacePattern =
   /tool|browser|computer|code_mode|image|app|plugin|shell|web_search|skill|mcp|artifact/;
-export const TOOL_SURFACE_PATTERN = new RegExp(
-  toolSurfacePattern.source,
-  toolSurfacePattern.flags,
+export const TOOL_SURFACE_PATTERN = readonlyRegExp(toolSurfacePattern);
+export const FORBIDDEN_EVENT_PATTERN = readonlyRegExp(
+  /command|file|mcp|dynamic.?tool|browser|computer|code.?mode|web.?search|image|app|plugin|shell|approval|collab/i,
 );
-export const FORBIDDEN_EVENT_PATTERN =
-  /command|file|mcp|dynamic.?tool|browser|computer|code.?mode|web.?search|image|app|plugin|shell|approval|collab/i;
 const allowedItemTypes = new Set([
   "userMessage",
   "agentMessage",
