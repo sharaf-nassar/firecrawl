@@ -4,7 +4,7 @@
 
 **Goal:** Prove installed Codex app-server can complete a deterministic two-turn structured-action loop, then add the disabled-by-default PostgreSQL action ledger, replay-envelope, checkpoint, ZDR, recovery, and retention foundation needed by local Browser Interact.
 
-**Architecture:** Gate zero drives one pinned Codex app-server 0.144.5 process and one ephemeral thread through two `turn/start` requests with a strict fill-only `ModelDecisionEnvelopeV1` output schema and no MCP or model tools. The host validates distinct model-wire types, normalizes them into unchanged internal `ModelDecisionV1`, executes the proposed side effect once, caches matching callback replay, and rejects mismatches before durable work begins. PostgreSQL then becomes authoritative for browser sessions, runs, execute-once actions, profiles, capabilities, proxy grants, replay envelopes, and checkpoint metadata. The existing stateless Playwright service exports a bounded post-scrape checkpoint before closing its context; the API stores sensitive state atomically on an owner-restricted volume and cleans it before request retention deletes database rows.
+**Architecture:** Gate zero drives one pinned Codex app-server 0.144.5 process and one ephemeral thread through two `turn/start` requests with the full production `ModelDecisionEnvelopeV1` wire schema and no MCP or model tools; its prompt and assertions deterministically select one fill variant. The host validates distinct model-wire types, normalizes them into unchanged internal `ModelDecisionV1`, executes the proposed side effect once, caches matching callback replay, and rejects mismatches before durable work begins. PostgreSQL then becomes authoritative for browser sessions, runs, execute-once actions, profiles, capabilities, proxy grants, replay envelopes, and checkpoint metadata. The existing stateless Playwright service exports a bounded post-scrape checkpoint before closing its context; the API stores sensitive state atomically on an owner-restricted volume and cleans it before request retention deletes database rows.
 
 **Tech Stack:** Codex CLI app-server 0.144.5 V2 JSON-RPC over stdio, JSON Schema Draft 7, TypeScript, Zod, Drizzle ORM, PostgreSQL 17, Playwright 1.58.1, Vitest, Docker Compose.
 
@@ -522,11 +522,68 @@ const closed = properties => ({
   additionalProperties: false,
 });
 
-const gateModelWireFillSchema = closed({
-  kind: { const: "fill" },
-  ref: { const: "gate-marker" },
-  value: { const: "approved" },
-});
+const modelWireBrowserOperationV1Schema = {
+  anyOf: [
+    closed({ kind: { const: "snapshot" } }),
+    closed({
+      kind: { const: "click" },
+      ref: { type: "string", minLength: 1, maxLength: 128 },
+    }),
+    closed({
+      kind: { const: "fill" },
+      ref: { type: "string", minLength: 1, maxLength: 128 },
+      value: { type: "string", maxLength: 20000 },
+    }),
+    closed({
+      kind: { const: "type" },
+      ref: { type: "string", minLength: 1, maxLength: 128 },
+      value: { type: "string", maxLength: 20000 },
+      delayMs: { type: "integer", minimum: 0, maximum: 250 },
+    }),
+    closed({
+      kind: { const: "press" },
+      ref: { type: "string", minLength: 1, maxLength: 128 },
+      key: { type: "string", minLength: 1, maxLength: 64 },
+    }),
+    closed({
+      kind: { const: "select" },
+      ref: { type: "string", minLength: 1, maxLength: 128 },
+      values: {
+        type: "array",
+        items: { type: "string", maxLength: 512 },
+        maxItems: 20,
+      },
+    }),
+    closed({
+      kind: { const: "scroll" },
+      deltaX: { type: "integer", minimum: -10000, maximum: 10000 },
+      deltaY: { type: "integer", minimum: -10000, maximum: 10000 },
+    }),
+    closed({
+      kind: { const: "wait" },
+      milliseconds: { type: "integer", minimum: 0, maximum: 30000 },
+    }),
+    closed({
+      kind: { const: "get_text" },
+      ref: {
+        anyOf: [
+          { type: "string", minLength: 1, maxLength: 128 },
+          { type: "null" },
+        ],
+      },
+    }),
+    closed({ kind: { const: "get_url" } }),
+    closed({
+      kind: { const: "navigate" },
+      url: { type: "string", maxLength: 8192 },
+    }),
+    closed({
+      kind: { const: "evaluate" },
+      expression: { type: "string", maxLength: 20000 },
+      args: closed({}),
+    }),
+  ],
+};
 
 const modelDecisionEnvelopeSchema = closed({
   decision: {
@@ -534,7 +591,7 @@ const modelDecisionEnvelopeSchema = closed({
       closed({
         version: { const: 1 },
         type: { const: "action" },
-        action: gateModelWireFillSchema,
+        action: modelWireBrowserOperationV1Schema,
       }),
       closed({
         version: { const: 1 },
@@ -563,14 +620,15 @@ function normalizeModelDecisionEnvelopeV1(envelope) {
 ```
 
 The root is the closed object `{ decision: ... }`; it never contains `anyOf`.
-The decision union is nested and every defined property is required. This
-Gate-only schema deliberately accepts one exact fill operation. It does not
-reuse either the production `ModelWireBrowserOperationV1` schema or the trusted
-internal `browserOperationSchema`. Reject schema or semantic mismatches as
-`model_protocol_error`; do not flatten action/output fields or fall back to
-unconstrained JSON. The Gate-local normalizer covers only its validated
-fill/final subset; the host plan implements exhaustive production wire
-normalization.
+The action/final decision union and full operation union are nested. Every
+operation is closed and requires every defined field. Wire `get_text.ref` is
+required nullable, and wire `evaluate.args` is a required closed empty object.
+This is the production `ModelWireBrowserOperationV1` schema, not the trusted
+internal `browserOperationSchema`. The deterministic prompt and exact assertion
+select the fill operation before the Gate-local fill/final normalizer runs.
+Reject schema or semantic mismatches as `model_protocol_error`; do not flatten
+action/output fields or fall back to unconstrained JSON. The host plan
+implements exhaustive production wire normalization.
 
 Reject duplicate response IDs, unknown response IDs, malformed JSON, server
 requests, `error` notifications, multiple completed agent messages per turn,
@@ -593,9 +651,9 @@ Return exactly {"decision":{"version":1,"type":"action","action":{"kind":"fill",
 ```
 
 Require the completed `agentMessage.text` to parse as the exact wrapped action
-object. Strictly validate the fill-only `ModelDecisionEnvelopeV1`, then call
-`normalizeModelDecisionEnvelopeV1` and only then use unchanged
-`ModelDecisionV1`.
+object. Strictly validate the full `ModelDecisionEnvelopeV1`, require the exact
+selected fill variant, then call `normalizeModelDecisionEnvelopeV1` and only
+then use unchanged `ModelDecisionV1`.
 Lock the wire and internal boundaries with these exact assertions:
 
 ```js
