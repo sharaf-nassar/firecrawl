@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import * as contract from "./gate-contract.mjs";
 import * as decisionWire from "./decision-wire.mjs";
 import * as lifecycle from "./lifecycle.mjs";
+import * as protocol from "./app-server-protocol.mjs";
 import * as preflight from "./preflight.mjs";
 
 const { gateError, hashFeatureInventory } = contract;
@@ -1091,6 +1092,44 @@ assert.deepEqual(Object.keys(lifecycle).toSorted(), [
   "runLifecycleSelfTest",
   "surfaceCleanupFailures",
 ]);
+assert.deepEqual(Object.keys(protocol).toSorted(), [
+  "AppServerClient",
+  "assertGeneratedSchemaValue",
+  "assertNoLateTurnMessages",
+  "auditAllAppServerEvents",
+  "extractTurnAgentMessageText",
+  "loadEventSchemas",
+  "runProtocolHardeningSelfTest",
+  "runTransportSelfTest",
+  "runUnloadedTurnRegression",
+  "schemaHash",
+  "startTurn",
+]);
+assert.equal(Object.keys(protocol).length, 11);
+assert.equal(
+  protocol.assertGeneratedSchemaValue(1, { schema: { type: "integer" } }),
+  1,
+);
+assert.throws(
+  () =>
+    protocol.assertGeneratedSchemaValue(1.5, {
+      schema: { type: "integer" },
+    }),
+  /codex_protocol_schema_mismatch/,
+);
+const originalProtocolStdoutWrite = process.stdout.write;
+let protocolSelfTestOutput = "";
+process.stdout.write = chunk => {
+  protocolSelfTestOutput += String(chunk);
+  return true;
+};
+try {
+  await protocol.runProtocolHardeningSelfTest({ silent: true });
+  await protocol.runTransportSelfTest({ silent: true });
+} finally {
+  process.stdout.write = originalProtocolStdoutWrite;
+}
+assert.equal(protocolSelfTestOutput, "");
 assert.deepEqual(Object.keys(preflight).toSorted(), [
   "parseInvocation",
   "runPreflight",
