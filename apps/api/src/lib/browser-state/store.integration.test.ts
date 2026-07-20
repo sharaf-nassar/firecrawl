@@ -366,7 +366,21 @@ describeWithDatabase("durable browser state store", () => {
       },
     });
     const replay = await store.prepareBrowserAction(run.id, action);
+    const terminalRetry = await store.completeBrowserAction({
+      runId: run.id,
+      actionId: action.actionId,
+      proposalHash: action.proposalHash,
+      outcome: "succeeded",
+      result: null,
+      page: {
+        url: "https://example.com/empty",
+        title: "Empty",
+        snapshotExcerpt: "",
+      },
+    });
     expect(replay).toEqual({ kind: "cached", observation: original });
+    expect(terminalRetry).toEqual(original);
+    expect(terminalRetry).toHaveProperty("result", null);
     expect(original).toHaveProperty("result", null);
   });
 
