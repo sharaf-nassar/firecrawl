@@ -430,6 +430,9 @@ function materializeTransportValue(value) {
     if (!Number.isFinite(materialized)) {
       throw gateError("codex_protocol_schema_mismatch");
     }
+    if (compareExactNumbers(value, materialized) !== 0) {
+      throw gateError("codex_protocol_schema_mismatch");
+    }
     return materialized;
   }
   if (Array.isArray(value)) return value.map(materializeTransportValue);
@@ -448,7 +451,11 @@ function materializeTransportValue(value) {
   return value;
 }
 
-function generatedSchemaMatches(value, schema, rootSchema) {
+const GENERATED_SCHEMA_RECURSION_BUDGET = 256;
+
+function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
+  if (remainingDepth <= 0) return false;
+  const nextDepth = remainingDepth - 1;
   if (schema === true) return true;
   if (schema === false || schema === null || typeof schema !== "object") {
     return false;
@@ -460,24 +467,32 @@ function generatedSchemaMatches(value, schema, rootSchema) {
       .replaceAll("~1", "/")
       .replaceAll("~0", "~");
     const target = rootSchema.definitions?.[name];
-    return target !== undefined && generatedSchemaMatches(value, target, rootSchema);
+    return (
+      target !== undefined &&
+      generatedSchemaMatches(value, target, rootSchema, nextDepth)
+    );
   }
   if (
     schema.allOf &&
-    !schema.allOf.every(part => generatedSchemaMatches(value, part, rootSchema))
+    !schema.allOf.every(part =>
+      generatedSchemaMatches(value, part, rootSchema, nextDepth),
+    )
   ) {
     return false;
   }
   if (
     schema.anyOf &&
-    !schema.anyOf.some(part => generatedSchemaMatches(value, part, rootSchema))
+    !schema.anyOf.some(part =>
+      generatedSchemaMatches(value, part, rootSchema, nextDepth),
+    )
   ) {
     return false;
   }
   if (
     schema.oneOf &&
-    schema.oneOf.filter(part => generatedSchemaMatches(value, part, rootSchema))
-      .length !== 1
+    schema.oneOf.filter(part =>
+      generatedSchemaMatches(value, part, rootSchema, nextDepth),
+    ).length !== 1
   ) {
     return false;
   }
@@ -532,7 +547,9 @@ function generatedSchemaMatches(value, schema, rootSchema) {
     }
     if (
       schema.items &&
-      !value.every(item => generatedSchemaMatches(item, schema.items, rootSchema))
+      !value.every(item =>
+        generatedSchemaMatches(item, schema.items, rootSchema, nextDepth),
+      )
     ) {
       return false;
     }
@@ -548,7 +565,14 @@ function generatedSchemaMatches(value, schema, rootSchema) {
     }
     for (const [key, item] of Object.entries(value)) {
       if (schema.properties && Object.hasOwn(schema.properties, key)) {
-        if (!generatedSchemaMatches(item, schema.properties[key], rootSchema)) {
+        if (
+          !generatedSchemaMatches(
+            item,
+            schema.properties[key],
+            rootSchema,
+            nextDepth,
+          )
+        ) {
           return false;
         }
       } else if (schema.additionalProperties === false) {
@@ -556,7 +580,12 @@ function generatedSchemaMatches(value, schema, rootSchema) {
       } else if (
         schema.additionalProperties &&
         typeof schema.additionalProperties === "object" &&
-        !generatedSchemaMatches(item, schema.additionalProperties, rootSchema)
+        !generatedSchemaMatches(
+          item,
+          schema.additionalProperties,
+          rootSchema,
+          nextDepth,
+        )
       ) {
         return false;
       }
@@ -572,6 +601,7 @@ export function assertGeneratedSchemaValue(value, schemaSource) {
       value,
       schemaSource.schema,
       schemaSource.schema,
+      GENERATED_SCHEMA_RECURSION_BUDGET,
     )
   ) {
     throw gateError("codex_protocol_schema_mismatch");
@@ -671,12 +701,14 @@ export class AppServerClient {
   }) {
     this.eventsPath = eventsPath;
     this.supervisor = supervisor;
+    this.scheduleTimer = scheduleTimer;
     this.cancelTimer = cancelTimer;
     this.messages = [];
     this.pending = new Map();
     this.nextId = 1;
     this.stdoutBytes = 0;
     this.stderrBytes = 0;
+    this.stderrRetainedBytes = 0;
     this.stdoutLines = [];
     this.stderrChunks = [];
     this.failure = null;
@@ -708,7 +740,8 @@ export class AppServerClient {
       this.resolveClosed = resolve;
     });
     this.stdoutFramer = new RawJsonlFramer(line => {
-      this.stdoutLines.push(Buffer.concat([line, Buffer.from("\n")]));
+      const frame = Buffer.concat([line, Buffer.from("\n")]);
+      this.stdoutLines.push(frame);
       this.handleLine(line);
     });
 
@@ -727,7 +760,7 @@ export class AppServerClient {
       this.cancelTimer(this.processWatchdog);
       this.closed = true;
       this.resolveClosed({ code, signal });
-      if (!this.stopping && !this.failure) {
+      if (!this.failure && (!this.stopping || this.pending.size > 0)) {
         this.fail(
           gateError(
             "codex_app_server_exited",
@@ -736,7 +769,7 @@ export class AppServerClient {
         );
       }
     });
-    this.processWatchdog = scheduleTimer(() => {
+    this.processWatchdog = this.scheduleTimer(() => {
       this.deadline.expire();
     }, this.deadline.remaining());
   }
@@ -760,7 +793,18 @@ export class AppServerClient {
 
   handleStderr(chunk) {
     this.stderrBytes += chunk.length;
-    this.stderrChunks.push(chunk);
+    if (!this.failure) {
+      const remaining =
+        MAX_OUTPUT_BYTES - this.stdoutBytes - this.stderrRetainedBytes;
+      if (remaining > 0) {
+        const retained =
+          chunk.length <= remaining
+            ? chunk
+            : Buffer.from(chunk.subarray(0, remaining));
+        this.stderrChunks.push(retained);
+        this.stderrRetainedBytes += retained.length;
+      }
+    }
     this.checkLimit();
   }
 
@@ -797,7 +841,7 @@ export class AppServerClient {
         return;
       }
       this.pending.delete(responseId);
-      clearTimeout(pending.watchdog);
+      this.cancelTimer(pending.watchdog);
       if (Object.hasOwn(message, "error")) {
         pending.reject(
           gateError("codex_response_error", JSON.stringify(message.error)),
@@ -826,16 +870,20 @@ export class AppServerClient {
   fail(error) {
     if (this.failure) return;
     this.failure = error;
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.watchdog);
-      pending.reject(error);
-    }
-    this.pending.clear();
+    this.#rejectPending(error);
     this.groupCleanupPromise ??= this.supervisor
       .terminateProcessGroup(this.pid, { graceful: false })
       .catch(cleanupError => {
         this.cleanupFailure = cleanupError;
       });
+  }
+
+  #rejectPending(error) {
+    for (const pending of this.pending.values()) {
+      this.cancelTimer(pending.watchdog);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   assertHealthy() {
@@ -848,10 +896,9 @@ export class AppServerClient {
     this.nextId += 1;
     const body = `${JSON.stringify({ id, method, params })}\n`;
     return new Promise((resolve, reject) => {
-      const watchdog = setTimeout(() => {
+      const watchdog = this.scheduleTimer(() => {
         const error = gateError("codex_app_server_timeout", method);
         this.fail(error);
-        reject(error);
       }, this.deadline.remaining());
       this.pending.set(id, { resolve, reject, watchdog });
       this.child.stdin.write(body, error => {
@@ -877,7 +924,17 @@ export class AppServerClient {
         }
       }
       const remaining = this.deadline.remaining();
-      await new Promise(resolve => setTimeout(resolve, Math.min(10, remaining)));
+      await new Promise(resolve => {
+        let timer;
+        let fired = false;
+        const finish = () => {
+          fired = true;
+          if (timer !== undefined) this.cancelTimer(timer);
+          resolve();
+        };
+        timer = this.scheduleTimer(finish, Math.min(10, remaining));
+        if (fired) this.cancelTimer(timer);
+      });
     }
   }
 
@@ -887,6 +944,14 @@ export class AppServerClient {
   }
 
   async stopOnce() {
+    if (this.pending.size > 0 && !this.failure) {
+      this.fail(
+        gateError(
+          "codex_app_server_exited",
+          `stopped with pending requests=${this.pending.size}`,
+        ),
+      );
+    }
     if (!this.stopping) {
       this.stopping = true;
       this.cancelTimer(this.processWatchdog);
@@ -899,12 +964,21 @@ export class AppServerClient {
       gracefulWaitMs = 0;
     }
     if (!this.closed && gracefulWaitMs > 0) {
-      await Promise.race([
-        this.closedPromise.then(() => true),
-        new Promise(resolve => setTimeout(resolve, gracefulWaitMs)).then(
-          () => false,
-        ),
-      ]);
+      await new Promise(resolve => {
+        let settled = false;
+        let gracefulTimer;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (gracefulTimer !== undefined) {
+            this.cancelTimer(gracefulTimer);
+          }
+          resolve();
+        };
+        gracefulTimer = this.scheduleTimer(finish, gracefulWaitMs);
+        if (settled) this.cancelTimer(gracefulTimer);
+        this.closedPromise.then(finish);
+      });
     }
     this.groupCleanupPromise ??= this.supervisor
       .terminateProcessGroup(this.pid, { graceful: this.closed })
@@ -925,6 +999,7 @@ export class AppServerClient {
       this.fail(error);
     }
     if (this.cleanupFailure) throw this.cleanupFailure;
+    if (this.failure) throw this.failure;
   }
 
   async storeEvents() {
@@ -1124,6 +1199,13 @@ export function auditAllAppServerEvents(messages, knownTurns) {
     const hasNestedThreadId = Object.hasOwn(params?.thread ?? {}, "id");
     const hasTurnId = Object.hasOwn(params ?? {}, "turnId");
     const hasNestedTurnId = Object.hasOwn(params?.turn ?? {}, "id");
+    if (
+      message.method.startsWith("turn/") &&
+      !hasTurnId &&
+      !hasNestedTurnId
+    ) {
+      throw gateError("model_protocol_error");
+    }
     let threadId;
     if (hasThreadId || hasNestedThreadId) {
       const directThreadId = hasThreadId ? params.threadId : undefined;
@@ -1357,6 +1439,65 @@ export async function runProtocolHardeningSelfTest({
       }),
     /codex_protocol_schema_mismatch/,
   );
+  const selfRecursiveSchema = {
+    schema: {
+      $ref: "#/definitions/Node",
+      definitions: { Node: { $ref: "#/definitions/Node" } },
+    },
+  };
+  assert.throws(
+    () => assertGeneratedSchemaValue({}, selfRecursiveSchema),
+    error =>
+      !(error instanceof RangeError) &&
+      error?.code === "codex_protocol_schema_mismatch",
+  );
+  const mutualRecursiveSchema = {
+    schema: {
+      $ref: "#/definitions/Left",
+      definitions: {
+        Left: { $ref: "#/definitions/Right" },
+        Right: { $ref: "#/definitions/Left" },
+      },
+    },
+  };
+  assert.throws(
+    () => assertGeneratedSchemaValue({}, mutualRecursiveSchema),
+    error =>
+      !(error instanceof RangeError) &&
+      error?.code === "codex_protocol_schema_mismatch",
+  );
+  const finiteRecursiveSchema = {
+    schema: {
+      $ref: "#/definitions/Node",
+      definitions: {
+        Node: {
+          anyOf: [
+            { type: "null" },
+            {
+              type: "object",
+              required: ["next"],
+              properties: { next: { $ref: "#/definitions/Node" } },
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+    },
+  };
+  const recursiveValue = depth => {
+    let value = null;
+    for (let index = 0; index < depth; index += 1) value = { next: value };
+    return value;
+  };
+  assert.deepEqual(
+    assertGeneratedSchemaValue(recursiveValue(32), finiteRecursiveSchema),
+    recursiveValue(32),
+  );
+  assert.throws(
+    () =>
+      assertGeneratedSchemaValue(recursiveValue(300), finiteRecursiveSchema),
+    /codex_protocol_schema_mismatch/,
+  );
   const knownTurns = [
     { threadId: "thread-audit", turnId: "turn-audit", completedIndex: 1 },
   ];
@@ -1451,6 +1592,33 @@ export async function runProtocolHardeningSelfTest({
     () => auditAllAppServerEvents(postTerminal, twoKnownTurns),
     /model_protocol_error/,
   );
+  const preterminalMissingTurnId = [
+    {
+      method: "turn/progress",
+      params: { threadId: "thread-audit" },
+    },
+    ...structuredClone(cleanAudit),
+  ];
+  assert.throws(
+    () =>
+      auditAllAppServerEvents(preterminalMissingTurnId, [
+        {
+          threadId: "thread-audit",
+          turnId: "turn-audit",
+          completedIndex: 2,
+        },
+      ]),
+    /model_protocol_error/,
+  );
+  const postTerminalMissingTurnId = structuredClone(cleanAudit);
+  postTerminalMissingTurnId.push({
+    method: "turn/progress",
+    params: { threadId: "thread-audit" },
+  });
+  assert.throws(
+    () => auditAllAppServerEvents(postTerminalMissingTurnId, knownTurns),
+    /model_protocol_error/,
+  );
   const unknownNestedThread = structuredClone(twoCleanTurns);
   unknownNestedThread[5].params.thread.id = "thread-unknown";
   assert.throws(
@@ -1462,6 +1630,129 @@ export async function runProtocolHardeningSelfTest({
   assert.throws(
     () => auditAllAppServerEvents(conflictingNestedThread, twoKnownTurns),
     /model_protocol_error/,
+  );
+  const injectedOutputSchema = {
+    type: "object",
+    properties: { answer: { type: "string" } },
+    required: ["answer"],
+    additionalProperties: false,
+  };
+  const completedParams = {
+    threadId: "thread-start",
+    turn: {
+      id: "turn-start",
+      status: "completed",
+      error: null,
+      itemsView: "notLoaded",
+    },
+  };
+  const completedItemParams = {
+    threadId: "thread-start",
+    turnId: "turn-start",
+    item: { id: "agent-start", type: "agentMessage", text: "{}" },
+  };
+  const startEventSchemas = {
+    turnStartParams: {
+      schema: {
+        type: "object",
+        required: ["outputSchema"],
+        properties: { outputSchema: { const: injectedOutputSchema } },
+      },
+    },
+    turnCompleted: {
+      schema: {
+        type: "object",
+        required: ["threadId", "turn"],
+        properties: {
+          threadId: { const: "thread-start" },
+          turn: { type: "object" },
+        },
+      },
+    },
+    itemCompleted: {
+      schema: {
+        type: "object",
+        required: ["threadId", "turnId", "item"],
+        properties: {
+          threadId: { const: "thread-start" },
+          turnId: { const: "turn-start" },
+          item: { type: "object" },
+        },
+      },
+    },
+  };
+  let requestedParams;
+  const startClient = {
+    messages: [],
+    async request(method, params) {
+      assert.equal(method, "turn/start");
+      requestedParams = params;
+      return { turn: { id: "turn-start" } };
+    },
+    async waitForNotification(method, predicate, startIndex) {
+      assert.equal(method, "turn/completed");
+      assert.equal(startIndex, 0);
+      const item = { method: "item/completed", params: completedItemParams };
+      const completed = { method, params: completedParams };
+      this.messages.push(item, completed);
+      assert.equal(predicate(completed.params), true);
+      return { message: completed, index: 1 };
+    },
+  };
+  const startedTurn = await startTurn(
+    startClient,
+    "thread-start",
+    "prompt",
+    startEventSchemas,
+    injectedOutputSchema,
+  );
+  assert.equal(requestedParams.outputSchema, injectedOutputSchema);
+  assert.equal(startedTurn.turn.id, "turn-start");
+  await assert.rejects(
+    startTurn(
+      { ...startClient, messages: [] },
+      "thread-start",
+      "prompt",
+      { ...startEventSchemas, turnStartParams: { schema: false } },
+      injectedOutputSchema,
+    ),
+    /codex_protocol_schema_mismatch/,
+  );
+  await assert.rejects(
+    startTurn(
+      {
+        ...startClient,
+        messages: [],
+        async request() {
+          return { turn: {} };
+        },
+      },
+      "thread-start",
+      "prompt",
+      startEventSchemas,
+      injectedOutputSchema,
+    ),
+    /codex_turn_start_malformed/,
+  );
+  await assert.rejects(
+    startTurn(
+      { ...startClient, messages: [] },
+      "thread-start",
+      "prompt",
+      { ...startEventSchemas, turnCompleted: { schema: false } },
+      injectedOutputSchema,
+    ),
+    /codex_protocol_schema_mismatch/,
+  );
+  await assert.rejects(
+    startTurn(
+      { ...startClient, messages: [] },
+      "thread-start",
+      "prompt",
+      { ...startEventSchemas, itemCompleted: { schema: false } },
+      injectedOutputSchema,
+    ),
+    /codex_protocol_schema_mismatch/,
   );
   if (!silent) process.stdout.write("codex_browser_format_hardening: PASS\n");
 }
@@ -1485,6 +1776,20 @@ export async function runTransportSelfTest({ silent = false } = {}) {
     }),
     0.1,
   );
+  for (const raw of [
+    "9007199254740991.5",
+    "9007199254740990.5",
+    "0.100000000000000005",
+  ]) {
+    const value = parseAppServerMessage(
+      Buffer.from(`{"method":"progress","params":{"value":${raw}}}`),
+    ).params.value;
+    assert.throws(
+      () =>
+        assertGeneratedSchemaValue(value, { schema: { type: "number" } }),
+      /codex_protocol_schema_mismatch/,
+    );
+  }
   const exactIntegerValue = parseAppServerMessage(
     Buffer.from('{"method":"progress","params":{"value":1.000e0}}'),
   ).params.value;
@@ -1627,7 +1932,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   client.stopping = true;
   child.emit("close", 0, null);
   client.stopping = false;
-  await client.stop();
+  await assert.rejects(client.stop(), /codex_response_id_invalid/);
   assert.equal(groupAlive, false);
 
   const appServerChild = pid => {
@@ -1647,6 +1952,201 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   const signalListenerCounts = ["SIGINT", "SIGTERM", "SIGHUP"].map(
     signal => process.listenerCount(signal),
   );
+
+  const boundedChild = appServerChild(604);
+  let boundedGroupAlive = true;
+  const boundedRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -604);
+      if (signal === 0) {
+        if (!boundedGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      boundedGroupAlive = false;
+    },
+  });
+  const boundedTimers = new Set();
+  const boundedClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events-bounded",
+    spawnChild: () => boundedChild,
+    supervisor: boundedRegistry,
+    scheduleTimer() {
+      const handle = Symbol("bounded-watchdog");
+      boundedTimers.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      boundedTimers.delete(handle);
+    },
+  });
+  boundedChild.stderr.emit("data", Buffer.alloc(MAX_OUTPUT_BYTES + 1));
+  boundedChild.stderr.emit("data", Buffer.alloc(4_096));
+  const boundedRetainedBytes =
+    Buffer.concat(boundedClient.stdoutLines).length +
+    Buffer.concat(boundedClient.stderrChunks).length;
+  assert.equal(boundedClient.stderrBytes, MAX_OUTPUT_BYTES + 4_097);
+  assert.equal(boundedRetainedBytes <= MAX_OUTPUT_BYTES, true);
+  assert.equal(boundedClient.failure?.code, "codex_output_limit");
+  boundedChild.stdout.end();
+  boundedChild.stderr.end();
+  boundedChild.emit("close", null, "SIGKILL");
+  await assert.rejects(
+    boundedClient.stop(),
+    /codex_output_limit/,
+  );
+  assert.equal(boundedGroupAlive, false);
+  assert.deepEqual(boundedTimers, new Set());
+
+  const pendingStopChild = appServerChild(605);
+  let pendingStopGroupAlive = true;
+  const pendingStopRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -605);
+      if (signal === 0) {
+        if (!pendingStopGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      pendingStopGroupAlive = false;
+    },
+  });
+  const pendingStopTimers = new Set();
+  const pendingStopClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events-pending-stop",
+    deadline: new ProcessDeadline(10, () => 0),
+    spawnChild: () => pendingStopChild,
+    supervisor: pendingStopRegistry,
+    scheduleTimer() {
+      const handle = Symbol("pending-stop-timer");
+      pendingStopTimers.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      pendingStopTimers.delete(handle);
+    },
+  });
+  const pendingStopRequest = pendingStopClient.request("pending-stop", {});
+  const pendingStopRejection = assert.rejects(
+    pendingStopRequest,
+    /codex_app_server_exited/,
+  );
+  const pendingStop = pendingStopClient.stop();
+  queueMicrotask(() => {
+    pendingStopChild.stdout.end();
+    pendingStopChild.stderr.end();
+    pendingStopChild.emit("close", null, "SIGKILL");
+  });
+  await pendingStopRejection;
+  await assert.rejects(pendingStop, /codex_app_server_exited/);
+  assert.equal(pendingStopClient.pending.size, 0);
+  assert.equal(pendingStopGroupAlive, false);
+  assert.deepEqual(pendingStopTimers, new Set());
+
+  const closePendingChild = appServerChild(606);
+  let closePendingGroupAlive = true;
+  const closePendingRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -606);
+      if (signal === 0) {
+        if (!closePendingGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      closePendingGroupAlive = false;
+    },
+  });
+  const closePendingTimers = new Set();
+  const closePendingClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events-close-pending",
+    deadline: new ProcessDeadline(10, () => 0),
+    spawnChild: () => closePendingChild,
+    supervisor: closePendingRegistry,
+    scheduleTimer() {
+      const handle = Symbol("close-pending-timer");
+      closePendingTimers.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      closePendingTimers.delete(handle);
+    },
+  });
+  const closePendingStop = closePendingClient.stop();
+  const closePendingRequest = closePendingClient.request(
+    "close-during-stop",
+    {},
+  );
+  const closePendingRejection = assert.rejects(
+    closePendingRequest,
+    /codex_app_server_exited/,
+  );
+  closePendingChild.stdout.end();
+  closePendingChild.stderr.end();
+  closePendingChild.emit("close", 0, null);
+  await closePendingRejection;
+  await assert.rejects(closePendingStop, /codex_app_server_exited/);
+  assert.equal(closePendingClient.pending.size, 0);
+  assert.equal(closePendingGroupAlive, false);
+  assert.deepEqual(closePendingTimers, new Set());
+
+  const cleanStopChild = appServerChild(607);
+  let cleanStopGroupAlive = true;
+  const cleanStopRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -607);
+      if (signal === 0) {
+        if (!cleanStopGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      cleanStopGroupAlive = false;
+    },
+  });
+  const cleanStopTimers = new Set();
+  const cleanStopClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events-clean-stop",
+    deadline: new ProcessDeadline(10, () => 0),
+    spawnChild: () => cleanStopChild,
+    supervisor: cleanStopRegistry,
+    scheduleTimer() {
+      const handle = Symbol("clean-stop-timer");
+      cleanStopTimers.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      cleanStopTimers.delete(handle);
+    },
+  });
+  const cleanStop = cleanStopClient.stop();
+  queueMicrotask(() => {
+    cleanStopChild.stdout.end();
+    cleanStopChild.stderr.end();
+    cleanStopChild.emit("close", 0, null);
+  });
+  await cleanStop;
+  assert.equal(cleanStopChild.stdin.ended, true);
+  assert.equal(cleanStopGroupAlive, false);
+  assert.deepEqual(cleanStopTimers, new Set());
 
   let expiredNow = 0;
   const expiredDeadline = new ProcessDeadline(1, () => expiredNow);
@@ -1742,13 +2242,17 @@ export async function runTransportSelfTest({ silent = false } = {}) {
     deadline: new ProcessDeadline(1, () => 2),
     spawnChild: () => retainedChild,
     supervisor: retainedRegistry,
-    scheduleTimer() {
-      const handle = Symbol("retained-watchdog");
+    scheduleTimer(callback) {
+      const handle = setImmediate(() => {
+        retainedWatchdogs.delete(handle);
+        callback();
+      });
       retainedWatchdogs.add(handle);
       return handle;
     },
     cancelTimer(handle) {
       retainedWatchdogs.delete(handle);
+      clearImmediate(handle);
     },
   });
   await assert.rejects(
