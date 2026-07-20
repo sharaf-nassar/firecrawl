@@ -60,14 +60,57 @@ function source(
 }
 
 function checkpoint(
-  overrides: Partial<StoredReplayCheckpoint> = {},
+  overrides: Record<string, unknown> = {},
 ): StoredReplayCheckpoint {
   return {
     version: 1,
     statePath: "replay/owner/scrape/state.json",
     storageState: {
-      cookies: [{ name: "session", value: "checkpoint-secret" }],
-      origins: [{ origin: "https://example.com", localStorage: [] }],
+      cookies: [
+        {
+          name: "session",
+          value: "checkpoint-secret",
+          domain: ".example.com",
+          path: "/",
+          expires: 2_000_000_000,
+          httpOnly: true,
+          secure: true,
+          sameSite: "Lax",
+        },
+      ],
+      origins: [
+        {
+          origin: "https://example.com",
+          localStorage: [{ name: "theme", value: "dark" }],
+          indexedDB: [
+            {
+              name: "auth",
+              version: 1,
+              stores: [
+                {
+                  name: "tokens",
+                  autoIncrement: false,
+                  keyPath: "id",
+                  records: [
+                    {
+                      key: "primary",
+                      value: { token: "idb-secret" },
+                    },
+                  ],
+                  indexes: [
+                    {
+                      name: "by-user",
+                      keyPath: "userId",
+                      multiEntry: false,
+                      unique: true,
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
     },
     finalUrl: "https://example.com/products/42",
     fingerprint: {
@@ -78,7 +121,7 @@ function checkpoint(
     checksum: "c".repeat(64),
     byteSize: 321,
     ...overrides,
-  };
+  } as StoredReplayCheckpoint;
 }
 
 describe("replay envelope normalization", () => {
@@ -334,6 +377,59 @@ describe("replay envelope normalization", () => {
     });
   });
 
+  it("validates HTTP headers, locales, timezones, and proxy countries", () => {
+    const result = normalizeReplayEnvelope(
+      source({
+        browserSettings: {
+          ...allBrowserSettings,
+          headers: {
+            "bad header": "value",
+            "X-Bad-Value": "line one\nline two",
+          },
+          locale: "en_US",
+          timezoneId: "Mars/Olympus_Mons",
+          location: { country: "ca", languages: ["fr-CA", "not_a_locale"] },
+          proxy: {
+            kind: "stealth",
+            country: "canada",
+            credentialRef: "proxy-credential:7",
+          },
+        },
+      }),
+    );
+    expect(result).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: [
+        "browserSettings.headers.bad header",
+        "browserSettings.headers.X-Bad-Value",
+        "browserSettings.locale",
+        "browserSettings.location.languages.1",
+        "browserSettings.proxy.country",
+        "browserSettings.timezoneId",
+      ],
+    });
+  });
+
+  it("rejects invalid option header tokens and values by field", () => {
+    expect(
+      normalizeReplayEnvelope(
+        source({
+          options: {
+            headers: {
+              "bad header": "value",
+              "X-Bad-Value": "one\ntwo",
+            },
+          },
+        }),
+      ),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["headers.bad header", "headers.X-Bad-Value"],
+    });
+  });
+
   it("rejects credentials embedded in target URLs without echoing them", () => {
     const result = normalizeReplayEnvelope(
       source({ url: "https://proxy-user:proxy-password@example.com/private" }),
@@ -364,6 +460,49 @@ describe("replay envelope normalization", () => {
       fields: ["browserSettings.proxy.credentialRef"],
     });
     expect(JSON.stringify(result)).not.toContain("proxy-password");
+  });
+
+  it("requires concrete credential refs and never echoes secret-shaped refs", () => {
+    const secretRef = "proxy-credential:proxy-password";
+    const result = normalizeReplayEnvelope(
+      source({
+        browserSettings: {
+          ...allBrowserSettings,
+          proxy: { kind: "basic", credentialRef: secretRef },
+        },
+      }),
+    );
+    expect(result).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["browserSettings.proxy.credentialRef"],
+    });
+    expect(JSON.stringify(result)).not.toContain(secretRef);
+    expect(
+      normalizeReplayEnvelope(
+        source({
+          browserSettings: {
+            ...allBrowserSettings,
+            proxy: {
+              kind: "basic",
+              credentialRef: "proxy-credential:opaque_7.1",
+            },
+          },
+        }),
+      ).kind,
+    ).toBe("ok");
+  });
+
+  it.each([
+    "http://localhost/path",
+    "http://127.0.0.1/path",
+    "https://internal/path",
+  ])("rejects a non-public retained target host: %s", url => {
+    expect(normalizeReplayEnvelope(source({ url }))).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["url"],
+    });
   });
 });
 
@@ -485,6 +624,150 @@ describe("replay resolution", () => {
       category: "replay_unavailable",
       fields: ["checkpoint.checksum"],
     });
+  });
+
+  it.each([
+    [
+      {
+        cookies: [
+          {
+            name: "session",
+            value: "secret",
+            domain: ".example.com",
+            path: "/",
+            expires: 2_000_000_000,
+            httpOnly: true,
+            secure: true,
+            sameSite: "Lax",
+            futureCookieField: true,
+          },
+        ],
+        origins: [],
+      },
+      "checkpoint.storageState.cookies.0.futureCookieField",
+    ],
+    [
+      {
+        cookies: [],
+        origins: [
+          {
+            origin: "https://example.com",
+            localStorage: [{ name: "token", value: 7 }],
+          },
+        ],
+      },
+      "checkpoint.storageState.origins.0.localStorage.0.value",
+    ],
+    [
+      {
+        cookies: [],
+        origins: [
+          {
+            origin: "https://example.com",
+            localStorage: [],
+            indexedDB: [{ name: "auth", version: 1, stores: "not-an-array" }],
+          },
+        ],
+      },
+      "checkpoint.storageState.origins.0.indexedDB.0.stores",
+    ],
+  ])(
+    "rejects malformed Playwright storage state at %s",
+    (storageState, field) => {
+      expect(
+        resolveReplayEnvelope(
+          source({ checkpoint: checkpoint({ storageState }) }),
+        ),
+      ).toMatchObject({
+        kind: "error",
+        category: "replay_unavailable",
+        fields: [field],
+      });
+    },
+  );
+
+  it("collects checkpoint errors with malformed source fields", () => {
+    const result = resolveReplayEnvelope(
+      source({
+        callerOrigin: "",
+        options: { futureOption: true },
+        checkpoint: checkpoint({ checksum: "bad" }),
+      }),
+    );
+    expect(result).toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+      fields: ["callerOrigin", "checkpoint.checksum", "futureOption"],
+    });
+  });
+
+  it.each(["http://localhost/final", "https://internal/final"])(
+    "rejects a checkpoint with a non-public host: %s",
+    finalUrl => {
+      expect(
+        resolveReplayEnvelope(
+          source({
+            checkpoint: checkpoint({
+              finalUrl,
+              fingerprint: {
+                finalUrl,
+                titleSha256: "a".repeat(64),
+                bodyTextSha256: "b".repeat(64),
+              },
+            }),
+          }),
+        ),
+      ).toMatchObject({
+        kind: "error",
+        category: "replay_unavailable",
+        fields: ["checkpoint.finalUrl", "checkpoint.fingerprint.finalUrl"],
+      });
+    },
+  );
+
+  it("detaches and deep-freezes every returned replay DTO branch", () => {
+    const browserSettings = structuredClone(allBrowserSettings);
+    const storedCheckpoint = checkpoint();
+    const input = source({
+      options: { actions: [{ type: "wait", selector: "#ready" }] },
+      browserSettings,
+      checkpoint: storedCheckpoint,
+    });
+    const resolved = resolveReplayEnvelope(input);
+    expect(resolved.kind).toBe("checkpoint");
+    if (resolved.kind !== "checkpoint") return;
+
+    browserSettings.headers.Authorization = "mutated";
+    storedCheckpoint.storageState.cookies[0].value = "mutated";
+    storedCheckpoint.storageState.origins[0].localStorage[0].value = "mutated";
+
+    expect(resolved.envelope.browserSettings.headers.Authorization).toBe(
+      "Bearer retained-token",
+    );
+    expect(resolved.checkpoint.storageState.cookies[0].value).toBe(
+      "checkpoint-secret",
+    );
+    expect(
+      resolved.checkpoint.storageState.origins[0].localStorage[0].value,
+    ).toBe("dark");
+
+    const assertDeepFrozen = (value: unknown, seen = new WeakSet<object>()) => {
+      if (value === null || typeof value !== "object" || seen.has(value))
+        return;
+      seen.add(value);
+      expect(Object.isFrozen(value)).toBe(true);
+      for (const nested of Object.values(value)) assertDeepFrozen(nested, seen);
+    };
+    assertDeepFrozen(resolved);
+    assertDeepFrozen(
+      resolveReplayEnvelope(
+        source({ options: { actions: [{ type: "wait", milliseconds: 1 }] } }),
+      ),
+    );
+    assertDeepFrozen(normalizeReplayEnvelope(source()));
+    assertDeepFrozen(
+      normalizeReplayEnvelope(source({ options: { futureOption: true } })),
+    );
   });
 
   it("rejects checkpoint URL credentials without echoing them", () => {

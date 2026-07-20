@@ -1,6 +1,12 @@
+import { validateHeaderName, validateHeaderValue } from "node:http";
+import { isIP } from "node:net";
+
 import { z } from "zod";
 
-import type { BaseScrapeOptions } from "../../controllers/v2/types";
+import {
+  URL as requestUrlSchema,
+  type BaseScrapeOptions,
+} from "../../controllers/v2/types";
 import { countries } from "../validate-country";
 import { rewriteUrl } from "../../scraper/scrapeURL/lib/rewriteUrl";
 
@@ -96,13 +102,56 @@ export interface ReplayEnvelopeV1 {
   }>;
 }
 
+type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 /** @public */
 export interface StoredReplayCheckpoint {
   version: 1;
   statePath: string;
   storageState: {
-    cookies: Array<Record<string, unknown>>;
-    origins: Array<Record<string, unknown>>;
+    cookies: Array<{
+      name: string;
+      value: string;
+      domain: string;
+      path: string;
+      expires: number;
+      httpOnly: boolean;
+      secure: boolean;
+      sameSite: "Strict" | "Lax" | "None";
+    }>;
+    origins: Array<{
+      origin: string;
+      localStorage: Array<{ name: string; value: string }>;
+      indexedDB?: Array<{
+        name: string;
+        version: number;
+        stores: Array<{
+          name: string;
+          autoIncrement: boolean;
+          keyPath?: string;
+          keyPathArray?: string[];
+          records: Array<{
+            key?: JsonValue;
+            keyEncoded?: JsonValue;
+            value?: JsonValue;
+            valueEncoded?: JsonValue;
+          }>;
+          indexes: Array<{
+            name: string;
+            keyPath?: string;
+            keyPathArray?: string[];
+            multiEntry: boolean;
+            unique: boolean;
+          }>;
+        }>;
+      }>;
+    }>;
   };
   finalUrl: string;
   fingerprint: {
@@ -154,6 +203,55 @@ export type ReplayEnvelopeNormalization =
 const boundedString = (maximum: number) => z.string().min(1).max(maximum);
 const specialLocationCountries = new Set(["us-generic", "us-whitelist"]);
 
+function isLanguageTag(value: string): boolean {
+  try {
+    return Intl.getCanonicalLocales(value).length === 1;
+  } catch (error) {
+    if (error instanceof RangeError) return false;
+    throw error;
+  }
+}
+
+function isTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch (error) {
+    if (error instanceof RangeError) return false;
+    throw error;
+  }
+}
+
+const languageTagSchema = boundedString(128).refine(isLanguageTag);
+const timeZoneSchema = boundedString(256).refine(isTimeZone);
+
+const headersSchema = z
+  .record(z.string(), z.string())
+  .superRefine((headers, context) => {
+    for (const [name, value] of Object.entries(headers)) {
+      try {
+        validateHeaderName(name);
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+        context.addIssue({
+          code: "custom",
+          path: [name],
+          message: "Invalid header name",
+        });
+      }
+      try {
+        validateHeaderValue(name, value);
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+        context.addIssue({
+          code: "custom",
+          path: [name],
+          message: "Invalid header value",
+        });
+      }
+    }
+  });
+
 function isSupportedLocationCountry(value: string): boolean {
   return (
     Object.hasOwn(countries, value.toUpperCase()) ||
@@ -181,11 +279,11 @@ const viewportSchema = z.strictObject({
 
 const locationSchema = z.strictObject({
   country: retainedLocationCountrySchema,
-  languages: z.array(boundedString(128)).max(32),
+  languages: z.array(languageTagSchema).max(32),
 });
 
 const browserSettingsSchema = z.strictObject({
-  headers: z.record(z.string(), z.string()),
+  headers: headersSchema,
   cookies: z
     .array(
       z.strictObject({
@@ -203,8 +301,8 @@ const browserSettingsSchema = z.strictObject({
   viewport: viewportSchema,
   deviceName: boundedString(256).optional(),
   userAgent: boundedString(4_096),
-  locale: boundedString(128),
-  timezoneId: boundedString(256).optional(),
+  locale: languageTagSchema,
+  timezoneId: timeZoneSchema.optional(),
   geolocation: z
     .strictObject({
       latitude: z.number().finite().min(-90).max(90),
@@ -215,10 +313,16 @@ const browserSettingsSchema = z.strictObject({
   location: locationSchema,
   proxy: z.strictObject({
     kind: z.enum(["basic", "stealth", "enhanced", "auto"]),
-    country: boundedString(64).optional(),
+    country: retainedLocationCountrySchema.optional(),
     credentialRef: z
       .string()
-      .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,1023}$/)
+      .regex(/^proxy-credential:[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/)
+      .refine(value => {
+        const opaqueId = value.slice("proxy-credential:".length);
+        return !/(?:^|[._-])(?:password|passwd|secret|token|user|username)(?:$|[._-])/i.test(
+          opaqueId,
+        );
+      })
       .optional(),
   }),
   skipTlsVerification: z.boolean(),
@@ -331,14 +435,14 @@ const optionPolicies = {
 const knownOptionKeys = new Set<string>(Object.keys(optionPolicies));
 
 const optionsSchema = z.strictObject({
-  headers: z.record(z.string(), z.string()).optional(),
+  headers: headersSchema.optional(),
   waitFor: z.number().int().nonnegative().finite().max(60_000).optional(),
   mobile: z.boolean().optional(),
   actions: z.array(actionSchema).max(50).optional(),
   location: z
     .strictObject({
       country: optionLocationCountrySchema.optional(),
-      languages: z.array(boundedString(128)).max(32).optional(),
+      languages: z.array(languageTagSchema).max(32).optional(),
     })
     .optional(),
   skipTlsVerification: z.boolean().optional(),
@@ -375,19 +479,84 @@ const optionsSchema = z.strictObject({
 const retainedUrlSchema = z
   .url()
   .regex(/^https?:\/\//i)
-  .refine(value => {
-    const url = new URL(value);
-    return url.username.length === 0 && url.password.length === 0;
+  .refine(value => isAllowedRetainedUrl(value));
+
+const storageCookieSchema = z.strictObject({
+  name: z.string(),
+  value: z.string(),
+  domain: z.string(),
+  path: z.string(),
+  expires: z.number().finite(),
+  httpOnly: z.boolean(),
+  secure: z.boolean(),
+  sameSite: z.enum(["Strict", "Lax", "None"]),
+});
+
+const indexedDBRecordSchema = z
+  .strictObject({
+    key: z.json().optional(),
+    keyEncoded: z.json().optional(),
+    value: z.json().optional(),
+    valueEncoded: z.json().optional(),
+  })
+  .superRefine((record, context) => {
+    if ((record.key === undefined) === (record.keyEncoded === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["key"],
+        message: "Invalid IndexedDB key",
+      });
+    }
+    if ((record.value === undefined) === (record.valueEncoded === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["value"],
+        message: "Invalid IndexedDB value",
+      });
+    }
   });
+
+const indexedDBIndexSchema = z.strictObject({
+  name: z.string(),
+  keyPath: z.string().optional(),
+  keyPathArray: z.array(z.string()).optional(),
+  multiEntry: z.boolean(),
+  unique: z.boolean(),
+});
+
+const indexedDBStoreSchema = z.strictObject({
+  name: z.string(),
+  autoIncrement: z.boolean(),
+  keyPath: z.string().optional(),
+  keyPathArray: z.array(z.string()).optional(),
+  records: z.array(indexedDBRecordSchema),
+  indexes: z.array(indexedDBIndexSchema),
+});
+
+const indexedDBDatabaseSchema = z.strictObject({
+  name: z.string(),
+  version: z.number().int().positive(),
+  stores: z.array(indexedDBStoreSchema),
+});
+
+const storageStateSchema = z.strictObject({
+  cookies: z.array(storageCookieSchema),
+  origins: z.array(
+    z.strictObject({
+      origin: retainedUrlSchema,
+      localStorage: z.array(
+        z.strictObject({ name: z.string(), value: z.string() }),
+      ),
+      indexedDB: z.array(indexedDBDatabaseSchema).optional(),
+    }),
+  ),
+});
 
 const checkpointSchema = z
   .strictObject({
     version: z.literal(1),
     statePath: boundedString(4_096),
-    storageState: z.strictObject({
-      cookies: z.array(z.record(z.string(), z.unknown())),
-      origins: z.array(z.record(z.string(), z.unknown())),
-    }),
+    storageState: storageStateSchema,
     finalUrl: retainedUrlSchema,
     fingerprint: z.strictObject({
       finalUrl: retainedUrlSchema,
@@ -429,12 +598,25 @@ function sortedFields(fields: Iterable<string>): string[] {
   return [...new Set(fields)].sort((left, right) => left.localeCompare(right));
 }
 
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || typeof value !== "object" || seen.has(value)) {
+    return value;
+  }
+  seen.add(value);
+  for (const nested of Object.values(value)) deepFreeze(nested, seen);
+  return Object.freeze(value);
+}
+
+function detachAndFreeze<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
+}
+
 function error(
   category: ReplayError["category"],
   fields: Iterable<string>,
 ): ReplayError {
   const normalizedFields = sortedFields(fields);
-  return {
+  return detachAndFreeze({
     kind: "error",
     category,
     fields: normalizedFields,
@@ -442,19 +624,40 @@ function error(
       category === "replay_unavailable"
         ? `Replay state is unavailable: ${normalizedFields.join(", ")}`
         : `Replay state is unsupported: ${normalizedFields.join(", ")}`,
-  };
+  } satisfies ReplayError);
 }
 
 function isRedacted(value: unknown): boolean {
   return typeof value === "string" && value.trim().startsWith("<redacted");
 }
 
+function isAllowedRetainedUrl(value: string): boolean {
+  if (!requestUrlSchema.safeParse(value).success) return false;
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    const unbracketedHostname = hostname.replace(/^\[|\]$/g, "");
+    return (
+      url.username.length === 0 &&
+      url.password.length === 0 &&
+      hostname.includes(".") &&
+      hostname !== "localhost" &&
+      !hostname.endsWith(".localhost") &&
+      hostname !== "local" &&
+      !hostname.endsWith(".local") &&
+      isIP(unbracketedHostname) === 0
+    );
+  } catch (error) {
+    if (error instanceof TypeError) return false;
+    throw error;
+  }
+}
+
 function canonicalUrl(value: string): string | undefined {
   const rewritten = rewriteUrl(value) ?? value;
   try {
     const url = new URL(rewritten);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return;
-    if (url.username || url.password) return;
+    if (!isAllowedRetainedUrl(url.href)) return;
     return url.href;
   } catch {
     return;
@@ -650,7 +853,7 @@ export function normalizeReplayEnvelope(
     action,
   }));
 
-  return {
+  return detachAndFreeze({
     kind: "ok",
     envelope: {
       version: 1,
@@ -662,39 +865,47 @@ export function normalizeReplayEnvelope(
       ...(profile ? { profile } : {}),
       actions,
     },
-  };
+  } satisfies ReplayEnvelopeNormalization);
 }
 
 export function resolveReplayEnvelope(
   source: ReplayEnvelopeSource,
 ): ReplayResolution {
   const normalized = normalizeReplayEnvelope(source);
+  const parsedCheckpoint =
+    source.checkpoint === undefined
+      ? undefined
+      : checkpointSchema.safeParse(source.checkpoint);
   if (normalized.kind === "error") {
+    const fields = [...normalized.fields];
+    let category = normalized.category;
+    if (parsedCheckpoint && !parsedCheckpoint.success) {
+      fields.push(
+        ...fieldsFromIssues("checkpoint", parsedCheckpoint.error.issues),
+      );
+      category = "replay_unavailable";
+    }
     if (
       normalized.category === "replay_unsupported" &&
       source.checkpoint === undefined
     ) {
-      return error("replay_unsupported", [
-        ...normalized.fields,
-        ...legacyUnrepresentableActionFields(source.options),
-      ]);
+      fields.push(...legacyUnrepresentableActionFields(source.options));
     }
-    return normalized;
+    return error(category, fields);
   }
 
-  if (source.checkpoint !== undefined) {
-    const parsedCheckpoint = checkpointSchema.safeParse(source.checkpoint);
+  if (parsedCheckpoint !== undefined) {
     if (!parsedCheckpoint.success) {
       return error(
         "replay_unavailable",
         fieldsFromIssues("checkpoint", parsedCheckpoint.error.issues),
       );
     }
-    return {
+    return detachAndFreeze({
       kind: "checkpoint",
       envelope: normalized.envelope,
       checkpoint: parsedCheckpoint.data,
-    };
+    } satisfies ReplayResolution);
   }
 
   const unsafeFields = normalized.envelope.actions
@@ -710,9 +921,9 @@ export function resolveReplayEnvelope(
     return error("replay_unsupported", unsafeFields);
   }
 
-  return {
+  return detachAndFreeze({
     kind: "legacy",
     envelope: normalized.envelope,
     safeActions: normalized.envelope.actions.map(action => action.action),
-  };
+  } satisfies ReplayResolution);
 }
