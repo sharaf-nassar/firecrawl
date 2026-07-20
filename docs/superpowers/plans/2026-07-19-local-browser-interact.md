@@ -131,6 +131,9 @@ public-egress and SSRF checks without entering the navigation set.
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
   requires a root object, forbids root `anyOf`, and supports the nested
   `anyOf` used under the required `decision` property and its action.
+- The pinned live validator also requires `type` on scalar literal leaves.
+  Model-wire fixed values use typed one-value `enum`; no output schema uses a
+  bare `const` leaf.
 - OCI bundles target installed `runc` 1.3.6 and Runtime Specification 1.2.1.
 - systemd socket units set `SocketUser`, `SocketGroup`, and `SocketMode=0660`;
   never rely on the default `0666` mode.

@@ -248,6 +248,9 @@ action and one turn before its policy outcome.
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
   requires a root object and forbids root `anyOf`; the same guide supports the
   nested `anyOf` used for the decision and operation unions.
+- The pinned live validator rejects scalar literal leaves without `type`.
+  Although generic JSON Schema permits other representations, every Gate wire
+  literal uses a typed one-value `enum`; bare `const` is forbidden.
 - Existing `apps/playwright-service-ts` pins Playwright `^1.58.1`. `browserContext.storageState({ indexedDB: true })` is available since 1.51; restoration into a live context is deferred to the Browser Service plan, which pins Playwright 1.61.1: [Playwright BrowserContext storageState](https://playwright.dev/docs/api/class-browsercontext#browser-context-storage-state).
 - Gate zero proves installed app-server multi-turn structured output and host
   execute-once behavior. Full outer `runc` isolation cannot be proven before
@@ -522,31 +525,34 @@ const closed = properties => ({
   additionalProperties: false,
 });
 
+const stringLiteral = value => ({ type: "string", enum: [value] });
+const versionOne = { type: "integer", enum: [1] };
+
 const modelWireBrowserOperationV1Schema = {
   anyOf: [
-    closed({ kind: { const: "snapshot" } }),
+    closed({ kind: stringLiteral("snapshot") }),
     closed({
-      kind: { const: "click" },
+      kind: stringLiteral("click"),
       ref: { type: "string", minLength: 1, maxLength: 128 },
     }),
     closed({
-      kind: { const: "fill" },
+      kind: stringLiteral("fill"),
       ref: { type: "string", minLength: 1, maxLength: 128 },
       value: { type: "string", maxLength: 20000 },
     }),
     closed({
-      kind: { const: "type" },
+      kind: stringLiteral("type"),
       ref: { type: "string", minLength: 1, maxLength: 128 },
       value: { type: "string", maxLength: 20000 },
       delayMs: { type: "integer", minimum: 0, maximum: 250 },
     }),
     closed({
-      kind: { const: "press" },
+      kind: stringLiteral("press"),
       ref: { type: "string", minLength: 1, maxLength: 128 },
       key: { type: "string", minLength: 1, maxLength: 64 },
     }),
     closed({
-      kind: { const: "select" },
+      kind: stringLiteral("select"),
       ref: { type: "string", minLength: 1, maxLength: 128 },
       values: {
         type: "array",
@@ -555,16 +561,16 @@ const modelWireBrowserOperationV1Schema = {
       },
     }),
     closed({
-      kind: { const: "scroll" },
+      kind: stringLiteral("scroll"),
       deltaX: { type: "integer", minimum: -10000, maximum: 10000 },
       deltaY: { type: "integer", minimum: -10000, maximum: 10000 },
     }),
     closed({
-      kind: { const: "wait" },
+      kind: stringLiteral("wait"),
       milliseconds: { type: "integer", minimum: 0, maximum: 30000 },
     }),
     closed({
-      kind: { const: "get_text" },
+      kind: stringLiteral("get_text"),
       ref: {
         anyOf: [
           { type: "string", minLength: 1, maxLength: 128 },
@@ -572,13 +578,13 @@ const modelWireBrowserOperationV1Schema = {
         ],
       },
     }),
-    closed({ kind: { const: "get_url" } }),
+    closed({ kind: stringLiteral("get_url") }),
     closed({
-      kind: { const: "navigate" },
+      kind: stringLiteral("navigate"),
       url: { type: "string", maxLength: 8192 },
     }),
     closed({
-      kind: { const: "evaluate" },
+      kind: stringLiteral("evaluate"),
       expression: { type: "string", maxLength: 20000 },
       args: closed({}),
     }),
@@ -589,13 +595,13 @@ const modelDecisionEnvelopeSchema = closed({
   decision: {
     anyOf: [
       closed({
-        version: { const: 1 },
-        type: { const: "action" },
+        version: versionOne,
+        type: stringLiteral("action"),
         action: modelWireBrowserOperationV1Schema,
       }),
       closed({
-        version: { const: 1 },
-        type: { const: "final" },
+        version: versionOne,
+        type: stringLiteral("final"),
         output: { type: "string", maxLength: 262144 },
       }),
     ],
@@ -623,6 +629,9 @@ The root is the closed object `{ decision: ... }`; it never contains `anyOf`.
 The action/final decision union and full operation union are nested. Every
 operation is closed and requires every defined field. Wire `get_text.ref` is
 required nullable, and wire `evaluate.args` is a required closed empty object.
+Every scalar leaf declares `type`; fixed version, decision-type, and kind
+literals use typed one-value enums. Recursively reject any schema node with a
+`const` key or an `enum` without `type` before starting app-server.
 This is the production `ModelWireBrowserOperationV1` schema, not the trusted
 internal `browserOperationSchema`. The deterministic prompt and exact assertion
 select the fill operation before the Gate-local fill/final normalizer runs.

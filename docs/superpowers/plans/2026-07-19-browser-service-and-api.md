@@ -1257,6 +1257,12 @@ Service validators. Raw model output uses only
 `modelDecisionEnvelopeV1Schema`; none may reuse an internal operation or
 decision schema.
 
+Zod `.literal()` remains the runtime validator and type representation; it is
+not the checked-in Structured Outputs JSON Schema. Any emitted or mirrored
+model-wire JSON Schema fixture must encode each fixed version/type/kind as a
+typed one-value `enum` and recursively reject bare `const` or an enum missing
+`type`. `protocol.test.ts` locks that rule for any JSON Schema fixture it owns.
+
 Reject unknown fields, omitted or non-nullable wire `get_text.ref`, nonempty
 wire `evaluate.args`, a missing/extra envelope field, malformed unions,
 flattened nullable action/output supersets, both result and error, neither

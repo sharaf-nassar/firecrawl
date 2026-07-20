@@ -210,7 +210,12 @@ action and final variants, and the action's
 `ModelWireBrowserOperationV1` union uses a second nested `anyOf`. Every object
 sets `additionalProperties: false` and requires every declared field;
 semantically optional model-wire fields are required nullable fields and are
-normalized during strict validation.
+normalized during strict validation. Every scalar schema node declares its
+`type`, including fixed literals. Fixed wire values use typed one-value enums,
+such as `{ "type": "integer", "enum": [1] }` for `version` and
+`{ "type": "string", "enum": ["action"] }` for a discriminant. Bare
+`const` leaves are forbidden because the pinned live Structured Outputs
+validator rejects scalar leaves without `type`.
 Representative examples of the two top-level decision variants are
 `{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}`
 and `{"decision":{"version":1,"type":"final","output":"done"}}`.

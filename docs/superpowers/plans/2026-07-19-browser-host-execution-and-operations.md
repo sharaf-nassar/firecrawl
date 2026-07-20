@@ -63,6 +63,8 @@ focused tests; do not run the entire Firecrawl suite locally.
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
   requires a root object and forbids root `anyOf`; the same guide supports the
   nested `anyOf` used for decision and operation variants.
+- The pinned live validator requires a scalar `type` even for fixed leaves.
+  Wire literals therefore use typed one-value enums and never bare `const`.
 - `/usr/bin/runc` is 1.3.6; host uses cgroup v2 with CPU, memory, PIDs, and I/O
   controllers.
 - AppArmor blocks unprivileged user namespaces. Rootless isolation is not a
@@ -418,6 +420,24 @@ fn closed_wire_args_normalize_to_internal_empty_map() {
     };
     assert!(args.is_empty());
 }
+
+#[test]
+fn model_schema_rejects_untyped_or_const_literals() {
+    let bare_const = serde_json::json!({ "const": 1 });
+    let untyped_enum = serde_json::json!({ "enum": [1] });
+    assert_eq!(
+        validate_model_wire_schema_definition(&bare_const).unwrap_err().category,
+        "model_schema_invalid",
+    );
+    assert_eq!(
+        validate_model_wire_schema_definition(&untyped_enum).unwrap_err().category,
+        "model_schema_invalid",
+    );
+
+    let schema = load_model_decision_envelope_schema().unwrap();
+    validate_model_wire_schema_definition(&schema).unwrap();
+    assert!(!schema.to_string().contains("\"const\""));
+}
 ```
 
 - [ ] **Step 2: Run tests and confirm red state**
@@ -587,8 +607,12 @@ root. `decision` contains nested `anyOf` branches for the closed action and
 final objects; action's required `action` property contains a second nested
 `anyOf` with every closed `ModelWireBrowserOperationV1` object above. Every
 object sets `additionalProperties:false`, and its `required` array contains
-every property it defines. Use `version.const=1`, the same operation limits,
-and final `output.maxLength=262144`. Wire `get_text.ref` is required nullable;
+every property it defines. Encode version as
+`{"type":"integer","enum":[1]}` and every decision `type` or operation
+`kind` as `{"type":"string","enum":["value"]}`. Every scalar schema node
+declares `type`; recursively reject bare `const` and any enum missing `type`.
+Keep the same operation limits and final `output.maxLength=262144`. Wire
+`get_text.ref` is required nullable;
 wire `evaluate.args` is a required closed empty object. Internal
 `BrowserOperation` still permits an omitted text ref and arbitrary trusted JSON
 arguments.
@@ -608,6 +632,11 @@ mismatch as `model_protocol_error`; do not implement a flattened nullable
 action/output superset, internal-schema reuse, or plain-JSON fallback. Tests
 serialize wire envelopes, validate against the schema, normalize them, and
 compare every variant/property name.
+
+`validate_model_wire_schema_definition` recursively walks objects and arrays.
+It returns `model_schema_invalid` for any `const` key, any scalar node without
+`type`, or any `enum` whose node lacks `type`; startup runs it against the
+checked-in schema before the first app-server process starts.
 
 - [ ] **Step 5: Bound observations and build untrusted turn text**
 
