@@ -140,12 +140,22 @@ The process has these boundaries:
   files, multi-agent behavior, built-in execution tool, or network tool
 - Adapter deadline, output limits, process watchdog, and strict event parser
 
-The only accepted model output is `ModelDecisionV1`:
+The only accepted model wire output is a strict
+`ModelDecisionEnvelopeV1`. The envelope exists because OpenAI Structured
+Outputs requires the root schema to be an object and forbids a root
+`anyOf`; the supported discriminated unions remain nested under the required
+`decision` property. After strict envelope validation, the adapter unwraps
+`.decision` and every later boundary continues to use the unchanged
+`ModelDecisionV1`:
 
 ```ts
-type ModelDecisionV1 =
+export type ModelDecisionV1 =
   | { version: 1; type: "action"; action: BrowserOperation }
   | { version: 1; type: "final"; output: string };
+
+export interface ModelDecisionEnvelopeV1 {
+  decision: ModelDecisionV1;
+}
 
 type BoundedPageState = {
   url: string;
@@ -173,13 +183,27 @@ type ObservationV1 =
     };
 ```
 
-Unknown fields, malformed JSON, multiple decisions, output outside the union,
-or any tool or approval event are protocol failures. Codex receives the
-original prompt and an initial bounded `ObservationV1` once. Later turns
-contain only action-result observations with sequence, action kind, definite
-outcome, sanitized result or error, URL/title metadata, and snapshot excerpts.
-`BoundedPageState` is the existing bounded URL/title/snapshot representation.
-Page content is explicitly marked untrusted.
+Every `turn/start.outputSchema` is a closed root object with exactly one
+required `decision` property. `decision` uses a nested `anyOf` for the closed
+action and final variants, and the action's `BrowserOperation` union uses a
+second nested `anyOf`. Every object sets `additionalProperties: false` and
+requires every declared field; semantically optional model-wire fields are
+required nullable fields and are normalized during strict validation. The two
+accepted wire shapes are exactly
+`{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}`
+and `{"decision":{"version":1,"type":"final","output":"done"}}`.
+[OpenAI's Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
+documents both the root-object constraint and supported nested `anyOf`.
+
+Unknown fields, malformed JSON, multiple decisions, envelope/schema/semantic
+mismatch, or any tool or approval event are `model_protocol_error` failures.
+There is no flattened nullable action/output object and no plain-JSON
+fallback. Codex receives the original prompt and an initial bounded
+`ObservationV1` once. Later turns contain only action-result observations with
+sequence, action kind, definite outcome, sanitized result or error, URL/title
+metadata, and snapshot excerpts. `BoundedPageState` is the existing bounded
+URL/title/snapshot representation. Page content is explicitly marked
+untrusted.
 
 For an action decision, the adapter assigns an action ID, monotonic sequence,
 normalized proposal hash, and effect classification. The API durably records
@@ -617,14 +641,15 @@ Browser Service provides bounded operations equivalent to:
 
 The Codex adapter accepts a prompt job with fixed model policy, original
 prompt, run identifier, deadline, and the server-controlled
-`ModelDecisionV1`/`ObservationV1` schema versions. It starts one app-server
-process and ephemeral thread, streams bounded protocol events, and returns
-only validated decisions plus sanitized usage/process metadata. For an action
-decision, it assigns action identity metadata and invokes an authenticated API
-callback; that callback records and authorizes the action, invokes Browser
-Service once, and returns only a bounded definite observation. The adapter
-contract accepts no MCP configuration, model tools, browser endpoint, or raw
-capability.
+`ModelDecisionEnvelopeV1`/`ModelDecisionV1`/`ObservationV1` schema versions.
+It starts one app-server process and ephemeral thread, streams bounded protocol
+events, strictly validates and unwraps the model envelope, and returns only
+validated internal decisions plus sanitized usage/process metadata. For an
+action decision, it assigns action identity metadata and invokes an
+authenticated API callback; that callback records and authorizes the action,
+invokes Browser Service once, and returns only a bounded definite observation.
+The adapter contract accepts no MCP configuration, model tools, browser
+endpoint, or raw capability.
 
 The code runner accepts language, source, session relay grant, deadline, and
 resource limits. It returns existing execution response fields. Neither
@@ -803,8 +828,9 @@ observable behavior and focused service/unit tests for isolation boundaries.
   recovery, and retention
 - Browser Service typed operation and live-view contracts
 - Fake app-server process/config construction, pinned V2 schema checksum,
-  strict `ModelDecisionV1` parsing, bounded multi-turn observations, zero tool
-  and approval events, cancellation, limits, timeout, and orphan cleanup
+  strict `ModelDecisionEnvelopeV1` validation and `ModelDecisionV1` unwrapping,
+  bounded multi-turn observations, zero tool and approval events,
+  cancellation, limits, timeout, and orphan cleanup
 - Node, Python, and Bash runner success/failure, resource limits, network
   isolation, output bounds, and process-tree termination
 - Broker schema/peer-credential enforcement, sealed descriptors, fixed-bundle
@@ -854,9 +880,11 @@ Phase 2 is complete when:
    subrequests, DNS rebinding, and the 8-origin limit.
 9. Replay either reproduces every retained browser-affecting option or returns
    an explicit `replay_unsupported`/`replay_unavailable` error.
-10. Codex sees only strict decision schemas and bounded observations. It has no
-    MCP servers, model tools, browser relay, user config, host files, shell,
-    Docker, plugins, hooks, skills, or arbitrary network destinations.
+10. Codex sees only the strict decision-envelope schema and bounded
+    observations. The host validates and unwraps the envelope before using the
+    unchanged internal decision type. Codex has no MCP servers, model tools,
+    browser relay, user config, host files, shell, Docker, plugins, hooks,
+    skills, or arbitrary network destinations.
 11. Hostile pages and code cannot escape Browser Service, Codex, or `runc`
     boundaries or access another owner/session/profile.
 12. No Browser/Interact path uses Gemini, Fireworks, Firecrawl Cloud, or an API

@@ -103,7 +103,8 @@ Fireworks, Firecrawl Cloud, or an API key.
 - `apps/api/src/lib/scrape-interact/browser-service-client.ts` — typed,
   deadline-aware Browser Service client.
 - `apps/api/src/lib/browser-runtime/protocol.ts` — strict shared
-  `BrowserOperation`, `ModelDecisionV1`, and `ObservationV1` schemas.
+  `BrowserOperation`, `ModelDecisionV1`, `ModelDecisionEnvelopeV1`, and
+  `ObservationV1` schemas.
 - `apps/api/src/lib/browser-runtime/execution-adapter.ts` — one-job host adapter
   interface and fail-closed default.
 - `apps/api/src/lib/browser-runtime/orchestrator.ts` — durable session, replay,
@@ -949,6 +950,27 @@ export type ModelDecisionV1 =
   | { version: 1; type: "action"; action: BrowserOperation }
   | { version: 1; type: "final"; output: string };
 
+export interface ModelDecisionEnvelopeV1 {
+  decision: ModelDecisionV1;
+}
+
+export const modelDecisionV1Schema = z.discriminatedUnion("type", [
+  z.object({
+    version: z.literal(1),
+    type: z.literal("action"),
+    action: browserOperationSchema,
+  }).strict(),
+  z.object({
+    version: z.literal(1),
+    type: z.literal("final"),
+    output: z.string().max(256 * 1024),
+  }).strict(),
+]);
+
+export const modelDecisionEnvelopeV1Schema = z.object({
+  decision: modelDecisionV1Schema,
+}).strict();
+
 export const PROMPT_LOOP_POLICY_V1 = {
   maxPromptCharacters: 10_000,
   maxSnapshotExcerptCharacters: 40_000,
@@ -988,11 +1010,16 @@ export type PromptRunResult = {
 };
 ```
 
-Implement strict Zod schemas for these types in `protocol.ts`. Reject unknown
-fields, malformed unions, both result and error, neither result nor error for
+Implement strict Zod schemas for these types in `protocol.ts`. The model wire
+schema is always `ModelDecisionEnvelopeV1`; after strict validation, host code
+unwraps `.decision` and uses unchanged `ModelDecisionV1`. Reject unknown
+fields, a missing/extra envelope field, malformed unions, flattened nullable
+action/output supersets, both result and error, neither result nor error for
 its outcome, excerpt over 40,000 characters, encoded observation over 64 KiB,
-and final output over 256 KiB. `protocol.test.ts` locks each accepted variant
-and every rejection.
+and final output over 256 KiB. Envelope/schema/semantic mismatches map to
+`model_protocol_error`. `protocol.test.ts` locks both wrapped variants,
+unwrapping, and every rejection. `PromptRunInput`, `PromptRunResult`, action
+callbacks, ledger rows, and observations retain their existing shapes.
 
 Keep `CodeRunInput` restricted to run ID, language, source, deadline, and
 correlation ID. The public request cannot set model, effort, policy/schema

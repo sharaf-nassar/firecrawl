@@ -124,8 +124,13 @@ public-egress and SSRF checks without entering the navigation set.
   DNS resolution, address pinning, redirect validation, and private-address
   denial.
 - Prompt mode pins Codex CLI/app-server 0.144.5 and the generated V2 protocol
-  schema checksum. Every turn supplies the strict `ModelDecisionV1` output
-  schema; the command is experimental, so every upgrade must pass Gate 0.
+  schema checksum. Every turn supplies the strict
+  `ModelDecisionEnvelopeV1` output schema and unwraps its validated
+  `ModelDecisionV1`; the command is experimental, so every upgrade must pass
+  Gate 0.
+- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
+  requires a root object, forbids root `anyOf`, and supports the nested
+  `anyOf` used under the required `decision` property and its action.
 - OCI bundles target installed `runc` 1.3.6 and Runtime Specification 1.2.1.
 - systemd socket units set `SocketUser`, `SocketGroup`, and `SocketMode=0660`;
   never rely on the default `0666` mode.
@@ -222,8 +227,10 @@ For every commit:
 ## Phase 2 Exit Criteria
 
 - Prompt Interact uses one pinned app-server 0.144.5 process and one ephemeral
-  `gpt-5.6-terra`/`medium` thread per request. Codex receives only strict
-  decision schemas and bounded observations, with no MCP, tools, or relay.
+  `gpt-5.6-terra`/`medium` thread per request. Codex returns a strict root
+  `ModelDecisionEnvelopeV1`; the host validates and unwraps its unchanged
+  internal `ModelDecisionV1`. Codex receives bounded observations and has no
+  MCP, tools, or relay.
 - Every accepted prompt action is durably prepared before dispatch, executes
   at most once, and records a definite result or terminal unknown outcome.
 - Node, Python, and Bash run inside disposable fixed `runc` bundles.

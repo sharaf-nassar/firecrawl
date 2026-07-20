@@ -60,6 +60,9 @@ focused tests; do not run the entire Firecrawl suite locally.
   `sandbox`, `cwd`, `dynamicTools`, and `environments`.
 - `TurnStartParams` supports `threadId`, text `input`, `model`, `effort`,
   `approvalPolicy`, `sandboxPolicy`, `environments`, and `outputSchema`.
+- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
+  requires a root object and forbids root `anyOf`; the same guide supports the
+  nested `anyOf` used for decision and operation variants.
 - `/usr/bin/runc` is 1.3.6; host uses cgroup v2 with CPU, memory, PIDs, and I/O
   controllers.
 - AppArmor blocks unprivileged user namespaces. Rootless isolation is not a
@@ -128,7 +131,8 @@ descriptor and use the existing page-oriented code contract.
 - Create `apps/browser-execution-adapter/src/app_server.rs` for JSON-RPC V2
   initialization, thread, turns, event bounds, and shutdown.
 - Create `apps/browser-execution-adapter/src/decision.rs` for strict
-  `ModelDecisionV1`, canonical proposal hashes, and duplicate checks.
+  `ModelDecisionEnvelopeV1` validation, `ModelDecisionV1` unwrapping,
+  canonical proposal hashes, and duplicate checks.
 - Create `apps/browser-execution-adapter/src/observations.rs` for bounded,
   explicitly untrusted turn inputs.
 - Create `apps/browser-execution-adapter/src/action_client.rs` for the
@@ -145,7 +149,8 @@ descriptor and use the existing page-oriented code contract.
 - Generate `host/browser-runtime/protocol/codex-app-server-0.144.5/` from the
   installed CLI and check in every generated JSON schema.
 - Create `host/browser-runtime/protocol/SHA256SUMS`.
-- Create `host/browser-runtime/protocol/model-decision-v1.schema.json`.
+- Create
+  `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`.
 - Create `apps/sandbox-broker/Cargo.toml`, `Cargo.lock`, and
   `src/{main,protocol,peer,bundles,oci,registry,redaction}.rs`.
 - Create `apps/sandbox-broker/tests/{protocol,policy,oci_config,lifecycle}.rs`.
@@ -344,7 +349,8 @@ before host execution is enabled."
 
 - Create: `host/browser-runtime/protocol/codex-app-server-0.144.5/`
 - Create: `host/browser-runtime/protocol/SHA256SUMS`
-- Create: `host/browser-runtime/protocol/model-decision-v1.schema.json`
+- Create:
+  `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`
 - Create: `apps/browser-execution-adapter/Cargo.toml`
 - Create: `apps/browser-execution-adapter/Cargo.lock`
 - Create: `apps/browser-execution-adapter/src/lib.rs`
@@ -361,10 +367,20 @@ side-effect rejection.
 ```rust
 #[test]
 fn side_effect_hash_is_canonical_and_cannot_repeat() {
-    let first = parse_decision(r#"{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}"#).unwrap();
-    let second = parse_decision(r#"{ "type":"action", "action":{"ref":"@e7","kind":"click"}, "version":1 }"#).unwrap();
+    let first = parse_decision_envelope(r#"{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}"#).unwrap().decision;
+    let second = parse_decision_envelope(r#"{"decision":{"type":"action","action":{"ref":"@e7","kind":"click"},"version":1}}"#).unwrap().decision;
     assert_eq!(normalized_hash(&first), normalized_hash(&second));
     assert_eq!(classify(&first), Effect::SideEffecting);
+}
+
+#[test]
+fn root_union_or_flattened_superset_is_rejected() {
+    assert!(parse_decision_envelope(
+        r#"{"version":1,"type":"final","output":"done"}"#,
+    ).is_err());
+    assert!(parse_decision_envelope(
+        r#"{"decision":{"version":1,"type":"final","output":"done","action":null}}"#,
+    ).is_err());
 }
 ```
 
@@ -389,7 +405,7 @@ Sort paths bytewise and write repository-root-relative SHA-256 lines. Check in
 all generated schemas. The builder
 repeats generation into a temporary directory and fails on any added, removed,
 or changed byte. `SHA256SUMS` also covers
-`model-decision-v1.schema.json`.
+`model-decision-envelope-v1.schema.json`.
 
 - [ ] **Step 4: Define exact model decision and browser operations**
 
@@ -404,6 +420,12 @@ use std::collections::BTreeMap;
 pub enum ModelDecisionV1 {
     Action { version: VersionOne, action: BrowserOperation },
     Final { version: VersionOne, output: String },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDecisionEnvelopeV1 {
+    pub decision: ModelDecisionV1,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -443,10 +465,30 @@ characters. Classify `snapshot`, `wait`, `get_text`, and `get_url` as
 `read_only`; classify every other operation as `side_effecting`. The API still
 reclassifies before authorization.
 
-Write closed draft-07 schema with root `oneOf`, `additionalProperties:false`
-at every object, `version.const=1`, the same operation limits, and final
-`output.maxLength=262144`. Tests serialize Rust types, validate against this
-schema, and compare all variant/property names.
+Write the checked-in draft-07 model-wire schema as one closed root object with
+exactly the required `decision` property. Do not put `anyOf` or `oneOf` at the
+root. `decision` contains nested `anyOf` branches for the closed action and
+final objects; action's required `action` property contains a second nested
+`anyOf` with every closed `BrowserOperation` object above. Every object sets
+`additionalProperties:false`, and its `required` array contains every property
+it defines. Use `version.const=1`, the same operation limits, and final
+`output.maxLength=262144`. Represent semantic `get_text.ref` omission on the
+wire as a required nullable string and normalize `null` to omission during
+strict envelope validation. Keep model-wire `evaluate.args` a closed empty
+object; the unchanged internal operation type remains a `BTreeMap` for trusted
+non-model callers.
+
+The only accepted model wire values are exactly shaped as
+`{"decision":{"version":1,"type":"action","action":{"kind":"click","ref":"@e7"}}}`
+or `{"decision":{"version":1,"type":"final","output":"done"}}`. Validate
+the complete envelope against
+`model-decision-envelope-v1.schema.json`, deserialize
+`ModelDecisionEnvelopeV1`, then unwrap `.decision`. From that boundary onward,
+hashing, classification, callbacks, and loop control use unchanged
+`ModelDecisionV1`. Reject envelope/schema/semantic mismatch as
+`model_protocol_error`; do not implement a flattened nullable action/output
+superset or plain-JSON fallback. Tests serialize wire envelopes, validate
+against the schema, unwrap them, and compare every variant/property name.
 
 - [ ] **Step 5: Bound observations and build untrusted turn text**
 
@@ -500,9 +542,10 @@ host actions without exposing a browser tool to the model."
 - [ ] **Step 1: Write failing fake app-server tests**
 
 Use an executable fixture that speaks newline-delimited JSON-RPC. Assert exact
-request order, one process/thread, unique request IDs, `outputSchema` on every
-turn, original prompt only on first turn, one action in flight, definite
-no-effect continuation, exact final result, action/turn/byte/deadline limits,
+request order, one process/thread, unique request IDs, the closed envelope
+`outputSchema` on every turn, original prompt only on first turn, one action in
+flight, definite no-effect continuation, exact final result,
+action/turn/byte/deadline limits,
 refusal, malformed JSON, duplicate decisions, premature EOF, cancellation,
 SIGTERM/SIGKILL, and complete cleanup.
 
@@ -514,7 +557,10 @@ async fn one_process_and_thread_drive_two_turns() {
     assert_eq!(fixture.processes(), 1);
     assert_eq!(fixture.thread_starts(), 1);
     assert_eq!(fixture.turn_starts(), 2);
-    assert_eq!(fixture.output_schemas(), vec![MODEL_SCHEMA, MODEL_SCHEMA]);
+    assert_eq!(fixture.output_schemas(), vec![
+        MODEL_DECISION_ENVELOPE_SCHEMA,
+        MODEL_DECISION_ENVELOPE_SCHEMA,
+    ]);
     assert_eq!(result.output, "done");
 }
 ```
@@ -525,7 +571,9 @@ Any server request is fatal. Reject command/file changes, MCP/dynamic/collab
 tool items, web search, computer use, hook execution, approval requests, user
 input requests, additional assistant decisions, and events for another thread
 or turn. Allow only protocol lifecycle, reasoning, token usage, and exactly one
-final `agentMessage` for the active turn.
+final `agentMessage` for the active turn. Fake responses use wrapped action and
+final values, and malformed root unions or flattened supersets fail as
+`model_protocol_error`.
 
 ```rust
 #[tokio::test]
@@ -550,7 +598,7 @@ Expected: FAIL because app-server loop and callback client do not exist.
 
 Spawn only the broker-returned Codex process pipes. Construct and send these
 JSON values; `request_id`, `thread_id`, `turn_input`, and
-`model_decision_schema` are typed values, not string substitutions:
+`model_decision_envelope_schema` are typed values, not string substitutions:
 
 ```rust
 json!({"id": 1, "method": "initialize", "params": {
@@ -575,16 +623,20 @@ json!({"id": request_id, "method": "turn/start", "params": {
     "input": [{"type": "text", "text": turn_input}],
     "model": "gpt-5.6-terra", "effort": "medium",
     "approvalPolicy": "never", "cwd": "/run/firecrawl-work",
-    "environments": [], "outputSchema": model_decision_schema
+    "environments": [], "outputSchema": model_decision_envelope_schema
 }})
 ```
 
 The implementation builds JSON values, never string-replaces IDs or text.
 Validate every response/notification against checked-in V2 schemas. Collect
 one completed `agentMessage`, require `turn/completed` status `completed`, then
-parse its text as strict `ModelDecisionV1`. Refusal, failed/interrupted turn,
-unknown method, unknown field in a consumed type, or any tool/approval event is
-`model_protocol_error`. Cap stdout events at 2 MiB and stderr at 256 KiB.
+validate its text against the closed `ModelDecisionEnvelopeV1` schema,
+deserialize the envelope, normalize nullable model-wire fields, and unwrap
+`.decision` into unchanged `ModelDecisionV1`. Refusal, failed/interrupted turn,
+unknown method, unknown field in a consumed type, envelope/schema/semantic
+mismatch, or any tool/approval event is `model_protocol_error`. No flattened
+nullable action/output superset or plain-JSON fallback exists. Cap stdout
+events at 2 MiB and stderr at 256 KiB.
 
 - [ ] **Step 5: Implement deterministic action callback loop**
 
@@ -852,7 +904,7 @@ Expected: FAIL because builders and bundles do not exist.
 - [ ] **Step 3: Build Codex rootfs with strict config**
 
 Pin base image by digest and install exactly Codex 0.144.5. Copy the generated
-V2 schema bundle, `SHA256SUMS`, and model decision schema into
+V2 schema bundle, `SHA256SUMS`, and model decision-envelope schema into
 `/opt/firecrawl/protocol`. Startup verifies all checksums before exec.
 
 Generated per-job config is exactly:
@@ -1501,7 +1553,8 @@ Validate fresh public MCP clients with no provider fallback."
 - [ ] Broker Cargo format, Clippy, and tests pass.
 - [ ] Focused API tests and TypeScript build pass.
 - [ ] One prompt request uses one app-server process and ephemeral thread.
-- [ ] Every turn uses closed `ModelDecisionV1` `outputSchema`.
+- [ ] Every turn uses closed root `ModelDecisionEnvelopeV1` `outputSchema`,
+  validates it, and unwraps unchanged `ModelDecisionV1`.
 - [ ] Original prompt appears only on initial turn; later turns contain only
   bounded definite observations.
 - [ ] Maximum 25 actions, 26 turns, 1 MiB observations, 300 seconds.
