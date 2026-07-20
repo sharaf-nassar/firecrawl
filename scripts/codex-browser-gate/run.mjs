@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtempSync } from "node:fs";
 import {
@@ -20,6 +20,13 @@ import process from "node:process";
 import { PassThrough } from "node:stream";
 
 import { createGateActionStore } from "./action-store.mjs";
+import {
+  modelDecisionEnvelopeSchema,
+  normalizeModelDecisionEnvelopeV1,
+  normalizedProposalHash,
+  parseModelDecisionEnvelopeV1,
+  runDecisionWireSelfTest,
+} from "./decision-wire.mjs";
 import {
   ALLOWED_ITEM_TYPES,
   CLEANUP_DRAIN_GRACE_MS,
@@ -41,100 +48,9 @@ import {
 } from "./gate-contract.mjs";
 import { parseInvocation, runPreflight } from "./preflight.mjs";
 import {
-  canonicalizeJsonBytes,
   hashCanonicalSchemaBundle,
   parseLosslessJson,
 } from "./schema-canonicalizer.mjs";
-
-const closed = properties => ({
-  type: "object",
-  properties,
-  required: Object.keys(properties),
-  additionalProperties: false,
-});
-
-const stringLiteral = value => ({ type: "string", enum: [value] });
-const versionOne = { type: "integer", enum: [1] };
-
-const modelWireBrowserOperationV1Schema = {
-  anyOf: [
-    closed({ kind: stringLiteral("snapshot") }),
-    closed({
-      kind: stringLiteral("click"),
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-    }),
-    closed({
-      kind: stringLiteral("fill"),
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      value: { type: "string", maxLength: 20000 },
-    }),
-    closed({
-      kind: stringLiteral("type"),
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      value: { type: "string", maxLength: 20000 },
-      delayMs: { type: "integer", minimum: 0, maximum: 250 },
-    }),
-    closed({
-      kind: stringLiteral("press"),
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      key: { type: "string", minLength: 1, maxLength: 64 },
-    }),
-    closed({
-      kind: stringLiteral("select"),
-      ref: { type: "string", minLength: 1, maxLength: 128 },
-      values: {
-        type: "array",
-        items: { type: "string", maxLength: 512 },
-        maxItems: 20,
-      },
-    }),
-    closed({
-      kind: stringLiteral("scroll"),
-      deltaX: { type: "integer", minimum: -10000, maximum: 10000 },
-      deltaY: { type: "integer", minimum: -10000, maximum: 10000 },
-    }),
-    closed({
-      kind: stringLiteral("wait"),
-      milliseconds: { type: "integer", minimum: 0, maximum: 30000 },
-    }),
-    closed({
-      kind: stringLiteral("get_text"),
-      ref: {
-        anyOf: [
-          { type: "string", minLength: 1, maxLength: 128 },
-          { type: "null" },
-        ],
-      },
-    }),
-    closed({ kind: stringLiteral("get_url") }),
-    closed({
-      kind: stringLiteral("navigate"),
-      url: { type: "string", maxLength: 8192 },
-    }),
-    closed({
-      kind: stringLiteral("evaluate"),
-      expression: { type: "string", maxLength: 20000 },
-      args: closed({}),
-    }),
-  ],
-};
-
-const modelDecisionEnvelopeSchema = closed({
-  decision: {
-    anyOf: [
-      closed({
-        version: versionOne,
-        type: stringLiteral("action"),
-        action: modelWireBrowserOperationV1Schema,
-      }),
-      closed({
-        version: versionOne,
-        type: stringLiteral("final"),
-        output: { type: "string", maxLength: 262144 },
-      }),
-    ],
-  },
-});
 
 const INITIAL_OBSERVATION = {
   version: 1,
@@ -147,73 +63,6 @@ const INITIAL_OBSERVATION = {
   },
 };
 
-function auditModelDecisionSchema(schema) {
-  const reject = () => {
-    throw gateError("model_protocol_error");
-  };
-  if (
-    !hasExactKeys(schema, [
-      "type",
-      "properties",
-      "required",
-      "additionalProperties",
-    ]) ||
-    schema.type !== "object" ||
-    schema.additionalProperties !== false ||
-    !hasExactKeys(schema.properties, ["decision"]) ||
-    schema.required.length !== 1 ||
-    schema.required[0] !== "decision" ||
-    !hasExactKeys(schema.properties.decision, ["anyOf"]) ||
-    schema.properties.decision.anyOf.length !== 2
-  ) {
-    reject();
-  }
-
-  function visit(node) {
-    if (node === null || typeof node !== "object" || Array.isArray(node)) {
-      reject();
-    }
-    if (Object.hasOwn(node, "const")) reject();
-    if (Object.hasOwn(node, "enum")) {
-      if (
-        typeof node.type !== "string" ||
-        !Array.isArray(node.enum) ||
-        node.enum.length === 0 ||
-        !node.enum.every(value => schemaTypeMatches(value, node.type))
-      ) {
-        reject();
-      }
-    }
-    const scalarAssertions = [
-      "minimum",
-      "maximum",
-      "minLength",
-      "maxLength",
-      "minItems",
-      "maxItems",
-    ];
-    if (
-      scalarAssertions.some(key => Object.hasOwn(node, key)) &&
-      typeof node.type !== "string"
-    ) {
-      reject();
-    }
-    if (node.properties) {
-      for (const child of Object.values(node.properties)) visit(child);
-    }
-    if (node.items) visit(node.items);
-    for (const key of ["anyOf", "oneOf", "allOf"]) {
-      for (const child of node[key] ?? []) visit(child);
-    }
-  }
-  visit(schema);
-}
-
-function normalizedProposalHash(operation) {
-  return createHash("sha256")
-    .update(canonicalizeJsonBytes(Buffer.from(JSON.stringify(operation), "utf8")))
-    .digest("hex");
-}
 
 class RawJsonlFramer {
   constructor(onLine) {
@@ -926,37 +775,6 @@ function schemaAstToValue(node, keyword) {
   }
 }
 
-function losslessJsonNodeToPlainValue(node) {
-  switch (node.kind) {
-    case "string":
-      return node.value;
-    case "number":
-      return safeSchemaNumber(node.raw);
-    case "true":
-      return true;
-    case "false":
-      return false;
-    case "null":
-      return null;
-    case "array":
-      return node.items.map(losslessJsonNodeToPlainValue);
-    case "object": {
-      const value = {};
-      for (const member of node.members) {
-        Object.defineProperty(value, member.key, {
-          configurable: true,
-          enumerable: true,
-          value: losslessJsonNodeToPlainValue(member.value),
-          writable: true,
-        });
-      }
-      return value;
-    }
-    default:
-      modelProtocolError();
-  }
-}
-
 function schemaTypeMatches(value, type) {
   const numeric = exactNumber(value);
   switch (type) {
@@ -1590,183 +1408,11 @@ class AppServerClient {
   }
 }
 
-function hasExactKeys(value, keys) {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    Object.keys(value).toSorted().join("\0") === keys.toSorted().join("\0")
-  );
-}
-
-function modelProtocolError() {
-  throw gateError("model_protocol_error");
-}
-
-function validString(value, minLength, maxLength) {
-  const length = typeof value === "string" ? [...value].length : -1;
-  return (
-    typeof value === "string" &&
-    length >= minLength &&
-    length <= maxLength
-  );
-}
-
-function validInteger(value, minimum, maximum) {
-  return (
-    Number.isInteger(value) && value >= minimum && value <= maximum
-  );
-}
-
-function validateModelWireBrowserOperationV1(operation) {
-  if (operation === null || typeof operation !== "object") {
-    modelProtocolError();
-  }
-  switch (operation.kind) {
-    case "snapshot":
-    case "get_url":
-      if (!hasExactKeys(operation, ["kind"])) modelProtocolError();
-      return;
-    case "click":
-      if (
-        !hasExactKeys(operation, ["kind", "ref"]) ||
-        !validString(operation.ref, 1, 128)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "fill":
-      if (
-        !hasExactKeys(operation, ["kind", "ref", "value"]) ||
-        !validString(operation.ref, 1, 128) ||
-        !validString(operation.value, 0, 20000)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "type":
-      if (
-        !hasExactKeys(operation, ["kind", "ref", "value", "delayMs"]) ||
-        !validString(operation.ref, 1, 128) ||
-        !validString(operation.value, 0, 20000) ||
-        !validInteger(operation.delayMs, 0, 250)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "press":
-      if (
-        !hasExactKeys(operation, ["kind", "ref", "key"]) ||
-        !validString(operation.ref, 1, 128) ||
-        !validString(operation.key, 1, 64)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "select":
-      if (
-        !hasExactKeys(operation, ["kind", "ref", "values"]) ||
-        !validString(operation.ref, 1, 128) ||
-        !Array.isArray(operation.values) ||
-        operation.values.length > 20 ||
-        !operation.values.every(value => validString(value, 0, 512))
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "scroll":
-      if (
-        !hasExactKeys(operation, ["kind", "deltaX", "deltaY"]) ||
-        !validInteger(operation.deltaX, -10000, 10000) ||
-        !validInteger(operation.deltaY, -10000, 10000)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "wait":
-      if (
-        !hasExactKeys(operation, ["kind", "milliseconds"]) ||
-        !validInteger(operation.milliseconds, 0, 30000)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "get_text":
-      if (
-        !hasExactKeys(operation, ["kind", "ref"]) ||
-        !(
-          operation.ref === null || validString(operation.ref, 1, 128)
-        )
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "navigate":
-      if (
-        !hasExactKeys(operation, ["kind", "url"]) ||
-        !validString(operation.url, 0, 8192)
-      ) {
-        modelProtocolError();
-      }
-      return;
-    case "evaluate":
-      if (
-        !hasExactKeys(operation, ["kind", "expression", "args"]) ||
-        !validString(operation.expression, 0, 20000) ||
-        !hasExactKeys(operation.args, [])
-      ) {
-        modelProtocolError();
-      }
-      return;
-    default:
-      modelProtocolError();
-  }
-}
-
-function validateModelDecisionEnvelopeV1(envelope) {
-  if (!hasExactKeys(envelope, ["decision"])) modelProtocolError();
-  const decision = envelope.decision;
-  if (decision?.type === "action") {
-    if (
-      !hasExactKeys(decision, ["version", "type", "action"]) ||
-      decision.version !== 1
-    ) {
-      modelProtocolError();
-    }
-    validateModelWireBrowserOperationV1(decision.action);
-    return;
-  }
-  if (
-    decision?.type !== "final" ||
-    !hasExactKeys(decision, ["version", "type", "output"]) ||
-    decision.version !== 1 ||
-    !validString(decision.output, 0, 262144)
-  ) {
-    modelProtocolError();
-  }
-}
-
-function normalizeModelDecisionEnvelopeV1(envelope) {
-  const decision = envelope.decision;
-  if (decision.type === "final") {
-    return { version: 1, type: "final", output: decision.output };
-  }
-  return {
-    version: 1,
-    type: "action",
-    action: {
-      kind: "fill",
-      ref: decision.action.ref,
-      value: decision.action.value,
-    },
-  };
-}
-
 function requireExact(value, expected) {
   try {
     assert.deepEqual(value, expected);
   } catch {
-    modelProtocolError();
+    throw gateError("model_protocol_error");
   }
 }
 
@@ -1777,14 +1423,16 @@ function parseTurnEnvelope({ turn, messages }, { threadId, turnId }) {
     turn.error !== null ||
     !["notLoaded", "summary", "full"].includes(turn.itemsView)
   ) {
-    modelProtocolError();
+    throw gateError("model_protocol_error");
   }
   const agentMessages = messages.filter(
     message =>
       message.method === "item/completed" &&
       message.params?.item?.type === "agentMessage",
   );
-  if (agentMessages.length !== 1) modelProtocolError();
+  if (agentMessages.length !== 1) {
+    throw gateError("model_protocol_error");
+  }
   const event = agentMessages[0];
   if (
     event.params.threadId !== threadId ||
@@ -1792,18 +1440,9 @@ function parseTurnEnvelope({ turn, messages }, { threadId, turnId }) {
     typeof event.params.item.id !== "string" ||
     typeof event.params.item.text !== "string"
   ) {
-    modelProtocolError();
+    throw gateError("model_protocol_error");
   }
-  let envelope;
-  try {
-    envelope = losslessJsonNodeToPlainValue(
-      parseLosslessJson(Buffer.from(event.params.item.text, "utf8")),
-    );
-  } catch {
-    modelProtocolError();
-  }
-  validateModelDecisionEnvelopeV1(envelope);
-  return envelope;
+  return parseModelDecisionEnvelopeV1(event.params.item.text);
 }
 
 function runUnloadedTurnRegression(eventSchemas) {
@@ -1872,7 +1511,7 @@ function auditTurnEvents(turn, messages, { threadId, turnId }) {
     turn.error !== null ||
     !["notLoaded", "summary", "full"].includes(turn.itemsView)
   ) {
-    modelProtocolError();
+    throw gateError("model_protocol_error");
   }
   let completedAgentMessages = 0;
   for (const message of messages) {
@@ -1886,7 +1525,7 @@ function auditTurnEvents(turn, messages, { threadId, turnId }) {
       ((method === "turn/started" || method === "turn/completed") &&
         message.params?.turn?.id !== turnId)
     ) {
-      modelProtocolError();
+      throw gateError("model_protocol_error");
     }
     if (FORBIDDEN_EVENT_PATTERN.test(method)) {
       throw gateError("codex_forbidden_event", method);
@@ -1920,13 +1559,13 @@ function assertNoLateTurnMessages(allMessages, result, { threadId, turnId }) {
       message.params?.threadId === threadId &&
       message.params?.turn === result.turn,
   );
-  if (completedIndex < 0) modelProtocolError();
+  if (completedIndex < 0) throw gateError("model_protocol_error");
   for (const message of allMessages.slice(completedIndex + 1)) {
     if (
       message.params?.turnId === turnId ||
       message.params?.turn?.id === turnId
     ) {
-      modelProtocolError();
+      throw gateError("model_protocol_error");
     }
   }
 }
@@ -1949,7 +1588,7 @@ function auditAllAppServerEvents(messages, knownTurns) {
       completed.params?.threadId !== turn.threadId ||
       completed.params?.turn?.id !== turn.turnId
     ) {
-      modelProtocolError();
+      throw gateError("model_protocol_error");
     }
   }
   let tools = 0;
@@ -1973,10 +1612,12 @@ function auditAllAppServerEvents(messages, knownTurns) {
           hasNestedThreadId &&
           directThreadId !== nestedThreadId)
       ) {
-        modelProtocolError();
+        throw gateError("model_protocol_error");
       }
       threadId = directThreadId ?? nestedThreadId;
-      if (!knownThreadIds.has(threadId)) modelProtocolError();
+      if (!knownThreadIds.has(threadId)) {
+        throw gateError("model_protocol_error");
+      }
     }
     if (hasTurnId || hasNestedTurnId) {
       const directTurnId = hasTurnId ? params.turnId : undefined;
@@ -1986,14 +1627,14 @@ function auditAllAppServerEvents(messages, knownTurns) {
         (hasNestedTurnId && typeof nestedTurnId !== "string") ||
         (hasTurnId && hasNestedTurnId && directTurnId !== nestedTurnId)
       ) {
-        modelProtocolError();
+        throw gateError("model_protocol_error");
       }
       const turnId = directTurnId ?? nestedTurnId;
       const matches = threadId !== undefined
         ? [turns.get(`${threadId}\0${turnId}`)].filter(Boolean)
         : (turnsById.get(turnId) ?? []);
       if (matches.length !== 1 || index > matches[0].completedIndex) {
-        modelProtocolError();
+        throw gateError("model_protocol_error");
       }
     }
     if (/approval/i.test(message.method)) {
@@ -2003,7 +1644,9 @@ function auditAllAppServerEvents(messages, knownTurns) {
     if (message.method.startsWith("item/")) {
       const key = `${message.params?.threadId}\0${message.params?.turnId}`;
       const turn = turns.get(key);
-      if (!turn || index > turn.completedIndex) modelProtocolError();
+      if (!turn || index > turn.completedIndex) {
+        throw gateError("model_protocol_error");
+      }
       const itemType = message.params?.item?.type;
       if (
         typeof itemType === "string" &&
@@ -2162,7 +1805,6 @@ async function runOne(runNumber) {
     }
     const featureHash = hashFeatureInventory(featureResult.stdout);
 
-    auditModelDecisionSchema(modelDecisionEnvelopeSchema);
     client = new AppServerClient({ cwd: work, env, eventsPath });
     if (!client.pid) throw gateError("codex_app_server_spawn_failed");
     const initialize = await client.request("initialize", {
@@ -2315,7 +1957,9 @@ async function runOne(runNumber) {
           message.params?.turn?.id === result.turn.id,
       ),
     }));
-    if (knownTurns.some(turn => turn.completedIndex < 0)) modelProtocolError();
+    if (knownTurns.some(turn => turn.completedIndex < 0)) {
+      throw gateError("model_protocol_error");
+    }
     const auditCounts = auditAllAppServerEvents(client.messages, knownTurns);
     const completedTurns = client.messages.filter(
       message =>
@@ -2465,28 +2109,7 @@ async function actionStoreSelfTest({ silent = false } = {}) {
 }
 
 async function hardeningSelfTest({ silent = false } = {}) {
-  const ordered = { kind: "fill", ref: "gate-marker", value: "approved" };
-  const permuted = { value: "approved", kind: "fill", ref: "gate-marker" };
-  assert.equal(normalizedProposalHash(ordered), normalizedProposalHash(permuted));
-  auditModelDecisionSchema(modelDecisionEnvelopeSchema);
-  const bareConst = structuredClone(modelDecisionEnvelopeSchema);
-  bareConst.properties.decision.anyOf[0].properties.version = { const: 1 };
-  assert.throws(() => auditModelDecisionSchema(bareConst), /model_protocol_error/);
-  const untypedEnum = structuredClone(modelDecisionEnvelopeSchema);
-  delete untypedEnum.properties.decision.anyOf[0].properties.type.type;
-  assert.throws(
-    () => auditModelDecisionSchema(untypedEnum),
-    /model_protocol_error/,
-  );
-  const untypedScalar = structuredClone(modelDecisionEnvelopeSchema);
-  delete untypedScalar.properties.decision.anyOf[1].properties.output.type;
-  assert.throws(
-    () => auditModelDecisionSchema(untypedScalar),
-    /model_protocol_error/,
-  );
-  const openRoot = structuredClone(modelDecisionEnvelopeSchema);
-  openRoot.additionalProperties = true;
-  assert.throws(() => auditModelDecisionSchema(openRoot), /model_protocol_error/);
+  await runDecisionWireSelfTest({ silent: true });
   assert.throws(
     () =>
       schemaAstToValue(
@@ -2595,8 +2218,6 @@ async function hardeningSelfTest({ silent = false } = {}) {
       }),
     /codex_protocol_schema_mismatch/,
   );
-  assert.equal(validString("😀", 1, 1), true);
-  assert.equal(validString("😀", 2, 2), false);
   if (!silent) process.stdout.write("codex_browser_format_hardening: PASS\n");
   let now = 1000;
   let expired = false;
@@ -2609,36 +2230,6 @@ async function hardeningSelfTest({ silent = false } = {}) {
   now = 1101;
   assert.throws(() => deadline.remaining(), /codex_app_server_timeout/);
   assert.equal(expired, true);
-  const duplicateDecisionTurn = {
-    turn: {
-      id: "turn-duplicate",
-      status: "completed",
-      error: null,
-      itemsView: "notLoaded",
-    },
-    messages: [
-      {
-        method: "item/completed",
-        params: {
-          threadId: "thread-duplicate",
-          turnId: "turn-duplicate",
-          item: {
-            id: "agent-duplicate",
-            type: "agentMessage",
-            text: String.raw`{"decision":{"version":1,"type":"final","output":"gate-complete"},"\u0064ecision":{"version":1,"type":"final","output":"gate-complete"}}`,
-          },
-        },
-      },
-    ],
-  };
-  assert.throws(
-    () =>
-      parseTurnEnvelope(duplicateDecisionTurn, {
-        threadId: "thread-duplicate",
-        turnId: "turn-duplicate",
-      }),
-    /model_protocol_error/,
-  );
   const knownTurns = [
     { threadId: "thread-audit", turnId: "turn-audit", completedIndex: 1 },
   ];

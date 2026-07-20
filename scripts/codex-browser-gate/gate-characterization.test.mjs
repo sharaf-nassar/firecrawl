@@ -6,9 +6,16 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import * as contract from "./gate-contract.mjs";
+import * as decisionWire from "./decision-wire.mjs";
 import * as preflight from "./preflight.mjs";
 
 const { gateError, hashFeatureInventory } = contract;
+const {
+  normalizeModelDecisionEnvelopeV1,
+  normalizedProposalHash,
+  parseModelDecisionEnvelopeV1,
+  runDecisionWireSelfTest,
+} = decisionWire;
 const { parseInvocation, runPreflight } = preflight;
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const gatePath = fileURLToPath(new URL("./run.mjs", import.meta.url));
@@ -1062,10 +1069,83 @@ assert.deepEqual(Object.keys(contract).toSorted(), [
   "gateError",
   "hashFeatureInventory",
 ]);
+assert.deepEqual(Object.keys(decisionWire).toSorted(), [
+  "modelDecisionEnvelopeSchema",
+  "normalizeModelDecisionEnvelopeV1",
+  "normalizedProposalHash",
+  "parseModelDecisionEnvelopeV1",
+  "runDecisionWireSelfTest",
+]);
 assert.deepEqual(Object.keys(preflight).toSorted(), [
   "parseInvocation",
   "runPreflight",
 ]);
+const actionEnvelopeText =
+  '{"decision":{"version":1,"type":"action","action":' +
+  '{"kind":"fill","ref":"gate-marker","value":"approved"}}}';
+assert.deepEqual(parseModelDecisionEnvelopeV1(actionEnvelopeText), {
+  decision: {
+    version: 1,
+    type: "action",
+    action: {
+      kind: "fill",
+      ref: "gate-marker",
+      value: "approved",
+    },
+  },
+});
+const finalEnvelopeText =
+  '{"decision":{"version":1,"type":"final",' +
+  '"output":"gate-complete"}}';
+assert.deepEqual(
+  normalizeModelDecisionEnvelopeV1(
+    parseModelDecisionEnvelopeV1(finalEnvelopeText),
+  ),
+  { version: 1, type: "final", output: "gate-complete" },
+);
+assert.throws(
+  () =>
+    parseModelDecisionEnvelopeV1(
+      '{"decision":{"version":1,"type":"final",' +
+        '"\\u0074ype":"action","output":"gate-complete"}}',
+    ),
+  /model_protocol_error/,
+);
+const orderedProposal = {
+  kind: "fill",
+  ref: "gate-marker",
+  value: "approved",
+};
+const permutedProposal = {
+  value: "approved",
+  kind: "fill",
+  ref: "gate-marker",
+};
+const changedProposal = {
+  kind: "fill",
+  ref: "gate-marker",
+  value: "changed",
+};
+assert.equal(
+  normalizedProposalHash(orderedProposal),
+  normalizedProposalHash(permutedProposal),
+);
+assert.notEqual(
+  normalizedProposalHash(orderedProposal),
+  normalizedProposalHash(changedProposal),
+);
+const originalStdoutWrite = process.stdout.write;
+let decisionWireOutput = "";
+process.stdout.write = chunk => {
+  decisionWireOutput += String(chunk);
+  return true;
+};
+try {
+  await runDecisionWireSelfTest({ silent: true });
+} finally {
+  process.stdout.write = originalStdoutWrite;
+}
+assert.equal(decisionWireOutput, "");
 assert.equal(contract.CODEX_VERSION_OUTPUT, "codex-cli 0.144.5");
 assert.equal(contract.CODEX_VERSION, "0.144.5");
 assert.equal(contract.MODEL, "gpt-5.6-terra");
