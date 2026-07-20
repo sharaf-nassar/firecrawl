@@ -233,7 +233,9 @@ For every commit:
   `gpt-5.6-terra`/`medium` thread per request. Codex returns a strict root
   `ModelDecisionEnvelopeV1`; the host validates its distinct model-wire
   operations and normalizes them into unchanged internal `ModelDecisionV1`.
-  Codex receives bounded observations and has no MCP, tools, or relay.
+  Turn-scoped `item/completed` supplies the sole agent-message text;
+  `turn/completed` supplies status/metadata and `turn.items` is never an output
+  source. Codex receives bounded observations and has no MCP, tools, or relay.
 - Every accepted prompt action is durably prepared before dispatch, executes
   at most once, and records a definite result or terminal unknown outcome.
 - Node, Python, and Bash run inside disposable fixed `runc` bundles.

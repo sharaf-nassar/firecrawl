@@ -645,6 +645,53 @@ or a `turn/completed` status other than `completed`. Apply a 120-second
 watchdog, cap combined stdout/stderr/event storage at 4 MiB, and kill the
 process group on timeout.
 
+Implement `startTurn(...)` to return `{ turn, messages }`, where `turn` is the
+active payload from `turn/completed`. `messages` contains only the bounded
+notifications buffered for that current turn. Correlate every
+notification by active `threadId` and `turnId` wherever those fields exist;
+reject cross-thread/cross-turn notifications, duplicate completed
+`agentMessage` items, missing/non-string message text, and any event after the
+active `turn/completed` as `model_protocol_error`.
+
+`parseTurnEnvelope({ turn, messages })` finds exactly one turn-scoped
+`item/completed` whose `item.type === "agentMessage"`, reads its string
+`item.text`, and parses that text as `ModelDecisionEnvelopeV1`. Never inspect
+`turn.items` for model output. Use `turn/completed` only to confirm active
+thread/turn identity, status/error, usage, and timing metadata. Accept
+`turn.itemsView` values `notLoaded`, `summary`, and `full`; none changes output
+extraction. Keep the existing item/tool/approval allowlist unchanged.
+
+Add this regression fixture before the live run:
+
+```js
+const wrappedFinal = {
+  decision: { version: 1, type: "final", output: "gate-complete" },
+};
+const unloadedTurnResult = {
+  turn: {
+    id: "turn-gate-1",
+    status: "completed",
+    items: [],
+    itemsView: "notLoaded",
+  },
+  messages: [{
+    method: "item/completed",
+    params: {
+      threadId: "thread-gate-1",
+      turnId: "turn-gate-1",
+      item: { type: "agentMessage", text: JSON.stringify(wrappedFinal) },
+    },
+  }],
+};
+assert.deepEqual(
+  parseTurnEnvelope(unloadedTurnResult, {
+    threadId: "thread-gate-1",
+    turnId: "turn-gate-1",
+  }),
+  wrappedFinal,
+);
+```
+
 - [ ] **Step 6: Drive the exact two-turn action loop**
 
 Turn one input is one `{ type: "text", text: <string> }` item containing the
@@ -659,10 +706,11 @@ ObservationV1:
 Return exactly {"decision":{"version":1,"type":"action","action":{"kind":"fill","ref":"gate-marker","value":"approved"}}}.
 ```
 
-Require the completed `agentMessage.text` to parse as the exact wrapped action
-object. Strictly validate the full `ModelDecisionEnvelopeV1`, require the exact
-selected fill variant, then call `normalizeModelDecisionEnvelopeV1` and only
-then use unchanged `ModelDecisionV1`.
+Require the authoritative turn-scoped `item/completed` `agentMessage.text` to
+parse as the exact wrapped action object. Strictly validate the full
+`ModelDecisionEnvelopeV1`, require the exact selected fill variant, then call
+`normalizeModelDecisionEnvelopeV1` and only then use unchanged
+`ModelDecisionV1`.
 Lock the wire and internal boundaries with these exact assertions:
 
 ```js

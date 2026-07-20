@@ -233,10 +233,28 @@ the internal `BrowserOperation` or `ModelDecisionV1` schema.
 Unknown fields, malformed JSON, multiple decisions, envelope/schema/semantic
 mismatch, or any tool or approval event are `model_protocol_error` failures.
 There is no flattened nullable action/output object and no plain-JSON
-fallback. Codex receives the original prompt and an initial bounded
-`ObservationV1` once. Later turns contain only action-result observations with
-sequence, action kind, definite outcome, sanitized result or error, URL/title
-metadata, and snapshot excerpts. `BoundedPageState` is the existing bounded
+fallback.
+
+For each active turn, its turn-scoped `item/completed` notification is the
+authoritative model-output source. Exactly one completed item must be an
+`agentMessage` with string `text`; that text is parsed and validated as
+`ModelDecisionEnvelopeV1`. `turn/completed` supplies only active thread/turn
+identity, terminal status/error, usage, and timing metadata. Its `turn.items`
+is never an output source. Accept `itemsView` values `notLoaded`, `summary`, or
+`full` without changing extraction; `notLoaded` intentionally permits an empty
+items array.
+
+The adapter buffers only bounded notifications for the current turn,
+correlates thread and turn identifiers wherever an event carries them, and
+rejects cross-thread/cross-turn events, duplicate completed agent messages,
+missing/non-string message text, and events arriving after terminal turn
+completion as `model_protocol_error`. This does not widen the item allowlist or
+permit tool/approval events.
+
+Codex receives the original prompt and an initial bounded `ObservationV1`
+once. Later turns contain only action-result observations with sequence,
+action kind, definite outcome, sanitized result or error, URL/title metadata,
+and snapshot excerpts. `BoundedPageState` is the existing bounded
 URL/title/snapshot representation. Page content is explicitly marked
 untrusted.
 

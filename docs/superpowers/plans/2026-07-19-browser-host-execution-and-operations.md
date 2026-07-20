@@ -711,6 +711,37 @@ async fn one_process_and_thread_drive_two_turns() {
     ]);
     assert_eq!(result.output, "done");
 }
+
+#[tokio::test]
+async fn unloaded_turn_items_use_item_completed_agent_message() {
+    let fixture = FakeAppServer::turn_events(vec![
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "text": "{\"decision\":{\"version\":1,\"type\":\"final\",\"output\":\"done\"}}"
+                }
+            }
+        }),
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [],
+                    "itemsView": "notLoaded"
+                }
+            }
+        }),
+    ]);
+    let result = run_prompt_job(prompt_request(), fixture.command()).await.unwrap();
+    assert_eq!(result.output, "done");
+}
 ```
 
 - [ ] **Step 2: Write failing forbidden-event tests**
@@ -721,7 +752,9 @@ input requests, additional assistant decisions, and events for another thread
 or turn. Allow only protocol lifecycle, reasoning, token usage, and exactly one
 final `agentMessage` for the active turn. Fake responses use wrapped action and
 final values, and malformed root unions or flattened supersets fail as
-`model_protocol_error`.
+`model_protocol_error`. Also reject a duplicate/missing completed agent
+message, missing/non-string agent text, a cross-thread/cross-turn event, and
+any notification arriving after active `turn/completed`.
 
 ```rust
 #[tokio::test]
@@ -776,16 +809,24 @@ json!({"id": request_id, "method": "turn/start", "params": {
 ```
 
 The implementation builds JSON values, never string-replaces IDs or text.
-Validate every response/notification against checked-in V2 schemas. Collect
-one completed `agentMessage`, require `turn/completed` status `completed`, then
-validate its text against the closed `ModelDecisionEnvelopeV1` schema,
+Validate every response/notification against checked-in V2 schemas. Buffer
+only bounded notifications for the current turn and correlate `threadId` and
+`turnId` wherever present. Exactly one active-turn `item/completed` must carry
+an `agentMessage` item with string `text`; that text is the authoritative model
+output. Validate it against the closed `ModelDecisionEnvelopeV1` schema,
 deserialize only the distinct wire types, and call
 `normalize_model_decision_envelope` to produce unchanged `ModelDecisionV1`.
-Refusal, failed/interrupted turn,
-unknown method, unknown field in a consumed type, envelope/schema/semantic
-mismatch, or any tool/approval event is `model_protocol_error`. No flattened
-nullable action/output superset or plain-JSON fallback exists. Cap stdout
-events at 2 MiB and stderr at 256 KiB.
+
+Use `turn/completed` only for active thread/turn identity, terminal
+status/error, usage, and timing metadata. Never read model output from
+`turn.items`; accept `itemsView` `notLoaded`, `summary`, or `full`, including an
+empty array for `notLoaded`. Refusal, failed/interrupted turn, unknown method,
+unknown field in a consumed type, cross-turn/thread or late event,
+duplicate/missing agent message, missing/non-string agent text,
+envelope/schema/semantic mismatch, or any tool/approval event is
+`model_protocol_error`. No flattened nullable action/output superset or
+plain-JSON fallback exists. Cap current-turn stdout events at 2 MiB and stderr
+at 256 KiB.
 
 - [ ] **Step 5: Implement deterministic action callback loop**
 
@@ -1705,6 +1746,9 @@ Validate fresh public MCP clients with no provider fallback."
 - [ ] Every turn uses closed root `ModelDecisionEnvelopeV1` `outputSchema`,
   validates distinct wire types, and normalizes unchanged internal
   `ModelDecisionV1`.
+- [ ] Exactly one active-turn `item/completed` agent message supplies output;
+  `turn/completed` supplies terminal metadata and unloaded `turn.items` is
+  accepted but never parsed for output.
 - [ ] Original prompt appears only on initial turn; later turns contain only
   bounded definite observations.
 - [ ] Maximum 25 actions, 26 turns, 1 MiB observations, 300 seconds.
