@@ -27,83 +27,103 @@ import {
   surfaceCleanupFailures,
 } from "./lifecycle.mjs";
 
+async function withOwnedRoot(lifecycle, rootPrefix, callback) {
+  const root = lifecycle.createRoot(rootPrefix);
+  let result;
+  let primaryFailure;
+  try {
+    result = await callback(root);
+  } catch (error) {
+    primaryFailure = error;
+  }
+
+  const cleanupFailures = [];
+  try {
+    await lifecycle.removeRoot(root);
+  } catch (error) {
+    cleanupFailures.push(error);
+  }
+  surfaceCleanupFailures(primaryFailure, cleanupFailures);
+  if (primaryFailure) throw primaryFailure;
+  return result;
+}
+
 async function runActionStoreSelfTest({ silent = false } = {}) {
   const lifecycle = new LifecycleRegistry();
-  const root = lifecycle.createRoot(
+  return withOwnedRoot(
+    lifecycle,
     join(tmpdir(), "codex-browser-action-store-"),
-  );
-  const markerPath = join(root, "marker");
-  try {
-    const store = createGateActionStore({ markerPath });
-    const action = {
-      version: 1, adapterJobId: "gate-job", sequence: 1,
-      actionId: "gate-action-1",
-      proposalHash: normalizedProposalHash({
-        kind: "fill", ref: "gate-marker", value: "approved",
-      }),
-      effect: "side_effecting",
-      operation: { kind: "fill", ref: "gate-marker", value: "approved" },
-    };
-    const first = await store.execute(action);
-    const replay = await store.execute(action);
-    await assert.rejects(
-      store.execute({ ...action, proposalHash: "0".repeat(64) }),
-      /action_identity_mismatch/,
-    );
-    assert.deepEqual(replay, first);
-    assert.equal(await readFile(markerPath, "utf8"), "approved\n");
-    const markerStat = await stat(markerPath);
-    assert.equal(markerStat.isFile(), true);
-    assert.equal(markerStat.mode & 0o777, 0o600);
-    const snapshot = store.snapshot();
-    assert.equal(snapshot.writeCount, 1);
-    assert.equal(snapshot.records.length, 1);
-    assert.deepEqual(
-      {
-        version: snapshot.records[0].version,
-        adapterJobId: snapshot.records[0].adapterJobId,
-        sequence: snapshot.records[0].sequence,
-        actionId: snapshot.records[0].actionId,
-        proposalHash: snapshot.records[0].proposalHash,
-        effect: snapshot.records[0].effect,
-        operation: snapshot.records[0].operation,
-        state: snapshot.records[0].state,
-      },
-      { ...action, state: "succeeded" },
-    );
-    await assert.rejects(
-      store.execute({
-        ...action,
-        actionId: "bad-operation",
-        sequence: 2,
-        operation: {
-          kind: "fill",
-          ref: "gate-marker",
-          value: "approved",
-          extra: true,
-        },
-      }),
-      /invalid_action_operation/,
-    );
-    const failedMarkerPath = join(root, "failed-marker");
-    await writeFile(failedMarkerPath, "occupied\n", { mode: 0o600 });
-    const failedStore = createGateActionStore({ markerPath: failedMarkerPath });
-    await assert.rejects(
-      failedStore.execute({
-        ...action,
-        actionId: "dispatch-failure",
-      }),
-      error => error?.code === "EEXIST",
-    );
-    assert.equal(failedStore.snapshot().records[0].state, "executing");
-    if (!silent) {
-      process.stdout.write(
-        `codex_browser_action_store: PASS writes=${snapshot.writeCount} records=${snapshot.records.length}\n`,
+    async root => {
+      const markerPath = join(root, "marker");
+      const store = createGateActionStore({ markerPath });
+      const action = {
+        version: 1, adapterJobId: "gate-job", sequence: 1,
+        actionId: "gate-action-1",
+        proposalHash: normalizedProposalHash({
+          kind: "fill", ref: "gate-marker", value: "approved",
+        }),
+        effect: "side_effecting",
+        operation: { kind: "fill", ref: "gate-marker", value: "approved" },
+      };
+      const first = await store.execute(action);
+      const replay = await store.execute(action);
+      await assert.rejects(
+        store.execute({ ...action, proposalHash: "0".repeat(64) }),
+        /action_identity_mismatch/,
       );
-    }
-  } finally {
-    await lifecycle.removeRoot(root);
-  }
+      assert.deepEqual(replay, first);
+      assert.equal(await readFile(markerPath, "utf8"), "approved\n");
+      const markerStat = await stat(markerPath);
+      assert.equal(markerStat.isFile(), true);
+      assert.equal(markerStat.mode & 0o777, 0o600);
+      const snapshot = store.snapshot();
+      assert.equal(snapshot.writeCount, 1);
+      assert.equal(snapshot.records.length, 1);
+      assert.deepEqual(
+        {
+          version: snapshot.records[0].version,
+          adapterJobId: snapshot.records[0].adapterJobId,
+          sequence: snapshot.records[0].sequence,
+          actionId: snapshot.records[0].actionId,
+          proposalHash: snapshot.records[0].proposalHash,
+          effect: snapshot.records[0].effect,
+          operation: snapshot.records[0].operation,
+          state: snapshot.records[0].state,
+        },
+        { ...action, state: "succeeded" },
+      );
+      await assert.rejects(
+        store.execute({
+          ...action,
+          actionId: "bad-operation",
+          sequence: 2,
+          operation: {
+            kind: "fill",
+            ref: "gate-marker",
+            value: "approved",
+            extra: true,
+          },
+        }),
+        /invalid_action_operation/,
+      );
+      const failedMarkerPath = join(root, "failed-marker");
+      await writeFile(failedMarkerPath, "occupied\n", { mode: 0o600 });
+      const failedStore = createGateActionStore({ markerPath: failedMarkerPath });
+      await assert.rejects(
+        failedStore.execute({
+          ...action,
+          actionId: "dispatch-failure",
+        }),
+        error => error?.code === "EEXIST",
+      );
+      assert.equal(failedStore.snapshot().records[0].state, "executing");
+      if (!silent) {
+        process.stdout.write(
+          `codex_browser_action_store: PASS writes=${snapshot.writeCount} records=${snapshot.records.length}\n`,
+        );
+      }
+    },
+  );
 }
 
 async function runCrossModuleHardeningSelfTest() {
@@ -236,6 +256,94 @@ async function runCrossModuleHardeningSelfTest() {
     () => surfaceCleanupFailures(undefined, [storeFailure]),
     error => error === storeFailure,
   );
+
+  const rootPrefix = "/fake/action-store-root-";
+  const fakeRoot = "/fake/action-store-root-1";
+  const primaryOnlyCalls = [];
+  await assert.rejects(
+    () =>
+      withOwnedRoot(
+        {
+          createRoot(prefix) {
+            primaryOnlyCalls.push(["create", prefix]);
+            return fakeRoot;
+          },
+          async removeRoot(root) {
+            primaryOnlyCalls.push(["remove", root]);
+          },
+        },
+        rootPrefix,
+        async root => {
+          primaryOnlyCalls.push(["callback", root]);
+          throw primaryFailure;
+        },
+      ),
+    error => error === primaryFailure,
+  );
+  assert.deepEqual(primaryOnlyCalls, [
+    ["create", rootPrefix],
+    ["callback", fakeRoot],
+    ["remove", fakeRoot],
+  ]);
+
+  const cleanupOnlyCalls = [];
+  await assert.rejects(
+    () =>
+      withOwnedRoot(
+        {
+          createRoot(prefix) {
+            cleanupOnlyCalls.push(["create", prefix]);
+            return fakeRoot;
+          },
+          async removeRoot(root) {
+            cleanupOnlyCalls.push(["remove", root]);
+            throw rootFailure;
+          },
+        },
+        rootPrefix,
+        async root => {
+          cleanupOnlyCalls.push(["callback", root]);
+        },
+      ),
+    error => error === rootFailure,
+  );
+  assert.deepEqual(cleanupOnlyCalls, [
+    ["create", rootPrefix],
+    ["callback", fakeRoot],
+    ["remove", fakeRoot],
+  ]);
+
+  const combinedCalls = [];
+  await assert.rejects(
+    () =>
+      withOwnedRoot(
+        {
+          createRoot(prefix) {
+            combinedCalls.push(["create", prefix]);
+            return fakeRoot;
+          },
+          async removeRoot(root) {
+            combinedCalls.push(["remove", root]);
+            throw rootFailure;
+          },
+        },
+        rootPrefix,
+        async root => {
+          combinedCalls.push(["callback", root]);
+          throw primaryFailure;
+        },
+      ),
+    error =>
+      error instanceof AggregateError &&
+      error.errors.length === 2 &&
+      error.errors[0] === primaryFailure &&
+      error.errors[1] === rootFailure,
+  );
+  assert.deepEqual(combinedCalls, [
+    ["create", rootPrefix],
+    ["callback", fakeRoot],
+    ["remove", fakeRoot],
+  ]);
 }
 
 async function runHardeningSelfTest({ silent = false } = {}) {
