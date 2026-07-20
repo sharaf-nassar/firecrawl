@@ -1470,15 +1470,24 @@ function auditAllAppServerEvents(messages, knownTurns) {
     if (typeof message.method !== "string") continue;
     const params = message.params;
     const hasThreadId = Object.hasOwn(params ?? {}, "threadId");
+    const hasNestedThreadId = Object.hasOwn(params?.thread ?? {}, "id");
     const hasTurnId = Object.hasOwn(params ?? {}, "turnId");
     const hasNestedTurnId = Object.hasOwn(params?.turn ?? {}, "id");
-    if (hasThreadId) {
+    let threadId;
+    if (hasThreadId || hasNestedThreadId) {
+      const directThreadId = hasThreadId ? params.threadId : undefined;
+      const nestedThreadId = hasNestedThreadId ? params.thread.id : undefined;
       if (
-        typeof params.threadId !== "string" ||
-        !knownThreadIds.has(params.threadId)
+        (hasThreadId && typeof directThreadId !== "string") ||
+        (hasNestedThreadId && typeof nestedThreadId !== "string") ||
+        (hasThreadId &&
+          hasNestedThreadId &&
+          directThreadId !== nestedThreadId)
       ) {
         modelProtocolError();
       }
+      threadId = directThreadId ?? nestedThreadId;
+      if (!knownThreadIds.has(threadId)) modelProtocolError();
     }
     if (hasTurnId || hasNestedTurnId) {
       const directTurnId = hasTurnId ? params.turnId : undefined;
@@ -1491,8 +1500,8 @@ function auditAllAppServerEvents(messages, knownTurns) {
         modelProtocolError();
       }
       const turnId = directTurnId ?? nestedTurnId;
-      const matches = hasThreadId
-        ? [turns.get(`${params.threadId}\0${turnId}`)].filter(Boolean)
+      const matches = threadId !== undefined
+        ? [turns.get(`${threadId}\0${turnId}`)].filter(Boolean)
         : (turnsById.get(turnId) ?? []);
       if (matches.length !== 1 || index > matches[0].completedIndex) {
         modelProtocolError();
@@ -2186,6 +2195,10 @@ async function hardeningSelfTest() {
       params: { threadId: "thread-other", turn: { id: "turn-other" } },
     },
     { method: "account/updated", params: {} },
+    {
+      method: "thread/started",
+      params: { thread: { id: "thread-other" } },
+    },
   ];
   assert.deepEqual(auditAllAppServerEvents(twoCleanTurns, twoKnownTurns), {
     tools: 0,
@@ -2216,6 +2229,18 @@ async function hardeningSelfTest() {
   });
   assert.throws(
     () => auditAllAppServerEvents(postTerminal, twoKnownTurns),
+    /model_protocol_error/,
+  );
+  const unknownNestedThread = structuredClone(twoCleanTurns);
+  unknownNestedThread[5].params.thread.id = "thread-unknown";
+  assert.throws(
+    () => auditAllAppServerEvents(unknownNestedThread, twoKnownTurns),
+    /model_protocol_error/,
+  );
+  const conflictingNestedThread = structuredClone(twoCleanTurns);
+  conflictingNestedThread[5].params.threadId = "thread-audit";
+  assert.throws(
+    () => auditAllAppServerEvents(conflictingNestedThread, twoKnownTurns),
     /model_protocol_error/,
   );
   const primaryFailure = new Error("primary_failure");
