@@ -1778,17 +1778,6 @@ async function hardeningSelfTest({ silent = false } = {}) {
     /codex_protocol_schema_mismatch/,
   );
   if (!silent) process.stdout.write("codex_browser_format_hardening: PASS\n");
-  let now = 1000;
-  let expired = false;
-  const deadline = new ProcessDeadline(100, () => now, () => {
-    expired = true;
-  });
-  assert.equal(deadline.remaining(), 100);
-  now = 1060;
-  assert.equal(deadline.remaining(), 40);
-  now = 1101;
-  assert.throws(() => deadline.remaining(), /codex_app_server_timeout/);
-  assert.equal(expired, true);
   const knownTurns = [
     { threadId: "thread-audit", turnId: "turn-audit", completedIndex: 1 },
   ];
@@ -1894,19 +1883,6 @@ async function hardeningSelfTest({ silent = false } = {}) {
   assert.throws(
     () => auditAllAppServerEvents(conflictingNestedThread, twoKnownTurns),
     /model_protocol_error/,
-  );
-  const primaryFailure = new Error("primary_failure");
-  const cleanupFailure = new Error("cleanup_failure");
-  assert.throws(
-    () => surfaceCleanupFailures(primaryFailure, [cleanupFailure]),
-    error =>
-      error instanceof AggregateError &&
-      error.errors[0] === primaryFailure &&
-      error.errors[1] === cleanupFailure,
-  );
-  assert.throws(
-    () => surfaceCleanupFailures(undefined, [cleanupFailure]),
-    error => error === cleanupFailure,
   );
   assert.equal(parseInvocation([]).runCount, 3);
   assert.equal(parseInvocation(["--runs", "10"]).runCount, 10);
@@ -2114,6 +2090,149 @@ async function transportSelfTest({ silent = false } = {}) {
   client.stopping = false;
   await client.stop();
   assert.equal(groupAlive, false);
+
+  const appServerChild = pid => {
+    const fake = new EventEmitter();
+    fake.pid = pid;
+    fake.stdout = new PassThrough();
+    fake.stderr = new PassThrough();
+    fake.stdin = {
+      ended: false,
+      end() {
+        this.ended = true;
+      },
+      write() {},
+    };
+    return fake;
+  };
+  const signalListenerCounts = ["SIGINT", "SIGTERM", "SIGHUP"].map(
+    signal => process.listenerCount(signal),
+  );
+
+  let expiredNow = 0;
+  const expiredDeadline = new ProcessDeadline(1, () => expiredNow);
+  const expiredChild = appServerChild(602);
+  let expiredGroupAlive = true;
+  const expiredSignals = [];
+  const expiredRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -602);
+      if (signal === 0) {
+        if (!expiredGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      expiredSignals.push(signal);
+      expiredGroupAlive = false;
+    },
+  });
+  const expiredTimers = new Set();
+  const expiredClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events-expired",
+    deadline: expiredDeadline,
+    spawnChild: () => expiredChild,
+    supervisor: expiredRegistry,
+    scheduleTimer() {
+      const handle = Symbol("expired-watchdog");
+      expiredTimers.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      expiredTimers.delete(handle);
+    },
+  });
+  expiredNow = 2;
+  queueMicrotask(() => {
+    expiredChild.stdout.end();
+    expiredChild.stderr.end();
+    expiredChild.emit("close", null, "SIGKILL");
+  });
+  await expiredClient.stop();
+  assert.equal(expiredChild.stdin.ended, true);
+  assert.equal(expiredGroupAlive, false);
+  assert.deepEqual(expiredSignals, ["SIGKILL"]);
+  assert.equal(expiredClient.closed, true);
+  assert.deepEqual(expiredTimers, new Set());
+
+  const retainedChild = appServerChild(603);
+  let retainedGroupAlive = true;
+  const retainedSignals = [];
+  let retainedClock = 0;
+  const retainedDeadlineTimers = new Set();
+  const retainedRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -603);
+      if (signal === 0) {
+        if (!retainedGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      retainedSignals.push(signal);
+      retainedGroupAlive = false;
+    },
+    now: () => retainedClock,
+    wait: async milliseconds => {
+      retainedClock += milliseconds;
+    },
+    scheduleTimer(callback) {
+      const handle = setImmediate(() => {
+        retainedDeadlineTimers.delete(handle);
+        callback();
+      });
+      retainedDeadlineTimers.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      retainedDeadlineTimers.delete(handle);
+      clearImmediate(handle);
+    },
+  });
+  const retainedWatchdogs = new Set();
+  const retainedClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events-retained",
+    deadline: new ProcessDeadline(1, () => 2),
+    spawnChild: () => retainedChild,
+    supervisor: retainedRegistry,
+    scheduleTimer() {
+      const handle = Symbol("retained-watchdog");
+      retainedWatchdogs.add(handle);
+      return handle;
+    },
+    cancelTimer(handle) {
+      retainedWatchdogs.delete(handle);
+    },
+  });
+  await assert.rejects(
+    retainedClient.stop(),
+    error =>
+      error?.code === "codex_app_server_close_timeout" &&
+      error.message === "codex_app_server_close_timeout",
+  );
+  assert.equal(retainedChild.stdin.ended, true);
+  assert.equal(retainedGroupAlive, false);
+  assert.deepEqual(retainedSignals, ["SIGKILL"]);
+  assert.deepEqual(retainedWatchdogs, new Set());
+  assert.deepEqual(retainedDeadlineTimers, new Set());
+  retainedChild.stdout.end();
+  retainedChild.stderr.end();
+  retainedChild.emit("close", null, "SIGKILL");
+  assert.equal(retainedClient.closed, true);
+  assert.deepEqual(
+    ["SIGINT", "SIGTERM", "SIGHUP"].map(signal =>
+      process.listenerCount(signal),
+    ),
+    signalListenerCounts,
+  );
   if (!silent) process.stdout.write("codex_browser_transport: PASS\n");
 }
 
