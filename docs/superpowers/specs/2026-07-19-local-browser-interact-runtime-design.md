@@ -23,10 +23,13 @@ on a private network or Unix socket.
 
 - Add a dedicated, backend-only Browser Service. Do not retrofit persistent
   sessions into `apps/playwright-service-ts`.
-- Start one ephemeral Codex process for each prompt-based Interact request.
+- Start one pinned Codex app-server 0.144.5 process with one ephemeral thread
+  for each prompt-based Interact request. Pin and checksum its generated V2
+  protocol schema with the OCI bundle.
 - Use `gpt-5.6-terra` with `medium` reasoning effort.
-- Expose only typed browser tools to Codex. Never expose a raw host shell,
-  Docker, user files, or the normal Codex tool environment.
+- Give Codex no MCP servers, model tools, browser relay, raw host shell,
+  Docker, user files, or normal Codex tool environment. The host executes
+  schema-constrained action proposals through the API policy boundary.
 - Execute Node, Python, and Bash code mode in disposable `runc` OCI sandboxes
   through a narrow root-owned broker.
 - Keep profiles durable and replay browser state after process or service
@@ -42,6 +45,9 @@ on a private network or Unix socket.
 - Stop is terminal for the active browser and execution. A later Interact call
   creates a new browser and replays the persisted scrape/profile context.
 - Never retry a model-generated browser action automatically.
+- Permit Codex to choose a materially different action after one definite
+  no-effect rejection or failure. An unknown outcome is terminal and is never
+  returned to the model.
 - Never fall back to Gemini, Fireworks, Firecrawl Cloud, or an API key.
 
 ## Current Gap
@@ -76,18 +82,16 @@ Firecrawl API (only published TCP surface)
   |       +--> app-postgres + MinIO
   |
   +--> browser-service (private Compose network)
-          |        |
-          |        +--> persistent Chromium + profile volume
-          |
-          +--> bounded browser operation RPC
-                       ^
-                       |
-private Unix socket    | browser capability, held by bridge
-          |            |
-host execution adapter --> root sandbox broker --> isolated `codex exec`
-          |                         |
-          |                         +--> isolated disposable code runner
-          +--> fixed job policy only
+  |       |
+  |       +--> persistent Chromium + profile volume
+  |       +--> bounded browser operation RPC + action deduplication
+  |
+  +<-- private Unix socket --> host execution adapter
+                                  |
+                                  +--> root sandbox broker
+                                         +--> isolated pinned `codex app-server`
+                                         |      (one process + ephemeral thread)
+                                         +--> disposable code runner
 ```
 
 ### Firecrawl API
@@ -117,48 +121,93 @@ host runtime directory. Mount that socket only into the API component that
 submits adapter jobs. The adapter owns Codex authentication and never returns
 credentials or raw environment data.
 
-Each prompt request starts one process with these boundaries:
+Each prompt request starts one Codex app-server 0.144.5 process and one
+ephemeral thread. The adapter uses the official app-server V2 multi-turn
+protocol and supplies an `outputSchema` on every turn. The generated protocol
+JSON Schema bundle is pinned and checksummed with the Codex OCI bundle; startup
+fails if the executable, protocol schema, or checksum differs.
 
-- `codex exec --ephemeral`
+The process has these boundaries:
+
 - Explicit model `gpt-5.6-terra` and reasoning effort `medium`
 - Outer `runc` mount/process isolation plus the read-only Codex sandbox
 - A new empty working directory with no host workspace or home-directory bind
 - Dedicated, adapter-controlled `CODEX_HOME` and generated profile
-- Only the private typed Browser MCP configured
-- Explicit `enabled_tools` for the request
-- Each enabled Browser MCP tool set to `approval_mode = "approve"`
-- `approval_policy = "never"` so unattended runs never wait for UI input
-- `features.shell_tool = false` and `features.unified_exec = false`
+- `approval_policy = "never"`; any approval request or event is a protocol
+  failure rather than an interactive pause
+- No MCP servers, model tools, browser relay, or tool calls
 - No user config, rules, skills, plugins, hooks, web search, shell, arbitrary
-  files, multi-agent behavior, built-in execution tool, or other MCP servers
-- Adapter deadline, output limit, subprocess watchdog, and structured result
-  schema
+  files, multi-agent behavior, built-in execution tool, or network tool
+- Adapter deadline, output limits, process watchdog, and strict event parser
 
-This boundary follows the verified official Codex configuration surface:
-isolated `CODEX_HOME`, explicit MCP tool enablement, per-tool approval mode,
-noninteractive approval policy, read-only sandboxing, ephemeral execution, and
-model/reasoning overrides. It must not use danger-full-access,
-`--dangerously-bypass-approvals-and-sandbox`, or equivalent yolo settings.
-Browser MCP annotations remain truthful about side effects; explicit per-tool
-approval is the API's bounded job authorization, not a false read-only hint.
-Because official Codex behavior still treats destructive MCP annotations as an
-approval boundary, a real side-effecting private-tool call on installed Codex
-0.144.5 is Phase 2 gate zero. It must complete headlessly with the exact
-isolated config above. If it pauses, rejects the call, exposes another tool, or
-requires a broader approval/sandbox setting, implementation stops and this
-design is revised before migrations or services are added.
+The only accepted model output is `ModelDecisionV1`:
 
-The OCI container is the outer host-filesystem boundary. Bind only the
-generated per-run configuration, the minimum read-only authentication file
-needed by the installed ChatGPT credential store, and one session relay into
-a pinned Codex root filesystem. Share host networking only because Codex must
-reach OpenAI; web search, shell, and all model-controlled network tools remain
-disabled. The model cannot select paths, binds, environment variables, MCP
-servers, or network destinations.
+```ts
+type ModelDecisionV1 =
+  | { version: 1; type: "action"; action: BrowserOperation }
+  | { version: 1; type: "final"; output: string };
+
+type BoundedPageState = {
+  url: string;
+  title: string;
+  snapshotExcerpt: string;
+};
+
+type ObservationV1 =
+  | {
+      version: 1;
+      type: "initial";
+      sequence: 0;
+      page: BoundedPageState;
+    }
+  | {
+      version: 1;
+      type: "action_result";
+      sequence: number;
+      actionId: string;
+      actionKind: BrowserOperation["kind"];
+      outcome: "succeeded" | "rejected_no_effect" | "failed_no_effect";
+      result?: unknown;
+      error?: { category: string; message: string };
+      page: BoundedPageState;
+    };
+```
+
+Unknown fields, malformed JSON, multiple decisions, output outside the union,
+or any tool or approval event are protocol failures. Codex receives the
+original prompt and an initial bounded `ObservationV1` once. Later turns
+contain only action-result observations with sequence, action kind, definite
+outcome, sanitized result or error, URL/title metadata, and snapshot excerpts.
+`BoundedPageState` is the existing bounded URL/title/snapshot representation.
+Page content is explicitly marked untrusted.
+
+For an action decision, the adapter assigns an action ID, monotonic sequence,
+normalized proposal hash, and effect classification. The API durably records
+and authorizes the action against run/session state, writer lease, origins,
+capability, deadline, and budgets before Browser Service executes it once.
+Exactly one action may be in flight. Its bounded observation becomes the next
+turn in the same thread. Codex never supplies identifiers, credentials,
+endpoints, policy, or idempotency keys.
+
+Per-request limits are 10,000 prompt characters, 40,000 snapshot-excerpt
+characters, 64 KiB per observation, 1 MiB aggregate injected observations,
+256 KiB final output, 25 action proposals, 26 model turns, and the caller's
+absolute deadline capped at 300 seconds. Cancellation, refusal, malformed or
+extra output, a limit breach, or unresolved action outcome fails closed. Every
+structurally valid action decision consumes one action and one turn before its
+policy outcome; rejection cannot be used to bypass either budget.
+
+The OCI container is the outer host-filesystem boundary. Bind only generated
+per-run configuration and the minimum read-only authentication file needed by
+the installed ChatGPT credential store into the pinned Codex root filesystem.
+Share host networking only because Codex must reach OpenAI; web search, shell,
+MCP, browser relay, and all model-controlled network tools remain disabled.
+The model cannot select paths, binds, environment variables, tools, or network
+destinations.
 
 Authentication material remains adapter-owned. Browser content, prompts, and
-tool results are visible to the selected OpenAI model; they are not sent to
-Gemini, Fireworks, or Firecrawl Cloud.
+bounded observations are visible to the selected OpenAI model; they are not
+sent to Gemini, Fireworks, or Firecrawl Cloud.
 
 ### Disposable Code Runner
 
@@ -184,11 +233,12 @@ Destroy the container, cgroup, and scratch data after every execution.
 
 The broker is a small systemd system service with a root-owned,
 adapter-group-restricted Unix socket. It accepts only an allowlisted bundle
-ID, job ID, fixed resource preset, deadline, sealed input descriptor, and
-pre-created relay descriptor. It rejects arbitrary commands, arguments,
-paths, mounts, environment variables, images, and network settings. The
-unprivileged adapter never obtains root, general `runc` control, or the
-broker's private filesystem. Neither service receives the Docker socket.
+ID, job ID, fixed resource preset, deadline, and sealed input descriptor. Code
+bundles additionally require a pre-created relay descriptor; the Codex bundle
+rejects relay descriptors. It rejects arbitrary commands, arguments, paths,
+mounts, environment variables, images, and network settings. The unprivileged
+adapter never obtains root, general `runc` control, or the broker's private
+filesystem. Neither service receives the Docker socket.
 
 This host already has `runc` 1.3.6 with namespaces, seccomp, cgroup v2,
 systemd cgroups, and AppArmor support. Ubuntu AppArmor currently blocks
@@ -251,18 +301,26 @@ backend endpoints or reusable bearer material.
 4. Browser Service restores a post-scrape checkpoint or performs only a
    replay-safe reconstruction of the original context.
 5. API creates an Interact run and a server-held browser capability.
-6. Host adapter creates isolated Codex configuration and starts one ephemeral
-   process with only the typed Browser MCP.
-7. Codex observes and acts through bounded typed operations.
-8. Adapter validates structured output, terminates the process, and returns
-   the result. API revokes the capability and persists terminal run state.
-9. Browser remains ready until stop or TTL expiry. Profile changes publish
+6. Host adapter asks the root broker to start one isolated pinned app-server
+   process and one ephemeral thread, then sends the original prompt, initial
+   bounded page observation, and strict decision schema.
+7. Codex emits one action proposal or final result. For each proposal, the
+   adapter assigns identity and effect metadata; API persists and authorizes
+   it before Browser Service executes it once.
+8. Adapter sends the resulting bounded observation on the next turn in the
+   same thread. Steps 7 and 8 repeat within action, turn, byte, and deadline
+   limits, with only one action in flight.
+9. A validated final result terminates the process. API revokes the capability
+   and persists terminal run state.
+10. Browser remains ready until stop or TTL expiry. Profile changes publish
    atomically when the writer session closes.
 
-Codex receives no automatic retry after an action error. The error and current
-page state remain available for the model to decide its next action within the
-same run. Only an idempotent infrastructure request may receive one bounded
-retry before any effect is observed.
+No model-generated browser action is retried automatically. A rejection or
+failure proven to have no effect is returned once; Codex may choose a
+materially different action within the same run. A side-effecting proposal
+with the same normalized hash is rejected even after definite no-effect.
+Repeated read-only proposals remain allowed. An unknown outcome terminates the
+run and session and is never returned for another model turn.
 
 ### Code Interact
 
@@ -278,11 +336,15 @@ An active Chromium or Codex process is never considered durable. On adapter,
 API, or Browser Service startup:
 
 1. Mark unfinished executions `interrupted` and revoke their capabilities.
-2. Kill adapter-owned orphan Codex and code-runner processes.
-3. Close or discard Browser Service processes not tied to a live registry.
-4. Preserve scrape replay context, session history, profile generations, and
-   artifacts.
-5. On the next Interact call, create a new browser, restore the last committed
+2. Resolve action rows still in `prepared` as `cancelled_no_effect`; they were
+   durably recorded but never dispatched.
+3. Resolve any action row still in `executing` as `outcome_unknown`, terminate
+   its run and browser session, and never replay it or return it to Codex.
+4. Kill adapter-owned orphan app-server and code-runner processes.
+5. Close or discard Browser Service processes not tied to a live registry.
+6. Preserve scrape replay context, action audit history, profile generations,
+   and artifacts, but do not resume a model thread or replay its action ledger.
+7. On the next Interact call, create a new browser, restore the last committed
    profile/checkpoint generation, and perform a replay-safe reconstruction.
 
 No request claims that an interrupted model or code execution resumed.
@@ -331,9 +393,9 @@ navigation, safe action, fingerprint check, or profile restore identifies the
 failing step and leaves the session terminal; prompt/code execution does not
 begin on partial reconstruction.
 
-## Browser Tools and Capabilities
+## Browser Operations and Capabilities
 
-The private MCP exposes only typed operations:
+`BrowserOperation` permits only typed operations:
 
 - `snapshot`
 - `click`
@@ -348,29 +410,34 @@ The private MCP exposes only typed operations:
 - `navigate`
 - Constrained `evaluate`
 
-Each operation has a strict input/output schema, maximum payload, operation
-timeout, and redaction policy. `evaluate` accepts a restricted page-context
-expression/program, not Node APIs, imports, filesystem access, sockets, or a
-Browser Service escape hatch. Snapshots expose stable element references and
-bounded text instead of unrestricted page dumps.
+Each operation has a strict input/output schema, effect classification,
+maximum payload, operation timeout, and redaction policy. The adapter accepts
+it only inside `ModelDecisionV1`; it is not exposed as a model tool.
+`evaluate` accepts a restricted page-context expression/program, not Node
+APIs, imports, filesystem access, sockets, or a Browser Service escape hatch.
+Snapshots expose stable element references and bounded text instead of
+unrestricted page dumps.
 
 `navigate` accepts only an absolute HTTP(S) URL whose normalized domain is
 already authorized by the session's navigation set. It cannot add an origin;
 only API validation of `allowedDomains` or a validated redirect/click may do
 that.
 
-Capability records stay server-side. Codex sees browser tool names and
-results, not bearer secrets. A capability is bound to:
+Capability records stay server-side. Codex sees operation schemas and bounded
+observations, not bearer secrets or a browser transport. A capability is bound
+to:
 
-- Local owner, scrape, browser session, Interact run, and Codex process ID
+- Local owner, scrape, browser session, Interact run, adapter job ID, and
+  supervisor process ID
 - Allowed operation set
 - Allowed origin set and navigation policy version
 - Maximum calls, bytes, wall-clock deadline, and per-operation deadline
 - Issued, redeemed, revoked, and expiry timestamps
 
-Only the per-run bridge can redeem it. Browser Service revalidates state on
-every call. Capabilities fail closed after completion, stop, timeout, process
-exit, owner mismatch, session replacement, or service recovery.
+Only the API's per-run action coordinator can redeem it. API and Browser
+Service revalidate state on every call. Capabilities fail closed after
+completion, stop, timeout, process exit, owner mismatch, session replacement,
+or service recovery.
 
 ## Navigation and Network Policy
 
@@ -454,6 +521,39 @@ queued -> starting -> running -> succeeded
 Terminal transitions use compare-and-set updates. Completion, cancellation,
 and timeout may race, but exactly one state and one cleanup owner win.
 
+### Interact Action
+
+```text
+prepared -> executing -> succeeded
+   |            |-----> failed_no_effect
+   |            `-----> outcome_unknown
+   |-----> rejected_no_effect
+   `-----> cancelled_no_effect
+```
+
+| State | Meaning | Recovery |
+|---|---|---|
+| `prepared` | Authorized and persisted; not dispatched | Cancel as proven no-effect |
+| `executing` | Dispatch began | Interruption becomes `outcome_unknown` |
+| `succeeded` | Effect and result are known | Return stored result |
+| `rejected_no_effect` | Policy rejected before dispatch | Return once; permit a different action |
+| `failed_no_effect` | Browser Service proves no effect | Return once; permit a different action |
+| `cancelled_no_effect` | Cancelled before dispatch | Terminal cancellation |
+| `outcome_unknown` | Effect cannot be proven | Terminate run and session |
+
+The API persists `prepared` before dispatch. It moves the row to `executing`
+immediately before Browser Service invocation. `prepared` proves no effect if
+the coordinator stops before dispatch; interruption during `executing` cannot
+prove whether an effect occurred and becomes `outcome_unknown`.
+
+Each row stores action ID, monotonic sequence, normalized proposal hash,
+effect classification, exact operation, bounded result or error metadata, and
+timestamps. Browser Service performs live deduplication by action ID. A
+matching callback replay returns the stored known result without executing
+again; the same action ID or sequence with a different hash is a protocol
+failure. `outcome_unknown` revokes capability and terminates both run and
+session. Restart never resumes the model loop or replays this ledger.
+
 ## Persistence and Migrations
 
 Add versioned local migrations before enabling Browser Service health. Align
@@ -468,8 +568,12 @@ Required durable records:
 - `browser_session_activities`: session/run, mode/language, bounded timing and
   exit metadata, source, correlation ID, and timestamps
 - `browser_interact_runs`: prompt/code mode, status, configured model/effort,
-  deadlines, adapter process identifier, output/artifact references, error
-  category, and lifecycle timestamps
+  deadlines, adapter job/supervisor identifiers, bounded model-thread activity
+  metadata, output/artifact references, error category, and lifecycle
+  timestamps
+- `browser_interact_actions`: run/session, action ID, monotonic sequence,
+  normalized proposal hash, effect classification, exact typed operation,
+  state, bounded result/error metadata, and lifecycle timestamps
 - `browser_profiles`: owner/name identity, latest committed generation, writer
   lease/session, retention state, and timestamps
 - `browser_profile_generations`: immutable generation metadata, filesystem
@@ -481,9 +585,10 @@ Required durable records:
   session, expiry, use limit, and revocation
 
 Use foreign keys to local owners/scrapes where retention semantics permit.
-Indexes cover owner/status, scrape/current session, run/status, expiry,
-profile writer lease, and capability/grant expiry. Migrations are idempotent
-under the existing migration runner and API health fails closed if pending.
+Indexes and unique constraints cover owner/status, scrape/current session,
+run/status, run/sequence, action ID/hash, expiry, profile writer lease, and
+capability/grant expiry. Migrations are idempotent under the existing migration
+runner and API health fails closed if pending.
 
 MinIO artifacts use stable owner/scrape/session/run prefixes and manifest
 records. Object retention follows database retention. Profile-volume cleanup
@@ -510,10 +615,16 @@ Browser Service provides bounded operations equivalent to:
 - Close session with save/discard policy
 - Health probe that creates and destroys a disposable session
 
-The Codex adapter accepts a prompt job with model policy, output schema,
-Browser MCP tool allowlist, run identifier, and deadline. It streams bounded
-events internally and returns only validated structured output plus sanitized
-usage/process metadata.
+The Codex adapter accepts a prompt job with fixed model policy, original
+prompt, run identifier, deadline, and the server-controlled
+`ModelDecisionV1`/`ObservationV1` schema versions. It starts one app-server
+process and ephemeral thread, streams bounded protocol events, and returns
+only validated decisions plus sanitized usage/process metadata. For an action
+decision, it assigns action identity metadata and invokes an authenticated API
+callback; that callback records and authorizes the action, invokes Browser
+Service once, and returns only a bounded definite observation. The adapter
+contract accepts no MCP configuration, model tools, browser endpoint, or raw
+capability.
 
 The code runner accepts language, source, session relay grant, deadline, and
 resource limits. It returns existing execution response fields. Neither
@@ -523,8 +634,10 @@ from the public request.
 
 Private contracts use cancellation signals. Client disconnect, stop, or
 deadline propagates API to adapter/Browser Service to child process. A
-transport retry is allowed only for an idempotency-keyed request whose outcome
-is known to have no externally visible effect.
+transport callback retry must retain action ID and normalized hash: a matching
+known result is returned from the ledger, a mismatch fails the protocol, and
+an unresolved `executing` result becomes terminal `outcome_unknown`. No
+browser operation is dispatched again.
 
 ## Live View and CDP Proxy
 
@@ -554,6 +667,9 @@ Internal failures use typed categories and sanitized detail:
 - `session_destroyed` or `session_expired` -> 410
 - `capability_denied` or `target_blocked` -> 403
 - `concurrency_exceeded` -> 429
+- `action_limit_exceeded` -> 429
+- `model_protocol_error` -> 502
+- `action_outcome_unknown` -> 502 and terminal browser session
 - `browser_unavailable`, `codex_unavailable`, or
   `sandbox_unavailable` -> 503
 - `model_unavailable` -> 503
@@ -574,21 +690,24 @@ unavailable.
 
 Security tests and review must address:
 
-- Page prompt injection asking Codex to use host tools or reveal secrets
-- Malicious DOM/tool output causing arbitrary MCP calls or oversized context
+- Page prompt injection asking Codex to escape the decision schema, use tools,
+  or reveal secrets
+- Malicious DOM/observation content causing invalid actions, protocol output,
+  duplicate side effects, or oversized context
 - Model-generated origin escape, unsafe `evaluate`, downloads, or data
   exfiltration
 - SSRF, open redirects, DNS rebinding, alternate IP syntax, WebSockets, and
   subresource access to local infrastructure
-- Cross-owner/session/profile access and stale capability replay
+- Cross-owner/session/profile access, stale capability replay, action ID/hash
+  collisions, callback mismatch, and ambiguous executing outcomes
 - Interactive live-view token theft, privilege confusion, click injection,
   and CSRF
 - Node/Python/Bash sandbox escape, fork bombs, output bombs, and access to
   Docker or host mounts
 - Sandbox-broker protocol abuse, descriptor/path smuggling, bundle tampering,
   stale job reuse, and attempts to select commands or resource policies
-- Codex access to user config, rules, skills, plugins, hooks, other MCPs,
-  workspace files, environment variables, and auth files
+- Codex access to user config, rules, skills, plugins, hooks, any MCP, model
+  tools, browser relay, workspace files, environment variables, and auth files
 - Profile corruption, partial publication, concurrent writers, and sensitive
   cookie leakage in logs or artifacts
 - Cancellation races and orphan Chromium, Codex, or code-runner processes
@@ -612,8 +731,8 @@ runtime:
 - `status`: show adapter, Browser Service, migration, active session/run,
   profile-lock, and cleanup state
 - `health`: verify migrations, app database, MinIO, disposable Browser Service
-  create/destroy, adapter socket/auth/model, typed Browser MCP bridge, and
-  `runc` broker/bundle isolation
+  create/destroy, adapter socket/auth/model, pinned app-server protocol schema,
+  structured-action loop, and `runc` broker/bundle isolation
 - `logs`: provide bounded component/correlation filtering with redaction
 
 Ordered shutdown stops accepting new runs, cancels adapters/runners, revokes
@@ -634,11 +753,15 @@ cannot race.
 
 ## Rollout
 
-0. Before repository implementation, run a throwaway installed-Codex spike
-   with an isolated temporary `CODEX_HOME` and a local side-effecting stub MCP
-   tool. Prove the exact model, reasoning, disabled built-ins, enabled-tool
-   allowlist, per-tool approval, `approval_policy = "never"`, and headless JSONL
-   completion behavior. Stop and revise the design on any mismatch.
+0. Before repository implementation, run three consecutive live two-turn
+   structured-action gates against installed Codex app-server 0.144.5. Each
+   run starts an isolated process and ephemeral thread with no MCP servers or
+   model tools. Turn one must propose one exact side effect; the host records
+   it and writes a marker once. A matching callback replay must return cached
+   output without another write, while a mismatched replay must fail. Turn two
+   receives the observation and must return the exact final result. Assert
+   zero tool or approval events and complete process, thread, marker, and
+   temporary-directory cleanup. Stop and revise on any mismatch.
 1. Add migrations, state helpers, replay envelope, post-scrape checkpoint, and
    cleanup/recovery logic
    behind `LOCAL_BROWSER_SERVICE_ENABLED=false`.
@@ -646,8 +769,9 @@ cannot race.
    and fixture-based contract tests.
 3. Add API compatibility integration, live-view proxy, and direct Browser API
    coverage while the Gemini path remains disabled in local mode.
-4. Add the isolated Codex adapter, private Browser MCP, fake-runner contract
-   tests, and one real end-to-end Codex smoke through the installed broker.
+4. Add the isolated pinned app-server adapter, deterministic action
+   coordinator and ledger, fake-protocol contract tests, and one real
+   end-to-end Codex smoke through the installed bundle.
 5. Add the disposable `runc` code runner for all three supported languages
    and escape/resource tests.
 6. Enable local Browser Service by default only after restart, stop, retention,
@@ -669,14 +793,18 @@ observable behavior and focused service/unit tests for isolation boundaries.
   ZDR/redacted context, and per-step failures
 - Browser and run state transitions, compare-and-set races, TTLs, idempotent
   stop, and restart interruption
+- Action state transitions, prepare-before-dispatch, live action-ID
+  deduplication, matching callback caching, hash/sequence mismatch, definite
+  no-effect continuation, duplicate side-effect rejection, and unknown-outcome
+  termination
 - Capability/grant ownership, expiry, operation/origin/call/byte limits, and
   revocation
 - One profile writer, read snapshots, atomic generation publication, crash
   recovery, and retention
 - Browser Service typed operation and live-view contracts
-- Fake Codex process command/config construction, private MCP exposure,
-  structured output, approval-free headless execution, denied unlisted tools,
-  cancellation, timeout, and orphan cleanup
+- Fake app-server process/config construction, pinned V2 schema checksum,
+  strict `ModelDecisionV1` parsing, bounded multi-turn observations, zero tool
+  and approval events, cancellation, limits, timeout, and orphan cleanup
 - Node, Python, and Bash runner success/failure, resource limits, network
   isolation, output bounds, and process-tree termination
 - Broker schema/peer-credential enforcement, sealed descriptors, fixed-bundle
@@ -697,8 +825,9 @@ observable behavior and focused service/unit tests for isolation boundaries.
   and Docker
 - Assert no traffic reaches Firecrawl Cloud, Gemini, or Fireworks
 
-After deterministic gates pass, run one real Codex smoke against a controlled
-public fixture using `gpt-5.6-terra` at `medium`. Finally invoke
+After deterministic gates and three consecutive live Gate0 runs pass, run one
+real Codex smoke against a controlled public fixture using `gpt-5.6-terra` at
+`medium`. Finally invoke
 `firecrawl_interact` and `firecrawl_interact_stop` from fresh Claude Code and
 Codex MCP sessions. Do not use public-site success as a substitute for fixture
 coverage.
@@ -708,7 +837,8 @@ coverage.
 Phase 2 is complete when:
 
 1. Prompt Interact works through the local MCP and existing `/v2` API contract
-   using one ephemeral `gpt-5.6-terra`/`medium` Codex process.
+   using one pinned app-server 0.144.5 process and one ephemeral thread per
+   request with `gpt-5.6-terra`/`medium`.
 2. Node, Python, and Bash code Interact run in disposable isolated sandboxes
    and return existing response fields.
 3. All direct `/v2/browser` create, list, execute, and delete flows pass.
@@ -724,15 +854,21 @@ Phase 2 is complete when:
    subrequests, DNS rebinding, and the 8-origin limit.
 9. Replay either reproduces every retained browser-affecting option or returns
    an explicit `replay_unsupported`/`replay_unavailable` error.
-10. Codex sees only approved typed browser tools and cannot access user config,
-    host files, shell, Docker, other MCPs, plugins, hooks, skills, or arbitrary
-    network destinations.
+10. Codex sees only strict decision schemas and bounded observations. It has no
+    MCP servers, model tools, browser relay, user config, host files, shell,
+    Docker, plugins, hooks, skills, or arbitrary network destinations.
 11. Hostile pages and code cannot escape Browser Service, Codex, or `runc`
     boundaries or access another owner/session/profile.
 12. No Browser/Interact path uses Gemini, Fireworks, Firecrawl Cloud, or an API
     key fallback.
 13. Only Firecrawl API is published on `127.0.0.1`; all health, migration,
     retention, recovery, and focused test gates pass.
+14. Every accepted action is durably prepared before dispatch and executes at
+    most once. Matching callback replays are cached, mismatches fail closed,
+    and an unknown outcome terminates the run and browser session.
+15. Gate0 completes three consecutive live two-turn structured-action runs
+    with exact marker/final output, callback deduplication, mismatch rejection,
+    zero tool/approval events, and complete cleanup.
 
 ## Trade-offs
 
@@ -740,9 +876,14 @@ Dedicated Browser Service adds another runtime and migration surface, but
 keeps persistent-session concerns out of the stateless scraper and preserves
 one API contract for MCP, SDK, and direct callers.
 
-One Codex process per prompt has startup latency and consumes ChatGPT usage,
-but gives strong request isolation and simple cancellation. The isolated
-profile and private typed MCP are required controls, not optional hardening.
+One app-server process and ephemeral thread per prompt has startup latency and
+consumes ChatGPT usage, but gives strong request isolation and simple
+cancellation. A deterministic host observe/act loop adds protocol turns and a
+durable action ledger, but avoids relying on nondeterministic model-driven MCP
+dispatch. Strict output schemas, API authorization, and execute-once handling
+are required controls, not optional hardening. Codex 0.144.5 labels
+`app-server` experimental, so the executable and generated V2 schema stay
+pinned and every upgrade must pass Gate0 before rollout.
 
 Durable profiles improve continuity but contain sensitive cookies and site
 state. Owner scoping, exclusive writers, immutable generations, atomic
