@@ -6,19 +6,20 @@
 > checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver local Browser and Interact parity through durable browser
-state, a private persistent Browser Service, isolated Codex and code execution,
-and restart-safe operator tooling.
+state, a private persistent Browser Service, deterministic host-coordinated
+Codex actions, isolated code execution, and restart-safe operator tooling.
 
 **Architecture:** Execute three dependency-ordered plans. First prove the exact
-installed Codex MCP approval boundary and add durable state plus replay-safe
-checkpoints. Then add the private Browser Service and API compatibility layer.
-Finally add host execution sandboxes, prompt/code integration, operations, and
-fresh-client acceptance. Keep the API as the only published TCP service.
+installed Codex structured-output loop and add durable state, execute-once
+action records, plus replay-safe checkpoints. Then add the private Browser
+Service and API compatibility layer. Finally add host execution sandboxes,
+prompt/code integration, operations, and fresh-client acceptance. Keep the API
+as the only published TCP service.
 
 **Tech Stack:** TypeScript, Node.js 22, PostgreSQL 17, Drizzle ORM, Playwright
-1.58.1 and 1.61.1, Chromium CDP, MCP TypeScript SDK 1.29.0, Rust 1.94,
-`runc` 1.3.6,
-OCI Runtime Specification 1.2.1, systemd 255, Docker Compose, Vitest
+1.58.1 and 1.61.1, Chromium CDP, Codex app-server V2 JSONL, Rust 1.94,
+`runc` 1.3.6, OCI Runtime Specification 1.2.1, systemd 255, Docker Compose,
+Vitest
 
 ---
 
@@ -39,13 +40,14 @@ criteria. Do not begin a later plan until every earlier exit criterion passes.
 
 - [ ] **Gate 0: Prove installed Codex behavior before service work**
 
-Run the first plan's side-effecting stub MCP check with installed
-`codex-cli 0.144.5`, `gpt-5.6-terra`, and `medium` reasoning. It must complete
-headlessly using only the allowlisted tool with truthful side-effect
-annotations. Shell, unified exec, web search, apps, plugins, skills, hooks,
-multi-agent, and all normal MCP servers must be absent. Stop and revise the
-design if exact per-tool preapproval does not work without a broader sandbox or
-approval setting.
+Run the first plan's two-turn structured-action check three consecutive times
+with installed `codex-cli 0.144.5`, `gpt-5.6-terra`, and `medium` reasoning.
+Each run must use one pinned app-server process and ephemeral thread, emit one
+schema-valid side-effect proposal, execute the host marker once, return a
+cached result for a matching callback replay, reject a mismatched replay, then
+emit the exact final result after its observation. Shell, unified exec, web
+search, apps, plugins, skills, hooks, multi-agent, model tools, and every MCP
+server must be absent. Stop and revise the design on any mismatch.
 
 - [ ] **Gate 1: Make replay safe before Browser Service execution**
 
@@ -65,8 +67,9 @@ pass deterministic hostile fixtures before any real Codex/browser run.
 The root broker must accept only fixed bundles and resource presets over its
 group-restricted socket. Code containers have no external network interface.
 Codex containers receive only their pinned root, generated config, read-only
-ChatGPT credential file, and one relay. Neither adapter nor broker receives the
-Docker socket.
+ChatGPT credential file, sealed prompt/schema input, and bounded protocol
+output; they reject browser relay descriptors. Code bundles alone receive a
+session relay. Neither adapter nor broker receives the Docker socket.
 
 - [ ] **Gate 4: Validate from fresh clients**
 
@@ -82,6 +85,7 @@ extend response detail but must not rename these concepts:
 - `browser_session_id`: durable API session row identifier
 - `browser_runtime_id`: one non-durable Chromium process incarnation
 - `browser_interact_run_id`: one prompt or code execution
+- `browser_interact_action_id`: one host-assigned prompt-mode action proposal
 - `profile_generation_id`: immutable committed profile generation
 - `replay_checkpoint_id`: immutable non-ZDR post-scrape checkpoint
 - `capability_id`: hash-addressed, server-held browser authority
@@ -92,6 +96,12 @@ Terminal session states are `destroyed`, `expired`, `interrupted`, and `error`.
 Terminal run states are `succeeded`, `failed`, `cancelled`, `timed_out`, and
 `interrupted`. State transitions use compare-and-set updates; cleanup ownership
 is claimed once.
+
+Action states are `prepared`, `executing`, `succeeded`,
+`rejected_no_effect`, `failed_no_effect`, `cancelled_no_effect`, and
+`outcome_unknown`. The API persists `prepared` before dispatch. An interrupted
+`prepared` action is proven no-effect; an interrupted `executing` action
+becomes terminal `outcome_unknown` and is never retried or returned to Codex.
 
 Public `origin` remains trace attribution. It never grants navigation.
 `allowedDomains` is the only direct caller grant. The target URL establishes
@@ -113,7 +123,9 @@ public-egress and SSRF checks without entering the navigation set.
   service-worker traffic can bypass it. Chromium's validating egress proxy owns
   DNS resolution, address pinning, redirect validation, and private-address
   denial.
-- Private MCP uses stable `@modelcontextprotocol/sdk` 1.29.0 stdio APIs.
+- Prompt mode pins Codex CLI/app-server 0.144.5 and the generated V2 protocol
+  schema checksum. Every turn supplies the strict `ModelDecisionV1` output
+  schema; the command is experimental, so every upgrade must pass Gate 0.
 - OCI bundles target installed `runc` 1.3.6 and Runtime Specification 1.2.1.
 - systemd socket units set `SocketUser`, `SocketGroup`, and `SocketMode=0660`;
   never rely on the default `0666` mode.
@@ -121,10 +133,10 @@ public-egress and SSRF checks without entering the navigation set.
 Primary references:
 
 - [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+- [Codex app-server](https://learn.chatgpt.com/docs/app-server)
 - [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 - [Playwright BrowserContext](https://playwright.dev/docs/api/class-browsercontext)
 - [Playwright BrowserType](https://playwright.dev/docs/api/class-browsertype)
-- [MCP TypeScript SDK server guide](https://ts.sdk.modelcontextprotocol.io/server)
 - [OCI Linux configuration](https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md)
 - [`runc` documentation](https://github.com/opencontainers/runc)
 
@@ -163,8 +175,9 @@ For every commit:
   `docs/superpowers/plans/2026-07-19-browser-interact-gate-and-state.md`.
 - [ ] Confirm its focused unit, migration, checkpoint, ZDR, retention, and
   recovery commands pass.
-- [ ] Confirm Gate 0's real Codex JSONL contains the allowlisted MCP tool call
-  and no command execution or approval wait.
+- [ ] Confirm Gate 0 passes three consecutive app-server runs with one durable
+  side-effect proposal, marker write-once behavior, callback deduplication,
+  mismatch rejection, exact final output, and zero tool/approval events.
 - [ ] Request requirements and code-quality review before Task 2.
 
 ### Task 2: Execute Browser Service and API Plan
@@ -183,7 +196,7 @@ For every commit:
 - [ ] Pause at the documented administrator install step for the user to enter
   credentials; do not work around the password boundary.
 - [ ] Confirm Codex and all three code languages run only through fixed OCI
-  bundles and the session relay.
+  bundles; only code bundles receive the session relay.
 - [ ] Confirm ordered restart, cancellation, orphan cleanup, retention, backup,
   and bounded logs.
 - [ ] Request final requirements and code-quality review.
@@ -196,6 +209,9 @@ For every commit:
   `scripts/local-firecrawl health`.
 - [ ] Verify one prompt Interact and Node, Python, and Bash code Interact against
   controlled fixtures.
+- [ ] Confirm prompt Interact records a monotonic action ledger, executes each
+  action at most once, permits a different action after definite no-effect,
+  and terminates on unknown outcome.
 - [ ] Restart during an active run and confirm terminal interruption, capability
   revocation, no orphan process, preserved committed profile, and safe later
   replay.
@@ -205,8 +221,11 @@ For every commit:
 
 ## Phase 2 Exit Criteria
 
-- Prompt Interact uses one ephemeral `gpt-5.6-terra`/`medium` Codex process and
-  only the private typed Browser MCP.
+- Prompt Interact uses one pinned app-server 0.144.5 process and one ephemeral
+  `gpt-5.6-terra`/`medium` thread per request. Codex receives only strict
+  decision schemas and bounded observations, with no MCP, tools, or relay.
+- Every accepted prompt action is durably prepared before dispatch, executes
+  at most once, and records a definite result or terminal unknown outcome.
 - Node, Python, and Bash run inside disposable fixed `runc` bundles.
 - Direct Browser create/list/execute/delete and scrape Interact/stop preserve
   their public response contracts.
