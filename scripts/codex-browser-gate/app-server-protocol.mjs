@@ -451,15 +451,37 @@ function materializeTransportValue(value) {
   return value;
 }
 
-const GENERATED_SCHEMA_RECURSION_BUDGET = 256;
-
-function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
-  if (remainingDepth <= 0) return false;
-  const nextDepth = remainingDepth - 1;
+function generatedSchemaMatches(value, schema, rootSchema, activePairs) {
   if (schema === true) return true;
   if (schema === false || schema === null || typeof schema !== "object") {
     return false;
   }
+  let activeValues = activePairs.get(schema);
+  if (activeValues?.has(value)) return false;
+  if (!activeValues) {
+    activeValues = new Set();
+    activePairs.set(schema, activeValues);
+  }
+  activeValues.add(value);
+  try {
+    return generatedSchemaMatchesActive(
+      value,
+      schema,
+      rootSchema,
+      activePairs,
+    );
+  } finally {
+    activeValues.delete(value);
+    if (activeValues.size === 0) activePairs.delete(schema);
+  }
+}
+
+function generatedSchemaMatchesActive(
+  value,
+  schema,
+  rootSchema,
+  activePairs,
+) {
   if (schema.$ref) {
     if (!schema.$ref.startsWith("#/definitions/")) return false;
     const name = schema.$ref
@@ -469,13 +491,13 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
     const target = rootSchema.definitions?.[name];
     return (
       target !== undefined &&
-      generatedSchemaMatches(value, target, rootSchema, nextDepth)
+      generatedSchemaMatches(value, target, rootSchema, activePairs)
     );
   }
   if (
     schema.allOf &&
     !schema.allOf.every(part =>
-      generatedSchemaMatches(value, part, rootSchema, nextDepth),
+      generatedSchemaMatches(value, part, rootSchema, activePairs),
     )
   ) {
     return false;
@@ -483,7 +505,7 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
   if (
     schema.anyOf &&
     !schema.anyOf.some(part =>
-      generatedSchemaMatches(value, part, rootSchema, nextDepth),
+      generatedSchemaMatches(value, part, rootSchema, activePairs),
     )
   ) {
     return false;
@@ -491,7 +513,7 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
   if (
     schema.oneOf &&
     schema.oneOf.filter(part =>
-      generatedSchemaMatches(value, part, rootSchema, nextDepth),
+      generatedSchemaMatches(value, part, rootSchema, activePairs),
     ).length !== 1
   ) {
     return false;
@@ -548,7 +570,7 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
     if (
       schema.items &&
       !value.every(item =>
-        generatedSchemaMatches(item, schema.items, rootSchema, nextDepth),
+        generatedSchemaMatches(item, schema.items, rootSchema, activePairs),
       )
     ) {
       return false;
@@ -570,7 +592,7 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
             item,
             schema.properties[key],
             rootSchema,
-            nextDepth,
+            activePairs,
           )
         ) {
           return false;
@@ -584,7 +606,7 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
           item,
           schema.additionalProperties,
           rootSchema,
-          nextDepth,
+          activePairs,
         )
       ) {
         return false;
@@ -595,18 +617,23 @@ function generatedSchemaMatches(value, schema, rootSchema, remainingDepth) {
 }
 
 export function assertGeneratedSchemaValue(value, schemaSource) {
-  auditGeneratedSchemaKeywords(schemaSource.schema);
-  if (
-    !generatedSchemaMatches(
-      value,
-      schemaSource.schema,
-      schemaSource.schema,
-      GENERATED_SCHEMA_RECURSION_BUDGET,
-    )
-  ) {
+  try {
+    auditGeneratedSchemaKeywords(schemaSource.schema);
+    if (
+      !generatedSchemaMatches(
+        value,
+        schemaSource.schema,
+        schemaSource.schema,
+        new Map(),
+      )
+    ) {
+      throw gateError("codex_protocol_schema_mismatch");
+    }
+    return materializeTransportValue(value);
+  } catch (error) {
+    if (error?.code === "codex_protocol_schema_mismatch") throw error;
     throw gateError("codex_protocol_schema_mismatch");
   }
-  return materializeTransportValue(value);
 }
 
 const SUPPORTED_SCHEMA_KEYWORDS = new Set([
@@ -1493,10 +1520,39 @@ export async function runProtocolHardeningSelfTest({
     assertGeneratedSchemaValue(recursiveValue(32), finiteRecursiveSchema),
     recursiveValue(32),
   );
+  assert.deepEqual(
+    assertGeneratedSchemaValue(recursiveValue(300), finiteRecursiveSchema),
+    recursiveValue(300),
+  );
+  const sharedRecursiveValue = recursiveValue(8);
+  const siblingRecursiveSchema = {
+    schema: {
+      type: "object",
+      required: ["left", "right"],
+      properties: {
+        left: { $ref: "#/definitions/Node" },
+        right: { $ref: "#/definitions/Node" },
+      },
+      additionalProperties: false,
+      definitions: finiteRecursiveSchema.schema.definitions,
+    },
+  };
+  assert.deepEqual(
+    assertGeneratedSchemaValue(
+      { left: sharedRecursiveValue, right: sharedRecursiveValue },
+      siblingRecursiveSchema,
+    ),
+    { left: sharedRecursiveValue, right: sharedRecursiveValue },
+  );
   assert.throws(
     () =>
-      assertGeneratedSchemaValue(recursiveValue(300), finiteRecursiveSchema),
-    /codex_protocol_schema_mismatch/,
+      assertGeneratedSchemaValue(
+        recursiveValue(10_000),
+        finiteRecursiveSchema,
+      ),
+    error =>
+      !(error instanceof RangeError) &&
+      error?.code === "codex_protocol_schema_mismatch",
   );
   const knownTurns = [
     { threadId: "thread-audit", turnId: "turn-audit", completedIndex: 1 },
