@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { mkdtempSync } from "node:fs";
 import {
   chmod,
   copyFile,
   mkdir,
-  mkdtemp,
   readFile,
   readdir,
   rm,
@@ -14,7 +15,9 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import process from "node:process";
+import { PassThrough } from "node:stream";
 
 import { createGateActionStore } from "./action-store.mjs";
 import {
@@ -29,6 +32,12 @@ const MODEL = "gpt-5.6-terra";
 const EFFORT = "medium";
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const WATCHDOG_MS = 120_000;
+const MAX_RUNS = 10;
+const CLEANUP_TERM_GRACE_MS = 250;
+const CLEANUP_KILL_GRACE_MS = 1_000;
+const CLEANUP_POLL_MS = 10;
+const CLEANUP_TOTAL_GRACE_MS = 5_000;
+const CLEANUP_DRAIN_GRACE_MS = 1_000;
 const REQUIRED_SCHEMA_DEFINITIONS = [
   "ThreadStartParams",
   "TurnStartParams",
@@ -305,22 +314,392 @@ function normalizedProposalHash(operation) {
     .digest("hex");
 }
 
-function killProcessGroup(child) {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Process is already gone.
+class RawJsonlFramer {
+  constructor(onLine) {
+    this.onLine = onLine;
+    this.pending = Buffer.alloc(0);
+  }
+
+  push(chunk) {
+    if (!Buffer.isBuffer(chunk)) {
+      throw gateError("codex_event_json_invalid");
+    }
+    this.pending =
+      this.pending.length === 0
+        ? chunk
+        : Buffer.concat([this.pending, chunk]);
+    let newline;
+    while ((newline = this.pending.indexOf(0x0a)) !== -1) {
+      const line = this.pending.subarray(0, newline);
+      this.pending = this.pending.subarray(newline + 1);
+      this.onLine(line);
+    }
+  }
+
+  finish() {
+    if (this.pending.length !== 0) {
+      throw gateError("codex_event_json_invalid");
     }
   }
 }
 
-function runCaptured(command, args, { cwd, env, timeoutMs = 20_000 } = {}) {
+function transportJsonNodeToPlainValue(node) {
+  switch (node.kind) {
+    case "string":
+      return node.value;
+    case "number": {
+      const value = Number(node.raw);
+      if (
+        !Number.isFinite(value) ||
+        (Number.isInteger(value) && !Number.isSafeInteger(value))
+      ) {
+        throw gateError("codex_event_json_invalid");
+      }
+      return value;
+    }
+    case "true":
+      return true;
+    case "false":
+      return false;
+    case "null":
+      return null;
+    case "array":
+      return node.items.map(transportJsonNodeToPlainValue);
+    case "object": {
+      const value = {};
+      for (const member of node.members) {
+        Object.defineProperty(value, member.key, {
+          configurable: true,
+          enumerable: true,
+          value: transportJsonNodeToPlainValue(member.value),
+          writable: true,
+        });
+      }
+      return value;
+    }
+    default:
+      throw gateError("codex_event_json_invalid");
+  }
+}
+
+function parseAppServerMessage(raw) {
+  try {
+    return transportJsonNodeToPlainValue(parseLosslessJson(raw));
+  } catch {
+    throw gateError("codex_event_json_invalid");
+  }
+}
+
+const wait = milliseconds =>
+  new Promise(resolve => setTimeout(resolve, milliseconds));
+
+class LifecycleRegistry {
+  constructor({
+    killProcess = process.kill.bind(process),
+    now = () => performance.now(),
+    wait: waitFor = wait,
+    removeTree = rm,
+    inspectPath = stat,
+    scheduleTimer = setTimeout,
+    cancelTimer = clearTimeout,
+  } = {}) {
+    this.killProcess = killProcess;
+    this.now = now;
+    this.wait = waitFor;
+    this.removeTree = removeTree;
+    this.inspectPath = inspectPath;
+    this.scheduleTimer = scheduleTimer;
+    this.cancelTimer = cancelTimer;
+    this.groups = new Map();
+    this.roots = new Map();
+    this.aborted = null;
+    this.closing = false;
+    this.cleanupPromise = null;
+    this.signalPromise = null;
+  }
+
+  assertAccepting() {
+    if (this.aborted) throw this.aborted;
+    if (this.closing) throw gateError("codex_lifecycle_closed");
+  }
+
+  ownProcessGroup(child, onAbort = () => {}) {
+    this.assertAccepting();
+    if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) {
+      throw gateError("codex_spawn_failed", "missing process group id");
+    }
+    const existing = this.groups.get(child.pid);
+    if (existing && existing.child !== child) {
+      throw gateError("codex_process_group_reused", String(child.pid));
+    }
+    this.groups.set(child.pid, {
+      child,
+      onAbort,
+      cleanupPromise: existing?.cleanupPromise ?? null,
+    });
+    return child.pid;
+  }
+
+  adoptProcessGroupForCleanup(child) {
+    if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) return;
+    if (!this.groups.has(child.pid)) {
+      this.groups.set(child.pid, {
+        child,
+        onAbort: () => {},
+        cleanupPromise: null,
+      });
+    }
+  }
+
+  ownRoot(root) {
+    this.assertAccepting();
+    if (typeof root !== "string" || root === "") {
+      throw gateError("codex_temp_root_invalid");
+    }
+    if (!this.roots.has(root)) {
+      this.roots.set(root, { cleanupPromise: null });
+    }
+    return root;
+  }
+
+  createRoot(prefix) {
+    this.assertAccepting();
+    const root = mkdtempSync(prefix);
+    this.roots.set(root, { cleanupPromise: null });
+    return root;
+  }
+
+  abort(error) {
+    if (this.aborted) return;
+    this.aborted = error;
+    for (const record of this.groups.values()) {
+      try {
+        record.onAbort(error);
+      } catch {
+        // Cleanup still owns and terminates the process group.
+      }
+    }
+  }
+
+  groupAlive(pgid) {
+    try {
+      this.killProcess(-pgid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") return false;
+      throw error;
+    }
+  }
+
+  sendGroupSignal(pgid, signal) {
+    try {
+      this.killProcess(-pgid, signal);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") return false;
+      throw error;
+    }
+  }
+
+  async waitForGroupDeath(pgid, graceMs) {
+    const expiresAt = this.now() + graceMs;
+    while (this.groupAlive(pgid)) {
+      const remaining = expiresAt - this.now();
+      if (remaining <= 0) return false;
+      await this.wait(Math.min(CLEANUP_POLL_MS, remaining));
+    }
+    return true;
+  }
+
+  withDeadline(operation, expiresAt, code) {
+    const remaining = expiresAt - this.now();
+    if (remaining <= 0) return Promise.reject(gateError(code));
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = this.scheduleTimer(() => {
+        if (settled) return;
+        settled = true;
+        reject(gateError(code));
+      }, remaining);
+      Promise.resolve(operation).then(
+        value => {
+          if (settled) return;
+          settled = true;
+          this.cancelTimer(timer);
+          resolve(value);
+        },
+        error => {
+          if (settled) return;
+          settled = true;
+          this.cancelTimer(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  terminateProcessGroup(pgid, { graceful = true } = {}) {
+    const record = this.groups.get(pgid);
+    if (!record) return Promise.resolve();
+    if (record.cleanupPromise) return record.cleanupPromise;
+    record.cleanupPromise = (async () => {
+      if (!this.groupAlive(pgid)) {
+        this.groups.delete(pgid);
+        return;
+      }
+      if (graceful) {
+        this.sendGroupSignal(pgid, "SIGTERM");
+        if (await this.waitForGroupDeath(pgid, CLEANUP_TERM_GRACE_MS)) {
+          this.groups.delete(pgid);
+          return;
+        }
+      }
+      this.sendGroupSignal(pgid, "SIGKILL");
+      if (!(await this.waitForGroupDeath(pgid, CLEANUP_KILL_GRACE_MS))) {
+        throw gateError("codex_process_group_survived", String(pgid));
+      }
+      this.groups.delete(pgid);
+    })();
+    return record.cleanupPromise;
+  }
+
+  removeRoot(root, expiresAt = this.now() + CLEANUP_TOTAL_GRACE_MS) {
+    const record = this.roots.get(root);
+    if (!record) return Promise.resolve();
+    if (record.cleanupPromise) return record.cleanupPromise;
+    record.cleanupPromise = this.withDeadline((async () => {
+      await this.removeTree(root, { force: true, recursive: true });
+      try {
+        await this.inspectPath(root);
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          this.roots.delete(root);
+          return;
+        }
+        throw error;
+      }
+      throw gateError("codex_temp_root_survived", root);
+    })(), expiresAt, "codex_temp_root_cleanup_timeout");
+    return record.cleanupPromise;
+  }
+
+  cleanup() {
+    if (this.cleanupPromise) return this.cleanupPromise;
+    this.closing = true;
+    const expiresAt = this.now() + CLEANUP_TOTAL_GRACE_MS;
+    const groupPromises = [...this.groups.keys()].map(pgid =>
+      this.terminateProcessGroup(pgid, { graceful: true }),
+    );
+    this.cleanupPromise = (async () => {
+      const failures = [];
+      let groupResults = [];
+      try {
+        groupResults = await this.withDeadline(
+          Promise.allSettled(groupPromises),
+          expiresAt,
+          "codex_process_cleanup_timeout",
+        );
+      } catch (error) {
+        failures.push(error);
+      }
+      for (const result of groupResults) {
+        if (result.status === "rejected") failures.push(result.reason);
+      }
+      let rootResults = [];
+      try {
+        rootResults = await this.withDeadline(
+          Promise.allSettled(
+            [...this.roots.keys()].map(root =>
+              this.removeRoot(root, expiresAt),
+            ),
+          ),
+          expiresAt,
+          "codex_temp_root_cleanup_timeout",
+        );
+      } catch (error) {
+        failures.push(error);
+      }
+      for (const result of rootResults) {
+        if (result.status === "rejected") failures.push(result.reason);
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "lifecycle_cleanup_failed");
+      }
+    })();
+    return this.cleanupPromise;
+  }
+}
+
+function installSignalHandlers(registry, processLike = process) {
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const previous = new Map(
+    signals.map(signal => [signal, processLike.rawListeners(signal)]),
+  );
+  const installed = new Map();
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    for (const signal of signals) {
+      processLike.removeListener(signal, installed.get(signal));
+      for (const listener of previous.get(signal)) {
+        processLike.on(signal, listener);
+      }
+    }
+  };
+  const onSignal = signal => {
+    if (registry.signalPromise) return;
+    const cleanupPromise = registry.cleanup();
+    registry.abort(gateError("codex_gate_cancelled", signal));
+    registry.signalPromise = (async () => {
+      try {
+        await cleanupPromise;
+      } catch (error) {
+        if (processLike.stderr?.write) {
+          processLike.stderr.write(
+            `${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      } finally {
+        restore();
+        processLike.kill(processLike.pid, signal);
+      }
+    })();
+  };
+  for (const signal of signals) {
+    for (const listener of previous.get(signal)) {
+      processLike.removeListener(signal, listener);
+    }
+    const listener = () => onSignal(signal);
+    installed.set(signal, listener);
+    processLike.on(signal, listener);
+  }
+  return { restore };
+}
+
+function combinePrimaryAndCleanup(primary, cleanup) {
+  return cleanup
+    ? new AggregateError([primary, cleanup], "operation_and_cleanup_failed")
+    : primary;
+}
+
+function runCaptured(
+  command,
+  args,
+  {
+    cwd,
+    env,
+    timeoutMs = 20_000,
+    spawnChild = spawn,
+    supervisor = gateLifecycle,
+    scheduleTimer = setTimeout,
+    cancelTimer = clearTimeout,
+  } = {},
+) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    supervisor.assertAccepting();
+    const child = spawnChild(command, args, {
       cwd,
       detached: true,
       env,
@@ -332,47 +711,67 @@ function runCaptured(command, args, { cwd, env, timeoutMs = 20_000 } = {}) {
     const stderr = [];
     let bytes = 0;
     let settled = false;
-    let failure;
+    let watchdog;
 
-    const finish = callback => value => {
+    const finish = async (failure, result, graceful) => {
       if (settled) return;
       settled = true;
-      clearTimeout(watchdog);
-      callback(value);
+      cancelTimer(watchdog);
+      if (!failure && graceful && supervisor.groupAlive(child.pid)) {
+        failure = gateError("codex_process_group_survived", String(child.pid));
+      }
+      let cleanupFailure;
+      try {
+        await supervisor.terminateProcessGroup(child.pid, { graceful });
+      } catch (error) {
+        cleanupFailure = error;
+      }
+      if (failure) {
+        reject(combinePrimaryAndCleanup(failure, cleanupFailure));
+      } else if (cleanupFailure) {
+        reject(cleanupFailure);
+      } else {
+        resolve(result);
+      }
     };
-    const succeed = finish(resolve);
-    const fail = finish(reject);
-    const watchdog = setTimeout(() => {
-      failure = gateError("codex_command_timeout", command);
-      killProcessGroup(child);
+    child.on("error", error => {
+      void finish(gateError("codex_spawn_failed", error.message), null, false);
+    });
+    try {
+      supervisor.ownProcessGroup(child, error => {
+        void finish(error, null, false);
+      });
+    } catch (error) {
+      supervisor.adoptProcessGroupForCleanup(child);
+      void finish(error, null, false);
+      return;
+    }
+    watchdog = scheduleTimer(() => {
+      void finish(gateError("codex_command_timeout", command), null, false);
     }, timeoutMs);
 
     const capture = target => chunk => {
       bytes += chunk.length;
-      if (bytes > MAX_OUTPUT_BYTES && !failure) {
-        failure = gateError("codex_output_limit");
-        killProcessGroup(child);
+      if (bytes > MAX_OUTPUT_BYTES) {
+        void finish(gateError("codex_output_limit"), null, false);
         return;
       }
-      if (!failure) target.push(chunk);
+      if (!settled) target.push(chunk);
     };
 
     child.stdout.on("data", capture(stdout));
     child.stderr.on("data", capture(stderr));
-    child.on("error", error => {
-      fail(gateError("codex_spawn_failed", error.message));
-    });
     child.on("close", (code, signal) => {
-      if (failure) {
-        fail(failure);
-        return;
-      }
-      succeed({
-        code,
-        signal,
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
-      });
+      void finish(
+        null,
+        {
+          code,
+          signal,
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: Buffer.concat(stderr).toString("utf8"),
+        },
+        true,
+      );
     });
   });
 }
@@ -694,10 +1093,11 @@ function generatedSchemaMatches(value, schema, rootSchema) {
     if (!types.some(type => schemaTypeMatches(value, type))) return false;
   }
   if (typeof value === "string") {
-    if (schema.minLength !== undefined && value.length < schema.minLength) {
+    const length = [...value].length;
+    if (schema.minLength !== undefined && length < schema.minLength) {
       return false;
     }
-    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+    if (schema.maxLength !== undefined && length > schema.maxLength) {
       return false;
     }
   }
@@ -865,25 +1265,39 @@ class ProcessDeadline {
 }
 
 class AppServerClient {
-  constructor({ cwd, env, eventsPath }) {
+  constructor({
+    cwd,
+    env,
+    eventsPath,
+    deadline,
+    spawnChild = spawn,
+    supervisor = gateLifecycle,
+    scheduleTimer = setTimeout,
+    cancelTimer = clearTimeout,
+  }) {
     this.eventsPath = eventsPath;
+    this.supervisor = supervisor;
+    this.cancelTimer = cancelTimer;
     this.messages = [];
     this.pending = new Map();
     this.nextId = 1;
     this.stdoutBytes = 0;
     this.stderrBytes = 0;
-    this.eventBytes = 0;
-    this.stdoutBuffer = "";
     this.stdoutLines = [];
     this.stderrChunks = [];
     this.failure = null;
+    this.cleanupFailure = null;
+    this.groupCleanupPromise = null;
+    this.stopPromise = null;
     this.stopping = false;
     this.closed = false;
-    this.deadline = new ProcessDeadline(WATCHDOG_MS, Date.now, () => {
-      this.fail(gateError("codex_app_server_timeout"));
-    });
+    this.deadline =
+      deadline ??
+      new ProcessDeadline(WATCHDOG_MS, () => performance.now(), () => {
+        this.fail(gateError("codex_app_server_timeout"));
+      });
 
-    this.child = spawn(
+    this.child = spawnChild(
       "codex",
       ["app-server", "--strict-config", "--stdio"],
       {
@@ -899,15 +1313,24 @@ class AppServerClient {
     this.closedPromise = new Promise(resolve => {
       this.resolveClosed = resolve;
     });
+    this.stdoutFramer = new RawJsonlFramer(line => {
+      this.stdoutLines.push(Buffer.concat([line, Buffer.from("\n")]));
+      this.handleLine(line);
+    });
 
-    this.child.stdout.setEncoding("utf8");
-    this.child.stdout.on("data", chunk => this.handleStdout(chunk));
-    this.child.stderr.on("data", chunk => this.handleStderr(chunk));
     this.child.on("error", error => {
       this.fail(gateError("codex_app_server_spawn_failed", error.message));
     });
+    try {
+      this.supervisor.ownProcessGroup(this.child, error => this.fail(error));
+    } catch (error) {
+      this.supervisor.adoptProcessGroupForCleanup(this.child);
+      this.fail(error);
+    }
+    this.child.stdout.on("data", chunk => this.handleStdout(chunk));
+    this.child.stderr.on("data", chunk => this.handleStderr(chunk));
     this.child.on("close", (code, signal) => {
-      clearTimeout(this.processWatchdog);
+      this.cancelTimer(this.processWatchdog);
       this.closed = true;
       this.resolveClosed({ code, signal });
       if (!this.stopping && !this.failure) {
@@ -919,32 +1342,26 @@ class AppServerClient {
         );
       }
     });
-    this.processWatchdog = setTimeout(() => {
+    this.processWatchdog = scheduleTimer(() => {
       this.deadline.expire();
     }, this.deadline.remaining());
   }
 
   checkLimit() {
-    if (
-      this.stdoutBytes + this.stderrBytes + this.eventBytes >
-      MAX_OUTPUT_BYTES
-    ) {
+    if (this.stdoutBytes + this.stderrBytes > MAX_OUTPUT_BYTES) {
       this.fail(gateError("codex_output_limit"));
     }
   }
 
   handleStdout(chunk) {
-    this.stdoutBytes += Buffer.byteLength(chunk);
-    this.stdoutBuffer += chunk;
-    let newline;
-    while ((newline = this.stdoutBuffer.indexOf("\n")) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline);
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      this.stdoutLines.push(`${line}\n`);
-      this.eventBytes += Buffer.byteLength(line) + 1;
-      this.handleLine(line);
-    }
+    this.stdoutBytes += chunk.length;
     this.checkLimit();
+    if (this.failure) return;
+    try {
+      this.stdoutFramer.push(chunk);
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   handleStderr(chunk) {
@@ -954,10 +1371,10 @@ class AppServerClient {
   }
 
   handleLine(line) {
-    if (!line.trim()) return;
+    if (line.every(byte => [0x09, 0x0d, 0x20].includes(byte))) return;
     let message;
     try {
-      message = JSON.parse(line);
+      message = parseAppServerMessage(line);
     } catch {
       this.fail(gateError("codex_event_json_invalid"));
       return;
@@ -1013,7 +1430,11 @@ class AppServerClient {
       pending.reject(error);
     }
     this.pending.clear();
-    killProcessGroup(this.child);
+    this.groupCleanupPromise ??= this.supervisor
+      .terminateProcessGroup(this.pid, { graceful: false })
+      .catch(cleanupError => {
+        this.cleanupFailure = cleanupError;
+      });
   }
 
   assertHealthy() {
@@ -1060,39 +1481,52 @@ class AppServerClient {
   }
 
   async stop() {
+    this.stopPromise ??= this.stopOnce();
+    return this.stopPromise;
+  }
+
+  async stopOnce() {
     if (!this.stopping) {
       this.stopping = true;
+      this.cancelTimer(this.processWatchdog);
       this.child.stdin.end();
     }
-    if (!this.closed) {
-      const graceful = await Promise.race([
-        this.closedPromise.then(() => true),
-        new Promise(resolve =>
-          setTimeout(
-            () => resolve(false),
-            Math.min(1_000, this.deadline.remaining()),
-          ),
-        ),
-      ]);
-      if (!graceful) {
-        killProcessGroup(this.child);
-        await this.closedPromise;
-      }
+    let gracefulWaitMs = 0;
+    try {
+      gracefulWaitMs = Math.min(1_000, this.deadline.remaining());
+    } catch {
+      gracefulWaitMs = 0;
     }
-    if (this.stdoutBuffer.length > 0) {
-      this.fail(gateError("codex_event_json_invalid"));
+    if (!this.closed && gracefulWaitMs > 0) {
+      await Promise.race([
+        this.closedPromise.then(() => true),
+        wait(gracefulWaitMs).then(() => false),
+      ]);
+    }
+    this.groupCleanupPromise ??= this.supervisor
+      .terminateProcessGroup(this.pid, { graceful: this.closed })
+      .catch(cleanupError => {
+        this.cleanupFailure = cleanupError;
+      });
+    await this.groupCleanupPromise;
+    if (!this.closed) {
+      await this.supervisor.withDeadline(
+        this.closedPromise,
+        this.supervisor.now() + CLEANUP_DRAIN_GRACE_MS,
+        "codex_app_server_close_timeout",
+      );
     }
     try {
-      process.kill(this.pid, 0);
-      throw gateError("codex_app_server_process_survived");
+      this.stdoutFramer.finish();
     } catch (error) {
-      if (error?.code !== "ESRCH") throw error;
+      this.fail(error);
     }
+    if (this.cleanupFailure) throw this.cleanupFailure;
   }
 
   async storeEvents() {
     this.checkLimit();
-    await writeFile(this.eventsPath, this.stdoutLines.join(""), {
+    await writeFile(this.eventsPath, Buffer.concat(this.stdoutLines), {
       mode: 0o600,
     });
   }
@@ -1116,10 +1550,11 @@ function modelProtocolError() {
 }
 
 function validString(value, minLength, maxLength) {
+  const length = typeof value === "string" ? [...value].length : -1;
   return (
     typeof value === "string" &&
-    value.length >= minLength &&
-    value.length <= maxLength
+    length >= minLength &&
+    length <= maxLength
   );
 }
 
@@ -1613,7 +2048,7 @@ async function runOne(runNumber) {
   let eventsPath;
   let primaryFailure;
   try {
-    root = await mkdtemp(join(tmpdir(), "codex-browser-gate-"));
+    root = gateLifecycle.createRoot(join(tmpdir(), "codex-browser-gate-"));
     const rootStat = await stat(root);
     if (!rootStat.isDirectory() || (rootStat.mode & 0o777) !== 0o700) {
       throw gateError("codex_temp_root_mode_invalid");
@@ -1900,8 +2335,7 @@ async function runOne(runNumber) {
     }
     if (root) {
       try {
-        await rm(root, { force: true, recursive: true });
-        await assertRemoved(root);
+        await gateLifecycle.removeRoot(root);
       } catch (error) {
         cleanupFailures.push(error);
       }
@@ -1910,8 +2344,10 @@ async function runOne(runNumber) {
   }
 }
 
-async function actionStoreSelfTest() {
-  const root = await mkdtemp(join(tmpdir(), "codex-browser-action-store-"));
+async function actionStoreSelfTest({ silent = false } = {}) {
+  const root = gateLifecycle.createRoot(
+    join(tmpdir(), "codex-browser-action-store-"),
+  );
   const markerPath = join(root, "marker");
   try {
     const store = createGateActionStore({ markerPath });
@@ -1968,15 +2404,17 @@ async function actionStoreSelfTest() {
       error => error?.code === "EEXIST",
     );
     assert.equal(failedStore.snapshot().records[0].state, "executing");
-    process.stdout.write(
-      `codex_browser_action_store: PASS writes=${snapshot.writeCount} records=${snapshot.records.length}\n`,
-    );
+    if (!silent) {
+      process.stdout.write(
+        `codex_browser_action_store: PASS writes=${snapshot.writeCount} records=${snapshot.records.length}\n`,
+      );
+    }
   } finally {
-    await rm(root, { force: true, recursive: true });
+    await gateLifecycle.removeRoot(root);
   }
 }
 
-async function hardeningSelfTest() {
+async function hardeningSelfTest({ silent = false } = {}) {
   const ordered = { kind: "fill", ref: "gate-marker", value: "approved" };
   const permuted = { value: "approved", kind: "fill", ref: "gate-marker" };
   assert.equal(normalizedProposalHash(ordered), normalizedProposalHash(permuted));
@@ -2095,7 +2533,21 @@ async function hardeningSelfTest() {
       auditGeneratedSchemaKeywords({ type: "integer", format: "int128" }),
     /codex_protocol_schema_mismatch/,
   );
-  process.stdout.write("codex_browser_format_hardening: PASS\n");
+  assert.doesNotThrow(() =>
+    assertGeneratedSchemaValue("😀", {
+      schema: { type: "string", maxLength: 1 },
+    }),
+  );
+  assert.throws(
+    () =>
+      assertGeneratedSchemaValue("😀", {
+        schema: { type: "string", minLength: 2 },
+      }),
+    /codex_protocol_schema_mismatch/,
+  );
+  assert.equal(validString("😀", 1, 1), true);
+  assert.equal(validString("😀", 2, 2), false);
+  if (!silent) process.stdout.write("codex_browser_format_hardening: PASS\n");
   let now = 1000;
   let expired = false;
   const deadline = new ProcessDeadline(100, () => now, () => {
@@ -2256,7 +2708,468 @@ async function hardeningSelfTest() {
     () => surfaceCleanupFailures(undefined, [cleanupFailure]),
     error => error === cleanupFailure,
   );
-  process.stdout.write("codex_browser_hardening: PASS\n");
+  assert.equal(parseRunCount([]), 3);
+  assert.equal(parseRunCount(["--runs", "10"]), 10);
+  for (const value of ["11", "9007199254740993", "Infinity"]) {
+    assert.throws(
+      () => parseRunCount(["--runs", value]),
+      /codex_gate_arguments_invalid/,
+    );
+  }
+  const preflightCalls = [];
+  const preflightChecks = Object.fromEntries(
+    ["actionStore", "hardening", "transport", "lifecycle"].map(name => [
+      name,
+      async options => preflightCalls.push([name, options]),
+    ]),
+  );
+  await runPreflight(preflightChecks);
+  assert.deepEqual(preflightCalls, [
+    ["actionStore", { silent: true }],
+    ["hardening", { silent: true }],
+    ["transport", { silent: true }],
+    ["lifecycle", { silent: true }],
+  ]);
+  await assert.rejects(
+    invoke(["--hardening-self-test", "ignored-extra"]),
+    /codex_gate_arguments_invalid/,
+  );
+  const preflightFailure = new Error("preflight_failure");
+  let versionDiscovered = false;
+  await assert.rejects(
+    prepareGate({
+      preflight: async () => {
+        throw preflightFailure;
+      },
+      discoverVersion: async () => {
+        versionDiscovered = true;
+      },
+    }),
+    error => error === preflightFailure,
+  );
+  assert.equal(versionDiscovered, false);
+  if (!silent) process.stdout.write("codex_browser_hardening: PASS\n");
+}
+
+async function transportSelfTest({ silent = false } = {}) {
+  const invalidUtf8 = Buffer.concat([
+    Buffer.from('{"method":"', "utf8"),
+    Buffer.from([0xc3, 0x28]),
+    Buffer.from('"}', "utf8"),
+  ]);
+  assert.throws(
+    () => parseAppServerMessage(invalidUtf8),
+    /codex_event_json_invalid/,
+  );
+  assert.equal(
+    parseAppServerMessage(
+      Buffer.from('{"method":"progress","params":{"value":0.1}}'),
+    ).params.value,
+    0.1,
+  );
+  assert.equal(
+    parseAppServerMessage(
+      Buffer.from('{"method":"replacement","params":{"value":"�"}}'),
+    ).params.value,
+    "�",
+  );
+  assert.throws(
+    () =>
+      parseAppServerMessage(
+        Buffer.from(
+          String.raw`{"method":"turn/started","\u006dethod":"turn/completed","params":{}}`,
+          "utf8",
+        ),
+      ),
+    /codex_event_json_invalid/,
+  );
+  assert.throws(
+    () =>
+      parseAppServerMessage(
+        Buffer.from('{"id":1,"result":{},"result":{"duplicate":true}}'),
+      ),
+    /codex_event_json_invalid/,
+  );
+
+  const lines = [];
+  const framer = new RawJsonlFramer(line => lines.push(line));
+  const encoded = Buffer.from('{"method":"😀"}\n', "utf8");
+  const split = encoded.indexOf(0xf0) + 2;
+  framer.push(encoded.subarray(0, split));
+  framer.push(encoded.subarray(split));
+  framer.finish();
+  assert.equal(lines.length, 1);
+  assert.deepEqual(lines[0], encoded.subarray(0, -1));
+
+  const child = new EventEmitter();
+  child.pid = 601;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = { end() {}, write() {} };
+  let groupAlive = true;
+  const supervisor = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -601);
+      if (signal === 0) {
+        if (!groupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      groupAlive = false;
+    },
+  });
+  const client = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events",
+    spawnChild: () => child,
+    supervisor,
+    scheduleTimer: () => 1,
+    cancelTimer() {},
+  });
+  const rawFrame = Buffer.from(
+    '{"method":"thread/started","params":{"threadId":"thread-raw"}}\n',
+  );
+  child.stdout.emit("data", rawFrame.subarray(0, 7));
+  child.stdout.emit("data", rawFrame.subarray(7));
+  assert.equal(client.messages[0].method, "thread/started");
+  assert.deepEqual(Buffer.concat(client.stdoutLines), rawFrame);
+  client.stopping = true;
+  child.emit("close", 0, null);
+  client.stopping = false;
+  await client.stop();
+  assert.equal(groupAlive, false);
+  if (!silent) process.stdout.write("codex_browser_transport: PASS\n");
+}
+
+async function lifecycleSelfTest({ silent = false } = {}) {
+  const createGroupHarness = (pids, termExits = new Set()) => {
+    const alive = new Set(pids);
+    const signals = [];
+    const killProcess = (target, signal) => {
+      assert(target < 0);
+      const pgid = -target;
+      if (signal === 0) {
+        if (!alive.has(pgid)) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      signals.push([pgid, signal]);
+      if (signal === "SIGKILL" || termExits.has(pgid)) alive.delete(pgid);
+    };
+    return { alive, killProcess, signals };
+  };
+  const fakeChild = pid => {
+    const child = new EventEmitter();
+    child.pid = pid;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = {
+      end() {},
+      write(_body, callback) {
+        callback?.();
+      },
+    };
+    return child;
+  };
+
+  const signalGroups = createGroupHarness([701, 702], new Set([701]));
+  let clock = 0;
+  const registry = new LifecycleRegistry({
+    killProcess: signalGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+  });
+  const authRoot = registry.createRoot(
+    join(tmpdir(), "codex-gate-lifecycle-"),
+  );
+  await mkdir(join(authRoot, "codex-home"), { mode: 0o700 });
+  await writeFile(join(authRoot, "codex-home", "auth.json"), "secret", {
+    mode: 0o600,
+  });
+  let aborted;
+  registry.ownProcessGroup(fakeChild(701), error => {
+    aborted = error;
+    void registry.terminateProcessGroup(701, { graceful: false });
+  });
+  registry.ownProcessGroup(fakeChild(702));
+  const signalProcess = new EventEmitter();
+  signalProcess.pid = 99;
+  let previousSignals = 0;
+  const previousHandler = () => {
+    previousSignals += 1;
+  };
+  signalProcess.once("SIGTERM", previousHandler);
+  let laterSignals = 0;
+  const reraised = [];
+  installSignalHandlers(registry, signalProcess);
+  const laterHandler = () => {
+    laterSignals += 1;
+  };
+  signalProcess.on("SIGTERM", laterHandler);
+  signalProcess.kill = (pid, signal) => {
+    reraised.push([pid, signal]);
+    signalProcess.emit(signal);
+  };
+  signalProcess.emit("SIGTERM");
+  const concurrentCleanup = registry.cleanup();
+  assert.equal(concurrentCleanup, registry.cleanupPromise);
+  await Promise.all([registry.signalPromise, concurrentCleanup]);
+  assert.match(aborted.message, /codex_gate_cancelled/);
+  assert.deepEqual(signalGroups.alive, new Set());
+  assert.deepEqual(
+    signalGroups.signals,
+    [
+      [701, "SIGTERM"],
+      [702, "SIGTERM"],
+      [702, "SIGKILL"],
+    ],
+  );
+  await assertRemoved(authRoot);
+  assert.deepEqual(reraised, [[99, "SIGTERM"]]);
+  assert.equal(previousSignals, 1);
+  assert.equal(laterSignals, 2);
+  assert(!signalProcess.listeners("SIGTERM").includes(previousHandler));
+
+  const acquisitionRegistry = new LifecycleRegistry();
+  const acquiredRoot = acquisitionRegistry.createRoot(
+    join(tmpdir(), "codex-gate-acquisition-"),
+  );
+  assert(acquisitionRegistry.roots.has(acquiredRoot));
+  const acquisitionCleanup = acquisitionRegistry.cleanup();
+  assert.throws(
+    () =>
+      acquisitionRegistry.createRoot(
+        join(tmpdir(), "codex-gate-late-acquisition-"),
+      ),
+    /codex_lifecycle_closed/,
+  );
+  await acquisitionCleanup;
+  await assertRemoved(acquiredRoot);
+
+  const stalledRootRegistry = new LifecycleRegistry({
+    removeTree: () => new Promise(() => {}),
+    now: () => 0,
+    scheduleTimer(callback) {
+      return setImmediate(callback);
+    },
+    cancelTimer(handle) {
+      clearImmediate(handle);
+    },
+  });
+  stalledRootRegistry.ownRoot("/stalled-root");
+  await assert.rejects(
+    stalledRootRegistry.removeRoot("/stalled-root", 1),
+    /codex_temp_root_cleanup_timeout/,
+  );
+
+  const timeoutGroups = createGroupHarness([801]);
+  const timeoutRegistry = new LifecycleRegistry({
+    killProcess: timeoutGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+  });
+  const retainedPipeChild = fakeChild(801);
+  await assert.rejects(
+    runCaptured("fake-timeout", [], {
+      spawnChild: () => retainedPipeChild,
+      supervisor: timeoutRegistry,
+      timeoutMs: 1,
+      scheduleTimer: callback => {
+        queueMicrotask(callback);
+        return 1;
+      },
+      cancelTimer() {},
+    }),
+    /codex_command_timeout/,
+  );
+  assert.deepEqual(timeoutGroups.alive, new Set());
+  assert(timeoutGroups.signals.some(([, signal]) => signal === "SIGKILL"));
+
+  const outputGroups = createGroupHarness([802]);
+  const outputRegistry = new LifecycleRegistry({
+    killProcess: outputGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+  });
+  const outputChild = fakeChild(802);
+  const outputPromise = runCaptured("fake-output", [], {
+    spawnChild: () => outputChild,
+    supervisor: outputRegistry,
+  });
+  outputChild.stdout.write(Buffer.alloc(MAX_OUTPUT_BYTES + 1));
+  await assert.rejects(outputPromise, /codex_output_limit/);
+  assert.deepEqual(outputGroups.alive, new Set());
+
+  const leakedCloseGroups = createGroupHarness([805]);
+  const leakedCloseRegistry = new LifecycleRegistry({
+    killProcess: leakedCloseGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+  });
+  const leakedCloseChild = fakeChild(805);
+  const leakedClosePromise = runCaptured("fake-close", [], {
+    spawnChild: () => leakedCloseChild,
+    supervisor: leakedCloseRegistry,
+  });
+  leakedCloseChild.emit("close", 0, null);
+  await assert.rejects(leakedClosePromise, /codex_process_group_survived/);
+  assert.deepEqual(leakedCloseGroups.alive, new Set());
+
+  const missingPidChild = fakeChild(undefined);
+  const missingPidPromise = runCaptured("fake-missing", [], {
+    spawnChild: () => missingPidChild,
+    supervisor: new LifecycleRegistry(),
+  });
+  queueMicrotask(() => {
+    missingPidChild.emit("error", new Error("ENOENT"));
+  });
+  await assert.rejects(missingPidPromise, /codex_spawn_failed/);
+
+  const stubbornAlive = new Set([804]);
+  const stubbornSignals = [];
+  let stubbornClock = 0;
+  const stubbornRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      const pgid = -target;
+      if (signal === 0) {
+        if (!stubbornAlive.has(pgid)) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      stubbornSignals.push([pgid, signal]);
+    },
+    now: () => stubbornClock,
+    wait: async milliseconds => {
+      stubbornClock += milliseconds;
+    },
+  });
+  stubbornRegistry.ownProcessGroup(fakeChild(804));
+  const stubbornRoot = stubbornRegistry.createRoot(
+    join(tmpdir(), "codex-gate-stubborn-"),
+  );
+  await assert.rejects(
+    stubbornRegistry.cleanup(),
+    /codex_process_group_survived/,
+  );
+  assert.deepEqual(stubbornSignals, [
+    [804, "SIGTERM"],
+    [804, "SIGKILL"],
+  ]);
+  assert(stubbornClock <= CLEANUP_TERM_GRACE_MS + CLEANUP_KILL_GRACE_MS);
+  await assertRemoved(stubbornRoot);
+
+  const permissionRegistry = new LifecycleRegistry({
+    killProcess() {
+      const error = new Error("permission denied");
+      error.code = "EPERM";
+      throw error;
+    },
+  });
+  const permissionRoot = permissionRegistry.createRoot(
+    join(tmpdir(), "codex-gate-permission-"),
+  );
+  permissionRegistry.ownProcessGroup(fakeChild(806));
+  await assert.rejects(permissionRegistry.cleanup(), /permission denied/);
+  await assertRemoved(permissionRoot);
+
+  const appGroups = createGroupHarness([803]);
+  const appRegistry = new LifecycleRegistry({
+    killProcess: appGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+  });
+  let operationalNow = 0;
+  const appChild = fakeChild(803);
+  const client = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events",
+    deadline: new ProcessDeadline(1, () => operationalNow),
+    spawnChild: () => appChild,
+    supervisor: appRegistry,
+    scheduleTimer: () => 1,
+    cancelTimer() {},
+  });
+  operationalNow = 2;
+  queueMicrotask(() => {
+    appChild.stdout.end();
+    appChild.stderr.end();
+    appChild.emit("close", null, "SIGKILL");
+  });
+  await client.stop();
+  assert.deepEqual(appGroups.alive, new Set());
+
+  const drainGroups = createGroupHarness([807]);
+  const drainRegistry = new LifecycleRegistry({
+    killProcess: drainGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+    scheduleTimer(callback) {
+      return setImmediate(callback);
+    },
+    cancelTimer(handle) {
+      clearImmediate(handle);
+    },
+  });
+  const drainChild = fakeChild(807);
+  const drainClient = new AppServerClient({
+    cwd: "/gate",
+    env: {},
+    eventsPath: "/gate/events",
+    deadline: new ProcessDeadline(1, () => 2),
+    spawnChild: () => drainChild,
+    supervisor: drainRegistry,
+    scheduleTimer: () => 1,
+    cancelTimer() {},
+  });
+  await assert.rejects(
+    drainClient.stop(),
+    /codex_app_server_close_timeout/,
+  );
+  assert.deepEqual(drainGroups.alive, new Set());
+  if (!silent) process.stdout.write("codex_browser_lifecycle: PASS\n");
+}
+
+async function runPreflight({
+  actionStore = actionStoreSelfTest,
+  hardening = hardeningSelfTest,
+  transport = transportSelfTest,
+  lifecycle = lifecycleSelfTest,
+} = {}) {
+  await actionStore({ silent: true });
+  await hardening({ silent: true });
+  await transport({ silent: true });
+  await lifecycle({ silent: true });
+}
+
+async function prepareGate({
+  preflight = runPreflight,
+  discoverVersion = () => runCaptured("codex", ["--version"]),
+} = {}) {
+  await preflight();
+  return discoverVersion();
 }
 
 function parseRunCount(args) {
@@ -2268,11 +3181,15 @@ function parseRunCount(args) {
   ) {
     throw gateError("codex_gate_arguments_invalid");
   }
-  return Number(args[1]);
+  const count = Number(args[1]);
+  if (!Number.isSafeInteger(count) || count > MAX_RUNS) {
+    throw gateError("codex_gate_arguments_invalid");
+  }
+  return count;
 }
 
-async function main() {
-  const versionResult = await runCaptured("codex", ["--version"]);
+async function main(runCount) {
+  const versionResult = await prepareGate();
   if (
     versionResult.code !== 0 ||
     versionResult.stdout.trim() !== CODEX_VERSION_OUTPUT
@@ -2283,7 +3200,6 @@ async function main() {
     );
   }
 
-  const runCount = parseRunCount(process.argv.slice(2));
   const results = [];
   for (let runNumber = 1; runNumber <= runCount; runNumber += 1) {
     results.push(await runOne(runNumber));
@@ -2314,14 +3230,53 @@ async function main() {
   );
 }
 
-const invocation =
-  process.argv[2] === "--action-store-self-test"
-    ? actionStoreSelfTest()
-    : process.argv[2] === "--hardening-self-test"
-      ? hardeningSelfTest()
-      : main();
+const gateLifecycle = new LifecycleRegistry();
+const signalHandlers = installSignalHandlers(gateLifecycle);
 
-invocation.catch(error => {
+function parseInvocation(args) {
+  const selfTests = new Map([
+    ["--action-store-self-test", actionStoreSelfTest],
+    ["--hardening-self-test", hardeningSelfTest],
+    ["--lifecycle-self-test", lifecycleSelfTest],
+    ["--transport-self-test", transportSelfTest],
+  ]);
+  if (args.length === 1 && selfTests.has(args[0])) {
+    return { selfTest: selfTests.get(args[0]) };
+  }
+  return { runCount: parseRunCount(args) };
+}
+
+async function invoke(args) {
+  const parsedInvocation = parseInvocation(args);
+  return parsedInvocation.selfTest
+    ? parsedInvocation.selfTest()
+    : main(parsedInvocation.runCount);
+}
+
+const invocation = invoke(process.argv.slice(2));
+
+async function settleInvocation() {
+  let primaryFailure;
+  try {
+    await invocation;
+  } catch (error) {
+    primaryFailure = error;
+  }
+  let cleanupFailure;
+  try {
+    await gateLifecycle.cleanup();
+  } catch (error) {
+    cleanupFailure = error;
+  } finally {
+    signalHandlers.restore();
+  }
+  if (primaryFailure) {
+    throw combinePrimaryAndCleanup(primaryFailure, cleanupFailure);
+  }
+  if (cleanupFailure) throw cleanupFailure;
+}
+
+settleInvocation().catch(error => {
   process.stderr.write(
     `${error instanceof Error ? error.message : String(error)}\n`,
   );
