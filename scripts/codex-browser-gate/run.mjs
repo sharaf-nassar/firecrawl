@@ -72,6 +72,14 @@ function requireExact(value, expected) {
   }
 }
 
+function appendDistinctCleanupFailure(
+  cleanupFailures,
+  primaryFailure,
+  error,
+) {
+  if (error !== primaryFailure) cleanupFailures.push(error);
+}
+
 async function runOne(runNumber) {
   let root;
   let client;
@@ -362,13 +370,21 @@ async function runOne(runNumber) {
       try {
         await client.stop();
       } catch (error) {
-        cleanupFailures.push(error);
+        appendDistinctCleanupFailure(
+          cleanupFailures,
+          primaryFailure,
+          error,
+        );
       }
       if (eventsPath) {
         try {
           await client.storeEvents();
         } catch (error) {
-          cleanupFailures.push(error);
+          appendDistinctCleanupFailure(
+            cleanupFailures,
+            primaryFailure,
+            error,
+          );
         }
       }
     }
@@ -376,7 +392,11 @@ async function runOne(runNumber) {
       try {
         await gateLifecycle.removeRoot(root);
       } catch (error) {
-        cleanupFailures.push(error);
+        appendDistinctCleanupFailure(
+          cleanupFailures,
+          primaryFailure,
+          error,
+        );
       }
     }
     surfaceCleanupFailures(primaryFailure, cleanupFailures);
@@ -496,6 +516,54 @@ async function hardeningSelfTest({ silent = false } = {}) {
     error => error === preflightFailure,
   );
   assert.equal(versionDiscovered, false);
+  const fakePrimaryFailure = gateError("model_protocol_error");
+  const sameOnlyCleanupFailures = [];
+  appendDistinctCleanupFailure(
+    sameOnlyCleanupFailures,
+    fakePrimaryFailure,
+    fakePrimaryFailure,
+  );
+  assert.throws(
+    () => {
+      try {
+        throw fakePrimaryFailure;
+      } finally {
+        surfaceCleanupFailures(
+          fakePrimaryFailure,
+          sameOnlyCleanupFailures,
+        );
+      }
+    },
+    error => error === fakePrimaryFailure,
+  );
+  const fakeStoreFailure = new Error("store cleanup failed");
+  const fakeRootFailure = new Error("root cleanup failed");
+  const distinctCleanupFailures = [];
+  for (const error of [
+    fakePrimaryFailure,
+    fakeStoreFailure,
+    fakeRootFailure,
+  ]) {
+    appendDistinctCleanupFailure(
+      distinctCleanupFailures,
+      fakePrimaryFailure,
+      error,
+    );
+  }
+  assert.deepEqual(distinctCleanupFailures, [
+    fakeStoreFailure,
+    fakeRootFailure,
+  ]);
+  assert.throws(
+    () =>
+      surfaceCleanupFailures(fakePrimaryFailure, distinctCleanupFailures),
+    error =>
+      error instanceof AggregateError &&
+      error.errors.length === 3 &&
+      error.errors[0] === fakePrimaryFailure &&
+      error.errors[1] === fakeStoreFailure &&
+      error.errors[2] === fakeRootFailure,
+  );
   if (!silent) process.stdout.write("codex_browser_hardening: PASS\n");
 }
 
