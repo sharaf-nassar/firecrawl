@@ -233,6 +233,73 @@ describe("replay envelope normalization", () => {
     });
   });
 
+  it.each(["US", "ca", "us-generic", "US-WHITELIST"])(
+    "accepts a current location country: %s",
+    country => {
+      const result = normalizeReplayEnvelope(
+        source({ options: { location: { country } } }),
+      );
+      expect(result.kind).toBe("ok");
+      if (result.kind !== "ok") return;
+      expect(result.envelope.browserSettings.location.country).toBe(
+        country.toLowerCase(),
+      );
+    },
+  );
+
+  it("rejects a non-ISO location country", () => {
+    expect(
+      normalizeReplayEnvelope(
+        source({ options: { location: { country: "canada" } } }),
+      ),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["location.country"],
+    });
+  });
+
+  it("enforces the current aggregate scrape wait budget", () => {
+    expect(
+      normalizeReplayEnvelope(
+        source({
+          options: {
+            waitFor: 30_000,
+            actions: [{ type: "wait", milliseconds: 30_000 }],
+          },
+        }),
+      ).kind,
+    ).toBe("ok");
+    expect(
+      normalizeReplayEnvelope(
+        source({
+          options: {
+            waitFor: 30_000,
+            actions: [{ type: "wait", milliseconds: 30_001 }],
+          },
+        }),
+      ),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["actions", "waitFor"],
+    });
+    expect(
+      normalizeReplayEnvelope(
+        source({
+          options: {
+            waitFor: 59_001,
+            actions: [{ type: "wait", selector: "#ready" }],
+          },
+        }),
+      ),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["actions", "waitFor"],
+    });
+  });
+
   it.each([
     [source({ url: "<redacted>" }), ["url"]],
     [source({ options: "<redacted>" }), ["options"]],
@@ -354,6 +421,36 @@ describe("replay resolution", () => {
     });
   });
 
+  it("aggregates every unsafe or malformed legacy action index", () => {
+    const result = resolveReplayEnvelope(
+      source({
+        options: {
+          actions: [
+            { type: "wait" },
+            { type: "click" },
+            { type: "write", text: "value" },
+            { type: "futureAction" },
+            { type: "scroll", direction: "sideways" },
+          ],
+        },
+      }),
+    );
+    expect(result).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+    });
+    if (result.kind !== "error") return;
+    expect(result.fields).toEqual(
+      expect.arrayContaining([
+        "actions.0",
+        "actions.1",
+        "actions.2",
+        "actions.3",
+        "actions.4",
+      ]),
+    );
+  });
+
   it("rejects a legacy profile without an immutable generation", () => {
     expect(
       resolveReplayEnvelope(
@@ -361,6 +458,16 @@ describe("replay resolution", () => {
           options: { profile: { name: "signed-in", saveChanges: false } },
         }),
       ),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: ["profile.generationId"],
+    });
+  });
+
+  it("rejects a profile generation when no profile was retained", () => {
+    expect(
+      resolveReplayEnvelope(source({ profileGenerationId: "generation:12" })),
     ).toMatchObject({
       kind: "error",
       category: "replay_unsupported",
@@ -378,6 +485,29 @@ describe("replay resolution", () => {
       category: "replay_unavailable",
       fields: ["checkpoint.checksum"],
     });
+  });
+
+  it("rejects checkpoint URL credentials without echoing them", () => {
+    const credentialUrl =
+      "https://proxy-user:proxy-password@example.com/products/42";
+    const result = resolveReplayEnvelope(
+      source({
+        checkpoint: checkpoint({
+          finalUrl: credentialUrl,
+          fingerprint: {
+            finalUrl: credentialUrl,
+            titleSha256: "a".repeat(64),
+            bodyTextSha256: "b".repeat(64),
+          },
+        }),
+      }),
+    );
+    expect(result).toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+      fields: ["checkpoint.finalUrl", "checkpoint.fingerprint.finalUrl"],
+    });
+    expect(JSON.stringify(result)).not.toContain("proxy-password");
   });
 
   it("retains only a server-side proxy credential reference", () => {

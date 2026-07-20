@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { BaseScrapeOptions } from "../../controllers/v2/types";
+import { countries } from "../validate-country";
 import { rewriteUrl } from "../../scraper/scrapeURL/lib/rewriteUrl";
 
 /** @public */
@@ -151,6 +152,24 @@ export type ReplayEnvelopeNormalization =
   | ReplayError;
 
 const boundedString = (maximum: number) => z.string().min(1).max(maximum);
+const specialLocationCountries = new Set(["us-generic", "us-whitelist"]);
+
+function isSupportedLocationCountry(value: string): boolean {
+  return (
+    Object.hasOwn(countries, value.toUpperCase()) ||
+    specialLocationCountries.has(value.toLowerCase())
+  );
+}
+
+const retainedLocationCountrySchema = boundedString(64)
+  .refine(isSupportedLocationCountry)
+  .transform(value => value.toLowerCase());
+
+const optionLocationCountrySchema = z
+  .string()
+  .max(64)
+  .refine(value => !value || isSupportedLocationCountry(value))
+  .transform(value => (value ? value.toLowerCase() : "us-generic"));
 
 const viewportSchema = z.strictObject({
   width: z.number().int().positive().max(7680),
@@ -161,7 +180,7 @@ const viewportSchema = z.strictObject({
 });
 
 const locationSchema = z.strictObject({
-  country: boundedString(64),
+  country: retainedLocationCountrySchema,
   languages: z.array(boundedString(128)).max(32),
 });
 
@@ -318,7 +337,7 @@ const optionsSchema = z.strictObject({
   actions: z.array(actionSchema).max(50).optional(),
   location: z
     .strictObject({
-      country: boundedString(64).optional(),
+      country: optionLocationCountrySchema.optional(),
       languages: z.array(boundedString(128)).max(32).optional(),
     })
     .optional(),
@@ -353,6 +372,14 @@ const optionsSchema = z.strictObject({
   __forceFirePDF: z.unknown().optional(),
 });
 
+const retainedUrlSchema = z
+  .url()
+  .regex(/^https?:\/\//i)
+  .refine(value => {
+    const url = new URL(value);
+    return url.username.length === 0 && url.password.length === 0;
+  });
+
 const checkpointSchema = z
   .strictObject({
     version: z.literal(1),
@@ -361,9 +388,9 @@ const checkpointSchema = z
       cookies: z.array(z.record(z.string(), z.unknown())),
       origins: z.array(z.record(z.string(), z.unknown())),
     }),
-    finalUrl: z.url().regex(/^https?:\/\//i),
+    finalUrl: retainedUrlSchema,
     fingerprint: z.strictObject({
-      finalUrl: z.url().regex(/^https?:\/\//i),
+      finalUrl: retainedUrlSchema,
       titleSha256: z.string().regex(/^[a-f0-9]{64}$/),
       bodyTextSha256: z.string().regex(/^[a-f0-9]{64}$/),
     }),
@@ -492,6 +519,35 @@ function effectForAction(action: ReplayAction): ReplayActionEffect {
   }
 }
 
+function aggregateWaitMs(options: z.output<typeof optionsSchema>): number {
+  return (
+    (options.waitFor ?? 0) +
+    (options.actions ?? []).reduce((total, action) => {
+      if (action.type !== "wait") return total;
+      if (action.milliseconds !== undefined) {
+        return total + action.milliseconds;
+      }
+      return action.selector !== undefined ? total + 1_000 : total;
+    }, 0)
+  );
+}
+
+function legacyUnrepresentableActionFields(options: unknown): string[] {
+  if (!isRecord(options) || !Array.isArray(options.actions)) return [];
+  return options.actions.flatMap((action, index) => {
+    if (!isRecord(action)) return [`actions.${index}`];
+    if (
+      action.type === "click" ||
+      action.type === "write" ||
+      action.type === "press" ||
+      action.type === "executeJavascript"
+    ) {
+      return [`actions.${index}`];
+    }
+    return actionSchema.safeParse(action).success ? [] : [`actions.${index}`];
+  });
+}
+
 export function normalizeReplayEnvelope(
   source: ReplayEnvelopeSource,
 ): ReplayEnvelopeNormalization {
@@ -525,6 +581,8 @@ export function normalizeReplayEnvelope(
     unsupported.push(
       ...fieldsFromIssues(undefined, parsedOptions.error.issues),
     );
+  } else if (aggregateWaitMs(parsedOptions.data) > 60_000) {
+    unsupported.push("actions", "waitFor");
   }
 
   const targetUrl = canonicalUrl(source.url as string);
@@ -558,6 +616,12 @@ export function normalizeReplayEnvelope(
     (typeof source.profileGenerationId !== "string" ||
       source.profileGenerationId.length === 0 ||
       source.profileGenerationId.length > 1_024)
+  ) {
+    unsupported.push("profile.generationId");
+  }
+  if (
+    typeof source.profileGenerationId === "string" &&
+    rawOptions.profile === undefined
   ) {
     unsupported.push("profile.generationId");
   }
@@ -605,7 +669,18 @@ export function resolveReplayEnvelope(
   source: ReplayEnvelopeSource,
 ): ReplayResolution {
   const normalized = normalizeReplayEnvelope(source);
-  if (normalized.kind === "error") return normalized;
+  if (normalized.kind === "error") {
+    if (
+      normalized.category === "replay_unsupported" &&
+      source.checkpoint === undefined
+    ) {
+      return error("replay_unsupported", [
+        ...normalized.fields,
+        ...legacyUnrepresentableActionFields(source.options),
+      ]);
+    }
+    return normalized;
+  }
 
   if (source.checkpoint !== undefined) {
     const parsedCheckpoint = checkpointSchema.safeParse(source.checkpoint);
