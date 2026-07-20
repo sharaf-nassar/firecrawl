@@ -45,9 +45,11 @@ with installed `codex-cli 0.144.5`, `gpt-5.6-terra`, and `medium` reasoning.
 Each run must use one pinned app-server process and ephemeral thread, emit one
 schema-valid side-effect proposal, execute the host marker once, return a
 cached result for a matching callback replay, reject a mismatched replay, then
-emit the exact final result after its observation. Shell, unified exec, web
-search, apps, plugins, skills, hooks, multi-agent, model tools, and every MCP
-server must be absent. Stop and revise the design on any mismatch.
+emit the exact final result after its observation. Each generation uses the
+shared lossless Node schema canonicalizer and all three canonical hashes must
+match. Shell, unified exec, web search, apps, plugins, skills, hooks,
+multi-agent, model tools, and every MCP server must be absent. Stop and revise
+the design on any mismatch.
 
 - [ ] **Gate 1: Make replay safe before Browser Service execution**
 
@@ -124,8 +126,8 @@ public-egress and SSRF checks without entering the navigation set.
   DNS resolution, address pinning, redirect validation, and private-address
   denial.
 - Prompt mode pins Codex CLI/app-server 0.144.5 and the generated V2 protocol
-  schema checksum after canonical JSON object-key normalization. Every turn
-  supplies the strict
+  schema checksum after shared lossless structural JSON canonicalization. Every
+  turn supplies the strict
   `ModelDecisionEnvelopeV1` output schema and normalizes its distinct
   `ModelWireDecisionV1` into internal `ModelDecisionV1`; the command is
   experimental, so every upgrade must pass Gate 0.

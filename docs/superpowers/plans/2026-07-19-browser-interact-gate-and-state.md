@@ -6,13 +6,15 @@
 
 **Architecture:** Gate zero drives one pinned Codex app-server 0.144.5 process and one ephemeral thread through two `turn/start` requests with the full production `ModelDecisionEnvelopeV1` wire schema and no MCP or model tools; its prompt and assertions deterministically select one fill variant. The host validates distinct model-wire types, normalizes them into unchanged internal `ModelDecisionV1`, executes the proposed side effect once, caches matching callback replay, and rejects mismatches before durable work begins. PostgreSQL then becomes authoritative for browser sessions, runs, execute-once actions, profiles, capabilities, proxy grants, replay envelopes, and checkpoint metadata. The existing stateless Playwright service exports a bounded post-scrape checkpoint before closing its context; the API stores sensitive state atomically on an owner-restricted volume and cleans it before request retention deletes database rows.
 
-**Tech Stack:** Codex CLI app-server 0.144.5 V2 JSON-RPC over stdio, JSON Schema Draft 7, TypeScript, Zod, Drizzle ORM, PostgreSQL 17, Playwright 1.58.1, Vitest, Docker Compose.
+**Tech Stack:** Node 22, Codex CLI app-server 0.144.5 V2 JSON-RPC over stdio, JSON Schema Draft 7, TypeScript, Zod, Drizzle ORM, PostgreSQL 17, Playwright 1.58.1, Vitest, Docker Compose.
 
 ---
 
 ## File map
 
 - Create `scripts/codex-browser-gate/action-store.mjs`: dependency-free host marker executor with action identity, deduplication, and mismatch rejection.
+- Create `scripts/codex-browser-gate/schema-canonicalizer.mjs`: shared Node 22 lossless structural JSON parser, canonical serializer, and schema fingerprint helpers.
+- Create `scripts/codex-browser-gate/schema-canonicalizer.test.mjs`: dependency-free canonicalizer grammar, losslessness, ordering, and fingerprint regressions.
 - Create `scripts/codex-browser-gate/run.mjs`: isolated app-server V2 client, strict decision-envelope schemas, event assertions, and three-run gate.
 - Delete `scripts/codex-browser-gate/mcp-server.mjs`: remove the failed direct-MCP Gate0 prototype after the replacement passes.
 - Create `apps/api/src/db/migrations/0004_browser_interact_foundation.sql`: durable browser and replay tables, constraints, foreign keys, and indexes.
@@ -262,6 +264,8 @@ action and one turn before its policy outcome.
 
 **Files:**
 - Create: `scripts/codex-browser-gate/action-store.mjs`
+- Create: `scripts/codex-browser-gate/schema-canonicalizer.mjs`
+- Create: `scripts/codex-browser-gate/schema-canonicalizer.test.mjs`
 - Create: `scripts/codex-browser-gate/run.mjs`
 - Delete: `scripts/codex-browser-gate/mcp-server.mjs`
 
@@ -424,7 +428,101 @@ the stored `ObservationV1` without opening the marker again. The mismatch path
 runs before any write. Rerun the self-test and expect
 `codex_browser_action_store: PASS writes=1 records=1`.
 
-- [ ] **Step 3: Generate and hash the pinned V2 schema**
+- [ ] **Step 3: Write failing lossless schema canonicalizer tests**
+
+Create `schema-canonicalizer.test.mjs` before the production module. Import
+`parseLosslessJson`, `canonicalizeJsonBytes`, `canonicalizeJsonFile`, and
+`hashCanonicalSchemaBundle` from `schema-canonicalizer.mjs`. Cover all of these
+cases:
+
+- reordered ordinary keys and integer-index keys canonicalize identically;
+  emitted order is the explicit UTF-16 order, including `"10"` before `"2"`,
+  rather than JavaScript object enumeration order;
+- reordered arrays differ, and a changed scalar differs;
+- `9007199254740993` remains exact and differs from `9007199254740992`;
+- `0.100000000000000005` remains exact and differs from `0.1`;
+- literal and escaped-equivalent duplicate decoded keys, such as `"a"` and
+  `"\u0061"`, are rejected;
+- invalid numbers, invalid strings, trailing data, truncated JSON, and other
+  grammar failures are rejected;
+- lone high and lone low surrogate escapes are rejected;
+- escaped and unescaped equivalent valid strings canonicalize identically,
+  including a valid supplementary-code-point surrogate pair;
+- raw `Buffer` and `Uint8Array` fixtures reject UTF-8 BOM bytes `EF BB BF`, an
+  overlong sequence such as `C0 AF`, a truncated multibyte sequence such as
+  `E2 82`, an isolated continuation byte `80`, and a UTF-8-encoded surrogate
+  sequence such as `ED A0 80`; place non-BOM cases inside raw JSON string
+  fixtures and require fatal decode rejection before tokenization;
+- valid literal U+FFFD bytes `EF BF BD` inside a raw JSON string fixture are
+  accepted, survive canonical output, and remain distinct from every
+  malformed-byte rejection, proving decoding never substitutes the replacement
+  character;
+- the [RFC 8785 Section 3.2.3 property-order test vector](https://www.rfc-editor.org/rfc/rfc8785.html#section-3.2.3)
+  produces its specified UTF-16 order, without claiming number, string, or
+  full JCS compatibility;
+- identical logical file sets with reordered object keys produce the same
+  path-framed schema digest;
+- the live `--runs 3` gate treats each pinned generation as an integration test
+  and requires one identical canonical hash across all three runs.
+
+Build lexical and escape fixtures with `String.raw` and `Buffer.from`; never
+create unsafe-number fixtures through JavaScript object literals or stringify
+them before the parser sees the source bytes.
+
+Run from repository root:
+
+```bash
+node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
+```
+
+Expected before implementation: FAIL with
+`ERR_MODULE_NOT_FOUND: schema-canonicalizer.mjs`.
+
+- [ ] **Step 4: Implement and use the shared lossless canonicalizer**
+
+`schema-canonicalizer.mjs` is the only protocol-schema canonicalizer used by
+Gate0 and the host build. It has no package dependencies and targets the Node
+22 already required by Phase 2. Export the four helpers named in Step 3; the
+byte helper returns a canonical `Buffer`, the file helper writes those bytes in
+place, and the bundle helper accepts an iterable of unique logical
+repository-relative `.json` paths plus raw bytes rather than temporary
+absolute roots. Its command-line entrypoint accepts `--canonicalize-file <path>` and
+`--canonicalize-tree <root>` so host build scripts invoke this exact module
+instead of reimplementing its rules.
+
+Raw bytes are authoritative input. The parse and byte-canonicalization exports
+require `Buffer` or `Uint8Array`, not a pre-decoded JavaScript string. Reject a
+leading `EF BB BF` BOM before decoding, then use
+`new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })` or an explicitly
+equivalent fatal decoder. Never use `Buffer.toString()` or any replacement-mode
+decoder for schema identity. The fatal boundary rejects overlong encodings,
+truncated multibyte input, isolated continuation bytes, and encoded UTF-8
+surrogates while accepting a genuine U+FFFD code point.
+
+Implement a tokenizer and recursive parser over the decoded JSON text.
+Validate the complete JSON grammar and EOF. Represent object nodes as ordered
+member arrays containing decoded key strings and parsed value nodes; detect a
+duplicate decoded key before constructing any JavaScript object. Validate all
+string escapes and control characters, combine only valid high/low surrogate
+pairs, and reject every unpaired surrogate. Validate JSON number grammar while
+retaining the exact raw number lexeme; never convert it through JavaScript
+`Number`. Store arrays as node arrays and retain the exact `true`, `false`, and
+`null` literal kinds.
+
+Serialize directly from that AST. Recursively sort object member arrays with
+an explicit unsigned UTF-16 code-unit lexicographic comparator; never use
+`localeCompare`, `Object.fromEntries`, object spread, or object enumeration for
+identity order. One deterministic string writer emits `\"`, `\\`, the short
+escapes for backspace/form-feed/newline/carriage-return/tab, lowercase
+`\u00xx` for other controls, and valid non-control Unicode as UTF-8 without
+normalization. Emit exact stored number lexemes and literal spellings. Preserve
+array order. Output compact UTF-8 with no BOM and no trailing newline.
+
+This is lossless structural canonicalization for generated schemas, not an RFC
+8785/JCS implementation. Retaining numeric lexemes can fail closed on
+semantically equivalent numeric spellings; that is acceptable. Sharing one
+Node implementation prevents JavaScript/Rust serialization drift and avoids
+integer-index key reordering.
 
 `run.mjs` parses `codex --version` and requires exactly
 `codex-cli 0.144.5`. For each live run, create one mode-0700 temporary root
@@ -438,39 +536,34 @@ codex app-server generate-json-schema --experimental --out <schema-directory>
 
 Require `codex_app_server_protocol.v2.schemas.json`, parse it, assert it
 contains `ThreadStartParams`, `TurnStartParams`, `ThreadStartResponse`, and
-`TurnCompletedNotification`, and retain the actual parsed schemas from that
-run for live message validation. Canonicalization below is only for identity;
-the validator must not substitute a weakened or separately authored schema.
-
-Canonicalize every generated `.json` for hashing: parse it, recursively sort
-object keys with `(a, b) => (a < b ? -1 : a > b ? 1 : 0)` so ordering is
-lexicographic by UTF-16 code unit rather than locale, preserve array order and
-scalar values, and serialize once with compact Node `JSON.stringify`. Encode
-that result as UTF-8 with no trailing newline. Reject parse failures and
-non-JSON input. Reject duplicate object keys when the parser exposes them;
-built-in `JSON.parse` does not expose duplicates and therefore provides only
-the required malformed-input rejection.
+`TurnCompletedNotification`, and retain the canonicalizer ASTs from that run
+for live message validation. The validator must not substitute a weakened or
+separately authored schema. When a schema numeric constraint must become a
+JavaScript number, first require an exact integer or finite value in the safe
+range expected by the pinned bundle; reject unsafe, non-finite, fractional
+where integer is required, or out-of-range constraints before conversion.
 
 For each `.json`, form its logical repository-relative path below
 `host/browser-runtime/protocol/codex-app-server-0.144.5/`, normalize separators
 to `/`, and sort paths with the same code-unit comparator. Feed SHA-256 each
 UTF-8 path, NUL, canonical JSON bytes, and NUL. Never feed raw generated JSON
-bytes into the identity hash. Reject any generated regular file that is not
-`.json`, so the complete generated file set remains explicit. Object-key order
-is semantically irrelevant, so normalization is deterministic identity
-framing, not schema weakening. Array reordering, scalar changes, and added or
-removed schema files must change the hash.
+bytes into the identity hash. Reject duplicate logical paths and any generated
+regular file that is not `.json`, so the complete generated file set remains
+explicit. Object-key order is semantically irrelevant, so normalization is
+deterministic identity framing, not schema weakening. Array reordering, scalar
+changes, and added or removed schema files must change the hash.
 
 Add gate self-tests proving reordered object keys produce the same digest,
-reordered arrays produce a different digest, a changed value produces a
-different digest, and malformed JSON fails. Require the canonical digest to
-match across all repeated live runs. Fail as
+reordered arrays and changed scalars produce different digests, unsafe integer
+and decimal lexemes remain exact, duplicate decoded keys and invalid JSON fail,
+and Unicode ordering follows the locked tests from Step 3. Require the
+canonical digest to match across all repeated live pinned generations. Fail as
 `codex_protocol_schema_mismatch` if generation, required definitions, or the
 canonical digest do not match installed 0.144.5. Retain that SHA-256 for the
 PASS line. The host adapter plan pins the same canonical bundle into the OCI
 build.
 
-- [ ] **Step 4: Create the isolated no-tool app-server configuration**
+- [ ] **Step 5: Create the isolated no-tool app-server configuration**
 
 Write this exact `codex-home/config.toml`; do not include an `mcp_servers`
 table:
@@ -527,7 +620,7 @@ matches `tool`, `browser`, `computer`, `code_mode`, `image`, `app`, `plugin`,
 `shell`, `web_search`, `skill`, `mcp`, or `artifact` unless it is an explicitly
 reviewed non-tool feature.
 
-- [ ] **Step 5: Implement the V2 JSON-RPC client and strict schemas**
+- [ ] **Step 6: Implement the V2 JSON-RPC client and strict schemas**
 
 Spawn `codex app-server --strict-config --stdio` without a shell, in its own
 process group, with isolated `CODEX_HOME` and empty `work` cwd. Send one JSON
@@ -744,13 +837,13 @@ assert.equal(
 Validate both fixture notification params against
 `<schema-directory>/v2/ItemCompletedNotification.json` and
 `<schema-directory>/v2/TurnCompletedNotification.json` from that live Gate
-run's Step 3 generated bundle. Resolve these beneath the run-owned temporary
+run's Step 4 generated bundle. Resolve these beneath the run-owned temporary
 schema directory; never use a machine-global audit path. The item event uses
 milliseconds; turn start/completion use seconds and `durationMs` uses
 milliseconds. Keep item `turnId` equal to `turn.id`; `turn/completed` carries
 `threadId` beside `turn` and no invented top-level `turnId`.
 
-- [ ] **Step 6: Drive the exact two-turn action loop**
+- [ ] **Step 7: Drive the exact two-turn action loop**
 
 Turn one input is one `{ type: "text", text: <string> }` item containing the
 original instruction and initial observation:
@@ -828,7 +921,7 @@ app, plugin, shell, approval, and collaboration events. Always terminate the
 app-server and remove the temporary root; after cleanup assert its process is
 gone and the root returns `ENOENT`.
 
-- [ ] **Step 7: Run three consecutive live gates**
+- [ ] **Step 8: Run three consecutive live gates**
 
 Run from repository root:
 
@@ -848,7 +941,7 @@ model, unexpected event, callback mismatch, duplicate write, incomplete
 cleanup, or need for broader approval/sandbox settings stops rollout. Do not
 begin Task 2 or weaken isolation; revise approved design first.
 
-- [ ] **Step 8: Stage and run actual hook**
+- [ ] **Step 9: Stage and run actual hook**
 
 After three live runs pass, remove the obsolete untracked direct-MCP fixture
 and assert it is absent:
@@ -859,21 +952,22 @@ test ! -e scripts/codex-browser-gate/mcp-server.mjs
 ```
 
 ```bash
-git add scripts/codex-browser-gate/action-store.mjs scripts/codex-browser-gate/run.mjs
+git add scripts/codex-browser-gate/action-store.mjs scripts/codex-browser-gate/schema-canonicalizer.mjs scripts/codex-browser-gate/schema-canonicalizer.test.mjs scripts/codex-browser-gate/run.mjs
 apps/api/.husky/_/pre-commit
 ```
 
-Expected: hook exits 0. If formatting changes either file, stage those two
-files again and rerun the same hook.
+Expected: hook exits 0. If formatting changes any file, stage those four files
+again and rerun the same hook.
 
-- [ ] **Step 9: Commit the passing gate**
+- [ ] **Step 10: Commit the passing gate**
 
 ```bash
 git commit -m "test: prove Codex structured browser actions" -m "Add a pinned app-server gate that validates two-turn structured
 decisions without MCP or model tools.
 
-Prove host-side action identity, cached replay, mismatch rejection,
-single marker execution, and complete cleanup across three live runs."
+Lock lossless schema fingerprints and prove host-side action identity,
+cached replay, mismatch rejection, single marker execution, and complete
+cleanup across three live runs."
 ```
 
 ### Task 2: Add browser and replay persistence migration

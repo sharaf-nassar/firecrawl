@@ -127,20 +127,43 @@ protocol and supplies an `outputSchema` on every turn. The generated protocol
 JSON Schema bundle is pinned and checksummed with the Codex OCI bundle; startup
 fails if the executable, protocol schema, or checksum differs.
 
-Protocol identity uses canonical JSON rather than raw generator bytes. Parse
-every generated `.json`, recursively sort object keys in lexicographic UTF-16
-code-unit order, preserve array order and scalar values, then serialize with
-Node `JSON.stringify` as compact UTF-8 with no trailing newline. Never use a
-locale-sensitive comparator. Reject malformed or non-JSON input; also reject
-duplicate object keys when the selected parser exposes them. Gate0's aggregate
-digest hashes each sorted repository-relative path, a NUL byte, its canonical
-JSON bytes, and a final NUL byte. The host `SHA256SUMS` manifest separately
-hashes each canonical on-disk file and records its repository-relative path.
-Object-key order is semantically irrelevant in JSON, so this deterministic
-normalization does not weaken schema validation: Gate0 still validates live
-messages against the actual parsed schemas generated for each run, and the
-deployed adapter loads the checked-in schemas for validation. Array order, file
-additions or removals, and scalar-value changes remain identity changes.
+Protocol identity uses one shared dependency-free Node 22 module,
+`scripts/codex-browser-gate/schema-canonicalizer.mjs`. It is a lossless
+structural JSON canonicalizer, not a partial or complete RFC 8785/JCS
+implementation. A tokenizer and recursive parser validate raw UTF-8 JSON
+through EOF, reject a BOM, malformed tokens, duplicate decoded object keys,
+and unpaired UTF-16 surrogates, and retain every number's exact source lexeme.
+It never constructs identity data through a normal JavaScript object or
+converts a number through `Number`.
+
+Raw `Buffer` or `Uint8Array` bytes are authoritative input. Reject the UTF-8
+BOM bytes before tokenization, then decode with
+`new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })` or an explicitly
+equivalent fatal decoder. Never decode with replacement semantics. Overlong,
+truncated, isolated-continuation, and UTF-8-encoded surrogate sequences fail;
+a valid literal U+FFFD inside a JSON string is accepted and remains
+distinguishable from malformed input bytes.
+
+Canonical serialization recursively sorts stored object members by decoded
+key in explicit lexicographic UTF-16 code-unit order, emits keys and string
+values through one deterministic escaping routine, retains exact number
+lexemes and JSON literals, and preserves array order. Output is compact UTF-8
+with no BOM and no trailing newline. Integer-index keys therefore cannot be
+silently reordered by JavaScript object property rules. Semantically equal
+numeric spellings may retain different identity bytes; that fail-closed
+over-detection is intentional for generated schemas.
+
+Gate0's aggregate digest hashes each sorted repository-relative path, a NUL
+byte, its canonical JSON bytes, and a final NUL byte. The host builder invokes
+the same module before file comparison, `SHA256SUMS`, and OCI inclusion; Rust
+only verifies and consumes canonical on-disk bytes and never independently
+canonicalizes them. Object-key order is semantically irrelevant, so this
+deterministic normalization does not weaken schema validation. Gate0 validates
+live messages against the losslessly parsed schemas generated for each run,
+and the deployed adapter loads the checked-in schemas for validation. Numeric
+schema constraints may be materialized only after explicit safe, finite, and
+range validation for the pinned generated schemas. Array order, file additions
+or removals, scalar values, and numeric lexemes remain identity changes.
 
 The process has these boundaries:
 
@@ -898,8 +921,10 @@ observable behavior and focused service/unit tests for isolation boundaries.
   recovery, and retention
 - Browser Service typed operation and live-view contracts
 - Fake app-server process/config construction, canonical pinned V2 schema
-  checksum, object-key/array/value/invalid-JSON canonicalization regressions,
-  strict `ModelDecisionEnvelopeV1` wire validation and normalization into
+  checksum, lossless structural canonicalizer grammar, duplicate-key,
+  surrogate, string-escape, number-lexeme, object-order, array, value, and
+  invalid-JSON regressions; strict `ModelDecisionEnvelopeV1` wire validation
+  and normalization into
   `ModelDecisionV1`, bounded multi-turn observations, zero tool and approval
   events, cancellation, limits, timeout, and orphan cleanup
 - Node, Python, and Bash runner success/failure, resource limits, network

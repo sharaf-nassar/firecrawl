@@ -53,6 +53,9 @@ focused tests; do not run the entire Firecrawl suite locally.
 - `codex app-server --strict-config --stdio` is the pinned process entrypoint.
 - `codex app-server generate-json-schema --experimental --out <dir>` emits the
   V2 protocol bundle used by this plan.
+- Node 22 is already required by the code bundle. Gate0's checked-in
+  `scripts/codex-browser-gate/schema-canonicalizer.mjs` is the only
+  protocol-schema canonicalizer; no new package or host tool is required.
 - V2 sequence is `initialize`, `initialized`, `thread/start`, then one or more
   `turn/start` requests. `TurnStartParams.outputSchema` constrains the final
   assistant message for each turn.
@@ -150,7 +153,8 @@ descriptor and use the existing page-oriented code contract.
 
 - Generate `host/browser-runtime/protocol/codex-app-server-0.144.5/` from the
   installed CLI and check in every generated JSON schema.
-- Create `host/browser-runtime/protocol/canonicalize-json.mjs`.
+- Reuse `scripts/codex-browser-gate/schema-canonicalizer.mjs` for Gate and host
+  protocol identity.
 - Create `host/browser-runtime/protocol/SHA256SUMS`.
 - Create
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`.
@@ -351,7 +355,8 @@ before host execution is enabled."
 **Files:**
 
 - Create: `host/browser-runtime/protocol/codex-app-server-0.144.5/`
-- Create: `host/browser-runtime/protocol/canonicalize-json.mjs`
+- Use: `scripts/codex-browser-gate/schema-canonicalizer.mjs`
+- Use: `scripts/codex-browser-gate/schema-canonicalizer.test.mjs`
 - Create: `host/browser-runtime/protocol/SHA256SUMS`
 - Create:
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`
@@ -450,28 +455,29 @@ cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml decision_lo
 
 Expected: FAIL because crate and decision parser do not exist.
 
-- [ ] **Step 3: Generate and checksum exact 0.144.5 protocol bundle**
+- [ ] **Step 3: Generate and canonicalize exact 0.144.5 bundle**
 
 First verify CLI version equals `codex-cli 0.144.5`; any other output exits
 78. Generate with the verified CLI command:
 
 ```bash
+node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
 codex app-server generate-json-schema --experimental --out host/browser-runtime/protocol/codex-app-server-0.144.5
+node scripts/codex-browser-gate/schema-canonicalizer.mjs --canonicalize-tree host/browser-runtime/protocol/codex-app-server-0.144.5
 ```
 
-Implement `canonicalize-json.mjs` without locale-sensitive ordering. For every
-`.json`, parse it, recursively sort object keys with
-`(a, b) => (a < b ? -1 : a > b ? 1 : 0)` for lexicographic UTF-16 code-unit
-order, preserve array order and scalar values, and write compact Node
-`JSON.stringify` UTF-8 with no trailing newline. Reject malformed or non-JSON
-input. Reject duplicate object keys when the selected parser exposes them;
-Node `JSON.parse` does not, so it provides the minimum required parse-failure
-rejection. Object-key order is semantically irrelevant; this deterministic
-normalization changes identity bytes without weakening any schema.
+Use only Gate0's shared dependency-free Node 22 lossless structural parser and
+serializer. It validates raw UTF-8 JSON and EOF, rejects BOMs, duplicate decoded
+keys, malformed strings/numbers, and unpaired surrogates, sorts object member
+arrays by decoded UTF-16 code units, preserves exact number lexemes and array
+order, and emits compact UTF-8 without a BOM or trailing newline. It never
+round-trips schema identity through JavaScript numbers or objects. This is not
+a partial RFC 8785/JCS implementation; numeric lexical changes may fail closed
+even when numerically equivalent.
 
-Canonicalize all generated schemas in place before checking them in. Also
-canonicalize `model-decision-envelope-v1.schema.json` before checksumming it.
-Sort repository-root-relative paths with the same code-unit comparator and
+Canonicalize all generated schemas in place before checking them in. After
+Step 4 writes `model-decision-envelope-v1.schema.json`, canonicalize that file
+too, then sort repository-root-relative paths with the shared comparator and
 write SHA-256 lines over canonical on-disk bytes. `SHA256SUMS` therefore covers
 the bytes installed into `/opt/firecrawl/protocol`, not raw generator output.
 
@@ -479,14 +485,20 @@ The builder regenerates into a temporary directory, rejects non-JSON regular
 files, canonicalizes every generated `.json`, then maps both roots to sorted
 repository-relative paths and compares the complete file set and canonical
 bytes before checking `SHA256SUMS`. Added or removed files, array reordering,
-and scalar changes still fail. The adapter continues loading and validating
-messages against the actual parsed schemas; canonicalization is only the bundle
-identity and checksum representation.
+scalar or numeric-lexeme changes, duplicate keys, and malformed JSON still
+fail. The adapter validates messages against the canonical schemas but never
+re-canonicalizes them in Rust. Schema numeric constraints are converted only
+after explicit safe, finite, and range validation appropriate to the pinned
+bundle.
 
-Add `canonicalize-json.mjs --self-test` regression cases proving reordered
-object keys have identical canonical bytes and digest, reordered arrays differ,
-a changed value differs, and malformed JSON fails. Run the self-test before
-generating `SHA256SUMS` and from the builder's protocol verification path.
+The shared tests were written before the production module in Gate Task 1.
+They cover ordinary and integer-index key order, the RFC 8785 UTF-16 ordering
+vector only, arrays, changed scalars, unsafe integers, precision-sensitive
+decimals, decoded duplicate keys, invalid grammar, lone surrogates, equivalent
+string escapes, fatal raw UTF-8 decoding, BOM, overlong, truncated,
+isolated-continuation, and encoded-surrogate rejection, valid U+FFFD
+preservation, and repeated pinned-generation hashes. Run them before generating
+`SHA256SUMS` and from every builder protocol-verification path.
 
 - [ ] **Step 4: Define exact model decision and browser operations**
 
@@ -663,6 +675,15 @@ It returns `model_schema_invalid` for any `const` key, any scalar node without
 `type`, or any `enum` whose node lacks `type`; startup runs it against the
 checked-in schema before the first app-server process starts.
 
+After writing the decision-envelope schema, run:
+
+```bash
+node scripts/codex-browser-gate/schema-canonicalizer.mjs --canonicalize-file host/browser-runtime/protocol/model-decision-envelope-v1.schema.json
+```
+
+Only then generate sorted repository-root-relative `SHA256SUMS` entries for
+the canonical protocol bundle and decision-envelope schema.
+
 - [ ] **Step 5: Bound observations and build untrusted turn text**
 
 Initial turn input contains original prompt exactly once plus serialized
@@ -689,7 +710,7 @@ values, internal addresses, raw headers, or stack traces.
 ```bash
 cargo fmt --manifest-path apps/browser-execution-adapter/Cargo.toml --check
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml decision_loop
-node host/browser-runtime/protocol/canonicalize-json.mjs --self-test
+node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
 sha256sum --check host/browser-runtime/protocol/SHA256SUMS
 ```
 
@@ -1220,12 +1241,15 @@ retention.
 - [ ] **Step 5: Build without runtime Docker access**
 
 `scripts/build-firecrawl-host` verifies prerequisites and exact versions,
-runs Gate0 three times, builds release Rust binaries and pinned Dockerfiles,
-uses `docker create` plus `docker export` only during operator-controlled
-setup, removes containers immediately, and writes sorted SHA-256 manifests.
-Top manifest records format version, CLI version, protocol checksum,
-rootfs/policy hashes, Gate0 attestation hash, and build timestamp. It never
-copies auth.
+runs the shared canonicalizer tests and Gate0 three times, regenerates protocol
+schemas into a temporary root, invokes the shared Node module before comparing
+their file set and canonical bytes with the checked-in bundle, builds release
+Rust binaries and pinned Dockerfiles, uses `docker create` plus `docker export`
+only during operator-controlled setup, removes containers immediately, and
+writes sorted SHA-256 manifests. Top manifest records format version, CLI
+version, protocol checksum, rootfs/policy hashes, Gate0 attestation hash, and
+build timestamp. It never copies auth. Rust tools verify and consume canonical
+on-disk bytes; they never implement a second canonicalizer.
 
 - [ ] **Step 6: Run deterministic bundle tests**
 
@@ -1669,6 +1693,7 @@ zero app-server tool/approval events and no broker Codex relay descriptor.
 - [ ] **Step 2: Run deterministic gates first**
 
 ```bash
+node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
 sha256sum --check host/browser-runtime/protocol/SHA256SUMS
 cargo test --manifest-path apps/sandbox-broker/Cargo.toml
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml
@@ -1781,7 +1806,8 @@ Validate fresh public MCP clients with no provider fallback."
 ## Final verification checklist
 
 - [ ] `git diff --check` exits 0.
-- [ ] `SHA256SUMS` matches the canonical Codex 0.144.5 V2 schema bundle.
+- [ ] `SHA256SUMS` matches the shared losslessly canonicalized Codex 0.144.5 V2
+      schema bundle.
 - [ ] Three consecutive live Gate0 structured-action runs pass.
 - [ ] Adapter Cargo format, Clippy, and tests pass.
 - [ ] Broker Cargo format, Clippy, and tests pass.
