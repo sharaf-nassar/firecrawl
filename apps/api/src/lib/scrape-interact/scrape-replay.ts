@@ -1,5 +1,17 @@
 import { rewriteUrl } from "../../scraper/scrapeURL/lib/rewriteUrl";
 
+/** @public */
+export type {
+  ReplayAction,
+  ReplayActionEffect,
+  ReplayBrowserSettingsV1,
+  ReplayEnvelopeNormalization,
+  ReplayEnvelopeSource,
+  ReplayEnvelopeV1,
+  ReplayResolution,
+  StoredReplayCheckpoint,
+} from "./replay-envelope";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
