@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import * as contract from "./gate-contract.mjs";
 import * as decisionWire from "./decision-wire.mjs";
+import * as lifecycle from "./lifecycle.mjs";
 import * as preflight from "./preflight.mjs";
 
 const { gateError, hashFeatureInventory } = contract;
@@ -16,6 +17,11 @@ const {
   parseModelDecisionEnvelopeV1,
   runDecisionWireSelfTest,
 } = decisionWire;
+const {
+  combinePrimaryAndCleanup,
+  ProcessDeadline,
+  surfaceCleanupFailures,
+} = lifecycle;
 const { parseInvocation, runPreflight } = preflight;
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const gatePath = fileURLToPath(new URL("./run.mjs", import.meta.url));
@@ -1076,10 +1082,62 @@ assert.deepEqual(Object.keys(decisionWire).toSorted(), [
   "parseModelDecisionEnvelopeV1",
   "runDecisionWireSelfTest",
 ]);
+assert.deepEqual(Object.keys(lifecycle).toSorted(), [
+  "LifecycleRegistry",
+  "ProcessDeadline",
+  "combinePrimaryAndCleanup",
+  "installSignalHandlers",
+  "runCaptured",
+  "runLifecycleSelfTest",
+  "surfaceCleanupFailures",
+]);
 assert.deepEqual(Object.keys(preflight).toSorted(), [
   "parseInvocation",
   "runPreflight",
 ]);
+
+const primaryFailure = new Error("primary");
+const cleanupFailure = new Error("cleanup");
+assert.equal(combinePrimaryAndCleanup(primaryFailure), primaryFailure);
+assert.throws(
+  () => surfaceCleanupFailures(primaryFailure, [cleanupFailure]),
+  error =>
+    error instanceof AggregateError &&
+    error.errors[0] === primaryFailure &&
+    error.errors[1] === cleanupFailure,
+);
+assert.throws(
+  () => surfaceCleanupFailures(undefined, [cleanupFailure]),
+  error => error === cleanupFailure,
+);
+
+let deadlineNow = 0;
+let expirationCount = 0;
+const deadline = new ProcessDeadline(
+  10,
+  () => deadlineNow,
+  () => {
+    expirationCount += 1;
+  },
+);
+assert.equal(deadline.remaining(), 10);
+deadlineNow = 9;
+assert.equal(deadline.remaining(), 1);
+deadlineNow = 10;
+assert.throws(
+  () => deadline.remaining(),
+  error =>
+    error?.code === "codex_app_server_timeout" &&
+    error.message === "codex_app_server_timeout",
+);
+assert.throws(
+  () => {
+    throw deadline.expire();
+  },
+  /codex_app_server_timeout/,
+);
+assert.equal(expirationCount, 1);
+
 const actionEnvelopeText =
   '{"decision":{"version":1,"type":"action","action":' +
   '{"kind":"fill","ref":"gate-marker","value":"approved"}}}';
