@@ -343,20 +343,98 @@ class RawJsonlFramer {
   }
 }
 
+const TRANSPORT_JSON_NUMBER = Symbol("transportJsonNumber");
+
+function parseExactJsonNumber(raw, errorCode) {
+  const reject = () => {
+    throw gateError(errorCode);
+  };
+  if (typeof raw !== "string" || raw.length > 1_024) reject();
+  const match = /^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(
+    raw,
+  );
+  if (!match) reject();
+  let coefficient;
+  let exponent;
+  try {
+    coefficient = BigInt(`${match[1]}${match[2]}${match[3] ?? ""}`);
+    exponent = BigInt(match[4] ?? "0") - BigInt((match[3] ?? "").length);
+  } catch {
+    reject();
+  }
+  if (exponent < -1_000n || exponent > 1_000n) reject();
+  let numerator = coefficient;
+  let denominator = 1n;
+  if (exponent >= 0n) {
+    numerator *= 10n ** exponent;
+  } else {
+    denominator = 10n ** -exponent;
+  }
+  const divisor = greatestCommonDivisor(
+    numerator < 0n ? -numerator : numerator,
+    denominator,
+  );
+  return {
+    denominator: denominator / divisor,
+    numerator: numerator / divisor,
+    raw,
+  };
+}
+
+function transportJsonNumber(raw) {
+  const exact = parseExactJsonNumber(raw, "codex_event_json_invalid");
+  if (!Number.isFinite(Number(raw))) {
+    throw gateError("codex_event_json_invalid");
+  }
+  return Object.freeze({ [TRANSPORT_JSON_NUMBER]: exact });
+}
+
+function isTransportJsonNumber(value) {
+  return value?.[TRANSPORT_JSON_NUMBER] !== undefined;
+}
+
+function exactNumber(value) {
+  if (isTransportJsonNumber(value)) return value[TRANSPORT_JSON_NUMBER];
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return parseExactJsonNumber(
+    String(value),
+    "codex_protocol_schema_mismatch",
+  );
+}
+
+function exactInteger(exact) {
+  if (!exact || exact.numerator % exact.denominator !== 0n) return undefined;
+  return exact.numerator / exact.denominator;
+}
+
+function compareExactNumbers(left, right) {
+  const leftExact = exactNumber(left);
+  const rightExact = exactNumber(right);
+  if (!leftExact || !rightExact) return undefined;
+  const difference =
+    leftExact.numerator * rightExact.denominator -
+    rightExact.numerator * leftExact.denominator;
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}
+
+function appServerResponseId(value) {
+  const integer = exactInteger(exactNumber(value));
+  if (
+    integer === undefined ||
+    integer < BigInt(Number.MIN_SAFE_INTEGER) ||
+    integer > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw gateError("codex_response_id_invalid");
+  }
+  return Number(integer);
+}
+
 function transportJsonNodeToPlainValue(node) {
   switch (node.kind) {
     case "string":
       return node.value;
-    case "number": {
-      const value = Number(node.raw);
-      if (
-        !Number.isFinite(value) ||
-        (Number.isInteger(value) && !Number.isSafeInteger(value))
-      ) {
-        throw gateError("codex_event_json_invalid");
-      }
-      return value;
-    }
+    case "number":
+      return transportJsonNumber(node.raw);
     case "true":
       return true;
     case "false":
@@ -713,47 +791,64 @@ function runCaptured(
     let settled = false;
     let watchdog;
 
-    const finish = async (failure, result, graceful) => {
+    const finish = (failure, result, graceful) => {
       if (settled) return;
       settled = true;
-      cancelTimer(watchdog);
-      if (!failure && graceful && supervisor.groupAlive(child.pid)) {
-        failure = gateError("codex_process_group_survived", String(child.pid));
-      }
-      let cleanupFailure;
-      try {
-        await supervisor.terminateProcessGroup(child.pid, { graceful });
-      } catch (error) {
-        cleanupFailure = error;
-      }
-      if (failure) {
-        reject(combinePrimaryAndCleanup(failure, cleanupFailure));
-      } else if (cleanupFailure) {
-        reject(cleanupFailure);
-      } else {
-        resolve(result);
-      }
+      const settle = async () => {
+        let primaryFailure = failure;
+        try {
+          cancelTimer(watchdog);
+        } catch (error) {
+          primaryFailure ??= error;
+        }
+        if (!primaryFailure && graceful) {
+          try {
+            if (supervisor.groupAlive(child.pid)) {
+              primaryFailure = gateError(
+                "codex_process_group_survived",
+                String(child.pid),
+              );
+            }
+          } catch (error) {
+            primaryFailure = error;
+          }
+        }
+        let cleanupFailure;
+        try {
+          await supervisor.terminateProcessGroup(child.pid, { graceful });
+        } catch (error) {
+          cleanupFailure = error;
+        }
+        if (primaryFailure) {
+          reject(combinePrimaryAndCleanup(primaryFailure, cleanupFailure));
+        } else if (cleanupFailure) {
+          reject(cleanupFailure);
+        } else {
+          resolve(result);
+        }
+      };
+      void settle().catch(reject);
     };
     child.on("error", error => {
-      void finish(gateError("codex_spawn_failed", error.message), null, false);
+      finish(gateError("codex_spawn_failed", error.message), null, false);
     });
     try {
       supervisor.ownProcessGroup(child, error => {
-        void finish(error, null, false);
+        finish(error, null, false);
       });
     } catch (error) {
       supervisor.adoptProcessGroupForCleanup(child);
-      void finish(error, null, false);
+      finish(error, null, false);
       return;
     }
     watchdog = scheduleTimer(() => {
-      void finish(gateError("codex_command_timeout", command), null, false);
+      finish(gateError("codex_command_timeout", command), null, false);
     }, timeoutMs);
 
     const capture = target => chunk => {
       bytes += chunk.length;
       if (bytes > MAX_OUTPUT_BYTES) {
-        void finish(gateError("codex_output_limit"), null, false);
+        finish(gateError("codex_output_limit"), null, false);
         return;
       }
       if (!settled) target.push(chunk);
@@ -762,7 +857,7 @@ function runCaptured(
     child.stdout.on("data", capture(stdout));
     child.stderr.on("data", capture(stderr));
     child.on("close", (code, signal) => {
-      void finish(
+      finish(
         null,
         {
           code,
@@ -1005,17 +1100,23 @@ function losslessJsonNodeToPlainValue(node) {
 }
 
 function schemaTypeMatches(value, type) {
+  const numeric = exactNumber(value);
   switch (type) {
     case "null":
       return value === null;
     case "array":
       return Array.isArray(value);
     case "object":
-      return value !== null && typeof value === "object" && !Array.isArray(value);
+      return (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        !isTransportJsonNumber(value)
+      );
     case "integer":
-      return Number.isInteger(value);
+      return exactInteger(numeric) !== undefined;
     case "number":
-      return typeof value === "number" && Number.isFinite(value);
+      return numeric !== undefined;
     case "string":
     case "boolean":
       return typeof value === type;
@@ -1025,22 +1126,94 @@ function schemaTypeMatches(value, type) {
 }
 
 const INTEGER_FORMAT_RANGES = new Map([
-  ["uint", [0, Number.MAX_SAFE_INTEGER]],
-  ["uint16", [0, 65_535]],
-  ["uint32", [0, 4_294_967_295]],
-  ["uint64", [0, Number.MAX_SAFE_INTEGER]],
-  ["int32", [-2_147_483_648, 2_147_483_647]],
-  ["int64", [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]],
+  ["uint", [0n, BigInt(Number.MAX_SAFE_INTEGER)]],
+  ["uint16", [0n, 65_535n]],
+  ["uint32", [0n, 4_294_967_295n]],
+  ["uint64", [0n, BigInt(Number.MAX_SAFE_INTEGER)]],
+  ["int32", [-2_147_483_648n, 2_147_483_647n]],
+  [
+    "int64",
+    [BigInt(Number.MIN_SAFE_INTEGER), BigInt(Number.MAX_SAFE_INTEGER)],
+  ],
 ]);
 
 function integerFormatMatches(value, format) {
   const range = INTEGER_FORMAT_RANGES.get(format);
+  const integer = exactInteger(exactNumber(value));
   return (
     range !== undefined &&
-    Number.isSafeInteger(value) &&
-    value >= range[0] &&
-    value <= range[1]
+    integer !== undefined &&
+    integer >= range[0] &&
+    integer <= range[1]
   );
+}
+
+function exactSchemaEqual(left, right) {
+  const leftExact = exactNumber(left);
+  const rightExact = exactNumber(right);
+  if (leftExact || rightExact) {
+    return (
+      leftExact !== undefined &&
+      rightExact !== undefined &&
+      compareExactNumbers(left, right) === 0
+    );
+  }
+  if (left === null || right === null || typeof left !== typeof right) {
+    return false;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => exactSchemaEqual(item, right[index]))
+    );
+  }
+  if (typeof left === "object") {
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every(
+        key =>
+          Object.hasOwn(right, key) && exactSchemaEqual(left[key], right[key]),
+      )
+    );
+  }
+  return Object.is(left, right);
+}
+
+function materializeTransportValue(value) {
+  if (isTransportJsonNumber(value)) {
+    const exact = exactNumber(value);
+    const integer = exactInteger(exact);
+    if (
+      integer !== undefined &&
+      (integer < BigInt(Number.MIN_SAFE_INTEGER) ||
+        integer > BigInt(Number.MAX_SAFE_INTEGER))
+    ) {
+      throw gateError("codex_protocol_schema_mismatch");
+    }
+    const materialized = Number(exact.raw);
+    if (!Number.isFinite(materialized)) {
+      throw gateError("codex_protocol_schema_mismatch");
+    }
+    return materialized;
+  }
+  if (Array.isArray(value)) return value.map(materializeTransportValue);
+  if (value !== null && typeof value === "object") {
+    const materialized = {};
+    for (const [key, item] of Object.entries(value)) {
+      Object.defineProperty(materialized, key, {
+        configurable: true,
+        enumerable: true,
+        value: materializeTransportValue(item),
+        writable: true,
+      });
+    }
+    return materialized;
+  }
+  return value;
 }
 
 function generatedSchemaMatches(value, schema, rootSchema) {
@@ -1078,13 +1251,13 @@ function generatedSchemaMatches(value, schema, rootSchema) {
   }
   if (
     schema.enum &&
-    !schema.enum.some(candidate => JSON.stringify(candidate) === JSON.stringify(value))
+    !schema.enum.some(candidate => exactSchemaEqual(candidate, value))
   ) {
     return false;
   }
   if (
     Object.hasOwn(schema, "const") &&
-    JSON.stringify(schema.const) !== JSON.stringify(value)
+    !exactSchemaEqual(schema.const, value)
   ) {
     return false;
   }
@@ -1101,12 +1274,22 @@ function generatedSchemaMatches(value, schema, rootSchema) {
       return false;
     }
   }
-  if (typeof value === "number") {
+  if (exactNumber(value)) {
     if (schema.format && !integerFormatMatches(value, schema.format)) {
       return false;
     }
-    if (schema.minimum !== undefined && value < schema.minimum) return false;
-    if (schema.maximum !== undefined && value > schema.maximum) return false;
+    if (
+      schema.minimum !== undefined &&
+      compareExactNumbers(value, schema.minimum) < 0
+    ) {
+      return false;
+    }
+    if (
+      schema.maximum !== undefined &&
+      compareExactNumbers(value, schema.maximum) > 0
+    ) {
+      return false;
+    }
   }
   if (Array.isArray(value)) {
     if (schema.minItems !== undefined && value.length < schema.minItems) {
@@ -1122,7 +1305,12 @@ function generatedSchemaMatches(value, schema, rootSchema) {
       return false;
     }
   }
-  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !isTransportJsonNumber(value)
+  ) {
     for (const key of schema.required ?? []) {
       if (!Object.hasOwn(value, key)) return false;
     }
@@ -1156,6 +1344,7 @@ function assertGeneratedSchemaValue(value, schemaSource) {
   ) {
     throw gateError("codex_protocol_schema_mismatch");
   }
+  return materializeTransportValue(value);
 }
 
 const SUPPORTED_SCHEMA_KEYWORDS = new Set([
@@ -1390,12 +1579,19 @@ class AppServerClient {
         this.fail(gateError("codex_server_request", message.method));
         return;
       }
-      const pending = this.pending.get(message.id);
-      if (!pending) {
-        this.fail(gateError("codex_response_id_unknown", String(message.id)));
+      let responseId;
+      try {
+        responseId = appServerResponseId(message.id);
+      } catch (error) {
+        this.fail(error);
         return;
       }
-      this.pending.delete(message.id);
+      const pending = this.pending.get(responseId);
+      if (!pending) {
+        this.fail(gateError("codex_response_id_unknown", String(responseId)));
+        return;
+      }
+      this.pending.delete(responseId);
       clearTimeout(pending.watchdog);
       if (Object.hasOwn(message, "error")) {
         pending.reject(
@@ -2000,7 +2196,7 @@ async function startTurn(client, threadId, prompt, eventSchemas) {
   ) {
     throw gateError("codex_turn_identity_mismatch");
   }
-  assertGeneratedSchemaValue(
+  completed.message.params = assertGeneratedSchemaValue(
     completed.message.params,
     eventSchemas.turnCompleted,
   );
@@ -2009,7 +2205,7 @@ async function startTurn(client, threadId, prompt, eventSchemas) {
     .filter(message => typeof message.method === "string");
   for (const message of messages) {
     if (message.method === "item/completed") {
-      assertGeneratedSchemaValue(
+      message.params = assertGeneratedSchemaValue(
         message.params,
         eventSchemas.itemCompleted,
       );
@@ -2139,12 +2335,8 @@ async function runOne(runNumber) {
       threadStartParams,
       eventSchemas.threadStartParams,
     );
-    const threadResponse = await client.request(
-      "thread/start",
-      threadStartParams,
-    );
-    assertGeneratedSchemaValue(
-      threadResponse,
+    const threadResponse = assertGeneratedSchemaValue(
+      await client.request("thread/start", threadStartParams),
       eventSchemas.threadStartResponse,
     );
     const threadId = threadResponse?.thread?.id;
@@ -2761,12 +2953,45 @@ async function transportSelfTest({ silent = false } = {}) {
     () => parseAppServerMessage(invalidUtf8),
     /codex_event_json_invalid/,
   );
+  const fractionalValue = parseAppServerMessage(
+    Buffer.from('{"method":"progress","params":{"value":0.1}}'),
+  ).params.value;
   assert.equal(
-    parseAppServerMessage(
-      Buffer.from('{"method":"progress","params":{"value":0.1}}'),
-    ).params.value,
+    assertGeneratedSchemaValue(fractionalValue, {
+      schema: { type: "number" },
+    }),
     0.1,
   );
+  const exactIntegerValue = parseAppServerMessage(
+    Buffer.from('{"method":"progress","params":{"value":1.000e0}}'),
+  ).params.value;
+  assert.equal(
+    assertGeneratedSchemaValue(exactIntegerValue, {
+      schema: { type: "integer", format: "uint16" },
+    }),
+    1,
+  );
+  for (const [raw, schema] of [
+    ["1.00000000000000000001", { type: "integer" }],
+    [
+      "65535.00000000000000000001",
+      { type: "integer", format: "uint16" },
+    ],
+    ["0.99999999999999999999", { type: "number", minimum: 1 }],
+    ["1.00000000000000000001", { type: "number", maximum: 1 }],
+    ["1.00000000000000000001", { type: "number", enum: [1] }],
+    ["1.00000000000000000001", { type: "number", const: 1 }],
+    ["1", { enum: [{}] }],
+    ["1", { const: {} }],
+  ]) {
+    const value = parseAppServerMessage(
+      Buffer.from(`{"method":"progress","params":{"value":${raw}}}`),
+    ).params.value;
+    assert.throws(
+      () => assertGeneratedSchemaValue(value, { schema }),
+      /codex_protocol_schema_mismatch/,
+    );
+  }
   assert.equal(
     parseAppServerMessage(
       Buffer.from('{"method":"replacement","params":{"value":"�"}}'),
@@ -2790,6 +3015,27 @@ async function transportSelfTest({ silent = false } = {}) {
       ),
     /codex_event_json_invalid/,
   );
+  for (const raw of ["1", "1.0", "1e0"]) {
+    assert.equal(
+      appServerResponseId(
+        parseAppServerMessage(Buffer.from(`{"id":${raw}}`)).id,
+      ),
+      1,
+    );
+  }
+  for (const raw of [
+    "1.00000000000000000001",
+    "9007199254740992",
+    "-9007199254740992",
+  ]) {
+    assert.throws(
+      () =>
+        appServerResponseId(
+          parseAppServerMessage(Buffer.from(`{"id":${raw}}`)).id,
+        ),
+      /codex_response_id_invalid/,
+    );
+  }
 
   const lines = [];
   const framer = new RawJsonlFramer(line => lines.push(line));
@@ -2837,6 +3083,24 @@ async function transportSelfTest({ silent = false } = {}) {
   child.stdout.emit("data", rawFrame.subarray(7));
   assert.equal(client.messages[0].method, "thread/started");
   assert.deepEqual(Buffer.concat(client.stdoutLines), rawFrame);
+
+  const exactIdRequest = client.request("exact-id", {});
+  child.stdout.emit(
+    "data",
+    Buffer.from('{"id":1.00000000000000000000,"result":{"ok":true}}\n'),
+  );
+  assert.deepEqual(await exactIdRequest, { ok: true });
+
+  const fractionalIdRequest = client.request("fractional-id", {});
+  child.stdout.emit(
+    "data",
+    Buffer.from('{"id":2.00000000000000000001,"result":{"ok":true}}\n'),
+  );
+  await assert.rejects(
+    fractionalIdRequest,
+    /codex_response_id_invalid/,
+  );
+  assert.equal(client.pending.size, 0);
   client.stopping = true;
   child.emit("close", 0, null);
   client.stopping = false;
@@ -2996,6 +3260,35 @@ async function lifecycleSelfTest({ silent = false } = {}) {
   assert.deepEqual(timeoutGroups.alive, new Set());
   assert(timeoutGroups.signals.some(([, signal]) => signal === "SIGKILL"));
 
+  let probeCleanupAttempted = false;
+  const probeChild = fakeChild(808);
+  const probePromise = runCaptured("fake-probe", [], {
+    spawnChild: () => probeChild,
+    supervisor: {
+      assertAccepting() {},
+      ownProcessGroup() {},
+      groupAlive() {
+        const error = new Error("permission denied");
+        error.code = "EPERM";
+        throw error;
+      },
+      async terminateProcessGroup() {
+        probeCleanupAttempted = true;
+      },
+    },
+  });
+  probeChild.emit("close", 0, null);
+  await assert.rejects(
+    Promise.race([
+      probePromise,
+      wait(100).then(() => {
+        throw new Error("probe settlement hung");
+      }),
+    ]),
+    /permission denied/,
+  );
+  assert.equal(probeCleanupAttempted, true);
+
   const outputGroups = createGroupHarness([802]);
   const outputRegistry = new LifecycleRegistry({
     killProcess: outputGroups.killProcess,
@@ -3149,6 +3442,66 @@ async function lifecycleSelfTest({ silent = false } = {}) {
     /codex_app_server_close_timeout/,
   );
   assert.deepEqual(drainGroups.alive, new Set());
+
+  if (process.platform === "linux") {
+    const realRegistry = new LifecycleRegistry();
+    const descendantScript = [
+      'process.on("SIGTERM", () => {});',
+      'process.stdout.write("descendant-ready\\n");',
+      "setInterval(() => {}, 1000);",
+    ].join("");
+    const parentScript = [
+      'const { spawn } = require("node:child_process");',
+      'process.on("SIGTERM", () => {});',
+      "spawn(process.execPath,",
+      `["-e", ${JSON.stringify(descendantScript)}],`,
+      '{ stdio: ["ignore", "inherit", "inherit"] });',
+      "setInterval(() => {}, 1000);",
+    ].join("");
+    const realChild = spawn(process.execPath, ["-e", parentScript], {
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    realRegistry.ownProcessGroup(realChild);
+    const realClose = new Promise(resolve => realChild.once("close", resolve));
+    try {
+      await realRegistry.withDeadline(
+        new Promise((resolve, reject) => {
+          const chunks = [];
+          realChild.stdout.on("data", chunk => {
+            chunks.push(chunk);
+            if (
+              Buffer.concat(chunks).includes(Buffer.from("descendant-ready"))
+            ) {
+              resolve();
+            }
+          });
+          realChild.once("error", reject);
+        }),
+        realRegistry.now() + 1_000,
+        "real_descendant_ready_timeout",
+      );
+      const cleanupStartedAt = performance.now();
+      await realRegistry.terminateProcessGroup(realChild.pid, {
+        graceful: true,
+      });
+      await realRegistry.withDeadline(
+        realClose,
+        realRegistry.now() + CLEANUP_DRAIN_GRACE_MS,
+        "real_process_pipe_drain_timeout",
+      );
+      const cleanupElapsed = performance.now() - cleanupStartedAt;
+      assert(cleanupElapsed >= CLEANUP_TERM_GRACE_MS - CLEANUP_POLL_MS);
+      assert(cleanupElapsed < 2_000);
+      assert.equal(realRegistry.groupAlive(realChild.pid), false);
+    } finally {
+      try {
+        process.kill(-realChild.pid, "SIGKILL");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+    }
+  }
   if (!silent) process.stdout.write("codex_browser_lifecycle: PASS\n");
 }
 
