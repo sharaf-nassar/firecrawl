@@ -625,6 +625,25 @@ function schemaTypeMatches(value, type) {
   }
 }
 
+const INTEGER_FORMAT_RANGES = new Map([
+  ["uint", [0, Number.MAX_SAFE_INTEGER]],
+  ["uint16", [0, 65_535]],
+  ["uint32", [0, 4_294_967_295]],
+  ["uint64", [0, Number.MAX_SAFE_INTEGER]],
+  ["int32", [-2_147_483_648, 2_147_483_647]],
+  ["int64", [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]],
+]);
+
+function integerFormatMatches(value, format) {
+  const range = INTEGER_FORMAT_RANGES.get(format);
+  return (
+    range !== undefined &&
+    Number.isSafeInteger(value) &&
+    value >= range[0] &&
+    value <= range[1]
+  );
+}
+
 function generatedSchemaMatches(value, schema, rootSchema) {
   if (schema === true) return true;
   if (schema === false || schema === null || typeof schema !== "object") {
@@ -683,6 +702,9 @@ function generatedSchemaMatches(value, schema, rootSchema) {
     }
   }
   if (typeof value === "number") {
+    if (schema.format && !integerFormatMatches(value, schema.format)) {
+      return false;
+    }
     if (schema.minimum !== undefined && value < schema.minimum) return false;
     if (schema.maximum !== undefined && value > schema.maximum) return false;
   }
@@ -769,6 +791,15 @@ function auditGeneratedSchemaKeywords(schema) {
   }
   for (const key of Object.keys(schema)) {
     if (!SUPPORTED_SCHEMA_KEYWORDS.has(key)) {
+      throw gateError("codex_protocol_schema_mismatch");
+    }
+  }
+  if (Object.hasOwn(schema, "format")) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (
+      !INTEGER_FORMAT_RANGES.has(schema.format) ||
+      !types.includes("integer")
+    ) {
       throw gateError("codex_protocol_schema_mismatch");
     }
   }
@@ -1415,6 +1446,13 @@ function auditAllAppServerEvents(messages, knownTurns) {
   const turns = new Map(
     knownTurns.map(turn => [`${turn.threadId}\0${turn.turnId}`, turn]),
   );
+  const knownThreadIds = new Set(knownTurns.map(turn => turn.threadId));
+  const turnsById = new Map();
+  for (const turn of knownTurns) {
+    const matches = turnsById.get(turn.turnId) ?? [];
+    matches.push(turn);
+    turnsById.set(turn.turnId, matches);
+  }
   for (const turn of knownTurns) {
     const completed = messages[turn.completedIndex];
     if (
@@ -1430,6 +1468,36 @@ function auditAllAppServerEvents(messages, knownTurns) {
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
     if (typeof message.method !== "string") continue;
+    const params = message.params;
+    const hasThreadId = Object.hasOwn(params ?? {}, "threadId");
+    const hasTurnId = Object.hasOwn(params ?? {}, "turnId");
+    const hasNestedTurnId = Object.hasOwn(params?.turn ?? {}, "id");
+    if (hasThreadId) {
+      if (
+        typeof params.threadId !== "string" ||
+        !knownThreadIds.has(params.threadId)
+      ) {
+        modelProtocolError();
+      }
+    }
+    if (hasTurnId || hasNestedTurnId) {
+      const directTurnId = hasTurnId ? params.turnId : undefined;
+      const nestedTurnId = hasNestedTurnId ? params.turn.id : undefined;
+      if (
+        (hasTurnId && typeof directTurnId !== "string") ||
+        (hasNestedTurnId && typeof nestedTurnId !== "string") ||
+        (hasTurnId && hasNestedTurnId && directTurnId !== nestedTurnId)
+      ) {
+        modelProtocolError();
+      }
+      const turnId = directTurnId ?? nestedTurnId;
+      const matches = hasThreadId
+        ? [turns.get(`${params.threadId}\0${turnId}`)].filter(Boolean)
+        : (turnsById.get(turnId) ?? []);
+      if (matches.length !== 1 || index > matches[0].completedIndex) {
+        modelProtocolError();
+      }
+    }
     if (/approval/i.test(message.method)) {
       approvals += 1;
       throw gateError("codex_forbidden_event", message.method);
@@ -1963,6 +2031,62 @@ async function hardeningSelfTest() {
       }),
     /codex_protocol_schema_mismatch/,
   );
+  const integerFormatCases = [
+    ["uint", 0, Number.MAX_SAFE_INTEGER, -1, Number.MAX_SAFE_INTEGER + 1],
+    ["uint16", 0, 65_535, -1, 65_536],
+    ["uint32", 0, 4_294_967_295, -1, 4_294_967_296],
+    ["uint64", 0, Number.MAX_SAFE_INTEGER, -1, Number.MAX_SAFE_INTEGER + 1],
+    [
+      "int32",
+      -2_147_483_648,
+      2_147_483_647,
+      -2_147_483_649,
+      2_147_483_648,
+    ],
+    [
+      "int64",
+      Number.MIN_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER,
+      Number.MIN_SAFE_INTEGER - 1,
+      Number.MAX_SAFE_INTEGER + 1,
+    ],
+  ];
+  for (const [
+    format,
+    minimum,
+    maximum,
+    underflow,
+    overflow,
+  ] of integerFormatCases) {
+    const schemaSource = { schema: { type: "integer", format } };
+    assert.doesNotThrow(() =>
+      assertGeneratedSchemaValue(minimum, schemaSource),
+    );
+    assert.doesNotThrow(() =>
+      assertGeneratedSchemaValue(maximum, schemaSource),
+    );
+    assert.throws(
+      () => assertGeneratedSchemaValue(underflow, schemaSource),
+      /codex_protocol_schema_mismatch/,
+    );
+    assert.throws(
+      () => assertGeneratedSchemaValue(overflow, schemaSource),
+      /codex_protocol_schema_mismatch/,
+    );
+  }
+  assert.throws(
+    () =>
+      assertGeneratedSchemaValue(Number.MAX_SAFE_INTEGER + 1, {
+        schema: { type: "integer", format: "uint64" },
+      }),
+    /codex_protocol_schema_mismatch/,
+  );
+  assert.throws(
+    () =>
+      auditGeneratedSchemaKeywords({ type: "integer", format: "int128" }),
+    /codex_protocol_schema_mismatch/,
+  );
+  process.stdout.write("codex_browser_format_hardening: PASS\n");
   let now = 1000;
   let expired = false;
   const deadline = new ProcessDeadline(100, () => now, () => {
@@ -2046,6 +2170,53 @@ async function hardeningSelfTest() {
   assert.throws(
     () => auditAllAppServerEvents(approvalEvent, knownTurns),
     /codex_forbidden_event/,
+  );
+  const twoKnownTurns = [
+    { threadId: "thread-audit", turnId: "turn-audit", completedIndex: 1 },
+    { threadId: "thread-other", turnId: "turn-other", completedIndex: 3 },
+  ];
+  const twoCleanTurns = [
+    ...structuredClone(cleanAudit),
+    {
+      method: "turn/progress",
+      params: { threadId: "thread-other", turnId: "turn-other" },
+    },
+    {
+      method: "turn/completed",
+      params: { threadId: "thread-other", turn: { id: "turn-other" } },
+    },
+    { method: "account/updated", params: {} },
+  ];
+  assert.deepEqual(auditAllAppServerEvents(twoCleanTurns, twoKnownTurns), {
+    tools: 0,
+    approvals: 0,
+  });
+  const nonItemCrossThread = structuredClone(twoCleanTurns);
+  nonItemCrossThread[2].params.threadId = "thread-unknown";
+  assert.throws(
+    () => auditAllAppServerEvents(nonItemCrossThread, twoKnownTurns),
+    /model_protocol_error/,
+  );
+  const nonItemCrossTurn = structuredClone(twoCleanTurns);
+  nonItemCrossTurn[2].params.threadId = "thread-audit";
+  assert.throws(
+    () => auditAllAppServerEvents(nonItemCrossTurn, twoKnownTurns),
+    /model_protocol_error/,
+  );
+  const nonItemUnknownTurn = structuredClone(twoCleanTurns);
+  nonItemUnknownTurn[2].params.turnId = "turn-unknown";
+  assert.throws(
+    () => auditAllAppServerEvents(nonItemUnknownTurn, twoKnownTurns),
+    /model_protocol_error/,
+  );
+  const postTerminal = structuredClone(twoCleanTurns);
+  postTerminal.push({
+    method: "turn/progress",
+    params: { threadId: "thread-other", turn: { id: "turn-other" } },
+  });
+  assert.throws(
+    () => auditAllAppServerEvents(postTerminal, twoKnownTurns),
+    /model_protocol_error/,
   );
   const primaryFailure = new Error("primary_failure");
   const cleanupFailure = new Error("cleanup_failure");
