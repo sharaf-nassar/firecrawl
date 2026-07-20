@@ -714,10 +714,12 @@ assert.equal(
 );
 ```
 
-Validate both fixture notification params against generated pinned schemas
-`/tmp/codex-schema-audit/v2/ItemCompletedNotification.json` and
-`/tmp/codex-schema-audit/v2/TurnCompletedNotification.json`. The item event
-uses milliseconds; turn start/completion use seconds and `durationMs` uses
+Validate both fixture notification params against
+`<schema-directory>/v2/ItemCompletedNotification.json` and
+`<schema-directory>/v2/TurnCompletedNotification.json` from that live Gate
+run's Step 3 generated bundle. Resolve these beneath the run-owned temporary
+schema directory; never use a machine-global audit path. The item event uses
+milliseconds; turn start/completion use seconds and `durationMs` uses
 milliseconds. Keep item `turnId` equal to `turn.id`; `turn/completed` carries
 `threadId` beside `turn` and no invented top-level `turnId`.
 

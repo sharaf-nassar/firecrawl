@@ -752,12 +752,15 @@ async fn unloaded_turn_items_use_item_completed_agent_message() {
 ```
 
 The fake server validates the two notification `params` objects against
-`/tmp/codex-schema-audit/v2/ItemCompletedNotification.json` and
-`/tmp/codex-schema-audit/v2/TurnCompletedNotification.json` before writing
-them. Item completion uses Unix milliseconds; `startedAt`/`completedAt` use
-Unix seconds and `durationMs` uses milliseconds. The item notification carries
-both `threadId` and `turnId`; turn completion carries `threadId` plus a `turn`
-whose `id` matches that item `turnId`.
+`host/browser-runtime/protocol/codex-app-server-0.144.5/v2/ItemCompletedNotification.json`
+and
+`host/browser-runtime/protocol/codex-app-server-0.144.5/v2/TurnCompletedNotification.json`
+before writing them. Resolve both from the repository root and verify them via
+the checked-in `SHA256SUMS`; never depend on a temporary audit directory. Item
+completion uses Unix milliseconds; `startedAt`/`completedAt` use Unix seconds
+and `durationMs` uses milliseconds. The item notification carries both
+`threadId` and `turnId`; turn completion carries `threadId` plus a `turn` whose
+`id` matches that item `turnId`.
 
 - [ ] **Step 2: Write failing forbidden-event tests**
 
