@@ -1111,6 +1111,21 @@ assert.throws(
     ),
   /model_protocol_error/,
 );
+const emptyEvaluateArgsKey =
+  '{"decision":{"version":1,"type":"action","action":' +
+  '{"kind":"evaluate","expression":"1","args":{"":123}}}}';
+assert.throws(
+  () => parseModelDecisionEnvelopeV1(emptyEvaluateArgsKey),
+  /model_protocol_error/,
+);
+const nulEvaluateArgsKey = String.raw`
+  {"decision":{"version":1,"type":"action","action":
+  {"kind":"evaluate","expression":"1","args":{"\u0000":123}}}}
+`;
+assert.throws(
+  () => parseModelDecisionEnvelopeV1(nulEvaluateArgsKey),
+  /model_protocol_error/,
+);
 const orderedProposal = {
   kind: "fill",
   ref: "gate-marker",
@@ -1141,11 +1156,70 @@ process.stdout.write = chunk => {
   return true;
 };
 try {
+  await runDecisionWireSelfTest();
   await runDecisionWireSelfTest({ silent: true });
+  await runDecisionWireSelfTest({ silent: false });
 } finally {
   process.stdout.write = originalStdoutWrite;
 }
 assert.equal(decisionWireOutput, "");
+const frozenSchemaObjects = new WeakSet();
+function assertDeepFrozen(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    frozenSchemaObjects.has(value)
+  ) {
+    return;
+  }
+  frozenSchemaObjects.add(value);
+  assert.equal(Object.isFrozen(value), true);
+  for (const child of Object.values(value)) assertDeepFrozen(child);
+}
+assertDeepFrozen(decisionWire.modelDecisionEnvelopeSchema);
+const schemaBytes = JSON.stringify(
+  decisionWire.modelDecisionEnvelopeSchema,
+);
+const schemaMutationAttempts = [
+  () => {
+    decisionWire.modelDecisionEnvelopeSchema.properties.decision = null;
+  },
+  () => {
+    const required =
+      decisionWire.modelDecisionEnvelopeSchema.required;
+    required.push("unexpected");
+  },
+  () => {
+    const alternatives =
+      decisionWire.modelDecisionEnvelopeSchema.properties.decision
+        .anyOf;
+    alternatives.push({});
+  },
+  () => {
+    const actionSchema =
+      decisionWire.modelDecisionEnvelopeSchema.properties.decision
+        .anyOf[0];
+    actionSchema.properties.type.enum[0] = "mutated";
+  },
+];
+for (const mutate of schemaMutationAttempts) {
+  assert.throws(mutate, TypeError);
+}
+assert.equal(
+  JSON.stringify(decisionWire.modelDecisionEnvelopeSchema),
+  schemaBytes,
+);
+assert.deepEqual(parseModelDecisionEnvelopeV1(actionEnvelopeText), {
+  decision: {
+    version: 1,
+    type: "action",
+    action: {
+      kind: "fill",
+      ref: "gate-marker",
+      value: "approved",
+    },
+  },
+});
 assert.equal(contract.CODEX_VERSION_OUTPUT, "codex-cli 0.144.5");
 assert.equal(contract.CODEX_VERSION, "0.144.5");
 assert.equal(contract.MODEL, "gpt-5.6-terra");

@@ -17,6 +17,21 @@ const closed = properties => ({
 const stringLiteral = value => ({ type: "string", enum: [value] });
 const versionOne = { type: "integer", enum: [1] };
 
+function deepFreeze(value, seen = new WeakSet()) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    seen.has(value)
+  ) {
+    return value;
+  }
+  seen.add(value);
+  for (const child of Object.values(value)) {
+    deepFreeze(child, seen);
+  }
+  return Object.freeze(value);
+}
+
 const modelWireBrowserOperationV1Schema = {
   anyOf: [
     closed({ kind: stringLiteral("snapshot") }),
@@ -80,30 +95,37 @@ const modelWireBrowserOperationV1Schema = {
   ],
 };
 
-export const modelDecisionEnvelopeSchema = closed({
-  decision: {
-    anyOf: [
-      closed({
-        version: versionOne,
-        type: stringLiteral("action"),
-        action: modelWireBrowserOperationV1Schema,
-      }),
-      closed({
-        version: versionOne,
-        type: stringLiteral("final"),
-        output: { type: "string", maxLength: 262144 },
-      }),
-    ],
-  },
-});
+export const modelDecisionEnvelopeSchema = deepFreeze(
+  closed({
+    decision: {
+      anyOf: [
+        closed({
+          version: versionOne,
+          type: stringLiteral("action"),
+          action: modelWireBrowserOperationV1Schema,
+        }),
+        closed({
+          version: versionOne,
+          type: stringLiteral("final"),
+          output: { type: "string", maxLength: 262144 },
+        }),
+      ],
+    },
+  }),
+);
 
 function hasExactKeys(value, keys) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return false;
+  }
+  const actualKeys = Object.keys(value);
   return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    Object.keys(value).toSorted().join("\0") ===
-      keys.toSorted().join("\0")
+    actualKeys.length === keys.length &&
+    keys.every(key => Object.hasOwn(value, key))
   );
 }
 
@@ -149,9 +171,11 @@ function auditModelDecisionSchema(schema) {
     schema.type !== "object" ||
     schema.additionalProperties !== false ||
     !hasExactKeys(schema.properties, ["decision"]) ||
+    !Array.isArray(schema.required) ||
     schema.required.length !== 1 ||
     schema.required[0] !== "decision" ||
     !hasExactKeys(schema.properties.decision, ["anyOf"]) ||
+    !Array.isArray(schema.properties.decision.anyOf) ||
     schema.properties.decision.anyOf.length !== 2
   ) {
     reject();
@@ -186,12 +210,31 @@ function auditModelDecisionSchema(schema) {
     ) {
       reject();
     }
-    if (node.properties) {
+    if (Object.hasOwn(node, "properties")) {
+      if (
+        node.type !== "object" ||
+        node.properties === null ||
+        typeof node.properties !== "object" ||
+        Array.isArray(node.properties) ||
+        node.additionalProperties !== false ||
+        !Array.isArray(node.required)
+      ) {
+        reject();
+      }
+      const propertyKeys = Object.keys(node.properties);
+      if (
+        node.required.length !== propertyKeys.length ||
+        !propertyKeys.every(key => node.required.includes(key))
+      ) {
+        reject();
+      }
       for (const child of Object.values(node.properties)) visit(child);
     }
-    if (node.items) visit(node.items);
+    if (Object.hasOwn(node, "items")) visit(node.items);
     for (const key of ["anyOf", "oneOf", "allOf"]) {
-      for (const child of node[key] ?? []) visit(child);
+      if (!Object.hasOwn(node, key)) continue;
+      if (!Array.isArray(node[key])) reject();
+      for (const child of node[key]) visit(child);
     }
   }
   visit(schema);
@@ -461,6 +504,197 @@ export async function runDecisionWireSelfTest(
   { silent = false } = {},
 ) {
   void silent;
+  const maxRef = "r".repeat(128);
+  const maxValue = "v".repeat(20000);
+  const maxKey = "k".repeat(64);
+  const maxSelectValue = "s".repeat(512);
+  const maxUrl = "u".repeat(8192);
+  const maxExpression = "e".repeat(20000);
+  const validOperations = [
+    { kind: "snapshot" },
+    { kind: "click", ref: "r" },
+    { kind: "click", ref: maxRef },
+    { kind: "fill", ref: "r", value: "" },
+    { kind: "fill", ref: maxRef, value: maxValue },
+    { kind: "type", ref: "r", value: "", delayMs: 0 },
+    {
+      kind: "type",
+      ref: maxRef,
+      value: maxValue,
+      delayMs: 250,
+    },
+    { kind: "press", ref: "r", key: "k" },
+    { kind: "press", ref: maxRef, key: maxKey },
+    { kind: "select", ref: "r", values: [] },
+    {
+      kind: "select",
+      ref: maxRef,
+      values: Array(20).fill(maxSelectValue),
+    },
+    { kind: "scroll", deltaX: -10000, deltaY: 10000 },
+    { kind: "wait", milliseconds: 0 },
+    { kind: "wait", milliseconds: 30000 },
+    { kind: "get_text", ref: null },
+    { kind: "get_text", ref: maxRef },
+    { kind: "get_url" },
+    { kind: "navigate", url: "" },
+    { kind: "navigate", url: maxUrl },
+    { kind: "evaluate", expression: "", args: {} },
+    { kind: "evaluate", expression: maxExpression, args: {} },
+  ];
+  for (const operation of validOperations) {
+    const envelope = {
+      decision: { version: 1, type: "action", action: operation },
+    };
+    assert.deepEqual(
+      parseModelDecisionEnvelopeV1(JSON.stringify(envelope)),
+      envelope,
+    );
+  }
+
+  for (const output of ["", "o".repeat(262144)]) {
+    const envelope = {
+      decision: { version: 1, type: "final", output },
+    };
+    assert.deepEqual(
+      parseModelDecisionEnvelopeV1(JSON.stringify(envelope)),
+      envelope,
+    );
+  }
+
+  const rejectOperation = operation => {
+    const envelope = {
+      decision: { version: 1, type: "action", action: operation },
+    };
+    assert.throws(
+      () => parseModelDecisionEnvelopeV1(JSON.stringify(envelope)),
+      error => error?.code === "model_protocol_error",
+    );
+  };
+  const invalidOperations = [
+    null,
+    [],
+    { kind: "unknown" },
+    { kind: "snapshot", extra: true },
+    { kind: "click" },
+    { kind: "click", ref: "" },
+    { kind: "click", ref: "r".repeat(129) },
+    { kind: "fill", ref: "r" },
+    { kind: "fill", ref: "r", value: "v".repeat(20001) },
+    { kind: "type", ref: "r", value: "" },
+    { kind: "type", ref: "r", value: "", delayMs: -1 },
+    { kind: "type", ref: "r", value: "", delayMs: 251 },
+    { kind: "type", ref: "r", value: "", delayMs: 1.5 },
+    { kind: "type", ref: "r", value: "", delayMs: 0.1 },
+    {
+      kind: "type",
+      ref: "r",
+      value: "",
+      delayMs: Number.MAX_SAFE_INTEGER + 1,
+    },
+    { kind: "press", ref: "r", key: "" },
+    { kind: "press", ref: "r", key: "k".repeat(65) },
+    { kind: "select", ref: "r", values: Array(21).fill("") },
+    { kind: "select", ref: "r", values: ["s".repeat(513)] },
+    { kind: "select", ref: "r", values: "value" },
+    { kind: "scroll", deltaX: -10001, deltaY: 0 },
+    { kind: "scroll", deltaX: 0, deltaY: 10001 },
+    { kind: "scroll", deltaX: 0.5, deltaY: 0 },
+    {
+      kind: "scroll",
+      deltaX: Number.MAX_SAFE_INTEGER + 1,
+      deltaY: 0,
+    },
+    { kind: "wait", milliseconds: -1 },
+    { kind: "wait", milliseconds: 30001 },
+    { kind: "wait", milliseconds: 1.5 },
+    {
+      kind: "wait",
+      milliseconds: Number.MAX_SAFE_INTEGER + 1,
+    },
+    { kind: "get_text", ref: "" },
+    { kind: "get_text", ref: "r".repeat(129) },
+    { kind: "get_url", extra: true },
+    { kind: "navigate", url: "u".repeat(8193) },
+    {
+      kind: "evaluate",
+      expression: "e".repeat(20001),
+      args: {},
+    },
+    { kind: "evaluate", expression: "", args: { extra: true } },
+  ];
+  for (const operation of invalidOperations) rejectOperation(operation);
+
+  const invalidEnvelopes = [
+    {},
+    { decision: null },
+    { decision: { version: 1, type: "unknown" } },
+    { decision: { version: 0, type: "final", output: "" } },
+    { decision: { version: 1.5, type: "final", output: "" } },
+    {
+      decision: {
+        version: Number.MAX_SAFE_INTEGER + 1,
+        type: "final",
+        output: "",
+      },
+    },
+    { decision: { version: 1, type: "action" } },
+    {
+      decision: {
+        version: 1,
+        type: "action",
+        action: { kind: "snapshot" },
+        extra: true,
+      },
+    },
+    { decision: { version: 1, type: "final" } },
+    {
+      decision: {
+        version: 1,
+        type: "final",
+        output: "o".repeat(262145),
+      },
+    },
+    {
+      decision: { version: 1, type: "final", output: "" },
+      extra: true,
+    },
+  ];
+  for (const envelope of invalidEnvelopes) {
+    assert.throws(
+      () => parseModelDecisionEnvelopeV1(JSON.stringify(envelope)),
+      error => error?.code === "model_protocol_error",
+    );
+  }
+
+  const invalidRawMessages = [
+    "{",
+    String.raw`
+      {"decision":{"version":1,"type":"final",
+      "\u0074ype":"action","output":"gate-complete"}}
+    `,
+    String.raw`
+      {"decision":{"version":1,"type":"final",
+      "output":"gate-complete"},"\u0064ecision":{}}
+    `,
+    String.raw`
+      {"decision":{"version":1,"type":"action","action":
+      {"kind":"evaluate","expression":"1","args":{"":123}}}}
+    `,
+    String.raw`
+      {"decision":{"version":1,"type":"action","action":
+      {"kind":"evaluate","expression":"1",
+      "args":{"\u0000":123}}}}
+    `,
+    Buffer.from([0xc3, 0x28]),
+  ];
+  for (const raw of invalidRawMessages) {
+    assert.throws(
+      () => parseModelDecisionEnvelopeV1(raw),
+      error => error?.code === "model_protocol_error",
+    );
+  }
+
   const ordered = {
     kind: "fill",
     ref: "gate-marker",
@@ -474,6 +708,10 @@ export async function runDecisionWireSelfTest(
   assert.equal(
     normalizedProposalHash(ordered),
     normalizedProposalHash(permuted),
+  );
+  assert.equal(
+    normalizedProposalHash(ordered),
+    "49ab57bf3d47260c01312dd62320de0a0048b466636b09f20fa7a9821802d1f2",
   );
   auditModelDecisionSchema(modelDecisionEnvelopeSchema);
   const bareConst = structuredClone(modelDecisionEnvelopeSchema);
@@ -502,15 +740,31 @@ export async function runDecisionWireSelfTest(
     () => auditModelDecisionSchema(openRoot),
     /model_protocol_error/,
   );
-  assert.equal(validString("😀", 1, 1), true);
-  assert.equal(validString("😀", 2, 2), false);
-  const duplicateDecision = String.raw`
-    {"decision":{"version":1,"type":"final","output":"gate-complete"},
-    "\u0064ecision":{"version":1,"type":"final",
-    "output":"gate-complete"}}
-  `;
+  const nestedOpen = structuredClone(modelDecisionEnvelopeSchema);
+  const nestedOpenOperations =
+    nestedOpen.properties.decision.anyOf[0].properties.action.anyOf;
+  const evaluateSchema = nestedOpenOperations.find(
+    schema => schema.properties.kind.enum[0] === "evaluate",
+  );
+  evaluateSchema.properties.args.additionalProperties = true;
   assert.throws(
-    () => parseModelDecisionEnvelopeV1(duplicateDecision),
+    () => auditModelDecisionSchema(nestedOpen),
     /model_protocol_error/,
   );
+  const mismatchedRequired = structuredClone(
+    modelDecisionEnvelopeSchema,
+  );
+  const mismatchedOperations =
+    mismatchedRequired.properties.decision.anyOf[0].properties.action
+      .anyOf;
+  const clickSchema = mismatchedOperations.find(
+    schema => schema.properties.kind.enum[0] === "click",
+  );
+  clickSchema.required = ["kind"];
+  assert.throws(
+    () => auditModelDecisionSchema(mismatchedRequired),
+    /model_protocol_error/,
+  );
+  assert.equal(validString("😀", 1, 1), true);
+  assert.equal(validString("😀", 2, 2), false);
 }
