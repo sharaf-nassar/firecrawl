@@ -283,7 +283,7 @@ export async function scrapeInteractController(
   if (prompt && !rawCode) {
     logger.info("Starting agent loop from prompt", { prompt, timeout });
 
-    markBrowserSessionUsedPrompt(session.id).catch(() => {});
+    await markBrowserSessionUsedPrompt(session.id);
 
     try {
       execResult = await executePromptViaBrowserAgent(
@@ -308,7 +308,7 @@ export async function scrapeInteractController(
       });
     }
 
-    enqueueBrowserSessionActivity({
+    await enqueueBrowserSessionActivity({
       team_id: req.auth.team_id,
       session_id: session.id,
       source: "interact",
@@ -343,7 +343,7 @@ export async function scrapeInteractController(
       });
     }
 
-    enqueueBrowserSessionActivity({
+    await enqueueBrowserSessionActivity({
       team_id: req.auth.team_id,
       session_id: session.id,
       source: "interact",

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import { Client, Pool } from "pg";
 import {
   afterAll,
   beforeAll,
@@ -86,6 +86,10 @@ describeWithDatabase("durable browser state store", () => {
       deadline_at: new Date(now.getTime() + 120_000).toISOString(),
       correlation_id: correlationId,
     });
+    await pool.query(
+      "UPDATE browser_sessions SET current_run_id = $1 WHERE id = $2",
+      [run.id, session.id],
+    );
     return { requestId, scrapeId, session, run };
   }
 
@@ -100,7 +104,9 @@ describeWithDatabase("durable browser state store", () => {
       sequence,
       actionId: randomUUID(),
       proposalHash: proposalHash(operation),
-      effect: ["snapshot", "get_text", "get_url"].includes(operation.kind)
+      effect: ["snapshot", "wait", "get_text", "get_url"].includes(
+        operation.kind,
+      )
         ? "read_only"
         : "side_effecting",
       operation,
@@ -263,6 +269,50 @@ describeWithDatabase("durable browser state store", () => {
     ).rejects.toThrow(/sequence/i);
   });
 
+  it("locks the active session and rejects stale or terminal run bindings", async () => {
+    const fixture = await createFixture({ state: "executing" });
+    const parallelRun = await store.createInteractRun({
+      id: randomUUID(),
+      request_id: fixture.requestId,
+      owner_id: ownerId,
+      session_id: fixture.session.id,
+      scrape_id: fixture.scrapeId,
+      state: "running",
+      mode: "prompt",
+      model: "gpt-5.6-terra",
+      reasoning_effort: "medium",
+      deadline_at: new Date(Date.now() + 120_000).toISOString(),
+      correlation_id: randomUUID(),
+    });
+    await expect(
+      store.prepareBrowserAction(
+        parallelRun.id,
+        request(1, { kind: "get_url" }),
+      ),
+    ).rejects.toThrow(/current run|binding/i);
+
+    const blocker = new Client({ connectionString: databaseUrl });
+    await blocker.connect();
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        `UPDATE browser_sessions
+            SET state = 'interrupted', terminal_at = now()
+          WHERE id = $1`,
+        [fixture.session.id],
+      );
+      const pending = store.prepareBrowserAction(
+        fixture.run.id,
+        request(1, { kind: "get_url" }),
+      );
+      await blocker.query("COMMIT");
+      await expect(pending).rejects.toThrow(/active session|binding/i);
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      await blocker.end();
+    }
+  });
+
   it("returns cached definite observations and rejects changed identities", async () => {
     const { run } = await createFixture({ state: "executing" });
     const action = request(1, { kind: "get_text", ref: "main" });
@@ -296,6 +346,28 @@ describeWithDatabase("durable browser state store", () => {
         actionId: randomUUID(),
       }),
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
+  });
+
+  it("preserves a successful JSON null result across callback replay", async () => {
+    const { run } = await createFixture({ state: "executing" });
+    const action = request(1, { kind: "get_text", ref: "empty" });
+    await store.prepareBrowserAction(run.id, action);
+    await store.markBrowserActionExecuting(run.id, action.actionId);
+    const original = await store.completeBrowserAction({
+      runId: run.id,
+      actionId: action.actionId,
+      proposalHash: action.proposalHash,
+      outcome: "succeeded",
+      result: null,
+      page: {
+        url: "https://example.com/empty",
+        title: "Empty",
+        snapshotExcerpt: "",
+      },
+    });
+    const replay = await store.prepareBrowserAction(run.id, action);
+    expect(replay).toEqual({ kind: "cached", observation: original });
+    expect(original).toHaveProperty("result", null);
   });
 
   it("allows repeated reads but rejects repeated side effects after no-effect", async () => {
@@ -342,6 +414,87 @@ describeWithDatabase("durable browser state store", () => {
     await expect(
       store.prepareBrowserAction(sideFixture.run.id, request(2, sideEffect)),
     ).rejects.toMatchObject({ name: "DuplicateSideEffectError" });
+
+    const failedFixture = await createFixture({ state: "executing" });
+    const failedSide = request(1, sideEffect);
+    await store.prepareBrowserAction(failedFixture.run.id, failedSide);
+    await store.markBrowserActionExecuting(
+      failedFixture.run.id,
+      failedSide.actionId,
+    );
+    await store.completeBrowserAction({
+      runId: failedFixture.run.id,
+      actionId: failedSide.actionId,
+      proposalHash: failedSide.proposalHash,
+      outcome: "failed_no_effect",
+      error: { category: "not_found", message: "target disappeared" },
+      page: {
+        url: "https://example.com",
+        title: "Example",
+        snapshotExcerpt: "",
+      },
+    });
+    await expect(
+      store.prepareBrowserAction(failedFixture.run.id, request(2, sideEffect)),
+    ).rejects.toMatchObject({ name: "DuplicateSideEffectError" });
+  });
+
+  it("canonicalizes nested operation keys and validates every operation", async () => {
+    const operations: BrowserOperation[] = [
+      { kind: "snapshot" },
+      { kind: "click", ref: "button" },
+      { kind: "fill", ref: "input", value: "value" },
+      { kind: "type", ref: "input", value: "value", delayMs: 10 },
+      { kind: "press", ref: "input", key: "Enter" },
+      { kind: "select", ref: "select", values: ["one"] },
+      { kind: "scroll", deltaX: 0, deltaY: 100 },
+      { kind: "wait", milliseconds: 10 },
+      { kind: "get_text", ref: "main" },
+      { kind: "get_url" },
+      { kind: "navigate", url: "https://example.com/next" },
+      {
+        kind: "evaluate",
+        expression: "args",
+        args: { z: 1, a: { y: 2, b: 3 } },
+      },
+    ];
+    const fixture = await createFixture({ state: "executing" });
+    for (const [index, operation] of operations.entries()) {
+      const action = request(index + 1, operation);
+      const expectedEffect = [
+        "snapshot",
+        "wait",
+        "get_text",
+        "get_url",
+      ].includes(operation.kind)
+        ? "read_only"
+        : "side_effecting";
+      expect(action.effect).toBe(expectedEffect);
+      await expect(
+        store.prepareBrowserAction(fixture.run.id, action),
+      ).resolves.toMatchObject({ kind: "prepared" });
+      await store.completeBrowserAction({
+        runId: fixture.run.id,
+        actionId: action.actionId,
+        proposalHash: action.proposalHash,
+        outcome: "rejected_no_effect",
+        error: { category: "coverage", message: "not dispatched" },
+        page: {
+          url: "https://example.com",
+          title: "Example",
+          snapshotExcerpt: "",
+        },
+      });
+      await expect(
+        store.prepareBrowserAction(fixture.run.id, {
+          ...request(index + 2, operation),
+          operation: {
+            ...operation,
+            unexpected: true,
+          } as unknown as BrowserOperation,
+        }),
+      ).rejects.toThrow();
+    }
   });
 
   it("compare-and-sets execution and bounds completion data", async () => {
@@ -495,6 +648,45 @@ describeWithDatabase("durable browser state store", () => {
       capabilitiesRevoked: 0,
       grantsRevoked: 0,
       writerLeasesCleared: 0,
+    });
+  });
+
+  it("rolls back every recovery mutation when a later update fails", async () => {
+    const fixture = await createFixture({ state: "executing" });
+    const action = request(1, { kind: "click", ref: "rollback" });
+    await store.prepareBrowserAction(fixture.run.id, action);
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION browser_recovery_test_fail()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'forced recovery failure';
+      END;
+      $$
+    `);
+    await pool.query(`
+      CREATE TRIGGER browser_recovery_test_fail
+      BEFORE UPDATE ON browser_interact_runs
+      FOR EACH ROW EXECUTE FUNCTION browser_recovery_test_fail()
+    `);
+    try {
+      await expect(
+        store.interruptUnfinishedBrowserWork(new Date()),
+      ).rejects.toThrow();
+    } finally {
+      await pool.query(
+        "DROP TRIGGER browser_recovery_test_fail ON browser_interact_runs",
+      );
+      await pool.query("DROP FUNCTION browser_recovery_test_fail()");
+    }
+    expect(
+      await store.getBrowserActionByIdentity(
+        fixture.run.id,
+        action.actionId,
+        action.sequence,
+      ),
+    ).toMatchObject({ state: "prepared" });
+    expect(await store.getBrowserSession(fixture.session.id)).toMatchObject({
+      state: "executing",
     });
   });
 });

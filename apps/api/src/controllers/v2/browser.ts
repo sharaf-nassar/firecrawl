@@ -471,7 +471,7 @@ export async function browserExecuteController(
     stderrLength: execResult.stderr?.length,
   });
 
-  enqueueBrowserSessionActivity({
+  await enqueueBrowserSessionActivity({
     team_id: req.auth.team_id,
     session_id: id,
     source: "browser",

@@ -252,6 +252,7 @@ function asAction(row: typeof schema.browser_interact_actions.$inferSelect) {
 
 function observationFromAction(
   action: BrowserInteractActionRow,
+  resultPresent = action.result !== null,
 ): ObservationV1 {
   if (
     (action.state !== "succeeded" &&
@@ -271,7 +272,7 @@ function observationFromAction(
     outcome: action.state,
     page,
   };
-  if (action.result !== null) {
+  if (resultPresent) {
     observation.result = action.result;
   }
   if (action.error_category !== null && action.error_detail !== null) {
@@ -444,6 +445,10 @@ export async function prepareBrowserAction(
     if (!run || run.state !== "running") {
       throw new Error("Browser action is not bound to an active run");
     }
+    await tx.execute(
+      sql`SELECT id FROM browser_sessions
+          WHERE id = ${run.session_id} FOR UPDATE`,
+    );
     const [session] = await tx
       .select()
       .from(schema.browser_sessions)
@@ -453,9 +458,12 @@ export async function prepareBrowserAction(
       !session ||
       session.owner_id !== run.owner_id ||
       session.request_id !== run.request_id ||
-      session.state !== "executing"
+      session.state !== "executing" ||
+      session.current_run_id !== run.id
     ) {
-      throw new Error("Browser action run/session binding is invalid");
+      throw new Error(
+        "Browser action active session/current run binding is invalid",
+      );
     }
 
     const identities = await tx
@@ -491,7 +499,20 @@ export async function prepareBrowserAction(
       if (action.state === "outcome_unknown") {
         throw new ActionOutcomeUnknownError();
       }
-      return { kind: "cached", observation: observationFromAction(action) };
+      const [presence] = await tx
+        .select({
+          resultPresent: sql<boolean>`${schema.browser_interact_actions.result} IS NOT NULL`,
+        })
+        .from(schema.browser_interact_actions)
+        .where(eq(schema.browser_interact_actions.id, action.id))
+        .limit(1);
+      return {
+        kind: "cached",
+        observation: observationFromAction(
+          action,
+          presence?.resultPresent ?? false,
+        ),
+      };
     }
 
     if (canonicalProposalHash(request.operation) !== request.proposalHash) {
@@ -642,7 +663,14 @@ export async function completeBrowserAction(
       if (action.state !== input.outcome) {
         throw new ActionIdentityMismatchError();
       }
-      return observationFromAction(action);
+      const [presence] = await tx
+        .select({
+          resultPresent: sql<boolean>`${schema.browser_interact_actions.result} IS NOT NULL`,
+        })
+        .from(schema.browser_interact_actions)
+        .where(eq(schema.browser_interact_actions.id, action.id))
+        .limit(1);
+      return observationFromAction(action, presence?.resultPresent ?? false);
     }
     if (action.state === "outcome_unknown") {
       throw new ActionOutcomeUnknownError();
@@ -671,7 +699,12 @@ export async function completeBrowserAction(
       .update(schema.browser_interact_actions)
       .set({
         state: input.outcome,
-        result: input.result ?? null,
+        result:
+          input.result === undefined
+            ? null
+            : input.result === null
+              ? sql`'null'::jsonb`
+              : input.result,
         page_state: input.page,
         error_category: input.error?.category ?? null,
         error_detail: input.error?.message ?? null,
