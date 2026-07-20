@@ -626,6 +626,54 @@ describe("replay resolution", () => {
     });
   });
 
+  it("preserves detached and frozen Playwright CHIPS cookie metadata", () => {
+    const storedCheckpoint = checkpoint();
+    const chipsCookie = {
+      ...storedCheckpoint.storageState.cookies[0],
+      partitionKey: "https://top-level.example",
+      _crHasCrossSiteAncestor: true,
+    };
+    storedCheckpoint.storageState.cookies = [chipsCookie];
+
+    const result = resolveReplayEnvelope(
+      source({ checkpoint: storedCheckpoint }),
+    );
+    expect(result.kind).toBe("checkpoint");
+    if (result.kind !== "checkpoint") return;
+
+    chipsCookie.partitionKey = "https://mutated.example";
+    chipsCookie._crHasCrossSiteAncestor = false;
+
+    expect(result.checkpoint.storageState.cookies[0]).toMatchObject({
+      partitionKey: "https://top-level.example",
+      _crHasCrossSiteAncestor: true,
+    });
+    expect(Object.isFrozen(result.checkpoint.storageState.cookies[0])).toBe(
+      true,
+    );
+  });
+
+  it.each([
+    ["partitionKey", 7],
+    ["_crHasCrossSiteAncestor", "yes"],
+  ])("rejects malformed Playwright cookie field %s", (field, value) => {
+    const storedCheckpoint = checkpoint();
+    storedCheckpoint.storageState.cookies = [
+      {
+        ...storedCheckpoint.storageState.cookies[0],
+        [field]: value,
+      },
+    ];
+
+    expect(
+      resolveReplayEnvelope(source({ checkpoint: storedCheckpoint })),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+      fields: [`checkpoint.storageState.cookies.0.${field}`],
+    });
+  });
+
   it.each([
     [
       {

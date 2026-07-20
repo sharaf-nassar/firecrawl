@@ -124,6 +124,8 @@ export interface StoredReplayCheckpoint {
       httpOnly: boolean;
       secure: boolean;
       sameSite: "Strict" | "Lax" | "None";
+      partitionKey?: string;
+      _crHasCrossSiteAncestor?: boolean;
     }>;
     origins: Array<{
       origin: string;
@@ -490,6 +492,8 @@ const storageCookieSchema = z.strictObject({
   httpOnly: z.boolean(),
   secure: z.boolean(),
   sameSite: z.enum(["Strict", "Lax", "None"]),
+  partitionKey: z.string().optional(),
+  _crHasCrossSiteAncestor: z.boolean().optional(),
 });
 
 const indexedDBRecordSchema = z
