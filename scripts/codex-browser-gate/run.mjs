@@ -18,6 +18,7 @@ import process from "node:process";
 
 import { createGateActionStore } from "./action-store.mjs";
 import {
+  canonicalizeJsonBytes,
   hashCanonicalSchemaBundle,
   parseLosslessJson,
 } from "./schema-canonicalizer.mjs";
@@ -230,10 +231,78 @@ const INITIAL_OBSERVATION = {
   },
 };
 
+function auditModelDecisionSchema(schema) {
+  const reject = () => {
+    throw gateError("model_protocol_error");
+  };
+  if (
+    !hasExactKeys(schema, [
+      "type",
+      "properties",
+      "required",
+      "additionalProperties",
+    ]) ||
+    schema.type !== "object" ||
+    schema.additionalProperties !== false ||
+    !hasExactKeys(schema.properties, ["decision"]) ||
+    schema.required.length !== 1 ||
+    schema.required[0] !== "decision" ||
+    !hasExactKeys(schema.properties.decision, ["anyOf"]) ||
+    schema.properties.decision.anyOf.length !== 2
+  ) {
+    reject();
+  }
+
+  function visit(node) {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) {
+      reject();
+    }
+    if (Object.hasOwn(node, "const")) reject();
+    if (Object.hasOwn(node, "enum")) {
+      if (
+        typeof node.type !== "string" ||
+        !Array.isArray(node.enum) ||
+        node.enum.length === 0 ||
+        !node.enum.every(value => schemaTypeMatches(value, node.type))
+      ) {
+        reject();
+      }
+    }
+    const scalarAssertions = [
+      "minimum",
+      "maximum",
+      "minLength",
+      "maxLength",
+      "minItems",
+      "maxItems",
+    ];
+    if (
+      scalarAssertions.some(key => Object.hasOwn(node, key)) &&
+      typeof node.type !== "string"
+    ) {
+      reject();
+    }
+    if (node.properties) {
+      for (const child of Object.values(node.properties)) visit(child);
+    }
+    if (node.items) visit(node.items);
+    for (const key of ["anyOf", "oneOf", "allOf"]) {
+      for (const child of node[key] ?? []) visit(child);
+    }
+  }
+  visit(schema);
+}
+
 function gateError(code, detail) {
   const error = new Error(detail ? `${code}: ${detail}` : code);
   error.code = code;
   return error;
+}
+
+function normalizedProposalHash(operation) {
+  return createHash("sha256")
+    .update(canonicalizeJsonBytes(Buffer.from(JSON.stringify(operation), "utf8")))
+    .digest("hex");
 }
 
 function killProcessGroup(child) {
@@ -418,7 +487,27 @@ function astObjectMember(node, key) {
   return node.members.find(member => member.key === key)?.value;
 }
 
-function safeSchemaNumber(raw) {
+const INTEGER_SCHEMA_KEYWORDS = new Set([
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "minProperties",
+  "maxProperties",
+  "minContains",
+  "maxContains",
+]);
+
+function greatestCommonDivisor(left, right) {
+  while (right !== 0n) {
+    const remainder = left % right;
+    left = right;
+    right = remainder;
+  }
+  return left;
+}
+
+function safeSchemaNumber(raw, keyword) {
   const match = /^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(
     raw,
   );
@@ -436,7 +525,20 @@ function safeSchemaNumber(raw) {
   } else {
     denominator = 10n ** BigInt(parseInt((-exponent).toString(), 10));
   }
+  if (INTEGER_SCHEMA_KEYWORDS.has(keyword) && numerator % denominator !== 0n) {
+    throw gateError("codex_protocol_schema_mismatch");
+  }
   if (numerator > BigInt(Number.MAX_SAFE_INTEGER) * denominator) {
+    throw gateError("codex_protocol_schema_mismatch");
+  }
+  const divisor = greatestCommonDivisor(numerator, denominator);
+  const reducedNumerator = numerator / divisor;
+  let reducedDenominator = denominator / divisor;
+  while (reducedDenominator % 2n === 0n) reducedDenominator /= 2n;
+  if (
+    reducedDenominator !== 1n ||
+    reducedNumerator > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
     throw gateError("codex_protocol_schema_mismatch");
   }
   const value = Number(raw);
@@ -446,7 +548,33 @@ function safeSchemaNumber(raw) {
   return value;
 }
 
-function schemaAstToValue(node) {
+function schemaAstToValue(node, keyword) {
+  switch (node.kind) {
+    case "string":
+      return node.value;
+    case "number":
+      return safeSchemaNumber(node.raw, keyword);
+    case "true":
+      return true;
+    case "false":
+      return false;
+    case "null":
+      return null;
+    case "array":
+      return node.items.map(item => schemaAstToValue(item, keyword));
+    case "object": {
+      const value = Object.create(null);
+      for (const member of node.members) {
+        value[member.key] = schemaAstToValue(member.value, member.key);
+      }
+      return value;
+    }
+    default:
+      throw gateError("codex_protocol_schema_mismatch");
+  }
+}
+
+function losslessJsonNodeToPlainValue(node) {
   switch (node.kind) {
     case "string":
       return node.value;
@@ -459,16 +587,21 @@ function schemaAstToValue(node) {
     case "null":
       return null;
     case "array":
-      return node.items.map(schemaAstToValue);
+      return node.items.map(losslessJsonNodeToPlainValue);
     case "object": {
-      const value = Object.create(null);
+      const value = {};
       for (const member of node.members) {
-        value[member.key] = schemaAstToValue(member.value);
+        Object.defineProperty(value, member.key, {
+          configurable: true,
+          enumerable: true,
+          value: losslessJsonNodeToPlainValue(member.value),
+          writable: true,
+        });
       }
       return value;
     }
     default:
-      throw gateError("codex_protocol_schema_mismatch");
+      modelProtocolError();
   }
 }
 
@@ -591,6 +724,7 @@ function generatedSchemaMatches(value, schema, rootSchema) {
 }
 
 function assertGeneratedSchemaValue(value, schemaSource) {
+  auditGeneratedSchemaKeywords(schemaSource.schema);
   if (
     !generatedSchemaMatches(
       value,
@@ -602,6 +736,57 @@ function assertGeneratedSchemaValue(value, schemaSource) {
   }
 }
 
+const SUPPORTED_SCHEMA_KEYWORDS = new Set([
+  "$ref",
+  "$schema",
+  "additionalProperties",
+  "allOf",
+  "anyOf",
+  "const",
+  "default",
+  "definitions",
+  "description",
+  "enum",
+  "format",
+  "items",
+  "maxItems",
+  "maxLength",
+  "maximum",
+  "minItems",
+  "minLength",
+  "minimum",
+  "oneOf",
+  "properties",
+  "required",
+  "title",
+  "type",
+]);
+
+function auditGeneratedSchemaKeywords(schema) {
+  if (schema === true || schema === false) return;
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+    throw gateError("codex_protocol_schema_mismatch");
+  }
+  for (const key of Object.keys(schema)) {
+    if (!SUPPORTED_SCHEMA_KEYWORDS.has(key)) {
+      throw gateError("codex_protocol_schema_mismatch");
+    }
+  }
+  for (const group of [schema.properties, schema.definitions]) {
+    for (const child of Object.values(group ?? {})) {
+      auditGeneratedSchemaKeywords(child);
+    }
+  }
+  for (const key of ["items", "additionalProperties"]) {
+    if (schema[key] !== undefined && typeof schema[key] === "object") {
+      auditGeneratedSchemaKeywords(schema[key]);
+    }
+  }
+  for (const key of ["allOf", "anyOf", "oneOf"]) {
+    for (const child of schema[key] ?? []) auditGeneratedSchemaKeywords(child);
+  }
+}
+
 async function loadEventSchemas(schemaDir) {
   try {
     const load = async name => {
@@ -610,11 +795,41 @@ async function loadEventSchemas(schemaDir) {
       return { ast, schema: schemaAstToValue(ast) };
     };
     return {
+      threadStartParams: await load("ThreadStartParams.json"),
+      turnStartParams: await load("TurnStartParams.json"),
+      threadStartResponse: await load("ThreadStartResponse.json"),
       itemCompleted: await load("ItemCompletedNotification.json"),
       turnCompleted: await load("TurnCompletedNotification.json"),
     };
   } catch {
     throw gateError("codex_protocol_schema_mismatch");
+  }
+}
+
+class ProcessDeadline {
+  constructor(durationMs, now = Date.now, onExpire = () => {}) {
+    this.now = now;
+    this.onExpire = onExpire;
+    this.expiresAt = now() + durationMs;
+    this.expired = false;
+  }
+
+  expirationError() {
+    return gateError("codex_app_server_timeout");
+  }
+
+  expire() {
+    if (!this.expired) {
+      this.expired = true;
+      this.onExpire();
+    }
+    return this.expirationError();
+  }
+
+  remaining() {
+    const remaining = this.expiresAt - this.now();
+    if (remaining <= 0) throw this.expire();
+    return remaining;
   }
 }
 
@@ -633,6 +848,9 @@ class AppServerClient {
     this.failure = null;
     this.stopping = false;
     this.closed = false;
+    this.deadline = new ProcessDeadline(WATCHDOG_MS, Date.now, () => {
+      this.fail(gateError("codex_app_server_timeout"));
+    });
 
     this.child = spawn(
       "codex",
@@ -658,6 +876,7 @@ class AppServerClient {
       this.fail(gateError("codex_app_server_spawn_failed", error.message));
     });
     this.child.on("close", (code, signal) => {
+      clearTimeout(this.processWatchdog);
       this.closed = true;
       this.resolveClosed({ code, signal });
       if (!this.stopping && !this.failure) {
@@ -669,6 +888,9 @@ class AppServerClient {
         );
       }
     });
+    this.processWatchdog = setTimeout(() => {
+      this.deadline.expire();
+    }, this.deadline.remaining());
   }
 
   checkLimit() {
@@ -777,7 +999,7 @@ class AppServerClient {
         const error = gateError("codex_app_server_timeout", method);
         this.fail(error);
         reject(error);
-      }, WATCHDOG_MS);
+      }, this.deadline.remaining());
       this.pending.set(id, { resolve, reject, watchdog });
       this.child.stdin.write(body, error => {
         if (error) this.fail(gateError("codex_app_server_write_failed"));
@@ -793,8 +1015,7 @@ class AppServerClient {
   }
 
   async waitForNotification(method, predicate, startIndex) {
-    const deadline = Date.now() + WATCHDOG_MS;
-    while (Date.now() < deadline) {
+    while (true) {
       this.assertHealthy();
       for (let index = startIndex; index < this.messages.length; index += 1) {
         const message = this.messages[index];
@@ -802,11 +1023,9 @@ class AppServerClient {
           return { message, index };
         }
       }
-      await new Promise(resolve => setTimeout(resolve, 10));
+      const remaining = this.deadline.remaining();
+      await new Promise(resolve => setTimeout(resolve, Math.min(10, remaining)));
     }
-    const error = gateError("codex_app_server_timeout", method);
-    this.fail(error);
-    throw error;
   }
 
   async stop() {
@@ -817,7 +1036,12 @@ class AppServerClient {
     if (!this.closed) {
       const graceful = await Promise.race([
         this.closedPromise.then(() => true),
-        new Promise(resolve => setTimeout(() => resolve(false), 1_000)),
+        new Promise(resolve =>
+          setTimeout(
+            () => resolve(false),
+            Math.min(1_000, this.deadline.remaining()),
+          ),
+        ),
       ]);
       if (!graceful) {
         killProcessGroup(this.child);
@@ -1052,7 +1276,9 @@ function parseTurnEnvelope({ turn, messages }, { threadId, turnId }) {
   }
   let envelope;
   try {
-    envelope = JSON.parse(event.params.item.text);
+    envelope = losslessJsonNodeToPlainValue(
+      parseLosslessJson(Buffer.from(event.params.item.text, "utf8")),
+    );
   } catch {
     modelProtocolError();
   }
@@ -1185,13 +1411,58 @@ function assertNoLateTurnMessages(allMessages, result, { threadId, turnId }) {
   }
 }
 
+function auditAllAppServerEvents(messages, knownTurns) {
+  const turns = new Map(
+    knownTurns.map(turn => [`${turn.threadId}\0${turn.turnId}`, turn]),
+  );
+  for (const turn of knownTurns) {
+    const completed = messages[turn.completedIndex];
+    if (
+      completed?.method !== "turn/completed" ||
+      completed.params?.threadId !== turn.threadId ||
+      completed.params?.turn?.id !== turn.turnId
+    ) {
+      modelProtocolError();
+    }
+  }
+  let tools = 0;
+  let approvals = 0;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (typeof message.method !== "string") continue;
+    if (/approval/i.test(message.method)) {
+      approvals += 1;
+      throw gateError("codex_forbidden_event", message.method);
+    }
+    if (message.method.startsWith("item/")) {
+      const key = `${message.params?.threadId}\0${message.params?.turnId}`;
+      const turn = turns.get(key);
+      if (!turn || index > turn.completedIndex) modelProtocolError();
+      const itemType = message.params?.item?.type;
+      if (
+        typeof itemType === "string" &&
+        /command|fileChange|mcpToolCall|dynamicToolCall|browser|computer|webSearch|image|app|plugin|shell|collab/i.test(
+          itemType,
+        )
+      ) {
+        tools += 1;
+        throw gateError("codex_forbidden_event", itemType);
+      }
+    }
+    if (FORBIDDEN_EVENT_PATTERN.test(message.method)) {
+      throw gateError("codex_forbidden_event", message.method);
+    }
+  }
+  return { tools, approvals };
+}
+
 function turnInput(text) {
   return [{ type: "text", text }];
 }
 
 async function startTurn(client, threadId, prompt, eventSchemas) {
   const startIndex = client.messages.length;
-  const response = await client.request("turn/start", {
+  const params = {
     threadId,
     input: turnInput(prompt),
     environments: [],
@@ -1201,7 +1472,9 @@ async function startTurn(client, threadId, prompt, eventSchemas) {
     model: MODEL,
     effort: EFFORT,
     outputSchema: modelDecisionEnvelopeSchema,
-  });
+  };
+  assertGeneratedSchemaValue(params, eventSchemas.turnStartParams);
+  const response = await client.request("turn/start", params);
   if (!response?.turn?.id) throw gateError("codex_turn_start_malformed");
   const turnId = response.turn.id;
   const completed = await client.waitForNotification(
@@ -1245,10 +1518,23 @@ async function assertRemoved(path) {
   throw gateError("codex_temp_root_survived", path);
 }
 
+function surfaceCleanupFailures(primaryFailure, cleanupFailures) {
+  if (cleanupFailures.length === 0) return;
+  if (primaryFailure) {
+    throw new AggregateError(
+      [primaryFailure, ...cleanupFailures],
+      "gate_and_cleanup_failed",
+    );
+  }
+  if (cleanupFailures.length === 1) throw cleanupFailures[0];
+  throw new AggregateError(cleanupFailures, "cleanup_failed");
+}
+
 async function runOne(runNumber) {
   let root;
   let client;
   let eventsPath;
+  let primaryFailure;
   try {
     root = await mkdtemp(join(tmpdir(), "codex-browser-gate-"));
     const rootStat = await stat(root);
@@ -1310,6 +1596,7 @@ async function runOne(runNumber) {
     }
     const featureHash = parseFeatureInventory(featureResult.stdout);
 
+    auditModelDecisionSchema(modelDecisionEnvelopeSchema);
     client = new AppServerClient({ cwd: work, env, eventsPath });
     if (!client.pid) throw gateError("codex_app_server_spawn_failed");
     const initialize = await client.request("initialize", {
@@ -1326,7 +1613,7 @@ async function runOne(runNumber) {
     }
     client.notify("initialized");
 
-    const threadResponse = await client.request("thread/start", {
+    const threadStartParams = {
       model: MODEL,
       cwd: work,
       approvalPolicy: "never",
@@ -1335,7 +1622,19 @@ async function runOne(runNumber) {
       dynamicTools: [],
       environments: [],
       runtimeWorkspaceRoots: [],
-    });
+    };
+    assertGeneratedSchemaValue(
+      threadStartParams,
+      eventSchemas.threadStartParams,
+    );
+    const threadResponse = await client.request(
+      "thread/start",
+      threadStartParams,
+    );
+    assertGeneratedSchemaValue(
+      threadResponse,
+      eventSchemas.threadStartResponse,
+    );
     const threadId = threadResponse?.thread?.id;
     if (
       typeof threadId !== "string" ||
@@ -1386,9 +1685,7 @@ async function runOne(runNumber) {
       adapterJobId: `gate-job-${randomUUID()}`,
       sequence: 1,
       actionId: `gate-action-${randomUUID()}`,
-      proposalHash: createHash("sha256")
-        .update(JSON.stringify(operation))
-        .digest("hex"),
+      proposalHash: normalizedProposalHash(operation),
       effect: "side_effecting",
       operation,
     };
@@ -1446,6 +1743,18 @@ async function runOne(runNumber) {
       threadId,
       turnId: turnTwo.turn.id,
     });
+    const knownTurns = [turnOne, turnTwo].map(result => ({
+      threadId,
+      turnId: result.turn.id,
+      completedIndex: client.messages.findIndex(
+        message =>
+          message.method === "turn/completed" &&
+          message.params?.threadId === threadId &&
+          message.params?.turn?.id === result.turn.id,
+      ),
+    }));
+    if (knownTurns.some(turn => turn.completedIndex < 0)) modelProtocolError();
+    const auditCounts = auditAllAppServerEvents(client.messages, knownTurns);
     const completedTurns = client.messages.filter(
       message =>
         message.method === "turn/completed" &&
@@ -1490,18 +1799,37 @@ async function runOne(runNumber) {
       turns: 2,
       actions: 1,
       writes: store.snapshot().writeCount,
-      tools: 0,
-      approvals: 0,
+      tools: auditCounts.tools,
+      approvals: auditCounts.approvals,
     };
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
   } finally {
+    const cleanupFailures = [];
     if (client) {
-      await client.stop().catch(() => {});
-      if (eventsPath) await client.storeEvents().catch(() => {});
+      try {
+        await client.stop();
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+      if (eventsPath) {
+        try {
+          await client.storeEvents();
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+      }
     }
     if (root) {
-      await rm(root, { force: true, recursive: true });
-      await assertRemoved(root);
+      try {
+        await rm(root, { force: true, recursive: true });
+        await assertRemoved(root);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
     }
+    surfaceCleanupFailures(primaryFailure, cleanupFailures);
   }
 }
 
@@ -1513,9 +1841,9 @@ async function actionStoreSelfTest() {
     const action = {
       version: 1, adapterJobId: "gate-job", sequence: 1,
       actionId: "gate-action-1",
-      proposalHash: createHash("sha256").update(JSON.stringify({
+      proposalHash: normalizedProposalHash({
         kind: "fill", ref: "gate-marker", value: "approved",
-      })).digest("hex"),
+      }),
       effect: "side_effecting",
       operation: { kind: "fill", ref: "gate-marker", value: "approved" },
     };
@@ -1530,12 +1858,209 @@ async function actionStoreSelfTest() {
     const snapshot = store.snapshot();
     assert.equal(snapshot.writeCount, 1);
     assert.equal(snapshot.records.length, 1);
+    assert.deepEqual(
+      {
+        version: snapshot.records[0].version,
+        adapterJobId: snapshot.records[0].adapterJobId,
+        sequence: snapshot.records[0].sequence,
+        actionId: snapshot.records[0].actionId,
+        proposalHash: snapshot.records[0].proposalHash,
+        effect: snapshot.records[0].effect,
+        operation: snapshot.records[0].operation,
+        state: snapshot.records[0].state,
+      },
+      { ...action, state: "succeeded" },
+    );
+    await assert.rejects(
+      store.execute({
+        ...action,
+        actionId: "bad-operation",
+        sequence: 2,
+        operation: { kind: "fill", ref: "gate-marker", value: "approved", extra: true },
+      }),
+      /invalid_action_operation/,
+    );
+    const failedMarkerPath = join(root, "failed-marker");
+    await writeFile(failedMarkerPath, "occupied\n", { mode: 0o600 });
+    const failedStore = createGateActionStore({ markerPath: failedMarkerPath });
+    await assert.rejects(
+      failedStore.execute({
+        ...action,
+        actionId: "dispatch-failure",
+      }),
+      error => error?.code === "EEXIST",
+    );
+    assert.equal(failedStore.snapshot().records[0].state, "executing");
     process.stdout.write(
       `codex_browser_action_store: PASS writes=${snapshot.writeCount} records=${snapshot.records.length}\n`,
     );
   } finally {
     await rm(root, { force: true, recursive: true });
   }
+}
+
+async function hardeningSelfTest() {
+  const ordered = { kind: "fill", ref: "gate-marker", value: "approved" };
+  const permuted = { value: "approved", kind: "fill", ref: "gate-marker" };
+  assert.equal(normalizedProposalHash(ordered), normalizedProposalHash(permuted));
+  auditModelDecisionSchema(modelDecisionEnvelopeSchema);
+  const bareConst = structuredClone(modelDecisionEnvelopeSchema);
+  bareConst.properties.decision.anyOf[0].properties.version = { const: 1 };
+  assert.throws(() => auditModelDecisionSchema(bareConst), /model_protocol_error/);
+  const untypedEnum = structuredClone(modelDecisionEnvelopeSchema);
+  delete untypedEnum.properties.decision.anyOf[0].properties.type.type;
+  assert.throws(
+    () => auditModelDecisionSchema(untypedEnum),
+    /model_protocol_error/,
+  );
+  const untypedScalar = structuredClone(modelDecisionEnvelopeSchema);
+  delete untypedScalar.properties.decision.anyOf[1].properties.output.type;
+  assert.throws(
+    () => auditModelDecisionSchema(untypedScalar),
+    /model_protocol_error/,
+  );
+  const openRoot = structuredClone(modelDecisionEnvelopeSchema);
+  openRoot.additionalProperties = true;
+  assert.throws(() => auditModelDecisionSchema(openRoot), /model_protocol_error/);
+  assert.throws(
+    () =>
+      schemaAstToValue(
+        parseLosslessJson(Buffer.from('{"maxLength":1.5}', "utf8")),
+      ),
+    /codex_protocol_schema_mismatch/,
+  );
+  assert.throws(
+    () =>
+      schemaAstToValue(
+        parseLosslessJson(Buffer.from('{"minimum":0.1}', "utf8")),
+      ),
+    /codex_protocol_schema_mismatch/,
+  );
+  assert.throws(
+    () =>
+      schemaAstToValue(
+        parseLosslessJson(
+          Buffer.from('{"maximum":9007199254740993}', "utf8"),
+        ),
+      ),
+    /codex_protocol_schema_mismatch/,
+  );
+  assert.throws(
+    () =>
+      assertGeneratedSchemaValue("abc", {
+        schema: { type: "string", pattern: "^a" },
+      }),
+    /codex_protocol_schema_mismatch/,
+  );
+  assert.throws(
+    () =>
+      assertGeneratedSchemaValue({}, {
+        schema: {
+          type: "object",
+          required: ["threadId"],
+          properties: { threadId: { type: "string" } },
+        },
+      }),
+    /codex_protocol_schema_mismatch/,
+  );
+  let now = 1000;
+  let expired = false;
+  const deadline = new ProcessDeadline(100, () => now, () => {
+    expired = true;
+  });
+  assert.equal(deadline.remaining(), 100);
+  now = 1060;
+  assert.equal(deadline.remaining(), 40);
+  now = 1101;
+  assert.throws(() => deadline.remaining(), /codex_app_server_timeout/);
+  assert.equal(expired, true);
+  const duplicateDecisionTurn = {
+    turn: {
+      id: "turn-duplicate",
+      status: "completed",
+      error: null,
+      itemsView: "notLoaded",
+    },
+    messages: [
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-duplicate",
+          turnId: "turn-duplicate",
+          item: {
+            id: "agent-duplicate",
+            type: "agentMessage",
+            text: String.raw`{"decision":{"version":1,"type":"final","output":"gate-complete"},"\u0064ecision":{"version":1,"type":"final","output":"gate-complete"}}`,
+          },
+        },
+      },
+    ],
+  };
+  assert.throws(
+    () =>
+      parseTurnEnvelope(duplicateDecisionTurn, {
+        threadId: "thread-duplicate",
+        turnId: "turn-duplicate",
+      }),
+    /model_protocol_error/,
+  );
+  const knownTurns = [
+    { threadId: "thread-audit", turnId: "turn-audit", completedIndex: 1 },
+  ];
+  const cleanAudit = [
+    {
+      method: "item/completed",
+      params: {
+        threadId: "thread-audit",
+        turnId: "turn-audit",
+        item: { id: "agent-audit", type: "agentMessage", text: "{}" },
+      },
+    },
+    {
+      method: "turn/completed",
+      params: { threadId: "thread-audit", turn: { id: "turn-audit" } },
+    },
+  ];
+  assert.deepEqual(auditAllAppServerEvents(cleanAudit, knownTurns), {
+    tools: 0,
+    approvals: 0,
+  });
+  assert.throws(
+    () => auditAllAppServerEvents(cleanAudit.toReversed(), knownTurns),
+    /model_protocol_error/,
+  );
+  const crossTurn = structuredClone(cleanAudit);
+  crossTurn[0].params.turnId = "turn-unknown";
+  assert.throws(
+    () => auditAllAppServerEvents(crossTurn, knownTurns),
+    /model_protocol_error/,
+  );
+  const toolEvent = structuredClone(cleanAudit);
+  toolEvent[0].params.item.type = "mcpToolCall";
+  assert.throws(
+    () => auditAllAppServerEvents(toolEvent, knownTurns),
+    /codex_forbidden_event/,
+  );
+  const approvalEvent = structuredClone(cleanAudit);
+  approvalEvent[0].method = "item/commandExecution/requestApproval";
+  assert.throws(
+    () => auditAllAppServerEvents(approvalEvent, knownTurns),
+    /codex_forbidden_event/,
+  );
+  const primaryFailure = new Error("primary_failure");
+  const cleanupFailure = new Error("cleanup_failure");
+  assert.throws(
+    () => surfaceCleanupFailures(primaryFailure, [cleanupFailure]),
+    error =>
+      error instanceof AggregateError &&
+      error.errors[0] === primaryFailure &&
+      error.errors[1] === cleanupFailure,
+  );
+  assert.throws(
+    () => surfaceCleanupFailures(undefined, [cleanupFailure]),
+    error => error === cleanupFailure,
+  );
+  process.stdout.write("codex_browser_hardening: PASS\n");
 }
 
 function parseRunCount(args) {
@@ -1593,10 +2118,14 @@ async function main() {
   );
 }
 
-(process.argv[2] === "--action-store-self-test"
-  ? actionStoreSelfTest()
-  : main()
-).catch(error => {
+const invocation =
+  process.argv[2] === "--action-store-self-test"
+    ? actionStoreSelfTest()
+    : process.argv[2] === "--hardening-self-test"
+      ? hardeningSelfTest()
+      : main();
+
+invocation.catch(error => {
   process.stderr.write(
     `${error instanceof Error ? error.message : String(error)}\n`,
   );

@@ -29,7 +29,7 @@ function hasExactKeys(value, expected) {
 function validateAction(action) {
   if (!hasExactKeys(action, REQUEST_KEYS)) fail("invalid_action_request");
   if (!hasExactKeys(action.operation, OPERATION_KEYS)) {
-    fail("invalid_action_request");
+    fail("invalid_action_operation");
   }
   if (
     action.version !== 1 ||
@@ -75,40 +75,29 @@ export function createGateActionStore({ markerPath }) {
 
       if (sequences.has(action.sequence)) fail("action_identity_mismatch");
 
-      const record = {
-        actionId: action.actionId,
-        adapterJobId: action.adapterJobId,
-        sequence: action.sequence,
-        proposalHash: action.proposalHash,
-        state: "prepared",
-      };
+      const record = { ...structuredClone(action), state: "prepared" };
       records.set(action.actionId, record);
       sequences.set(action.sequence, action.actionId);
       record.state = "executing";
 
-      try {
-        await writeFile(markerPath, "approved\n", { flag: "wx", mode: 0o600 });
-        writeCount += 1;
-        record.observation = {
-          version: 1,
-          type: "action_result",
-          sequence: 1,
-          actionId: action.actionId,
-          actionKind: "fill",
-          outcome: "succeeded",
-          result: { value: "approved" },
-          page: {
-            url: "https://gate.invalid/form",
-            title: "Gate fixture",
-            snapshotExcerpt: "textbox gate-marker value=approved",
-          },
-        };
-        record.state = "succeeded";
-        return structuredClone(record.observation);
-      } catch (error) {
-        record.state = "failed";
-        throw error;
-      }
+      await writeFile(markerPath, "approved\n", { flag: "wx", mode: 0o600 });
+      writeCount += 1;
+      record.observation = {
+        version: 1,
+        type: "action_result",
+        sequence: 1,
+        actionId: action.actionId,
+        actionKind: "fill",
+        outcome: "succeeded",
+        result: { value: "approved" },
+        page: {
+          url: "https://gate.invalid/form",
+          title: "Gate fixture",
+          snapshotExcerpt: "textbox gate-marker value=approved",
+        },
+      };
+      record.state = "succeeded";
+      return structuredClone(record.observation);
     },
 
     snapshot() {
