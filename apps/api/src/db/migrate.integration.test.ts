@@ -11,9 +11,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Client } from "pg";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  toDurableBrowserActivityInsert,
+  toDurableBrowserSessionInsert,
+} from "../lib/browser-state/legacy-compatibility";
 import { runApplicationMigrations } from "./migrate";
+import { browser_session_activities, browser_sessions } from "./schema/public";
 
 const databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
 const describeWithDatabase = databaseUrl ? describe : describe.skip;
@@ -90,6 +96,15 @@ const browserFoundationTables = [
   "browser_replay_checkpoints",
   "browser_capabilities",
   "browser_proxy_grants",
+];
+
+const browserRequestIndexes = [
+  "browser_sessions_request_id_idx",
+  "browser_session_activities_request_id_idx",
+  "browser_interact_runs_request_id_idx",
+  "browser_interact_actions_request_id_idx",
+  "browser_replay_envelopes_request_id_idx",
+  "browser_replay_checkpoints_request_id_idx",
 ];
 
 async function insertEveryOperationalChildBeforeParent(
@@ -415,6 +430,120 @@ describeWithDatabase("application migrations", () => {
     );
   });
 
+  it("indexes every growing browser table that cascades by request", async () => {
+    const indexes = await client.query<{ indexname: string }>(
+      `SELECT indexname
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = ANY($1::text[])
+        ORDER BY indexname`,
+      [browserRequestIndexes],
+    );
+    expect(indexes.rows.map(row => row.indexname)).toEqual(
+      [...browserRequestIndexes].sort(),
+    );
+
+    const redundantTokenIndexes = await client.query<{ indexname: string }>(
+      `SELECT indexname
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = ANY($1::text[])
+        ORDER BY indexname`,
+      [
+        [
+          "browser_capabilities_token_hash_idx",
+          "browser_proxy_grants_token_hash_idx",
+        ],
+      ],
+    );
+    expect(redundantTokenIndexes.rows).toEqual([]);
+  });
+
+  it("maps legacy browser writers to valid durable rows", async () => {
+    const sessionId = randomUUID();
+    const now = new Date("2026-07-20T22:00:00.000Z");
+    await client.query(
+      `INSERT INTO requests
+         (id, kind, api_version, team_id, origin, target_hint)
+       VALUES ($1, 'browser', 'v2', $2, 'test', 'legacy browser writer')`,
+      [sessionId, ownerId],
+    );
+
+    const database = drizzle({ client });
+    await database.insert(browser_sessions).values(
+      toDurableBrowserSessionInsert(
+        {
+          id: sessionId,
+          team_id: ownerId,
+          browser_id: "legacy-browser-id",
+          workspace_id: "",
+          context_id: "",
+          cdp_url: "ws://browser.example/cdp",
+          cdp_path: "/view",
+          cdp_interactive_path: "/interactive",
+          stream_web_view: false,
+          status: "active",
+          ttl_total: 300,
+          ttl_without_activity: 60,
+          credits_used: null,
+          created_at: now.toISOString(),
+          updated_at: now.toISOString(),
+        },
+        now,
+      ),
+    );
+    await database.insert(browser_session_activities).values(
+      toDurableBrowserActivityInsert({
+        team_id: ownerId,
+        session_id: sessionId,
+        source: "browser",
+        language: "javascript",
+        timeout: 10_000,
+        exit_code: 0,
+        killed: false,
+        created_at: now.toISOString(),
+      }),
+    );
+
+    const result = await client.query(
+      `SELECT session.request_id,
+              session.owner_id,
+              session.runtime_epoch,
+              session.replay_version,
+              session.state,
+              session.absolute_deadline_at,
+              session.idle_deadline_at,
+              activity.request_id AS activity_request_id,
+              activity.owner_id AS activity_owner_id,
+              activity.mode,
+              activity.timeout_ms,
+              activity.correlation_id
+         FROM browser_sessions AS session
+         JOIN browser_session_activities AS activity
+           ON activity.session_id = session.id
+        WHERE session.id = $1`,
+      [sessionId],
+    );
+    expect(result.rows).toEqual([
+      {
+        request_id: sessionId,
+        owner_id: ownerId,
+        runtime_epoch: 1,
+        replay_version: 1,
+        state: "ready",
+        absolute_deadline_at: new Date(now.getTime() + 300_000),
+        idle_deadline_at: new Date(now.getTime() + 60_000),
+        activity_request_id: sessionId,
+        activity_owner_id: ownerId,
+        mode: "browser_operation",
+        timeout_ms: 10_000,
+        correlation_id: sessionId,
+      },
+    ]);
+
+    await client.query("DELETE FROM requests WHERE id = $1", [sessionId]);
+  });
+
   it("enforces browser identity, action, checksum, and cascade contracts", async () => {
     const fixture = {
       ownerId,
@@ -580,6 +709,7 @@ describeWithDatabase("application migrations", () => {
         `UPDATE browser_sessions SET current_run_id = $2 WHERE id = $1`,
         [fixture.sessionId, fixture.runId],
       );
+      await client.query("SET CONSTRAINTS ALL IMMEDIATE");
 
       await expect(
         client.query(
@@ -698,6 +828,29 @@ describeWithDatabase("application migrations", () => {
         checksum,
       ],
     );
+
+    for (const [statement, targetId, constraint] of [
+      [
+        "UPDATE browser_profiles SET latest_generation_id = $2 WHERE id = $1",
+        fixture.profileId,
+        "browser_profiles_latest_generation_fk",
+      ],
+      [
+        "UPDATE browser_sessions SET current_run_id = $2 WHERE id = $1",
+        fixture.sessionId,
+        "browser_sessions_current_run_fk",
+      ],
+    ]) {
+      await client.query("BEGIN");
+      try {
+        await client.query(statement, [targetId, randomUUID()]);
+        await expect(
+          client.query(`SET CONSTRAINTS ${constraint} IMMEDIATE`),
+        ).rejects.toMatchObject({ code: "23503" });
+      } finally {
+        await client.query("ROLLBACK");
+      }
+    }
     await client.query(
       `INSERT INTO browser_capabilities
          (id, token_hash, owner_id, session_id, run_id,

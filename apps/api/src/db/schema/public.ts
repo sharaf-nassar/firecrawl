@@ -228,6 +228,7 @@ export const browser_replay_envelopes = pgTable(
       "browser_replay_envelopes_navigation_policy_version_check",
       sql`${table.navigation_policy_version} = 1`,
     ),
+    index("browser_replay_envelopes_request_id_idx").on(table.request_id),
   ],
 );
 
@@ -270,6 +271,7 @@ export const browser_replay_checkpoints = pgTable(
       sql`${table.byte_size} >= 0`,
     ),
     index("browser_replay_checkpoints_expires_at_idx").on(table.expires_at),
+    index("browser_replay_checkpoints_request_id_idx").on(table.request_id),
   ],
 );
 
@@ -279,12 +281,10 @@ export const browser_sessions = pgTable(
     id: uuid("id").primaryKey(),
     request_id: uuid("request_id")
       .notNull()
-      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" })
-      .$defaultFn(() => ""),
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" }),
     owner_id: uuid("owner_id")
       .notNull()
-      .references(() => local_owners.id, { onDelete: "cascade" })
-      .$defaultFn(() => ""),
+      .references(() => local_owners.id, { onDelete: "cascade" }),
     scrape_id: uuid("scrape_id").references((): AnyPgColumn => scrapes.id, {
       onDelete: "cascade",
     }),
@@ -299,15 +299,9 @@ export const browser_sessions = pgTable(
     ),
     replay_version: integer("replay_version").notNull().default(1),
     state: text("state").notNull().default("creating"),
-    absolute_deadline_at: ts("absolute_deadline_at")
-      .notNull()
-      .$defaultFn(() => new Date().toISOString()),
-    idle_deadline_at: ts("idle_deadline_at")
-      .notNull()
-      .$defaultFn(() => new Date().toISOString()),
-    last_activity_at: ts("last_activity_at")
-      .notNull()
-      .$defaultFn(() => new Date().toISOString()),
+    absolute_deadline_at: ts("absolute_deadline_at").notNull(),
+    idle_deadline_at: ts("idle_deadline_at").notNull(),
+    last_activity_at: ts("last_activity_at").notNull(),
     current_run_id: uuid("current_run_id").references(
       (): AnyPgColumn => browser_interact_runs.id,
       { onDelete: "set null" },
@@ -353,6 +347,7 @@ export const browser_sessions = pgTable(
       sql`${table.prompt_credits_used} >= 0`,
     ),
     index("browser_sessions_owner_state_idx").on(table.owner_id, table.state),
+    index("browser_sessions_request_id_idx").on(table.request_id),
     index("browser_sessions_scrape_created_at_idx")
       .on(table.scrape_id, table.created_at.desc())
       .where(sql`${table.scrape_id} IS NOT NULL`),
@@ -416,6 +411,7 @@ export const browser_interact_runs = pgTable(
       table.session_id,
       table.state,
     ),
+    index("browser_interact_runs_request_id_idx").on(table.request_id),
     index("browser_interact_runs_owner_state_idx").on(
       table.owner_id,
       table.state,
@@ -495,6 +491,7 @@ export const browser_interact_actions = pgTable(
       table.run_id,
       table.state,
     ),
+    index("browser_interact_actions_request_id_idx").on(table.request_id),
     index("browser_interact_actions_session_state_idx").on(
       table.session_id,
       table.state,
@@ -517,12 +514,10 @@ export const browser_session_activities = pgTable(
     id: bigintNum("id").primaryKey().generatedAlwaysAsIdentity(),
     request_id: uuid("request_id")
       .notNull()
-      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" })
-      .$defaultFn(() => ""),
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" }),
     owner_id: uuid("owner_id")
       .notNull()
-      .references(() => local_owners.id, { onDelete: "cascade" })
-      .$defaultFn(() => ""),
+      .references(() => local_owners.id, { onDelete: "cascade" }),
     session_id: uuid("session_id")
       .notNull()
       .references(() => browser_sessions.id, { onDelete: "cascade" }),
@@ -536,9 +531,7 @@ export const browser_session_activities = pgTable(
     killed: boolean("killed").notNull().default(false),
     kill_reason: text("kill_reason"),
     source: text("source").notNull().default("browser"),
-    correlation_id: uuid("correlation_id")
-      .notNull()
-      .$defaultFn(() => ""),
+    correlation_id: uuid("correlation_id").notNull(),
     created_at: ts("created_at").notNull().defaultNow(),
     completed_at: ts("completed_at"),
     team_id: text("team_id"),
@@ -557,6 +550,7 @@ export const browser_session_activities = pgTable(
       table.session_id,
       table.created_at.desc(),
     ),
+    index("browser_session_activities_request_id_idx").on(table.request_id),
   ],
 );
 
@@ -627,7 +621,6 @@ export const browser_capabilities = pgTable(
       "browser_capabilities_per_operation_timeout_ms_check",
       sql`${table.per_operation_timeout_ms} > 0`,
     ),
-    index("browser_capabilities_token_hash_idx").on(table.token_hash),
     index("browser_capabilities_expires_at_idx").on(table.expires_at),
   ],
 );
@@ -666,7 +659,6 @@ export const browser_proxy_grants = pgTable(
       "browser_proxy_grants_uses_check",
       sql`${table.uses} >= 0 AND ${table.uses} <= ${table.use_limit}`,
     ),
-    index("browser_proxy_grants_token_hash_idx").on(table.token_hash),
     index("browser_proxy_grants_expires_at_idx").on(table.expires_at),
   ],
 );

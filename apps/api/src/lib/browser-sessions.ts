@@ -3,32 +3,16 @@ import { deleteKey, getValue, setValue } from "../services/redis";
 import { db } from "../db/connection";
 import * as schema from "../db/schema";
 import { logger as _logger } from "./logger";
+import {
+  toDurableBrowserSessionInsert,
+  type LegacyBrowserSessionRow as BrowserSessionRow,
+  type LegacyBrowserSessionStatus as BrowserSessionStatus,
+} from "./browser-state/legacy-compatibility";
 
 const logger = _logger.child({ module: "browser-sessions" });
 
 function activeBrowserCountKey(teamId: string): string {
   return `browser_sessions:active_count:${teamId}`;
-}
-
-type BrowserSessionStatus = "active" | "destroyed" | "error";
-
-interface BrowserSessionRow {
-  id: string;
-  team_id: string;
-  scrape_id?: string | null; // linked scrape job id for /scrape/:jobId/interact sessions
-  browser_id: string; // browser service sessionId
-  workspace_id: string; // unused (legacy), stored as ""
-  context_id: string; // unused (legacy), stored as ""
-  cdp_url: string; // full CDP WebSocket URL from browser service
-  cdp_path: string; // repurposed: stores the view WebSocket URL
-  cdp_interactive_path: string; // repurposed: stores the interactive view WebSocket URL
-  stream_web_view: boolean;
-  status: BrowserSessionStatus;
-  ttl_total: number;
-  ttl_without_activity: number | null;
-  credits_used: number | null;
-  created_at: string; // ISO timestamp
-  updated_at: string; // ISO timestamp
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +35,7 @@ export async function insertBrowserSession(
     try {
       const [data] = await db
         .insert(schema.browser_sessions)
-        .values(full)
+        .values(toDurableBrowserSessionInsert(full, new Date(now)))
         .returning();
 
       return data as BrowserSessionRow;

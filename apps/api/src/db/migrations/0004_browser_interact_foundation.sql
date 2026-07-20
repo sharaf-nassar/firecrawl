@@ -253,6 +253,8 @@ CREATE INDEX browser_profile_generations_expires_at_idx
   WHERE expires_at IS NOT NULL;
 CREATE INDEX browser_sessions_owner_state_idx
   ON browser_sessions (owner_id, state);
+CREATE INDEX browser_sessions_request_id_idx
+  ON browser_sessions (request_id);
 CREATE INDEX browser_sessions_scrape_created_at_idx
   ON browser_sessions (scrape_id, created_at DESC)
   WHERE scrape_id IS NOT NULL;
@@ -262,6 +264,8 @@ CREATE INDEX browser_sessions_absolute_deadline_at_idx
   ON browser_sessions (absolute_deadline_at);
 CREATE INDEX browser_interact_runs_session_state_idx
   ON browser_interact_runs (session_id, state);
+CREATE INDEX browser_interact_runs_request_id_idx
+  ON browser_interact_runs (request_id);
 CREATE INDEX browser_interact_runs_owner_state_idx
   ON browser_interact_runs (owner_id, state);
 CREATE INDEX browser_interact_runs_scrape_queued_at_idx
@@ -271,6 +275,8 @@ CREATE INDEX browser_interact_runs_deadline_at_idx
   ON browser_interact_runs (deadline_at);
 CREATE INDEX browser_interact_actions_run_state_idx
   ON browser_interact_actions (run_id, state);
+CREATE INDEX browser_interact_actions_request_id_idx
+  ON browser_interact_actions (request_id);
 CREATE INDEX browser_interact_actions_session_state_idx
   ON browser_interact_actions (session_id, state);
 CREATE INDEX browser_interact_actions_run_sequence_state_idx
@@ -279,13 +285,15 @@ CREATE INDEX browser_interact_actions_action_hash_idx
   ON browser_interact_actions (action_id, proposal_hash);
 CREATE INDEX browser_replay_checkpoints_expires_at_idx
   ON browser_replay_checkpoints (expires_at);
-CREATE INDEX browser_capabilities_token_hash_idx
-  ON browser_capabilities (token_hash);
+CREATE INDEX browser_replay_envelopes_request_id_idx
+  ON browser_replay_envelopes (request_id);
+CREATE INDEX browser_replay_checkpoints_request_id_idx
+  ON browser_replay_checkpoints (request_id);
 CREATE INDEX browser_capabilities_expires_at_idx
   ON browser_capabilities (expires_at);
-CREATE INDEX browser_proxy_grants_token_hash_idx
-  ON browser_proxy_grants (token_hash);
 CREATE INDEX browser_proxy_grants_expires_at_idx
   ON browser_proxy_grants (expires_at);
 CREATE INDEX browser_session_activities_session_created_at_idx
   ON browser_session_activities (session_id, created_at DESC);
+CREATE INDEX browser_session_activities_request_id_idx
+  ON browser_session_activities (request_id);
