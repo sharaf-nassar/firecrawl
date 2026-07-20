@@ -32,6 +32,7 @@ const preflightFilename = "0002_preflight_orphan_webhooks.sql";
 const retentionFkFilename = "0002_retention_foreign_keys.sql";
 const resolvedWebhookDeadlineFilename =
   "0003_resolved_placeholder_webhook_deadlines.sql";
+const browserInteractFilename = "0004_browser_interact_foundation.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -76,6 +77,19 @@ const directConsumerTables = [
   "deterministic_json_scripts",
   "deterministic_json_llm_cache",
   "webhook_logs",
+];
+
+const browserFoundationTables = [
+  "browser_sessions",
+  "browser_session_activities",
+  "browser_interact_runs",
+  "browser_interact_actions",
+  "browser_profiles",
+  "browser_profile_generations",
+  "browser_replay_envelopes",
+  "browser_replay_checkpoints",
+  "browser_capabilities",
+  "browser_proxy_grants",
 ];
 
 async function insertEveryOperationalChildBeforeParent(
@@ -174,6 +188,7 @@ describeWithDatabase("application migrations", () => {
       preflightFilename,
       retentionFkFilename,
       resolvedWebhookDeadlineFilename,
+      browserInteractFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
       true,
@@ -384,6 +399,7 @@ describeWithDatabase("application migrations", () => {
       ...foundationTables,
       ...operationalTables,
       ...directConsumerTables,
+      ...browserFoundationTables,
     ];
     const tables = await client.query<{ tablename: string }>(
       `SELECT tablename
@@ -396,6 +412,468 @@ describeWithDatabase("application migrations", () => {
 
     expect(tables.rows.map(row => row.tablename)).toEqual(
       requiredTables.sort(),
+    );
+  });
+
+  it("enforces browser identity, action, checksum, and cascade contracts", async () => {
+    const fixture = {
+      ownerId,
+      requestId: randomUUID(),
+      scrapeId: randomUUID(),
+      profileId: randomUUID(),
+      generationId: randomUUID(),
+      checkpointId: randomUUID(),
+      sessionId: randomUUID(),
+      runId: randomUUID(),
+      actionRowId: randomUUID(),
+      actionId: randomUUID(),
+      capabilityId: randomUUID(),
+      grantId: randomUUID(),
+    };
+    const checksum = "a".repeat(64);
+
+    await client.query("BEGIN");
+    try {
+      await client.query(
+        `INSERT INTO requests
+           (id, kind, api_version, team_id, origin, target_hint)
+         VALUES ($1, 'scrape', 'v2', $2, 'test', 'browser migration')`,
+        [fixture.requestId, fixture.ownerId],
+      );
+      await client.query(
+        `INSERT INTO scrapes
+           (id, request_id, url, is_successful, time_taken, team_id,
+            credits_cost)
+         VALUES ($1, $2, 'https://example.com/browser', true, 1, $3, 1)`,
+        [fixture.scrapeId, fixture.requestId, fixture.ownerId],
+      );
+      await client.query(
+        `INSERT INTO browser_profiles (id, owner_id, name)
+         VALUES ($1, $2, 'default')`,
+        [fixture.profileId, fixture.ownerId],
+      );
+      await client.query(
+        `INSERT INTO browser_profile_generations
+           (id, profile_id, generation, state_path, byte_size, checksum)
+         VALUES ($1, $2, 1, 'profiles/default/1.json', 10, $3)`,
+        [fixture.generationId, fixture.profileId, checksum],
+      );
+      await client.query(
+        `INSERT INTO browser_replay_envelopes
+           (scrape_id, request_id, owner_id, version,
+            navigation_policy_version, envelope)
+         VALUES ($1, $2, $3, 1, 1, '{}')`,
+        [fixture.scrapeId, fixture.requestId, fixture.ownerId],
+      );
+      await client.query(
+        `INSERT INTO browser_replay_checkpoints
+           (id, scrape_id, request_id, owner_id, envelope_version,
+            state_path, final_url, fingerprint, checksum, byte_size,
+            expires_at)
+         VALUES ($1, $2, $3, $4, 1, 'replays/state.json',
+                 'https://example.com/browser', '{}', $5, 10,
+                 now() + interval '1 day')`,
+        [
+          fixture.checkpointId,
+          fixture.scrapeId,
+          fixture.requestId,
+          fixture.ownerId,
+          checksum,
+        ],
+      );
+      await client.query(
+        `INSERT INTO browser_sessions
+           (id, request_id, owner_id, scrape_id, browser_id, runtime_epoch,
+            profile_id, profile_generation_id, replay_version, state,
+            absolute_deadline_at, idle_deadline_at, last_activity_at)
+         VALUES ($1, $2, $3, $4, 'browser-1', 1, $5, $6, 1, 'ready',
+                 now() + interval '1 hour', now() + interval '5 minutes',
+                 now())`,
+        [
+          fixture.sessionId,
+          fixture.requestId,
+          fixture.ownerId,
+          fixture.scrapeId,
+          fixture.profileId,
+          fixture.generationId,
+        ],
+      );
+      await client.query(
+        `INSERT INTO browser_interact_runs
+           (id, request_id, owner_id, session_id, scrape_id, mode, state,
+            model, reasoning_effort, deadline_at, correlation_id)
+         VALUES ($1, $2, $3, $4, $5, 'prompt', 'running',
+                 'gpt-5.6-terra', 'medium', now() + interval '1 minute', $6)`,
+        [
+          fixture.runId,
+          fixture.requestId,
+          fixture.ownerId,
+          fixture.sessionId,
+          fixture.scrapeId,
+          randomUUID(),
+        ],
+      );
+      await client.query(
+        `INSERT INTO browser_interact_actions
+           (id, request_id, owner_id, run_id, session_id, adapter_job_id,
+            action_id, sequence, proposal_hash, effect, operation, state)
+         VALUES ($1, $2, $3, $4, $5, 'adapter-job-1', $6, 1, $7,
+                 'side_effecting', '{"kind":"click","ref":"a"}',
+                 'prepared')`,
+        [
+          fixture.actionRowId,
+          fixture.requestId,
+          fixture.ownerId,
+          fixture.runId,
+          fixture.sessionId,
+          fixture.actionId,
+          checksum,
+        ],
+      );
+      await client.query(
+        `INSERT INTO browser_capabilities
+           (id, token_hash, owner_id, session_id, run_id,
+            adapter_process_id, operations, origins,
+            navigation_policy_version, call_limit, byte_limit,
+            wall_deadline_at, per_operation_timeout_ms, expires_at)
+         VALUES ($1, $2, $3, $4, $5, 42, '["click"]',
+                 '["https://example.com"]', 1, 25, 1048576,
+                 now() + interval '1 minute', 10000,
+                 now() + interval '1 minute')`,
+        [
+          fixture.capabilityId,
+          "b".repeat(64),
+          fixture.ownerId,
+          fixture.sessionId,
+          fixture.runId,
+        ],
+      );
+      await client.query(
+        `INSERT INTO browser_proxy_grants
+           (id, token_hash, owner_id, session_id, permission, use_limit,
+            expires_at)
+         VALUES ($1, $2, $3, $4, 'interactive', 5,
+                 now() + interval '1 minute')`,
+        [fixture.grantId, "c".repeat(64), fixture.ownerId, fixture.sessionId],
+      );
+      await client.query(
+        `INSERT INTO browser_session_activities
+           (request_id, owner_id, session_id, run_id, mode, language,
+            timeout_ms, source, correlation_id)
+         VALUES ($1, $2, $3, $4, 'prompt', 'javascript', 60000,
+                 'browser', $5)`,
+        [
+          fixture.requestId,
+          fixture.ownerId,
+          fixture.sessionId,
+          fixture.runId,
+          randomUUID(),
+        ],
+      );
+      await client.query(
+        `UPDATE browser_profiles
+            SET latest_generation_id = $2, writer_session_id = $3
+          WHERE id = $1`,
+        [fixture.profileId, fixture.generationId, fixture.sessionId],
+      );
+      await client.query(
+        `UPDATE browser_sessions SET current_run_id = $2 WHERE id = $1`,
+        [fixture.sessionId, fixture.runId],
+      );
+
+      await expect(
+        client.query(
+          `INSERT INTO browser_profiles (id, owner_id, name)
+           VALUES (gen_random_uuid(), $1, 'default')`,
+          [fixture.ownerId],
+        ),
+      ).rejects.toMatchObject({ code: "23505" });
+      await client.query("ROLLBACK");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
+
+    const isolatedCheck = async (statement: string, values: unknown[]) => {
+      await client.query("BEGIN");
+      try {
+        await expect(client.query(statement, values)).rejects.toMatchObject({
+          code: expect.stringMatching(/^(23505|23514)$/),
+        });
+      } finally {
+        await client.query("ROLLBACK");
+      }
+    };
+
+    await client.query(
+      `INSERT INTO requests
+         (id, kind, api_version, team_id, origin, target_hint)
+       VALUES ($1, 'scrape', 'v2', $2, 'test', 'browser migration')`,
+      [fixture.requestId, fixture.ownerId],
+    );
+    await client.query(
+      `INSERT INTO scrapes
+         (id, request_id, url, is_successful, time_taken, team_id,
+          credits_cost)
+       VALUES ($1, $2, 'https://example.com/browser', true, 1, $3, 1)`,
+      [fixture.scrapeId, fixture.requestId, fixture.ownerId],
+    );
+    await client.query(
+      `INSERT INTO browser_profiles (id, owner_id, name)
+       VALUES ($1, $2, 'default')`,
+      [fixture.profileId, fixture.ownerId],
+    );
+    await client.query(
+      `INSERT INTO browser_profile_generations
+         (id, profile_id, generation, byte_size, checksum)
+       VALUES ($1, $2, 1, 10, $3)`,
+      [fixture.generationId, fixture.profileId, checksum],
+    );
+    await client.query(
+      `INSERT INTO browser_replay_envelopes
+         (scrape_id, request_id, owner_id, version,
+          navigation_policy_version, envelope)
+       VALUES ($1, $2, $3, 1, 1, '{}')`,
+      [fixture.scrapeId, fixture.requestId, fixture.ownerId],
+    );
+    await client.query(
+      `INSERT INTO browser_replay_checkpoints
+         (id, scrape_id, request_id, owner_id, envelope_version, final_url,
+          fingerprint, checksum, byte_size, expires_at)
+       VALUES ($1, $2, $3, $4, 1, 'https://example.com', '{}', $5, 10,
+               now() + interval '1 day')`,
+      [
+        fixture.checkpointId,
+        fixture.scrapeId,
+        fixture.requestId,
+        fixture.ownerId,
+        checksum,
+      ],
+    );
+    await client.query(
+      `INSERT INTO browser_sessions
+         (id, request_id, owner_id, scrape_id, runtime_epoch, profile_id,
+          profile_generation_id, replay_version, state,
+          absolute_deadline_at, idle_deadline_at, last_activity_at)
+       VALUES ($1, $2, $3, $4, 1, $5, $6, 1, 'ready',
+               now() + interval '1 hour', now() + interval '5 minutes',
+               now())`,
+      [
+        fixture.sessionId,
+        fixture.requestId,
+        fixture.ownerId,
+        fixture.scrapeId,
+        fixture.profileId,
+        fixture.generationId,
+      ],
+    );
+    await client.query(
+      `INSERT INTO browser_interact_runs
+         (id, request_id, owner_id, session_id, scrape_id, mode, state,
+          model, reasoning_effort, deadline_at, correlation_id)
+       VALUES ($1, $2, $3, $4, $5, 'prompt', 'running', 'gpt-5.6-terra',
+               'medium', now() + interval '1 minute', $6)`,
+      [
+        fixture.runId,
+        fixture.requestId,
+        fixture.ownerId,
+        fixture.sessionId,
+        fixture.scrapeId,
+        randomUUID(),
+      ],
+    );
+    await client.query(
+      `INSERT INTO browser_interact_actions
+         (id, request_id, owner_id, run_id, session_id, adapter_job_id,
+          action_id, sequence, proposal_hash, effect, operation, state)
+       VALUES ($1, $2, $3, $4, $5, 'adapter-job-1', $6, 1, $7,
+               'side_effecting', '{}', 'prepared')`,
+      [
+        fixture.actionRowId,
+        fixture.requestId,
+        fixture.ownerId,
+        fixture.runId,
+        fixture.sessionId,
+        fixture.actionId,
+        checksum,
+      ],
+    );
+    await client.query(
+      `INSERT INTO browser_capabilities
+         (id, token_hash, owner_id, session_id, run_id,
+          adapter_process_id, operations, origins,
+          navigation_policy_version, call_limit, byte_limit,
+          wall_deadline_at, per_operation_timeout_ms, expires_at)
+       VALUES ($1, $2, $3, $4, $5, 42, '["click"]',
+               '["https://example.com"]', 1, 25, 1048576,
+               now() + interval '1 minute', 10000,
+               now() + interval '1 minute')`,
+      [
+        fixture.capabilityId,
+        "b".repeat(64),
+        fixture.ownerId,
+        fixture.sessionId,
+        fixture.runId,
+      ],
+    );
+    await client.query(
+      `INSERT INTO browser_proxy_grants
+         (id, token_hash, owner_id, session_id, permission, use_limit,
+          expires_at)
+       VALUES ($1, $2, $3, $4, 'interactive', 5,
+               now() + interval '1 minute')`,
+      [fixture.grantId, "c".repeat(64), fixture.ownerId, fixture.sessionId],
+    );
+    await client.query(
+      `INSERT INTO browser_session_activities
+         (request_id, owner_id, session_id, run_id, mode, language,
+          timeout_ms, source, correlation_id)
+       VALUES ($1, $2, $3, $4, 'prompt', 'javascript', 60000,
+               'browser', $5)`,
+      [
+        fixture.requestId,
+        fixture.ownerId,
+        fixture.sessionId,
+        fixture.runId,
+        randomUUID(),
+      ],
+    );
+
+    await isolatedCheck(
+      `INSERT INTO browser_interact_actions
+         (id, request_id, owner_id, run_id, session_id, adapter_job_id,
+          action_id, sequence, proposal_hash, effect, operation, state)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, 'adapter-job-1',
+               gen_random_uuid(), 1, $5, 'read_only', '{}', 'prepared')`,
+      [
+        fixture.requestId,
+        fixture.ownerId,
+        fixture.runId,
+        fixture.sessionId,
+        "d".repeat(64),
+      ],
+    );
+    await isolatedCheck(
+      `INSERT INTO browser_interact_actions
+         (id, request_id, owner_id, run_id, session_id, adapter_job_id,
+          action_id, sequence, proposal_hash, effect, operation, state)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, 'adapter-job-1', $5, 2,
+               $6, 'read_only', '{}', 'prepared')`,
+      [
+        fixture.requestId,
+        fixture.ownerId,
+        fixture.runId,
+        fixture.sessionId,
+        fixture.actionId,
+        "d".repeat(64),
+      ],
+    );
+    for (const [column, value] of [
+      ["state", "invalid"],
+      ["effect", "invalid"],
+      ["proposal_hash", "NOT-SHA-256"],
+    ]) {
+      await isolatedCheck(
+        `INSERT INTO browser_interact_actions
+           (id, request_id, owner_id, run_id, session_id, adapter_job_id,
+            action_id, sequence, proposal_hash, effect, operation, state)
+         SELECT gen_random_uuid(), $1, $2, $3, $4, 'adapter-job-1',
+                gen_random_uuid(), 2,
+                ${column === "proposal_hash" ? "$5" : `'${checksum}'`},
+                ${column === "effect" ? "$5" : "'read_only'"}, '{}',
+                ${column === "state" ? "$5" : "'prepared'"}`,
+        [
+          fixture.requestId,
+          fixture.ownerId,
+          fixture.runId,
+          fixture.sessionId,
+          value,
+        ],
+      );
+    }
+    const secondProfileId = randomUUID();
+    await client.query(
+      `INSERT INTO browser_profiles (id, owner_id, name)
+       VALUES ($1, $2, 'secondary')`,
+      [secondProfileId, fixture.ownerId],
+    );
+    await client.query(
+      `UPDATE browser_profiles SET writer_session_id = $2 WHERE id = $1`,
+      [fixture.profileId, fixture.sessionId],
+    );
+    await isolatedCheck(
+      "UPDATE browser_profiles SET writer_session_id = $2 WHERE id = $1",
+      [secondProfileId, fixture.sessionId],
+    );
+
+    await client.query(
+      `INSERT INTO local_artifacts
+         (object_key, owner_id, request_id, kind, content_type, byte_size,
+          checksum)
+       VALUES ('legacy-null-checksum', $1, $2, 'legacy', 'text/plain', 1,
+               NULL)`,
+      [fixture.ownerId, fixture.requestId],
+    );
+    await isolatedCheck(
+      `INSERT INTO local_artifacts
+         (object_key, owner_id, request_id, kind, content_type, byte_size,
+          checksum)
+       VALUES ('invalid-browser-checksum', $1, $2, 'browser',
+               'application/json', 1, 'ABC')`,
+      [fixture.ownerId, fixture.requestId],
+    );
+
+    await client.query("DELETE FROM requests WHERE id = $1", [
+      fixture.requestId,
+    ]);
+    const cascaded = await client.query(
+      `SELECT
+         (SELECT count(*) FROM browser_sessions WHERE id = $1)::text
+           AS sessions,
+         (SELECT count(*) FROM browser_interact_runs WHERE id = $2)::text
+           AS runs,
+         (SELECT count(*) FROM browser_interact_actions WHERE id = $3)::text
+           AS actions,
+         (SELECT count(*) FROM browser_replay_envelopes
+           WHERE scrape_id = $4)::text AS envelopes,
+         (SELECT count(*) FROM browser_replay_checkpoints
+           WHERE scrape_id = $4)::text AS checkpoints,
+         (SELECT count(*) FROM browser_capabilities
+           WHERE session_id = $1)::text AS capabilities,
+         (SELECT count(*) FROM browser_proxy_grants
+           WHERE session_id = $1)::text AS grants,
+         (SELECT count(*) FROM browser_session_activities
+           WHERE session_id = $1)::text AS activities,
+         (SELECT count(*) FROM local_owners WHERE id = $5)::text AS owners,
+         (SELECT count(*) FROM browser_profiles
+           WHERE owner_id = $5)::text AS profiles`,
+      [
+        fixture.sessionId,
+        fixture.runId,
+        fixture.actionRowId,
+        fixture.scrapeId,
+        fixture.ownerId,
+      ],
+    );
+    expect(cascaded.rows).toEqual([
+      {
+        sessions: "0",
+        runs: "0",
+        actions: "0",
+        envelopes: "0",
+        checkpoints: "0",
+        capabilities: "0",
+        grants: "0",
+        activities: "0",
+        owners: "1",
+        profiles: "2",
+      },
+    ]);
+    await client.query("DELETE FROM browser_profiles WHERE owner_id = $1", [
+      fixture.ownerId,
+    ]);
+    await client.query(
+      "DELETE FROM local_artifacts WHERE object_key = 'legacy-null-checksum'",
     );
   });
 
@@ -792,6 +1270,10 @@ describeWithDatabase("application migrations", () => {
       await copyFile(
         join(__dirname, "migrations", resolvedWebhookDeadlineFilename),
         join(migrationsDirectory, resolvedWebhookDeadlineFilename),
+      );
+      await copyFile(
+        join(__dirname, "migrations", browserInteractFilename),
+        join(migrationsDirectory, browserInteractFilename),
       );
       await writeFile(
         join(migrationsDirectory, "0004_failure.sql"),

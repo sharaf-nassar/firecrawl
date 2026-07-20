@@ -13,6 +13,11 @@ import {
   timestamp,
   date,
   bytea,
+  check,
+  index,
+  unique,
+  uniqueIndex,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 
 const ts = (name: string) =>
@@ -94,40 +99,577 @@ export const blocklist_hits = pgTable("blocklist_hits", {
   created_at: ts("created_at").notNull().defaultNow(),
 });
 
+const local_owners = pgTable("local_owners", {
+  id: uuid("id").primaryKey(),
+  label: text("label").notNull(),
+  created_at: ts("created_at").notNull().defaultNow(),
+});
+
+/** @public Durable local artifact manifest used by browser-state storage. */
+export const local_artifacts = pgTable(
+  "local_artifacts",
+  {
+    object_key: text("object_key").primaryKey(),
+    owner_id: uuid("owner_id").notNull(),
+    request_id: uuid("request_id"),
+    job_id: uuid("job_id"),
+    kind: text("kind").notNull(),
+    content_type: text("content_type").notNull(),
+    byte_size: bigintNum("byte_size").notNull(),
+    checksum: text("checksum"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    delete_after: ts("delete_after"),
+  },
+  table => [
+    check(
+      "local_artifacts_checksum_check",
+      sql`${table.checksum} IS NULL OR ${table.checksum} ~ '^[a-f0-9]{64}$'`,
+    ),
+  ],
+);
+
+/** @public Durable browser profile identity. */
+export const browser_profiles = pgTable(
+  "browser_profiles",
+  {
+    id: uuid("id").primaryKey(),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    latest_generation_id: uuid("latest_generation_id").references(
+      (): AnyPgColumn => browser_profile_generations.id,
+      { onDelete: "set null" },
+    ),
+    writer_session_id: uuid("writer_session_id").references(
+      (): AnyPgColumn => browser_sessions.id,
+      { onDelete: "set null" },
+    ),
+    retention_expires_at: ts("retention_expires_at"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+  },
+  table => [
+    unique("browser_profiles_owner_id_name_key").on(table.owner_id, table.name),
+    uniqueIndex("browser_profiles_writer_session_idx")
+      .on(table.writer_session_id)
+      .where(sql`${table.writer_session_id} IS NOT NULL`),
+    index("browser_profiles_owner_updated_idx").on(
+      table.owner_id,
+      table.updated_at.desc(),
+    ),
+    index("browser_profiles_retention_expires_at_idx")
+      .on(table.retention_expires_at)
+      .where(sql`${table.retention_expires_at} IS NOT NULL`),
+  ],
+);
+
+/** @public Immutable browser profile generation metadata. */
+export const browser_profile_generations = pgTable(
+  "browser_profile_generations",
+  {
+    id: uuid("id").primaryKey(),
+    profile_id: uuid("profile_id")
+      .notNull()
+      .references(() => browser_profiles.id, { onDelete: "cascade" }),
+    generation: integer("generation").notNull(),
+    state_path: text("state_path"),
+    byte_size: bigintNum("byte_size").notNull(),
+    checksum: text("checksum").notNull(),
+    committed_at: ts("committed_at").notNull().defaultNow(),
+    expires_at: ts("expires_at"),
+    file_deleted_at: ts("file_deleted_at"),
+  },
+  table => [
+    unique("browser_profile_generations_profile_id_generation_key").on(
+      table.profile_id,
+      table.generation,
+    ),
+    check(
+      "browser_profile_generations_generation_check",
+      sql`${table.generation} > 0`,
+    ),
+    check(
+      "browser_profile_generations_byte_size_check",
+      sql`${table.byte_size} >= 0`,
+    ),
+    check(
+      "browser_profile_generations_checksum_check",
+      sql`${table.checksum} ~ '^[a-f0-9]{64}$'`,
+    ),
+    index("browser_profile_generations_expires_at_idx")
+      .on(table.expires_at)
+      .where(sql`${table.expires_at} IS NOT NULL`),
+  ],
+);
+
+/** @public Durable scrape replay envelope. */
+export const browser_replay_envelopes = pgTable(
+  "browser_replay_envelopes",
+  {
+    scrape_id: uuid("scrape_id")
+      .primaryKey()
+      .references((): AnyPgColumn => scrapes.id, { onDelete: "cascade" }),
+    request_id: uuid("request_id")
+      .notNull()
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    navigation_policy_version: integer("navigation_policy_version").notNull(),
+    envelope: jsonb("envelope").notNull(),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+  },
+  table => [
+    check("browser_replay_envelopes_version_check", sql`${table.version} = 1`),
+    check(
+      "browser_replay_envelopes_navigation_policy_version_check",
+      sql`${table.navigation_policy_version} = 1`,
+    ),
+  ],
+);
+
+/** @public Durable browser replay checkpoint metadata. */
+export const browser_replay_checkpoints = pgTable(
+  "browser_replay_checkpoints",
+  {
+    id: uuid("id").primaryKey(),
+    scrape_id: uuid("scrape_id")
+      .notNull()
+      .unique()
+      .references((): AnyPgColumn => scrapes.id, { onDelete: "cascade" }),
+    request_id: uuid("request_id")
+      .notNull()
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    envelope_version: integer("envelope_version").notNull(),
+    state_path: text("state_path"),
+    final_url: text("final_url").notNull(),
+    fingerprint: jsonb("fingerprint").notNull(),
+    checksum: text("checksum").notNull(),
+    byte_size: bigintNum("byte_size").notNull(),
+    created_at: ts("created_at").notNull().defaultNow(),
+    expires_at: ts("expires_at").notNull(),
+    file_deleted_at: ts("file_deleted_at"),
+  },
+  table => [
+    check(
+      "browser_replay_checkpoints_envelope_version_check",
+      sql`${table.envelope_version} = 1`,
+    ),
+    check(
+      "browser_replay_checkpoints_checksum_check",
+      sql`${table.checksum} ~ '^[a-f0-9]{64}$'`,
+    ),
+    check(
+      "browser_replay_checkpoints_byte_size_check",
+      sql`${table.byte_size} >= 0`,
+    ),
+    index("browser_replay_checkpoints_expires_at_idx").on(table.expires_at),
+  ],
+);
+
+export const browser_sessions = pgTable(
+  "browser_sessions",
+  {
+    id: uuid("id").primaryKey(),
+    request_id: uuid("request_id")
+      .notNull()
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" })
+      .$defaultFn(() => ""),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" })
+      .$defaultFn(() => ""),
+    scrape_id: uuid("scrape_id").references((): AnyPgColumn => scrapes.id, {
+      onDelete: "cascade",
+    }),
+    browser_id: text("browser_id"),
+    runtime_epoch: integer("runtime_epoch").notNull().default(1),
+    profile_id: uuid("profile_id").references(() => browser_profiles.id, {
+      onDelete: "set null",
+    }),
+    profile_generation_id: uuid("profile_generation_id").references(
+      () => browser_profile_generations.id,
+      { onDelete: "set null" },
+    ),
+    replay_version: integer("replay_version").notNull().default(1),
+    state: text("state").notNull().default("creating"),
+    absolute_deadline_at: ts("absolute_deadline_at")
+      .notNull()
+      .$defaultFn(() => new Date().toISOString()),
+    idle_deadline_at: ts("idle_deadline_at")
+      .notNull()
+      .$defaultFn(() => new Date().toISOString()),
+    last_activity_at: ts("last_activity_at")
+      .notNull()
+      .$defaultFn(() => new Date().toISOString()),
+    current_run_id: uuid("current_run_id").references(
+      (): AnyPgColumn => browser_interact_runs.id,
+      { onDelete: "set null" },
+    ),
+    prompt_used: boolean("prompt_used").notNull().default(false),
+    credits_used: integer("credits_used").default(0),
+    prompt_credits_used: integer("prompt_credits_used").notNull().default(0),
+    stream_web_view: boolean("stream_web_view").notNull().default(false),
+    workspace_id: text("workspace_id"),
+    context_id: text("context_id"),
+    cdp_url: text("cdp_url"),
+    cdp_path: text("cdp_path"),
+    cdp_interactive_path: text("cdp_interactive_path"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+    terminal_at: ts("terminal_at"),
+    terminal_reason: text("terminal_reason"),
+    team_id: text("team_id"),
+    status: text("status").notNull().default("active"),
+    ttl_total: integer("ttl_total"),
+    ttl_without_activity: integer("ttl_without_activity"),
+    deleted_at: ts("deleted_at"),
+  },
+  table => [
+    check(
+      "browser_sessions_runtime_epoch_check",
+      sql`${table.runtime_epoch} > 0`,
+    ),
+    check(
+      "browser_sessions_replay_version_check",
+      sql`${table.replay_version} = 1`,
+    ),
+    check(
+      "browser_sessions_state_check",
+      sql`${table.state} IN ('creating', 'replaying', 'ready', 'executing', 'stopping', 'destroyed', 'expired', 'interrupted', 'error')`,
+    ),
+    check(
+      "browser_sessions_credits_used_check",
+      sql`${table.credits_used} >= 0`,
+    ),
+    check(
+      "browser_sessions_prompt_credits_used_check",
+      sql`${table.prompt_credits_used} >= 0`,
+    ),
+    index("browser_sessions_owner_state_idx").on(table.owner_id, table.state),
+    index("browser_sessions_scrape_created_at_idx")
+      .on(table.scrape_id, table.created_at.desc())
+      .where(sql`${table.scrape_id} IS NOT NULL`),
+    index("browser_sessions_idle_deadline_at_idx").on(table.idle_deadline_at),
+    index("browser_sessions_absolute_deadline_at_idx").on(
+      table.absolute_deadline_at,
+    ),
+  ],
+);
+
+/** @public Durable browser Interact run state. */
+export const browser_interact_runs = pgTable(
+  "browser_interact_runs",
+  {
+    id: uuid("id").primaryKey(),
+    request_id: uuid("request_id")
+      .notNull()
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    session_id: uuid("session_id")
+      .notNull()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    scrape_id: uuid("scrape_id").references((): AnyPgColumn => scrapes.id, {
+      onDelete: "cascade",
+    }),
+    mode: text("mode").notNull().default("prompt"),
+    state: text("state").notNull(),
+    language: text("language"),
+    model: text("model").notNull(),
+    reasoning_effort: text("reasoning_effort").notNull(),
+    deadline_at: ts("deadline_at").notNull(),
+    correlation_id: uuid("correlation_id").notNull(),
+    adapter_process_id: integer("adapter_process_id"),
+    cancelled_at: ts("cancelled_at"),
+    output_reference: jsonb("output_reference"),
+    artifact_references: jsonb("artifact_references")
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    error_category: text("error_category"),
+    error_detail: text("error_detail"),
+    queued_at: ts("queued_at").notNull().defaultNow(),
+    started_at: ts("started_at"),
+    finished_at: ts("finished_at"),
+  },
+  table => [
+    check(
+      "browser_interact_runs_mode_check",
+      sql`${table.mode} IN ('prompt', 'code', 'browser_operation', 'replay')`,
+    ),
+    check(
+      "browser_interact_runs_state_check",
+      sql`${table.state} IN ('queued', 'starting', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')`,
+    ),
+    check(
+      "browser_interact_runs_artifact_references_check",
+      sql`jsonb_typeof(${table.artifact_references}) = 'array'`,
+    ),
+    index("browser_interact_runs_session_state_idx").on(
+      table.session_id,
+      table.state,
+    ),
+    index("browser_interact_runs_owner_state_idx").on(
+      table.owner_id,
+      table.state,
+    ),
+    index("browser_interact_runs_scrape_queued_at_idx")
+      .on(table.scrape_id, table.queued_at.desc())
+      .where(sql`${table.scrape_id} IS NOT NULL`),
+    index("browser_interact_runs_deadline_at_idx").on(table.deadline_at),
+  ],
+);
+
+/** @public Execute-once browser action ledger. */
+export const browser_interact_actions = pgTable(
+  "browser_interact_actions",
+  {
+    id: uuid("id").primaryKey(),
+    request_id: uuid("request_id")
+      .notNull()
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    run_id: uuid("run_id")
+      .notNull()
+      .references(() => browser_interact_runs.id, { onDelete: "cascade" }),
+    session_id: uuid("session_id")
+      .notNull()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    adapter_job_id: text("adapter_job_id").notNull(),
+    action_id: uuid("action_id").notNull().unique(),
+    sequence: integer("sequence").notNull(),
+    proposal_hash: text("proposal_hash").notNull(),
+    effect: text("effect").notNull(),
+    operation: jsonb("operation").notNull(),
+    state: text("state").notNull(),
+    result: jsonb("result"),
+    page_state: jsonb("page_state"),
+    error_category: text("error_category"),
+    error_detail: text("error_detail"),
+    prepared_at: ts("prepared_at").notNull().defaultNow(),
+    executing_at: ts("executing_at"),
+    finished_at: ts("finished_at"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+  },
+  table => [
+    unique("browser_interact_actions_run_id_sequence_key").on(
+      table.run_id,
+      table.sequence,
+    ),
+    unique("browser_interact_actions_run_id_action_id_key").on(
+      table.run_id,
+      table.action_id,
+    ),
+    unique("browser_interact_actions_run_id_sequence_proposal_hash_key").on(
+      table.run_id,
+      table.sequence,
+      table.proposal_hash,
+    ),
+    check(
+      "browser_interact_actions_sequence_check",
+      sql`${table.sequence} BETWEEN 1 AND 25`,
+    ),
+    check(
+      "browser_interact_actions_proposal_hash_check",
+      sql`${table.proposal_hash} ~ '^[a-f0-9]{64}$'`,
+    ),
+    check(
+      "browser_interact_actions_effect_check",
+      sql`${table.effect} IN ('read_only', 'side_effecting')`,
+    ),
+    check(
+      "browser_interact_actions_state_check",
+      sql`${table.state} IN ('prepared', 'executing', 'succeeded', 'rejected_no_effect', 'failed_no_effect', 'cancelled_no_effect', 'outcome_unknown')`,
+    ),
+    index("browser_interact_actions_run_state_idx").on(
+      table.run_id,
+      table.state,
+    ),
+    index("browser_interact_actions_session_state_idx").on(
+      table.session_id,
+      table.state,
+    ),
+    index("browser_interact_actions_run_sequence_state_idx").on(
+      table.run_id,
+      table.sequence,
+      table.state,
+    ),
+    index("browser_interact_actions_action_hash_idx").on(
+      table.action_id,
+      table.proposal_hash,
+    ),
+  ],
+);
+
 export const browser_session_activities = pgTable(
   "browser_session_activities",
   {
-    id: bigintNum("id").notNull().generatedAlwaysAsIdentity(),
-    team_id: text("team_id").notNull(),
-    session_id: text("session_id").notNull(),
-    language: text("language").notNull(),
-    timeout: integer("timeout").notNull(),
+    id: bigintNum("id").primaryKey().generatedAlwaysAsIdentity(),
+    request_id: uuid("request_id")
+      .notNull()
+      .references((): AnyPgColumn => requests.id, { onDelete: "cascade" })
+      .$defaultFn(() => ""),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" })
+      .$defaultFn(() => ""),
+    session_id: uuid("session_id")
+      .notNull()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    run_id: uuid("run_id").references(() => browser_interact_runs.id, {
+      onDelete: "cascade",
+    }),
+    mode: text("mode").notNull().default("prompt"),
+    language: text("language"),
+    timeout_ms: integer("timeout_ms").notNull().default(1),
     exit_code: integer("exit_code"),
     killed: boolean("killed").notNull().default(false),
+    kill_reason: text("kill_reason"),
+    source: text("source").notNull().default("browser"),
+    correlation_id: uuid("correlation_id")
+      .notNull()
+      .$defaultFn(() => ""),
     created_at: ts("created_at").notNull().defaultNow(),
-    source: text("source").default("browser"),
+    completed_at: ts("completed_at"),
+    team_id: text("team_id"),
+    timeout: integer("timeout"),
   },
+  table => [
+    check(
+      "browser_session_activities_mode_check",
+      sql`${table.mode} IN ('prompt', 'code', 'browser_operation', 'replay')`,
+    ),
+    check(
+      "browser_session_activities_timeout_ms_check",
+      sql`${table.timeout_ms} > 0`,
+    ),
+    index("browser_session_activities_session_created_at_idx").on(
+      table.session_id,
+      table.created_at.desc(),
+    ),
+  ],
 );
 
-export const browser_sessions = pgTable("browser_sessions", {
-  id: uuid("id").notNull(),
-  team_id: text("team_id").notNull(),
-  browser_id: text("browser_id").notNull(),
-  workspace_id: text("workspace_id").notNull(),
-  context_id: text("context_id").notNull(),
-  cdp_url: text("cdp_url").notNull(),
-  cdp_path: text("cdp_path").notNull(),
-  stream_web_view: boolean("stream_web_view").notNull().default(false),
-  status: text("status").notNull().default("active"),
-  ttl_total: integer("ttl_total").notNull(),
-  ttl_without_activity: integer("ttl_without_activity"),
-  created_at: ts("created_at").notNull().defaultNow(),
-  updated_at: ts("updated_at").notNull().defaultNow(),
-  deleted_at: ts("deleted_at"),
-  credits_used: integer("credits_used"),
-  cdp_interactive_path: text("cdp_interactive_path"),
-  scrape_id: uuid("scrape_id"),
-});
+/** @public Hashed browser capability grants. */
+export const browser_capabilities = pgTable(
+  "browser_capabilities",
+  {
+    id: uuid("id").primaryKey(),
+    token_hash: text("token_hash").notNull().unique(),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    session_id: uuid("session_id")
+      .notNull()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    run_id: uuid("run_id")
+      .notNull()
+      .references(() => browser_interact_runs.id, { onDelete: "cascade" }),
+    adapter_process_id: integer("adapter_process_id").notNull(),
+    operations: jsonb("operations").notNull(),
+    origins: jsonb("origins").notNull(),
+    navigation_policy_version: integer("navigation_policy_version").notNull(),
+    call_limit: integer("call_limit").notNull(),
+    calls_used: integer("calls_used").notNull().default(0),
+    byte_limit: bigintNum("byte_limit").notNull(),
+    bytes_used: bigintNum("bytes_used").notNull().default(0),
+    wall_deadline_at: ts("wall_deadline_at").notNull(),
+    per_operation_timeout_ms: integer("per_operation_timeout_ms").notNull(),
+    issued_at: ts("issued_at").notNull().defaultNow(),
+    redeemed_at: ts("redeemed_at"),
+    revoked_at: ts("revoked_at"),
+    expires_at: ts("expires_at").notNull(),
+  },
+  table => [
+    check(
+      "browser_capabilities_token_hash_check",
+      sql`${table.token_hash} ~ '^[a-f0-9]{64}$'`,
+    ),
+    check(
+      "browser_capabilities_operations_check",
+      sql`jsonb_typeof(${table.operations}) = 'array'`,
+    ),
+    check(
+      "browser_capabilities_origins_check",
+      sql`jsonb_typeof(${table.origins}) = 'array'`,
+    ),
+    check(
+      "browser_capabilities_navigation_policy_version_check",
+      sql`${table.navigation_policy_version} = 1`,
+    ),
+    check(
+      "browser_capabilities_call_limit_check",
+      sql`${table.call_limit} > 0`,
+    ),
+    check(
+      "browser_capabilities_calls_used_check",
+      sql`${table.calls_used} >= 0 AND ${table.calls_used} <= ${table.call_limit}`,
+    ),
+    check(
+      "browser_capabilities_byte_limit_check",
+      sql`${table.byte_limit} >= 0`,
+    ),
+    check(
+      "browser_capabilities_bytes_used_check",
+      sql`${table.bytes_used} >= 0 AND ${table.bytes_used} <= ${table.byte_limit}`,
+    ),
+    check(
+      "browser_capabilities_per_operation_timeout_ms_check",
+      sql`${table.per_operation_timeout_ms} > 0`,
+    ),
+    index("browser_capabilities_token_hash_idx").on(table.token_hash),
+    index("browser_capabilities_expires_at_idx").on(table.expires_at),
+  ],
+);
+
+/** @public Hashed browser proxy grants. */
+export const browser_proxy_grants = pgTable(
+  "browser_proxy_grants",
+  {
+    id: uuid("id").primaryKey(),
+    token_hash: text("token_hash").notNull().unique(),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    session_id: uuid("session_id")
+      .notNull()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    permission: text("permission").notNull(),
+    use_limit: integer("use_limit").notNull(),
+    uses: integer("uses").notNull().default(0),
+    issued_at: ts("issued_at").notNull().defaultNow(),
+    redeemed_at: ts("redeemed_at"),
+    revoked_at: ts("revoked_at"),
+    expires_at: ts("expires_at").notNull(),
+  },
+  table => [
+    check(
+      "browser_proxy_grants_token_hash_check",
+      sql`${table.token_hash} ~ '^[a-f0-9]{64}$'`,
+    ),
+    check(
+      "browser_proxy_grants_permission_check",
+      sql`${table.permission} IN ('passive', 'interactive', 'cdp')`,
+    ),
+    check("browser_proxy_grants_use_limit_check", sql`${table.use_limit} > 0`),
+    check(
+      "browser_proxy_grants_uses_check",
+      sql`${table.uses} >= 0 AND ${table.uses} <= ${table.use_limit}`,
+    ),
+    index("browser_proxy_grants_token_hash_idx").on(table.token_hash),
+    index("browser_proxy_grants_expires_at_idx").on(table.expires_at),
+  ],
+);
 
 export const concurrency_log = pgTable("concurrency_log", {
   id: bigintNum("id").notNull().generatedByDefaultAsIdentity(),
