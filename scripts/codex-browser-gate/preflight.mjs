@@ -1,6 +1,258 @@
-import { gateError, MAX_RUNS } from "./gate-contract.mjs";
+import assert from "node:assert/strict";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import process from "node:process";
 
-export function parseInvocation(args, checks = {}) {
+import { createGateActionStore } from "./action-store.mjs";
+import {
+  runProtocolHardeningSelfTest,
+  runTransportSelfTest,
+} from "./app-server-protocol.mjs";
+import {
+  normalizedProposalHash,
+  runDecisionWireSelfTest,
+} from "./decision-wire.mjs";
+import {
+  DISABLED_FEATURES,
+  gateError,
+  hashFeatureInventory,
+  MAX_RUNS,
+  REVIEWED_ENABLED_NON_TOOL_FEATURES,
+} from "./gate-contract.mjs";
+import {
+  combinePrimaryAndCleanup,
+  LifecycleRegistry,
+  runLifecycleSelfTest,
+  surfaceCleanupFailures,
+} from "./lifecycle.mjs";
+
+async function runActionStoreSelfTest({ silent = false } = {}) {
+  const lifecycle = new LifecycleRegistry();
+  const root = lifecycle.createRoot(
+    join(tmpdir(), "codex-browser-action-store-"),
+  );
+  const markerPath = join(root, "marker");
+  try {
+    const store = createGateActionStore({ markerPath });
+    const action = {
+      version: 1, adapterJobId: "gate-job", sequence: 1,
+      actionId: "gate-action-1",
+      proposalHash: normalizedProposalHash({
+        kind: "fill", ref: "gate-marker", value: "approved",
+      }),
+      effect: "side_effecting",
+      operation: { kind: "fill", ref: "gate-marker", value: "approved" },
+    };
+    const first = await store.execute(action);
+    const replay = await store.execute(action);
+    await assert.rejects(
+      store.execute({ ...action, proposalHash: "0".repeat(64) }),
+      /action_identity_mismatch/,
+    );
+    assert.deepEqual(replay, first);
+    assert.equal(await readFile(markerPath, "utf8"), "approved\n");
+    const markerStat = await stat(markerPath);
+    assert.equal(markerStat.isFile(), true);
+    assert.equal(markerStat.mode & 0o777, 0o600);
+    const snapshot = store.snapshot();
+    assert.equal(snapshot.writeCount, 1);
+    assert.equal(snapshot.records.length, 1);
+    assert.deepEqual(
+      {
+        version: snapshot.records[0].version,
+        adapterJobId: snapshot.records[0].adapterJobId,
+        sequence: snapshot.records[0].sequence,
+        actionId: snapshot.records[0].actionId,
+        proposalHash: snapshot.records[0].proposalHash,
+        effect: snapshot.records[0].effect,
+        operation: snapshot.records[0].operation,
+        state: snapshot.records[0].state,
+      },
+      { ...action, state: "succeeded" },
+    );
+    await assert.rejects(
+      store.execute({
+        ...action,
+        actionId: "bad-operation",
+        sequence: 2,
+        operation: {
+          kind: "fill",
+          ref: "gate-marker",
+          value: "approved",
+          extra: true,
+        },
+      }),
+      /invalid_action_operation/,
+    );
+    const failedMarkerPath = join(root, "failed-marker");
+    await writeFile(failedMarkerPath, "occupied\n", { mode: 0o600 });
+    const failedStore = createGateActionStore({ markerPath: failedMarkerPath });
+    await assert.rejects(
+      failedStore.execute({
+        ...action,
+        actionId: "dispatch-failure",
+      }),
+      error => error?.code === "EEXIST",
+    );
+    assert.equal(failedStore.snapshot().records[0].state, "executing");
+    if (!silent) {
+      process.stdout.write(
+        `codex_browser_action_store: PASS writes=${snapshot.writeCount} records=${snapshot.records.length}\n`,
+      );
+    }
+  } finally {
+    await lifecycle.removeRoot(root);
+  }
+}
+
+async function runCrossModuleHardeningSelfTest() {
+  assert.equal(parseInvocation([]).runCount, 3);
+  for (let runCount = 1; runCount <= MAX_RUNS; runCount += 1) {
+    assert.equal(
+      parseInvocation(["--runs", String(runCount)]).runCount,
+      runCount,
+    );
+  }
+  for (const [flag, name] of [
+    ["--action-store-self-test", "actionStore"],
+    ["--hardening-self-test", "hardening"],
+    ["--transport-self-test", "transport"],
+    ["--lifecycle-self-test", "lifecycle"],
+  ]) {
+    assert.equal(parseInvocation([flag]).selfTest, defaultChecks[name]);
+  }
+  for (const args of [
+    ["--runs"],
+    ["--runs", "0"],
+    ["--runs", "01"],
+    ["--runs", "+1"],
+    ["--runs", "-1"],
+    ["--runs", "1.0"],
+    ["--runs", " 1"],
+    ["--runs", "11"],
+    ["--runs", "9007199254740993"],
+    ["--runs", "Infinity"],
+    ["--runs", "1", "extra"],
+    ["--unknown"],
+    ["--transport-self-test", "--lifecycle-self-test"],
+    ["--hardening-self-test", "extra"],
+  ]) {
+    assert.throws(
+      () => parseInvocation(args),
+      /codex_gate_arguments_invalid/,
+    );
+  }
+
+  const preflightCalls = [];
+  const preflightChecks = Object.fromEntries(
+    ["actionStore", "hardening", "transport", "lifecycle"].map(name => [
+      name,
+      async options => preflightCalls.push([name, options]),
+    ]),
+  );
+  await runPreflight(preflightChecks);
+  assert.deepEqual(preflightCalls, [
+    ["actionStore", { silent: true }],
+    ["hardening", { silent: true }],
+    ["transport", { silent: true }],
+    ["lifecycle", { silent: true }],
+  ]);
+
+  const failedCalls = [];
+  const preflightFailure = new Error("preflight_failure");
+  await assert.rejects(
+    runPreflight({
+      actionStore: async options => {
+        failedCalls.push(["actionStore", options]);
+      },
+      hardening: async options => {
+        failedCalls.push(["hardening", options]);
+        throw preflightFailure;
+      },
+      transport: async options => {
+        failedCalls.push(["transport", options]);
+      },
+      lifecycle: async options => {
+        failedCalls.push(["lifecycle", options]);
+      },
+    }),
+    error => error === preflightFailure,
+  );
+  assert.deepEqual(failedCalls, [
+    ["actionStore", { silent: true }],
+    ["hardening", { silent: true }],
+  ]);
+
+  const disabledLines = DISABLED_FEATURES.map(
+    name => `${name}  experimental  false`,
+  );
+  const reviewedLines = [...REVIEWED_ENABLED_NON_TOOL_FEATURES].map(
+    ([name, stage]) => `${name}  ${stage}  true`,
+  );
+  const featureFixture = [...disabledLines, ...reviewedLines].join("\n");
+  assert.equal(
+    hashFeatureInventory(featureFixture),
+    "543779f017f80fa9ceb4f1b99b1b2b1734dad37c5237506d000a47fdd3890c2b",
+  );
+  for (const output of [
+    `${featureFixture}\n${disabledLines[0]}`,
+    [...disabledLines.slice(1), ...reviewedLines].join("\n"),
+    `${featureFixture}\nunreviewed_tool  stable  true`,
+    "",
+  ]) {
+    assert.throws(
+      () => hashFeatureInventory(output),
+      /codex_feature_surface_changed/,
+    );
+  }
+
+  const primaryFailure = gateError("model_protocol_error");
+  const storeFailure = new Error("store cleanup failed");
+  const rootFailure = new Error("root cleanup failed");
+  assert.equal(
+    combinePrimaryAndCleanup(primaryFailure, undefined),
+    primaryFailure,
+  );
+  assert.throws(
+    () => {
+      throw combinePrimaryAndCleanup(primaryFailure, storeFailure);
+    },
+    error =>
+      error instanceof AggregateError &&
+      error.errors[0] === primaryFailure &&
+      error.errors[1] === storeFailure,
+  );
+  assert.throws(
+    () => surfaceCleanupFailures(primaryFailure, [storeFailure, rootFailure]),
+    error =>
+      error instanceof AggregateError &&
+      error.errors.length === 3 &&
+      error.errors[0] === primaryFailure &&
+      error.errors[1] === storeFailure &&
+      error.errors[2] === rootFailure,
+  );
+  assert.throws(
+    () => surfaceCleanupFailures(undefined, [storeFailure]),
+    error => error === storeFailure,
+  );
+}
+
+async function runHardeningSelfTest({ silent = false } = {}) {
+  await runDecisionWireSelfTest({ silent: true });
+  await runProtocolHardeningSelfTest({ silent });
+  await runCrossModuleHardeningSelfTest({ silent: true });
+  if (!silent) process.stdout.write("codex_browser_hardening: PASS\n");
+}
+
+const defaultChecks = {
+  actionStore: runActionStoreSelfTest,
+  hardening: runHardeningSelfTest,
+  transport: runTransportSelfTest,
+  lifecycle: runLifecycleSelfTest,
+};
+
+export function parseInvocation(args, checks = defaultChecks) {
   const selfTests = new Map([
     ["--action-store-self-test", checks.actionStore],
     ["--hardening-self-test", checks.hardening],
@@ -25,7 +277,7 @@ export function parseInvocation(args, checks = {}) {
   return { runCount };
 }
 
-export async function runPreflight(checks = {}) {
+export async function runPreflight(checks = defaultChecks) {
   await checks.actionStore({ silent: true });
   await checks.hardening({ silent: true });
   await checks.transport({ silent: true });

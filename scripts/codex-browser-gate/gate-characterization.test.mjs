@@ -26,6 +26,23 @@ const {
 const { parseInvocation, runPreflight } = preflight;
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const gatePath = fileURLToPath(new URL("./run.mjs", import.meta.url));
+const productionSourcePaths = [
+  "action-store.mjs",
+  "app-server-protocol.mjs",
+  "decision-wire.mjs",
+  "gate-contract.mjs",
+  "lifecycle.mjs",
+  "preflight.mjs",
+  "run.mjs",
+  "schema-canonicalizer.mjs",
+];
+const productionSources = Object.fromEntries(
+  productionSourcePaths.map(name => [
+    name,
+    readFileSync(new URL(name, import.meta.url), "utf8"),
+  ]),
+);
+const runSource = productionSources["run.mjs"];
 
 function readLinuxProcessTable() {
   if (process.platform !== "linux") return [];
@@ -1134,6 +1151,53 @@ assert.deepEqual(Object.keys(preflight).toSorted(), [
   "parseInvocation",
   "runPreflight",
 ]);
+
+for (const pattern of [
+  /class RawJsonlFramer/,
+  /class LifecycleRegistry/,
+  /class ProcessDeadline/,
+  /function generatedSchemaMatches/,
+  /function validateModelDecisionEnvelopeV1/,
+  /function actionStoreSelfTest/,
+  /function hardeningSelfTest/,
+  /function transportSelfTest/,
+  /function lifecycleSelfTest/,
+  /^export\s/m,
+]) {
+  assert.doesNotMatch(runSource, pattern);
+}
+
+for (const name of [
+  "gate-contract.mjs",
+  "lifecycle.mjs",
+  "decision-wire.mjs",
+  "app-server-protocol.mjs",
+]) {
+  assert.doesNotMatch(
+    productionSources[name],
+    /["']\.\/(?:preflight|run)\.mjs["']/,
+  );
+}
+assert.doesNotMatch(
+  productionSources["app-server-protocol.mjs"],
+  /["']\.\/decision-wire\.mjs["']/,
+);
+for (const source of Object.values(productionSources)) {
+  assert.doesNotMatch(source, /\bimport\s*\(/);
+}
+
+const prepareGateStart = runSource.indexOf("async function prepareGate");
+const prepareGateEnd = runSource.indexOf("async function main", prepareGateStart);
+assert.notEqual(prepareGateStart, -1);
+assert.notEqual(prepareGateEnd, -1);
+const prepareGateSource = runSource.slice(prepareGateStart, prepareGateEnd);
+const preflightCall = prepareGateSource.indexOf("await runPreflight()");
+const versionCall = prepareGateSource.indexOf(
+  'runCaptured("codex", ["--version"]',
+);
+assert.notEqual(preflightCall, -1);
+assert.notEqual(versionCall, -1);
+assert.ok(preflightCall < versionCall);
 
 const primaryFailure = new Error("primary");
 const cleanupFailure = new Error("cleanup");
