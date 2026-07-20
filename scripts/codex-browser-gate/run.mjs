@@ -21,123 +21,30 @@ import { PassThrough } from "node:stream";
 
 import { createGateActionStore } from "./action-store.mjs";
 import {
+  ALLOWED_ITEM_TYPES,
+  CLEANUP_DRAIN_GRACE_MS,
+  CLEANUP_KILL_GRACE_MS,
+  CLEANUP_POLL_MS,
+  CLEANUP_TERM_GRACE_MS,
+  CLEANUP_TOTAL_GRACE_MS,
+  CODEX_VERSION,
+  CODEX_VERSION_OUTPUT,
+  CONFIG,
+  EFFORT,
+  FORBIDDEN_EVENT_PATTERN,
+  gateError,
+  hashFeatureInventory,
+  MAX_OUTPUT_BYTES,
+  MODEL,
+  REQUIRED_SCHEMA_DEFINITIONS,
+  WATCHDOG_MS,
+} from "./gate-contract.mjs";
+import { parseInvocation, runPreflight } from "./preflight.mjs";
+import {
   canonicalizeJsonBytes,
   hashCanonicalSchemaBundle,
   parseLosslessJson,
 } from "./schema-canonicalizer.mjs";
-
-const CODEX_VERSION_OUTPUT = "codex-cli 0.144.5";
-const CODEX_VERSION = "0.144.5";
-const MODEL = "gpt-5.6-terra";
-const EFFORT = "medium";
-const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
-const WATCHDOG_MS = 120_000;
-const MAX_RUNS = 10;
-const CLEANUP_TERM_GRACE_MS = 250;
-const CLEANUP_KILL_GRACE_MS = 1_000;
-const CLEANUP_POLL_MS = 10;
-const CLEANUP_TOTAL_GRACE_MS = 5_000;
-const CLEANUP_DRAIN_GRACE_MS = 1_000;
-const REQUIRED_SCHEMA_DEFINITIONS = [
-  "ThreadStartParams",
-  "TurnStartParams",
-  "ThreadStartResponse",
-  "TurnCompletedNotification",
-];
-
-const CONFIG = `model = "gpt-5.6-terra"
-model_reasoning_effort = "medium"
-approval_policy = "never"
-sandbox_mode = "read-only"
-web_search = "disabled"
-
-[history]
-persistence = "none"
-
-[analytics]
-enabled = false
-
-[features]
-apps = false
-artifact = false
-auth_elicitation = false
-browser_use = false
-browser_use_external = false
-browser_use_full_cdp_access = false
-code_mode = false
-code_mode_host = false
-code_mode_only = false
-computer_use = false
-enable_mcp_apps = false
-goals = false
-hooks = false
-image_generation = false
-in_app_browser = false
-memories = false
-multi_agent = false
-plugins = false
-plugin_sharing = false
-remote_plugin = false
-request_permissions_tool = false
-shell_snapshot = false
-shell_tool = false
-skill_mcp_dependency_install = false
-standalone_web_search = false
-tool_call_mcp_elicitation = false
-tool_suggest = false
-unified_exec = false
-workspace_dependencies = false
-`;
-
-const DISABLED_FEATURES = [
-  "apps",
-  "artifact",
-  "auth_elicitation",
-  "browser_use",
-  "browser_use_external",
-  "browser_use_full_cdp_access",
-  "code_mode",
-  "code_mode_host",
-  "code_mode_only",
-  "computer_use",
-  "enable_mcp_apps",
-  "goals",
-  "hooks",
-  "image_generation",
-  "in_app_browser",
-  "memories",
-  "multi_agent",
-  "plugins",
-  "plugin_sharing",
-  "remote_plugin",
-  "request_permissions_tool",
-  "shell_snapshot",
-  "shell_tool",
-  "skill_mcp_dependency_install",
-  "standalone_web_search",
-  "tool_call_mcp_elicitation",
-  "tool_suggest",
-  "unified_exec",
-  "workspace_dependencies",
-];
-
-const REVIEWED_ENABLED_NON_TOOL_FEATURES = new Map([
-  ["guardian_approval", "stable"],
-  ["remote_compaction_v2", "stable"],
-  ["resize_all_images", "removed"],
-  ["tool_search_always_defer_mcp_tools", "removed"],
-  ["tui_app_server", "removed"],
-]);
-
-const TOOL_SURFACE_PATTERN =
-  /tool|browser|computer|code_mode|image|app|plugin|shell|web_search|skill|mcp|artifact/;
-const FORBIDDEN_EVENT_PATTERN =
-  /command|file|mcp|dynamic.?tool|browser|computer|code.?mode|web.?search|image|app|plugin|shell|approval|collab/i;
-const ALLOWED_ITEM_TYPES = new Set([
-  "userMessage",
-  "agentMessage",
-  "reasoning",
-]);
 
 const closed = properties => ({
   type: "object",
@@ -300,12 +207,6 @@ function auditModelDecisionSchema(schema) {
     }
   }
   visit(schema);
-}
-
-function gateError(code, detail) {
-  const error = new Error(detail ? `${code}: ${detail}` : code);
-  error.code = code;
-  return error;
 }
 
 function normalizedProposalHash(operation) {
@@ -869,49 +770,6 @@ function runCaptured(
       );
     });
   });
-}
-
-function parseFeatureInventory(output) {
-  const inventory = [];
-  const names = new Set();
-
-  for (const line of output.split("\n")) {
-    if (!line.trim()) continue;
-    const match = /^(\S+)\s{2,}(.+?)\s{2,}(true|false)$/.exec(line);
-    if (!match || names.has(match[1])) {
-      throw gateError("codex_feature_surface_changed");
-    }
-    names.add(match[1]);
-    inventory.push({
-      name: match[1],
-      stage: match[2],
-      enabled: match[3] === "true",
-    });
-  }
-
-  if (inventory.length === 0) {
-    throw gateError("codex_feature_surface_changed");
-  }
-
-  const byName = new Map(inventory.map(feature => [feature.name, feature]));
-  for (const name of DISABLED_FEATURES) {
-    if (!byName.has(name) || byName.get(name).enabled) {
-      throw gateError("codex_feature_surface_changed", name);
-    }
-  }
-
-  for (const feature of inventory) {
-    if (!feature.enabled || !TOOL_SURFACE_PATTERN.test(feature.name)) continue;
-    if (REVIEWED_ENABLED_NON_TOOL_FEATURES.get(feature.name) !== feature.stage) {
-      throw gateError("codex_feature_surface_changed", feature.name);
-    }
-  }
-
-  const canonical = inventory
-    .toSorted((left, right) => left.name.localeCompare(right.name))
-    .map(feature => `${feature.name}\t${feature.stage}\t${feature.enabled}\n`)
-    .join("");
-  return createHash("sha256").update(canonical).digest("hex");
 }
 
 async function schemaHash(schemaDir) {
@@ -2302,7 +2160,7 @@ async function runOne(runNumber) {
     if (featureResult.code !== 0) {
       throw gateError("codex_features_failed", featureResult.stderr.trim());
     }
-    const featureHash = parseFeatureInventory(featureResult.stdout);
+    const featureHash = hashFeatureInventory(featureResult.stdout);
 
     auditModelDecisionSchema(modelDecisionEnvelopeSchema);
     client = new AppServerClient({ cwd: work, env, eventsPath });
@@ -2900,11 +2758,11 @@ async function hardeningSelfTest({ silent = false } = {}) {
     () => surfaceCleanupFailures(undefined, [cleanupFailure]),
     error => error === cleanupFailure,
   );
-  assert.equal(parseRunCount([]), 3);
-  assert.equal(parseRunCount(["--runs", "10"]), 10);
+  assert.equal(parseInvocation([]).runCount, 3);
+  assert.equal(parseInvocation(["--runs", "10"]).runCount, 10);
   for (const value of ["11", "9007199254740993", "Infinity"]) {
     assert.throws(
-      () => parseRunCount(["--runs", value]),
+      () => parseInvocation(["--runs", value]),
       /codex_gate_arguments_invalid/,
     );
   }
@@ -3505,40 +3363,18 @@ async function lifecycleSelfTest({ silent = false } = {}) {
   if (!silent) process.stdout.write("codex_browser_lifecycle: PASS\n");
 }
 
-async function runPreflight({
-  actionStore = actionStoreSelfTest,
-  hardening = hardeningSelfTest,
-  transport = transportSelfTest,
-  lifecycle = lifecycleSelfTest,
-} = {}) {
-  await actionStore({ silent: true });
-  await hardening({ silent: true });
-  await transport({ silent: true });
-  await lifecycle({ silent: true });
-}
-
 async function prepareGate({
-  preflight = runPreflight,
+  preflight = () =>
+    runPreflight({
+      actionStore: actionStoreSelfTest,
+      hardening: hardeningSelfTest,
+      transport: transportSelfTest,
+      lifecycle: lifecycleSelfTest,
+    }),
   discoverVersion = () => runCaptured("codex", ["--version"]),
 } = {}) {
   await preflight();
   return discoverVersion();
-}
-
-function parseRunCount(args) {
-  if (args.length === 0) return 3;
-  if (
-    args.length !== 2 ||
-    args[0] !== "--runs" ||
-    !/^[1-9]\d*$/.test(args[1])
-  ) {
-    throw gateError("codex_gate_arguments_invalid");
-  }
-  const count = Number(args[1]);
-  if (!Number.isSafeInteger(count) || count > MAX_RUNS) {
-    throw gateError("codex_gate_arguments_invalid");
-  }
-  return count;
 }
 
 async function main(runCount) {
@@ -3586,21 +3422,13 @@ async function main(runCount) {
 const gateLifecycle = new LifecycleRegistry();
 const signalHandlers = installSignalHandlers(gateLifecycle);
 
-function parseInvocation(args) {
-  const selfTests = new Map([
-    ["--action-store-self-test", actionStoreSelfTest],
-    ["--hardening-self-test", hardeningSelfTest],
-    ["--lifecycle-self-test", lifecycleSelfTest],
-    ["--transport-self-test", transportSelfTest],
-  ]);
-  if (args.length === 1 && selfTests.has(args[0])) {
-    return { selfTest: selfTests.get(args[0]) };
-  }
-  return { runCount: parseRunCount(args) };
-}
-
 async function invoke(args) {
-  const parsedInvocation = parseInvocation(args);
+  const parsedInvocation = parseInvocation(args, {
+    actionStore: actionStoreSelfTest,
+    hardening: hardeningSelfTest,
+    transport: transportSelfTest,
+    lifecycle: lifecycleSelfTest,
+  });
   return parsedInvocation.selfTest
     ? parsedInvocation.selfTest()
     : main(parsedInvocation.runCount);
