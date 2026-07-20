@@ -719,8 +719,10 @@ async fn unloaded_turn_items_use_item_completed_agent_message() {
             "method": "item/completed",
             "params": {
                 "threadId": "thread-1",
-                "turnId": "turn-1",
+                "turnId": "01985f6d-9c40-7000-8000-000000000001",
+                "completedAtMs": 1750000001000_i64,
                 "item": {
+                    "id": "agent-message-1",
                     "type": "agentMessage",
                     "text": "{\"decision\":{\"version\":1,\"type\":\"final\",\"output\":\"done\"}}"
                 }
@@ -731,18 +733,31 @@ async fn unloaded_turn_items_use_item_completed_agent_message() {
             "params": {
                 "threadId": "thread-1",
                 "turn": {
-                    "id": "turn-1",
+                    "id": "01985f6d-9c40-7000-8000-000000000001",
                     "status": "completed",
                     "items": [],
-                    "itemsView": "notLoaded"
+                    "itemsView": "notLoaded",
+                    "startedAt": 1750000000_i64,
+                    "completedAt": 1750000001_i64,
+                    "durationMs": 1000_i64,
+                    "error": null
                 }
             }
         }),
     ]);
     let result = run_prompt_job(prompt_request(), fixture.command()).await.unwrap();
     assert_eq!(result.output, "done");
+    assert_eq!(fixture.last_turn_timing(), (1750000000, 1750000001, 1000));
 }
 ```
+
+The fake server validates the two notification `params` objects against
+`/tmp/codex-schema-audit/v2/ItemCompletedNotification.json` and
+`/tmp/codex-schema-audit/v2/TurnCompletedNotification.json` before writing
+them. Item completion uses Unix milliseconds; `startedAt`/`completedAt` use
+Unix seconds and `durationMs` uses milliseconds. The item notification carries
+both `threadId` and `turnId`; turn completion carries `threadId` plus a `turn`
+whose `id` matches that item `turnId`.
 
 - [ ] **Step 2: Write failing forbidden-event tests**
 

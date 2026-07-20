@@ -667,30 +667,59 @@ Add this regression fixture before the live run:
 const wrappedFinal = {
   decision: { version: 1, type: "final", output: "gate-complete" },
 };
-const unloadedTurnResult = {
+const turnCompletedParams = {
+  threadId: "thread-gate-1",
   turn: {
-    id: "turn-gate-1",
+    id: "01985f6d-9c40-7000-8000-000000000001",
     status: "completed",
     items: [],
     itemsView: "notLoaded",
+    startedAt: 1750000000,
+    completedAt: 1750000001,
+    durationMs: 1000,
+    error: null,
   },
+};
+const unloadedTurnResult = {
+  turn: turnCompletedParams.turn,
   messages: [{
     method: "item/completed",
     params: {
       threadId: "thread-gate-1",
-      turnId: "turn-gate-1",
-      item: { type: "agentMessage", text: JSON.stringify(wrappedFinal) },
+      turnId: "01985f6d-9c40-7000-8000-000000000001",
+      completedAtMs: 1750000001000,
+      item: {
+        id: "agent-message-gate-1",
+        type: "agentMessage",
+        text: JSON.stringify(wrappedFinal),
+      },
     },
   }],
 };
 assert.deepEqual(
   parseTurnEnvelope(unloadedTurnResult, {
     threadId: "thread-gate-1",
-    turnId: "turn-gate-1",
+    turnId: "01985f6d-9c40-7000-8000-000000000001",
   }),
   wrappedFinal,
 );
+assert.equal(unloadedTurnResult.turn.durationMs, 1000);
+assert.equal(
+  (unloadedTurnResult.turn.completedAt - unloadedTurnResult.turn.startedAt) * 1000,
+  unloadedTurnResult.turn.durationMs,
+);
+assert.equal(
+  unloadedTurnResult.messages[0].params.completedAtMs,
+  unloadedTurnResult.turn.completedAt * 1000,
+);
 ```
+
+Validate both fixture notification params against generated pinned schemas
+`/tmp/codex-schema-audit/v2/ItemCompletedNotification.json` and
+`/tmp/codex-schema-audit/v2/TurnCompletedNotification.json`. The item event
+uses milliseconds; turn start/completion use seconds and `durationMs` uses
+milliseconds. Keep item `turnId` equal to `turn.id`; `turn/completed` carries
+`threadId` beside `turn` and no invented top-level `turnId`.
 
 - [ ] **Step 6: Drive the exact two-turn action loop**
 
