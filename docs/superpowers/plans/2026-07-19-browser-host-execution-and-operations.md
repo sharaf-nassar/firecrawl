@@ -150,6 +150,7 @@ descriptor and use the existing page-oriented code contract.
 
 - Generate `host/browser-runtime/protocol/codex-app-server-0.144.5/` from the
   installed CLI and check in every generated JSON schema.
+- Create `host/browser-runtime/protocol/canonicalize-json.mjs`.
 - Create `host/browser-runtime/protocol/SHA256SUMS`.
 - Create
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`.
@@ -350,6 +351,7 @@ before host execution is enabled."
 **Files:**
 
 - Create: `host/browser-runtime/protocol/codex-app-server-0.144.5/`
+- Create: `host/browser-runtime/protocol/canonicalize-json.mjs`
 - Create: `host/browser-runtime/protocol/SHA256SUMS`
 - Create:
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`
@@ -457,11 +459,34 @@ First verify CLI version equals `codex-cli 0.144.5`; any other output exits
 codex app-server generate-json-schema --experimental --out host/browser-runtime/protocol/codex-app-server-0.144.5
 ```
 
-Sort paths bytewise and write repository-root-relative SHA-256 lines. Check in
-all generated schemas. The builder
-repeats generation into a temporary directory and fails on any added, removed,
-or changed byte. `SHA256SUMS` also covers
-`model-decision-envelope-v1.schema.json`.
+Implement `canonicalize-json.mjs` without locale-sensitive ordering. For every
+`.json`, parse it, recursively sort object keys with
+`(a, b) => (a < b ? -1 : a > b ? 1 : 0)` for lexicographic UTF-16 code-unit
+order, preserve array order and scalar values, and write compact Node
+`JSON.stringify` UTF-8 with no trailing newline. Reject malformed or non-JSON
+input. Reject duplicate object keys when the selected parser exposes them;
+Node `JSON.parse` does not, so it provides the minimum required parse-failure
+rejection. Object-key order is semantically irrelevant; this deterministic
+normalization changes identity bytes without weakening any schema.
+
+Canonicalize all generated schemas in place before checking them in. Also
+canonicalize `model-decision-envelope-v1.schema.json` before checksumming it.
+Sort repository-root-relative paths with the same code-unit comparator and
+write SHA-256 lines over canonical on-disk bytes. `SHA256SUMS` therefore covers
+the bytes installed into `/opt/firecrawl/protocol`, not raw generator output.
+
+The builder regenerates into a temporary directory, rejects non-JSON regular
+files, canonicalizes every generated `.json`, then maps both roots to sorted
+repository-relative paths and compares the complete file set and canonical
+bytes before checking `SHA256SUMS`. Added or removed files, array reordering,
+and scalar changes still fail. The adapter continues loading and validating
+messages against the actual parsed schemas; canonicalization is only the bundle
+identity and checksum representation.
+
+Add `canonicalize-json.mjs --self-test` regression cases proving reordered
+object keys have identical canonical bytes and digest, reordered arrays differ,
+a changed value differs, and malformed JSON fails. Run the self-test before
+generating `SHA256SUMS` and from the builder's protocol verification path.
 
 - [ ] **Step 4: Define exact model decision and browser operations**
 
@@ -664,6 +689,7 @@ values, internal addresses, raw headers, or stack traces.
 ```bash
 cargo fmt --manifest-path apps/browser-execution-adapter/Cargo.toml --check
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml decision_loop
+node host/browser-runtime/protocol/canonicalize-json.mjs --self-test
 sha256sum --check host/browser-runtime/protocol/SHA256SUMS
 ```
 
@@ -1755,7 +1781,7 @@ Validate fresh public MCP clients with no provider fallback."
 ## Final verification checklist
 
 - [ ] `git diff --check` exits 0.
-- [ ] `SHA256SUMS` matches exact generated Codex 0.144.5 V2 schema bundle.
+- [ ] `SHA256SUMS` matches the canonical Codex 0.144.5 V2 schema bundle.
 - [ ] Three consecutive live Gate0 structured-action runs pass.
 - [ ] Adapter Cargo format, Clippy, and tests pass.
 - [ ] Broker Cargo format, Clippy, and tests pass.

@@ -235,9 +235,9 @@ action and one turn before its policy outcome.
   each final assistant message: [Codex app-server](https://developers.openai.com/codex/app-server).
 - `codex app-server generate-json-schema --experimental --out <dir>` emits the
   current V2 request, response, and notification schemas. Commit their
-  deterministic bundle checksum beside the later OCI bundle; Gate0 generates
-  and validates it from installed 0.144.5 without checking generated files
-  into this foundation change.
+  canonical bundle checksum beside the later OCI bundle; Gate0 generates,
+  parses, validates, and canonically hashes it from installed 0.144.5 without
+  checking generated files into this foundation change.
 - Codex configuration supports `approval_policy = "never"`,
   `model_reasoning_effort`, `web_search = "disabled"`, and disabling `apps`,
   `hooks`, `multi_agent`, `shell_tool`, and `unified_exec`:
@@ -438,10 +438,37 @@ codex app-server generate-json-schema --experimental --out <schema-directory>
 
 Require `codex_app_server_protocol.v2.schemas.json`, parse it, assert it
 contains `ThreadStartParams`, `TurnStartParams`, `ThreadStartResponse`, and
-`TurnCompletedNotification`, then hash stable relative paths plus file bytes.
-Fail as `codex_protocol_schema_mismatch` if generation or required definitions
-do not match installed 0.144.5. Retain the SHA-256 for the PASS line. The host
-adapter plan pins this same generated bundle into the OCI build.
+`TurnCompletedNotification`, and retain the actual parsed schemas from that
+run for live message validation. Canonicalization below is only for identity;
+the validator must not substitute a weakened or separately authored schema.
+
+Canonicalize every generated `.json` for hashing: parse it, recursively sort
+object keys with `(a, b) => (a < b ? -1 : a > b ? 1 : 0)` so ordering is
+lexicographic by UTF-16 code unit rather than locale, preserve array order and
+scalar values, and serialize once with compact Node `JSON.stringify`. Encode
+that result as UTF-8 with no trailing newline. Reject parse failures and
+non-JSON input. Reject duplicate object keys when the parser exposes them;
+built-in `JSON.parse` does not expose duplicates and therefore provides only
+the required malformed-input rejection.
+
+For each `.json`, form its logical repository-relative path below
+`host/browser-runtime/protocol/codex-app-server-0.144.5/`, normalize separators
+to `/`, and sort paths with the same code-unit comparator. Feed SHA-256 each
+UTF-8 path, NUL, canonical JSON bytes, and NUL. Never feed raw generated JSON
+bytes into the identity hash. Reject any generated regular file that is not
+`.json`, so the complete generated file set remains explicit. Object-key order
+is semantically irrelevant, so normalization is deterministic identity
+framing, not schema weakening. Array reordering, scalar changes, and added or
+removed schema files must change the hash.
+
+Add gate self-tests proving reordered object keys produce the same digest,
+reordered arrays produce a different digest, a changed value produces a
+different digest, and malformed JSON fails. Require the canonical digest to
+match across all repeated live runs. Fail as
+`codex_protocol_schema_mismatch` if generation, required definitions, or the
+canonical digest do not match installed 0.144.5. Retain that SHA-256 for the
+PASS line. The host adapter plan pins the same canonical bundle into the OCI
+build.
 
 - [ ] **Step 4: Create the isolated no-tool app-server configuration**
 
@@ -1669,9 +1696,9 @@ node scripts/codex-browser-gate/run.mjs --runs 3
 ```
 
 Expected: one PASS line with `runs=3`, `turns=6`, `actions=3`, `writes=3`,
-`tools=0`, `approvals=0`, and stable protocol-schema/feature hashes. Every run
-must prove exact first-turn action, cached matching callback, rejected
-mismatch, exact second-turn final output, and complete cleanup.
+`tools=0`, `approvals=0`, and stable canonical protocol-schema and feature
+hashes. Every run must prove exact first-turn action, cached matching callback,
+rejected mismatch, exact second-turn final output, and complete cleanup.
 
 - [ ] **Step 2: Run all focused API tests**
 

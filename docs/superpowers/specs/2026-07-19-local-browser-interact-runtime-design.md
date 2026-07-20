@@ -127,6 +127,21 @@ protocol and supplies an `outputSchema` on every turn. The generated protocol
 JSON Schema bundle is pinned and checksummed with the Codex OCI bundle; startup
 fails if the executable, protocol schema, or checksum differs.
 
+Protocol identity uses canonical JSON rather than raw generator bytes. Parse
+every generated `.json`, recursively sort object keys in lexicographic UTF-16
+code-unit order, preserve array order and scalar values, then serialize with
+Node `JSON.stringify` as compact UTF-8 with no trailing newline. Never use a
+locale-sensitive comparator. Reject malformed or non-JSON input; also reject
+duplicate object keys when the selected parser exposes them. Gate0's aggregate
+digest hashes each sorted repository-relative path, a NUL byte, its canonical
+JSON bytes, and a final NUL byte. The host `SHA256SUMS` manifest separately
+hashes each canonical on-disk file and records its repository-relative path.
+Object-key order is semantically irrelevant in JSON, so this deterministic
+normalization does not weaken schema validation: Gate0 still validates live
+messages against the actual parsed schemas generated for each run, and the
+deployed adapter loads the checked-in schemas for validation. Array order, file
+additions or removals, and scalar-value changes remain identity changes.
+
 The process has these boundaries:
 
 - Explicit model `gpt-5.6-terra` and reasoning effort `medium`
@@ -882,7 +897,8 @@ observable behavior and focused service/unit tests for isolation boundaries.
 - One profile writer, read snapshots, atomic generation publication, crash
   recovery, and retention
 - Browser Service typed operation and live-view contracts
-- Fake app-server process/config construction, pinned V2 schema checksum,
+- Fake app-server process/config construction, canonical pinned V2 schema
+  checksum, object-key/array/value/invalid-JSON canonicalization regressions,
   strict `ModelDecisionEnvelopeV1` wire validation and normalization into
   `ModelDecisionV1`, bounded multi-turn observations, zero tool and approval
   events, cancellation, limits, timeout, and orphan cleanup
@@ -951,7 +967,8 @@ Phase 2 is complete when:
     and an unknown outcome terminates the run and browser session.
 15. Gate0 completes three consecutive live two-turn structured-action runs
     with exact marker/final output, callback deduplication, mismatch rejection,
-    zero tool/approval events, and complete cleanup.
+    one stable canonical schema digest, zero tool/approval events, and complete
+    cleanup.
 
 ## Trade-offs
 

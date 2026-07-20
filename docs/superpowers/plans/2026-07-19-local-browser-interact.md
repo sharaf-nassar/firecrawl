@@ -124,7 +124,8 @@ public-egress and SSRF checks without entering the navigation set.
   DNS resolution, address pinning, redirect validation, and private-address
   denial.
 - Prompt mode pins Codex CLI/app-server 0.144.5 and the generated V2 protocol
-  schema checksum. Every turn supplies the strict
+  schema checksum after canonical JSON object-key normalization. Every turn
+  supplies the strict
   `ModelDecisionEnvelopeV1` output schema and normalizes its distinct
   `ModelWireDecisionV1` into internal `ModelDecisionV1`; the command is
   experimental, so every upgrade must pass Gate 0.
