@@ -12,12 +12,15 @@ export const CLEANUP_KILL_GRACE_MS = 1_000;
 export const CLEANUP_POLL_MS = 10;
 export const CLEANUP_TOTAL_GRACE_MS = 5_000;
 export const CLEANUP_DRAIN_GRACE_MS = 1_000;
-export const REQUIRED_SCHEMA_DEFINITIONS = [
+const requiredSchemaDefinitions = Object.freeze([
   "ThreadStartParams",
   "TurnStartParams",
   "ThreadStartResponse",
   "TurnCompletedNotification",
-];
+]);
+export const REQUIRED_SCHEMA_DEFINITIONS = Object.freeze([
+  ...requiredSchemaDefinitions,
+]);
 
 export const CONFIG = `model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
@@ -63,7 +66,7 @@ unified_exec = false
 workspace_dependencies = false
 `;
 
-export const DISABLED_FEATURES = [
+const disabledFeatures = Object.freeze([
   "apps",
   "artifact",
   "auth_elicitation",
@@ -93,9 +96,10 @@ export const DISABLED_FEATURES = [
   "tool_suggest",
   "unified_exec",
   "workspace_dependencies",
-];
+]);
+export const DISABLED_FEATURES = Object.freeze([...disabledFeatures]);
 
-export const REVIEWED_ENABLED_NON_TOOL_FEATURES = new Map([
+const reviewedEnabledNonToolFeatures = new Map([
   ["guardian_approval", "stable"],
   ["remote_compaction_v2", "stable"],
   ["resize_all_images", "removed"],
@@ -103,15 +107,87 @@ export const REVIEWED_ENABLED_NON_TOOL_FEATURES = new Map([
   ["tui_app_server", "removed"],
 ]);
 
-export const TOOL_SURFACE_PATTERN =
+function readonlyMap(source) {
+  let facade;
+  facade = {
+    get size() {
+      return source.size;
+    },
+    get(key) {
+      return source.get(key);
+    },
+    has(key) {
+      return source.has(key);
+    },
+    entries() {
+      return source.entries();
+    },
+    keys() {
+      return source.keys();
+    },
+    values() {
+      return source.values();
+    },
+    forEach(callback, thisArg) {
+      source.forEach((value, key) => {
+        callback.call(thisArg, value, key, facade);
+      });
+    },
+    [Symbol.iterator]() {
+      return source[Symbol.iterator]();
+    },
+  };
+  return Object.freeze(facade);
+}
+
+function readonlySet(source) {
+  let facade;
+  facade = {
+    get size() {
+      return source.size;
+    },
+    has(value) {
+      return source.has(value);
+    },
+    entries() {
+      return source.entries();
+    },
+    keys() {
+      return source.keys();
+    },
+    values() {
+      return source.values();
+    },
+    forEach(callback, thisArg) {
+      source.forEach(value => {
+        callback.call(thisArg, value, value, facade);
+      });
+    },
+    [Symbol.iterator]() {
+      return source[Symbol.iterator]();
+    },
+  };
+  return Object.freeze(facade);
+}
+
+export const REVIEWED_ENABLED_NON_TOOL_FEATURES = readonlyMap(
+  reviewedEnabledNonToolFeatures,
+);
+
+const toolSurfacePattern =
   /tool|browser|computer|code_mode|image|app|plugin|shell|web_search|skill|mcp|artifact/;
+export const TOOL_SURFACE_PATTERN = new RegExp(
+  toolSurfacePattern.source,
+  toolSurfacePattern.flags,
+);
 export const FORBIDDEN_EVENT_PATTERN =
   /command|file|mcp|dynamic.?tool|browser|computer|code.?mode|web.?search|image|app|plugin|shell|approval|collab/i;
-export const ALLOWED_ITEM_TYPES = new Set([
+const allowedItemTypes = new Set([
   "userMessage",
   "agentMessage",
   "reasoning",
 ]);
+export const ALLOWED_ITEM_TYPES = readonlySet(allowedItemTypes);
 
 export function gateError(code, detail) {
   const error = new Error(detail ? `${code}: ${detail}` : code);
@@ -142,15 +218,15 @@ export function hashFeatureInventory(output) {
   }
 
   const byName = new Map(inventory.map(feature => [feature.name, feature]));
-  for (const name of DISABLED_FEATURES) {
+  for (const name of disabledFeatures) {
     if (!byName.has(name) || byName.get(name).enabled) {
       throw gateError("codex_feature_surface_changed", name);
     }
   }
 
   for (const feature of inventory) {
-    if (!feature.enabled || !TOOL_SURFACE_PATTERN.test(feature.name)) continue;
-    if (REVIEWED_ENABLED_NON_TOOL_FEATURES.get(feature.name) !== feature.stage) {
+    if (!feature.enabled || !toolSurfacePattern.test(feature.name)) continue;
+    if (reviewedEnabledNonToolFeatures.get(feature.name) !== feature.stage) {
       throw gateError("codex_feature_surface_changed", feature.name);
     }
   }
