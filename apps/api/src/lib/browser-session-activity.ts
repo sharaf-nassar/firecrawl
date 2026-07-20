@@ -1,16 +1,11 @@
-import { redisEvictConnection } from "../services/redis";
-import { db } from "../db/connection";
-import * as schema from "../db/schema";
 import { logger as _logger } from "./logger";
 import {
   toDurableBrowserActivityInsert,
   type LegacyBrowserSessionActivityEvent as BrowserSessionActivityEvent,
 } from "./browser-state/legacy-compatibility";
+import { appendBrowserActivity } from "./browser-state/store";
 
 const logger = _logger.child({ module: "browser-sessions" });
-
-const QUEUE_KEY = "browser-session-activity-queue";
-const BATCH_SIZE = 500;
 
 export function enqueueBrowserSessionActivity(
   event: Omit<BrowserSessionActivityEvent, "created_at">,
@@ -20,23 +15,14 @@ export function enqueueBrowserSessionActivity(
     created_at: new Date().toISOString(),
   };
 
-  redisEvictConnection.rpush(QUEUE_KEY, JSON.stringify(row)).catch(() => {});
+  return appendBrowserActivity(toDurableBrowserActivityInsert(row)).catch(
+    err => {
+      logger.error("Error inserting browser session activity", { err });
+      throw err;
+    },
+  );
 }
 
 export async function processBrowserSessionActivityJobs() {
-  const raw = (await redisEvictConnection.lpop(QUEUE_KEY, BATCH_SIZE)) ?? [];
-  if (raw.length === 0) return;
-
-  const rows: BrowserSessionActivityEvent[] = raw.map(x => JSON.parse(x));
-
-  try {
-    await db
-      .insert(schema.browser_session_activities)
-      .values(rows.map(toDurableBrowserActivityInsert));
-  } catch (err) {
-    logger.error("Error inserting browser session activities", {
-      err,
-      count: rows.length,
-    });
-  }
+  // Compatibility no-op: activities are inserted synchronously at enqueue.
 }

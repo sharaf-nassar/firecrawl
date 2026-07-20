@@ -1,5 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
-import { deleteKey, getValue, setValue } from "../services/redis";
+import { deleteKey } from "../services/redis";
 import { db } from "../db/connection";
 import * as schema from "../db/schema";
 import { logger as _logger } from "./logger";
@@ -8,6 +8,10 @@ import {
   type LegacyBrowserSessionRow as BrowserSessionRow,
   type LegacyBrowserSessionStatus as BrowserSessionStatus,
 } from "./browser-state/legacy-compatibility";
+import {
+  didSessionUsePrompt,
+  markSessionPromptUsed,
+} from "./browser-state/store";
 
 const logger = _logger.child({ module: "browser-sessions" });
 
@@ -236,44 +240,26 @@ export async function updateBrowserSessionCreditsUsed(
 }
 
 // ---------------------------------------------------------------------------
-// Prompt usage tracking (Redis)
+// Prompt usage tracking (durable PostgreSQL compatibility facade)
 // ---------------------------------------------------------------------------
-
-const PROMPT_FLAG_TTL_SECONDS = 7200; // 2 hours, well beyond max session TTL
-
-function promptFlagKey(sessionId: string): string {
-  return `browser_session:used_prompt:${sessionId}`;
-}
 
 export async function markBrowserSessionUsedPrompt(
   sessionId: string,
 ): Promise<void> {
-  try {
-    await setValue(promptFlagKey(sessionId), "1", PROMPT_FLAG_TTL_SECONDS);
-  } catch {
-    // Redis down — non-fatal, will fall back to standard rate at billing time
-  }
+  await markSessionPromptUsed(sessionId);
 }
 
 export async function didBrowserSessionUsePrompt(
   sessionId: string,
 ): Promise<boolean> {
-  try {
-    const val = await getValue(promptFlagKey(sessionId));
-    return val === "1";
-  } catch {
-    return false;
-  }
+  return didSessionUsePrompt(sessionId);
 }
 
 export async function clearBrowserSessionPromptFlag(
-  sessionId: string,
+  _sessionId: string,
 ): Promise<void> {
-  try {
-    await deleteKey(promptFlagKey(sessionId));
-  } catch {
-    // non-fatal
-  }
+  // Durable accounting is monotonic for the session lifetime. Kept only so
+  // existing billing call sites can finish their compatibility rollout.
 }
 
 // ---------------------------------------------------------------------------

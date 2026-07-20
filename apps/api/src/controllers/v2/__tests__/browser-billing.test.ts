@@ -4,16 +4,16 @@ import { vi } from "vitest";
 // Mocks — must come before imports
 // ---------------------------------------------------------------------------
 
-const mockGetValue = vi.fn<(key: string) => Promise<string | null>>();
-const mockSetValue =
-  vi.fn<(key: string, value: string, ttl: number) => Promise<void>>();
-const mockDeleteKey = vi.fn<(key: string) => Promise<void>>();
+const mockMarkSessionPromptUsed = vi.fn<(id: string) => Promise<void>>();
+const mockDidSessionUsePrompt = vi.fn<(id: string) => Promise<boolean>>();
+
+vi.mock("../../../lib/browser-state/store", () => ({
+  markSessionPromptUsed: (id: string) => mockMarkSessionPromptUsed(id),
+  didSessionUsePrompt: (id: string) => mockDidSessionUsePrompt(id),
+}));
 
 vi.mock("../../../services/redis", () => ({
-  getValue: (key: string) => mockGetValue(key),
-  setValue: (key: string, value: string, ttl: number) =>
-    mockSetValue(key, value, ttl),
-  deleteKey: (key: string) => mockDeleteKey(key),
+  deleteKey: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../../../lib/logger", () => ({
@@ -43,9 +43,8 @@ import {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockGetValue.mockResolvedValue(null);
-  mockSetValue.mockResolvedValue(undefined);
-  mockDeleteKey.mockResolvedValue(undefined);
+  mockMarkSessionPromptUsed.mockResolvedValue(undefined);
+  mockDidSessionUsePrompt.mockResolvedValue(false);
 });
 
 // ---------------------------------------------------------------------------
@@ -97,13 +96,13 @@ describe("calculateBrowserSessionCredits", () => {
   });
 
   describe("with interact rate (420/hr)", () => {
-    it("returns minimum 2 credits for very short sessions", () => {
+    it("returns the one-minute minimum for very short sessions", () => {
       expect(calculateBrowserSessionCredits(0, INTERACT_CREDITS_PER_HOUR)).toBe(
-        2,
+        7,
       );
       expect(
         calculateBrowserSessionCredits(1000, INTERACT_CREDITS_PER_HOUR),
-      ).toBe(2);
+      ).toBe(7);
     });
 
     it("calculates 7 credits per minute", () => {
@@ -130,11 +129,10 @@ describe("calculateBrowserSessionCredits", () => {
       ).toBe(420);
     });
 
-    it("rounds up to next integer", () => {
-      // 31s / 3600s * 420 = 3.616... → ceil = 4
+    it("keeps the one-minute minimum below 60 seconds", () => {
       expect(
         calculateBrowserSessionCredits(31_000, INTERACT_CREDITS_PER_HOUR),
-      ).toBe(4);
+      ).toBe(7);
     });
   });
 
@@ -169,71 +167,60 @@ describe("calculateBrowserSessionCredits", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Prompt flag Redis helpers
+// Durable prompt-accounting facade
 // ---------------------------------------------------------------------------
 
 describe("prompt usage tracking", () => {
   describe("markBrowserSessionUsedPrompt", () => {
-    it("sets Redis flag with 2-hour TTL", async () => {
+    it("persists prompt use through the durable store", async () => {
       await markBrowserSessionUsedPrompt("session-123");
 
-      expect(mockSetValue).toHaveBeenCalledWith(
-        "browser_session:used_prompt:session-123",
-        "1",
-        7200,
-      );
+      expect(mockMarkSessionPromptUsed).toHaveBeenCalledWith("session-123");
     });
 
-    it("does not throw on Redis failure", async () => {
-      mockSetValue.mockRejectedValueOnce(new Error("Redis down"));
+    it("does not hide PostgreSQL failures", async () => {
+      const failure = new Error("PostgreSQL down");
+      mockMarkSessionPromptUsed.mockRejectedValueOnce(failure);
 
-      await expect(
-        markBrowserSessionUsedPrompt("session-123"),
-      ).resolves.not.toThrow();
+      await expect(markBrowserSessionUsedPrompt("session-123")).rejects.toBe(
+        failure,
+      );
     });
   });
 
   describe("didBrowserSessionUsePrompt", () => {
-    it("returns true when flag is set", async () => {
-      mockGetValue.mockResolvedValueOnce("1");
+    it("returns true when durable prompt use is set", async () => {
+      mockDidSessionUsePrompt.mockResolvedValueOnce(true);
 
       const result = await didBrowserSessionUsePrompt("session-123");
       expect(result).toBe(true);
-      expect(mockGetValue).toHaveBeenCalledWith(
-        "browser_session:used_prompt:session-123",
-      );
+      expect(mockDidSessionUsePrompt).toHaveBeenCalledWith("session-123");
     });
 
     it("returns false when flag is not set", async () => {
-      mockGetValue.mockResolvedValueOnce(null);
+      mockDidSessionUsePrompt.mockResolvedValueOnce(false);
 
       const result = await didBrowserSessionUsePrompt("session-123");
       expect(result).toBe(false);
     });
 
-    it("returns false on Redis failure (graceful fallback to browser rate)", async () => {
-      mockGetValue.mockRejectedValueOnce(new Error("Redis down"));
+    it("does not downgrade billing on PostgreSQL failure", async () => {
+      const failure = new Error("PostgreSQL down");
+      mockDidSessionUsePrompt.mockRejectedValueOnce(failure);
 
-      const result = await didBrowserSessionUsePrompt("session-123");
-      expect(result).toBe(false);
+      await expect(didBrowserSessionUsePrompt("session-123")).rejects.toBe(
+        failure,
+      );
     });
   });
 
   describe("clearBrowserSessionPromptFlag", () => {
-    it("deletes the Redis key", async () => {
-      await clearBrowserSessionPromptFlag("session-123");
-
-      expect(mockDeleteKey).toHaveBeenCalledWith(
-        "browser_session:used_prompt:session-123",
-      );
-    });
-
-    it("does not throw on Redis failure", async () => {
-      mockDeleteKey.mockRejectedValueOnce(new Error("Redis down"));
-
+    it("keeps durable prompt use monotonic", async () => {
       await expect(
         clearBrowserSessionPromptFlag("session-123"),
       ).resolves.not.toThrow();
+      expect(mockMarkSessionPromptUsed).not.toHaveBeenCalled();
+      expect(mockDidSessionUsePrompt).not.toHaveBeenCalled();
     });
   });
 });
@@ -244,7 +231,7 @@ describe("prompt usage tracking", () => {
 
 describe("billing rate selection", () => {
   it("uses 420/hr when prompt flag is set", async () => {
-    mockGetValue.mockResolvedValueOnce("1");
+    mockDidSessionUsePrompt.mockResolvedValueOnce(true);
 
     const usedPrompt = await didBrowserSessionUsePrompt("session-123");
     const rate = usedPrompt
@@ -258,7 +245,7 @@ describe("billing rate selection", () => {
   });
 
   it("uses 120/hr when no prompt was used", async () => {
-    mockGetValue.mockResolvedValueOnce(null);
+    mockDidSessionUsePrompt.mockResolvedValueOnce(false);
 
     const usedPrompt = await didBrowserSessionUsePrompt("session-123");
     const rate = usedPrompt
@@ -271,25 +258,11 @@ describe("billing rate selection", () => {
     expect(credits).toBe(10);
   });
 
-  it("falls back to 120/hr when Redis is down", async () => {
-    mockGetValue.mockRejectedValueOnce(new Error("Redis down"));
-
-    const usedPrompt = await didBrowserSessionUsePrompt("session-123");
-    const rate = usedPrompt
-      ? INTERACT_CREDITS_PER_HOUR
-      : BROWSER_CREDITS_PER_HOUR;
-    const credits = calculateBrowserSessionCredits(5 * 60_000, rate);
-
-    expect(usedPrompt).toBe(false);
-    expect(rate).toBe(120);
-    expect(credits).toBe(10);
-  });
-
-  it("full flow: mark → check → bill → clear", async () => {
+  it("full flow: mark → durable check → bill", async () => {
     await markBrowserSessionUsedPrompt("session-456");
-    expect(mockSetValue).toHaveBeenCalledTimes(1);
+    expect(mockMarkSessionPromptUsed).toHaveBeenCalledTimes(1);
 
-    mockGetValue.mockResolvedValueOnce("1");
+    mockDidSessionUsePrompt.mockResolvedValueOnce(true);
     const usedPrompt = await didBrowserSessionUsePrompt("session-456");
     expect(usedPrompt).toBe(true);
 
@@ -300,6 +273,6 @@ describe("billing rate selection", () => {
     expect(credits).toBe(21); // 3 min * 7 credits/min
 
     await clearBrowserSessionPromptFlag("session-456");
-    expect(mockDeleteKey).toHaveBeenCalledTimes(1);
+    expect(mockDidSessionUsePrompt).toHaveBeenCalledTimes(1);
   });
 });

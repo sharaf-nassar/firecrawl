@@ -1,4 +1,5 @@
 import { config } from "./config";
+import { runApplicationMigrations } from "./db/migrate";
 import { type ChildProcess, spawn } from "child_process";
 import { existsSync } from "fs";
 import * as net from "net";
@@ -8,6 +9,7 @@ import { containerRemovalCommand } from "./harness-container";
 import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
 import { createSharedShutdown } from "./harness-shutdown";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
+import { logger as applicationLogger } from "./lib/logger";
 import {
   createLocalRetentionService,
   runLocalRetentionLoop,
@@ -674,9 +676,19 @@ async function setupApplicationPostgres(): Promise<void> {
   process.env.APPLICATION_DATABASE_URL = databaseUrl;
   config.APPLICATION_DATABASE_URL = databaseUrl;
 
-  const migrate = execForward("app-db@migrate", ["pnpm", "db:migrate"]);
-  await migrate.promise;
+  await runApplicationMigrations(config);
   logger.success("Application database migrations applied");
+
+  const browserServiceEnabled = (
+    config as typeof config & { LOCAL_BROWSER_SERVICE_ENABLED?: boolean }
+  ).LOCAL_BROWSER_SERVICE_ENABLED;
+  if (browserServiceEnabled === true) {
+    const { interruptUnfinishedBrowserWork } = await import(
+      "./lib/browser-state/store.js"
+    );
+    const recovered = await interruptUnfinishedBrowserWork(new Date());
+    applicationLogger.info("Recovered durable browser state", recovered);
+  }
 }
 
 async function buildNuqPostgresImage(runtime: string): Promise<void> {
