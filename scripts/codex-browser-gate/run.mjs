@@ -14,6 +14,10 @@ import process from "node:process";
 
 import { createGateActionStore } from "./action-store.mjs";
 import {
+  assertSameCodexIdentity,
+  captureCodexIdentity,
+} from "./codex-executable.mjs";
+import {
   AppServerClient,
   assertGeneratedSchemaValue,
   assertNoLateTurnMessages,
@@ -38,8 +42,6 @@ import {
   surfaceCleanupFailures,
 } from "./lifecycle.mjs";
 import {
-  CODEX_VERSION,
-  CODEX_VERSION_OUTPUT,
   CONFIG,
   EFFORT,
   FORBIDDEN_EVENT_PATTERN,
@@ -76,7 +78,7 @@ function appendDistinctCleanupFailure(
   if (error !== primaryFailure) cleanupFailures.push(error);
 }
 
-async function runOne(runNumber) {
+async function runOne(runNumber, codexExecutablePath) {
   let root;
   let client;
   let eventsPath;
@@ -113,7 +115,7 @@ async function runOne(runNumber) {
 
     const env = { ...process.env, CODEX_HOME: codexHome };
     const schemaResult = await runCaptured(
-      "codex",
+      codexExecutablePath,
       [
         "app-server",
         "generate-json-schema",
@@ -133,17 +135,22 @@ async function runOne(runNumber) {
     const eventSchemas = await loadEventSchemas(schemaDir);
     runUnloadedTurnRegression(eventSchemas);
 
-    const featureResult = await runCaptured("codex", ["features", "list"], {
-      cwd: work,
-      env,
-      supervisor: gateLifecycle,
-    });
+    const featureResult = await runCaptured(
+      codexExecutablePath,
+      ["features", "list"],
+      {
+        cwd: work,
+        env,
+        supervisor: gateLifecycle,
+      },
+    );
     if (featureResult.code !== 0) {
       throw gateError("codex_features_failed", featureResult.stderr.trim());
     }
     const featureHash = hashFeatureInventory(featureResult.stdout);
 
     client = new AppServerClient({
+      command: codexExecutablePath,
       cwd: work,
       env,
       eventsPath,
@@ -399,29 +406,31 @@ async function runOne(runNumber) {
   }
 }
 
-async function prepareGate() {
+async function prepareGate(selection) {
   await runPreflight();
-  return runCaptured("codex", ["--version"], {
+  return captureCodexIdentity({
+    ...selection,
     supervisor: gateLifecycle,
   });
 }
 
 async function main(runCount) {
-  const versionResult = await prepareGate();
-  if (
-    versionResult.code !== 0 ||
-    versionResult.stdout.trim() !== CODEX_VERSION_OUTPUT
-  ) {
-    throw gateError(
-      "codex_version_mismatch",
-      JSON.stringify(versionResult.stdout.trim()),
-    );
-  }
+  const selection = {
+    pathValue: process.env.PATH,
+    cwd: process.cwd(),
+  };
+  const codexIdentity = await prepareGate(selection);
 
   const results = [];
   for (let runNumber = 1; runNumber <= runCount; runNumber += 1) {
-    results.push(await runOne(runNumber));
+    results.push(await runOne(runNumber, codexIdentity.resolvedPath));
   }
+  const postRunIdentity = await captureCodexIdentity({
+    ...selection,
+    supervisor: gateLifecycle,
+    failureCode: "codex_version_changed",
+  });
+  assertSameCodexIdentity(codexIdentity, postRunIdentity);
 
   for (const key of ["root", "markerPath", "pid", "threadId", "actionId"]) {
     if (new Set(results.map(result => result[key])).size !== results.length) {
@@ -440,7 +449,7 @@ async function main(runCount) {
   const sum = key =>
     results.reduce((total, result) => total + result[key], 0);
   process.stdout.write(
-    `codex_browser_gate: PASS runs=${runCount} version=${CODEX_VERSION} ` +
+    `codex_browser_gate: PASS runs=${runCount} version=${codexIdentity.version} ` +
       `model=${MODEL} effort=${EFFORT} turns=${sum("turns")} ` +
       `actions=${sum("actions")} writes=${sum("writes")} ` +
       `tools=${sum("tools")} approvals=${sum("approvals")} ` +

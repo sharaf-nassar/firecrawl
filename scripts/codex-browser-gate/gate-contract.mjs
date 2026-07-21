@@ -1,7 +1,5 @@
 import { createHash } from "node:crypto";
 
-export const CODEX_VERSION_OUTPUT = "codex-cli 0.144.5";
-export const CODEX_VERSION = "0.144.5";
 export const MODEL = "gpt-5.6-terra";
 export const EFFORT = "medium";
 export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;

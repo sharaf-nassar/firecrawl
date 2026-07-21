@@ -717,6 +717,7 @@ export async function loadEventSchemas(schemaDir) {
 
 export class AppServerClient {
   constructor({
+    command,
     cwd,
     env,
     eventsPath,
@@ -726,6 +727,9 @@ export class AppServerClient {
     scheduleTimer = setTimeout,
     cancelTimer = clearTimeout,
   }) {
+    if (typeof command !== "string" || command === "") {
+      throw gateError("codex_app_server_spawn_failed");
+    }
     this.eventsPath = eventsPath;
     this.supervisor = supervisor;
     this.scheduleTimer = scheduleTimer;
@@ -751,7 +755,7 @@ export class AppServerClient {
       });
 
     this.child = spawnChild(
-      "codex",
+      command,
       ["app-server", "--strict-config", "--stdio"],
       {
         cwd,
@@ -1951,15 +1955,24 @@ export async function runTransportSelfTest({ silent = false } = {}) {
       groupAlive = false;
     },
   });
+  let spawnArguments;
   const client = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events",
-    spawnChild: () => child,
+    spawnChild: (command, args) => {
+      spawnArguments = [command, args];
+      return child;
+    },
     supervisor,
     scheduleTimer: () => 1,
     cancelTimer() {},
   });
+  assert.deepEqual(spawnArguments, [
+    "/selected/codex",
+    ["app-server", "--strict-config", "--stdio"],
+  ]);
   const rawFrame = Buffer.from(
     '{"method":"thread/started","params":{"threadId":"thread-raw"}}\n',
   );
@@ -2027,6 +2040,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   });
   const boundedTimers = new Set();
   const boundedClient = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events-bounded",
@@ -2077,6 +2091,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   });
   const pendingStopTimers = new Set();
   const pendingStopClient = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events-pending-stop",
@@ -2127,6 +2142,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   });
   const closePendingTimers = new Set();
   const closePendingClient = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events-close-pending",
@@ -2178,6 +2194,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   });
   const cleanStopTimers = new Set();
   const cleanStopClient = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events-clean-stop",
@@ -2226,6 +2243,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   });
   const expiredTimers = new Set();
   const expiredClient = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events-expired",
@@ -2292,6 +2310,7 @@ export async function runTransportSelfTest({ silent = false } = {}) {
   });
   const retainedWatchdogs = new Set();
   const retainedClient = new AppServerClient({
+    command: "/selected/codex",
     cwd: "/gate",
     env: {},
     eventsPath: "/gate/events-retained",

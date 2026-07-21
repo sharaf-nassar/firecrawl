@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import * as contract from "./gate-contract.mjs";
+import * as codexExecutable from "./codex-executable.mjs";
 import * as decisionWire from "./decision-wire.mjs";
 import * as lifecycle from "./lifecycle.mjs";
 import * as protocol from "./app-server-protocol.mjs";
@@ -29,6 +30,7 @@ const gatePath = fileURLToPath(new URL("./run.mjs", import.meta.url));
 const productionSourcePaths = [
   "action-store.mjs",
   "app-server-protocol.mjs",
+  "codex-executable.mjs",
   "decision-wire.mjs",
   "gate-contract.mjs",
   "lifecycle.mjs",
@@ -1077,8 +1079,6 @@ assert.deepEqual(Object.keys(contract).toSorted(), [
   "CLEANUP_POLL_MS",
   "CLEANUP_TERM_GRACE_MS",
   "CLEANUP_TOTAL_GRACE_MS",
-  "CODEX_VERSION",
-  "CODEX_VERSION_OUTPUT",
   "CONFIG",
   "DISABLED_FEATURES",
   "EFFORT",
@@ -1092,6 +1092,11 @@ assert.deepEqual(Object.keys(contract).toSorted(), [
   "WATCHDOG_MS",
   "gateError",
   "hashFeatureInventory",
+]);
+assert.deepEqual(Object.keys(codexExecutable).toSorted(), [
+  "assertSameCodexIdentity",
+  "captureCodexIdentity",
+  "parseCodexVersionOutput",
 ]);
 assert.deepEqual(Object.keys(decisionWire).toSorted(), [
   "modelDecisionEnvelopeSchema",
@@ -1168,6 +1173,7 @@ for (const pattern of [
 }
 
 for (const name of [
+  "codex-executable.mjs",
   "gate-contract.mjs",
   "lifecycle.mjs",
   "decision-wire.mjs",
@@ -1193,11 +1199,53 @@ assert.notEqual(prepareGateEnd, -1);
 const prepareGateSource = runSource.slice(prepareGateStart, prepareGateEnd);
 const preflightCall = prepareGateSource.indexOf("await runPreflight()");
 const versionCall = prepareGateSource.indexOf(
-  'runCaptured("codex", ["--version"]',
+  "captureCodexIdentity({",
 );
 assert.notEqual(preflightCall, -1);
 assert.notEqual(versionCall, -1);
 assert.ok(preflightCall < versionCall);
+
+const mainSource = runSource.slice(prepareGateEnd);
+const firstRunCall = mainSource.indexOf(
+  "runOne(runNumber, codexIdentity.resolvedPath)",
+);
+const postRunCapture = mainSource.indexOf("const postRunIdentity");
+const identityAssertion = mainSource.indexOf(
+  "assertSameCodexIdentity(codexIdentity, postRunIdentity)",
+);
+const passWrite = mainSource.indexOf("process.stdout.write(");
+assert.notEqual(firstRunCall, -1);
+assert.notEqual(postRunCapture, -1);
+assert.notEqual(identityAssertion, -1);
+assert.notEqual(passWrite, -1);
+assert.ok(firstRunCall < postRunCapture);
+assert.ok(postRunCapture < identityAssertion);
+assert.ok(identityAssertion < passWrite);
+assert.match(
+  mainSource.slice(postRunCapture, identityAssertion),
+  /failureCode: "codex_version_changed"/,
+);
+assert.match(
+  mainSource.slice(postRunCapture, identityAssertion),
+  /\.\.\.selection/,
+);
+assert.doesNotMatch(runSource, /runCaptured\("codex"/);
+assert.doesNotMatch(
+  productionSources["app-server-protocol.mjs"],
+  /spawnChild\(\s*["']codex["']/,
+);
+assert.match(runSource, /command: codexExecutablePath/);
+assert.match(runSource, /version=\$\{codexIdentity\.version\}/);
+assert.match(
+  runSource,
+  /runCaptured\(\s*codexExecutablePath,\s*\[\s*"app-server",\s*"generate-json-schema"/,
+);
+assert.match(
+  runSource,
+  /runCaptured\(\s*codexExecutablePath,\s*\["features", "list"\]/,
+);
+assert.equal("CODEX_VERSION" in contract, false);
+assert.equal("CODEX_VERSION_OUTPUT" in contract, false);
 
 const primaryFailure = new Error("primary");
 const cleanupFailure = new Error("cleanup");
@@ -1381,8 +1429,6 @@ assert.deepEqual(parseModelDecisionEnvelopeV1(actionEnvelopeText), {
     },
   },
 });
-assert.equal(contract.CODEX_VERSION_OUTPUT, "codex-cli 0.144.5");
-assert.equal(contract.CODEX_VERSION, "0.144.5");
 assert.equal(contract.MODEL, "gpt-5.6-terra");
 assert.equal(contract.EFFORT, "medium");
 assert.equal(contract.MAX_OUTPUT_BYTES, 4 * 1024 * 1024);
