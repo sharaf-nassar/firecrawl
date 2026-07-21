@@ -3,6 +3,7 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 import { config } from "../config";
 import { getArtifactStore, type ArtifactStore } from "../lib/artifacts";
 import { BrowserStateFilesystem } from "../lib/browser-state/filesystem-store";
+import { inspectBrowserStateProcessIdentity } from "../lib/browser-state/process-identity";
 import { logger as defaultLogger } from "../lib/logger";
 import {
   resolveLocalRuntimeConfig,
@@ -49,15 +50,17 @@ export type ArtifactManifestClaim = {
 };
 
 export type ExpiredBrowserStateFile = {
-  kind: "replay-checkpoint" | "profile-generation";
+  kind: "replay-checkpoint" | "replay-cleanup-intent" | "profile-generation";
   id: string;
   statePath: string;
   checksum: string;
   deleteAfter: Date;
+  scrapeId?: string;
 };
 
 export type BrowserStateFileClaim = {
   file: ExpiredBrowserStateFile;
+  deleteFile: boolean;
   markFileDeleted(): Promise<boolean>;
   release(): Promise<void>;
 };
@@ -72,15 +75,24 @@ type RetentionFailureProgress = OperationalCleanupResult & {
   artifactCandidates: number;
   artifactsDeleted: number;
   artifactFailures: number;
+  browserStateCandidates: number;
+  browserStateFilesDeleted: number;
+  browserStateFailures: number;
   durationMs: number;
 };
 
-type RetentionFailurePhase = "artifact-delete" | "operational-cleanup";
+type RetentionFailurePhase =
+  | "artifact-delete"
+  | "browser-state-delete"
+  | "operational-cleanup";
 
 abstract class LocalRetentionFailure extends Error {
   readonly artifactCandidates: number;
   readonly artifactsDeleted: number;
   readonly artifactFailures: number;
+  readonly browserStateCandidates: number;
+  readonly browserStateFilesDeleted: number;
+  readonly browserStateFailures: number;
   readonly requestsDeleted: number;
   readonly dependentRowsDeleted: number;
   readonly requestIds: string[];
@@ -99,6 +111,9 @@ abstract class LocalRetentionFailure extends Error {
     this.artifactCandidates = progress.artifactCandidates;
     this.artifactsDeleted = progress.artifactsDeleted;
     this.artifactFailures = progress.artifactFailures;
+    this.browserStateCandidates = progress.browserStateCandidates;
+    this.browserStateFilesDeleted = progress.browserStateFilesDeleted;
+    this.browserStateFailures = progress.browserStateFailures;
     this.requestsDeleted = progress.requestsDeleted;
     this.dependentRowsDeleted = progress.dependentRowsDeleted;
     this.requestIds = [...progress.requestIds];
@@ -185,6 +200,10 @@ export class LocalOperationalRetentionError extends LocalRetentionFailure {
         artifactCandidates: options.progress?.artifactCandidates ?? 0,
         artifactsDeleted: options.progress?.artifactsDeleted ?? 0,
         artifactFailures: options.progress?.artifactFailures ?? 0,
+        browserStateCandidates: options.progress?.browserStateCandidates ?? 0,
+        browserStateFilesDeleted:
+          options.progress?.browserStateFilesDeleted ?? 0,
+        browserStateFailures: options.progress?.browserStateFailures ?? 0,
         requestsDeleted: options.progress?.requestsDeleted ?? 0,
         dependentRowsDeleted: options.progress?.dependentRowsDeleted ?? 0,
         requestIds,
@@ -228,16 +247,40 @@ export class LocalRetentionShutdownTimeoutError extends Error {
   }
 }
 
-export class LocalBrowserStateRetentionError extends Error {
-  readonly code = "browser_state_delete_failed";
+type BrowserStateFailureOperation =
+  | "claim"
+  | "filesystem-delete"
+  | "metadata-cas"
+  | "claim-release";
 
-  constructor(
-    readonly kind: ExpiredBrowserStateFile["kind"],
-    readonly statePath: string,
-    cause: unknown,
-  ) {
-    super("Browser state retention delete failed", { cause });
-    this.name = "LocalBrowserStateRetentionError";
+export type BrowserStateRetentionFailure = {
+  fileKind: ExpiredBrowserStateFile["kind"];
+  operation: BrowserStateFailureOperation;
+  errorName: string;
+  errorCode?: string;
+  cleanupError?: ReturnType<typeof errorMetadata>;
+};
+
+type BrowserStateRetentionFailureOptions = RetentionFailureProgress & {
+  failures: BrowserStateRetentionFailure[];
+  cause: unknown;
+};
+
+export class LocalBrowserStateRetentionError extends LocalRetentionFailure {
+  readonly failures: BrowserStateRetentionFailure[];
+
+  constructor(options: BrowserStateRetentionFailureOptions) {
+    super(
+      "LocalBrowserStateRetentionError",
+      "Browser state retention delete failed",
+      "browser_state_delete_failed",
+      "browser-state-delete",
+      options,
+      options.cause,
+    );
+    this.failures = options.failures
+      .slice(0, RETENTION_BATCH_SIZE)
+      .map(failure => ({ ...failure }));
   }
 }
 
@@ -283,6 +326,9 @@ type IterationResult = OperationalCleanupResult & {
   artifactCandidates: number;
   artifactsDeleted: number;
   artifactFailures: number;
+  browserStateCandidates: number;
+  browserStateFilesDeleted: number;
+  browserStateFailures: number;
 };
 
 type LoopOptions = {
@@ -323,6 +369,27 @@ type BrowserStateFileRow = {
   state_path: string;
   checksum: string;
   delete_after: Date;
+  scrape_id: string | null;
+};
+
+type BrowserCleanupIntentRow = {
+  id: string;
+  scrape_id: string;
+  state_path: string;
+  checksum: string;
+  state: "cleanup" | "preparing";
+  created_at: Date;
+  writer_lease: string | null;
+  writer_pid: number | null;
+  writer_boot_id: string | null;
+  writer_start_time: string | null;
+};
+
+type SelectedBrowserStateFile = {
+  file: ExpiredBrowserStateFile;
+  deleteFile: boolean;
+  intentState?: BrowserCleanupIntentRow["state"];
+  writerLease?: string | null;
 };
 
 function toManifest(row: ArtifactManifestRow): ExpiredArtifactManifest {
@@ -343,6 +410,20 @@ function toBrowserStateFile(row: BrowserStateFileRow): ExpiredBrowserStateFile {
     statePath: row.state_path,
     checksum: row.checksum,
     deleteAfter: row.delete_after,
+    ...(row.scrape_id ? { scrapeId: row.scrape_id } : {}),
+  };
+}
+
+function toCleanupIntentFile(
+  row: BrowserCleanupIntentRow,
+): ExpiredBrowserStateFile {
+  return {
+    kind: "replay-cleanup-intent",
+    id: row.id,
+    statePath: row.state_path,
+    checksum: row.checksum,
+    deleteAfter: row.created_at,
+    scrapeId: row.scrape_id,
   };
 }
 
@@ -371,6 +452,9 @@ function retentionFailureMetadata(error: unknown): Record<string, unknown> {
     artifactCandidates: error.artifactCandidates,
     artifactsDeleted: error.artifactsDeleted,
     artifactFailures: error.artifactFailures,
+    browserStateCandidates: error.browserStateCandidates,
+    browserStateFilesDeleted: error.browserStateFilesDeleted,
+    browserStateFailures: error.browserStateFailures,
     requestsDeleted: error.requestsDeleted,
     dependentRowsDeleted: error.dependentRowsDeleted,
     requestIds: error.requestIds,
@@ -381,6 +465,8 @@ function retentionFailureMetadata(error: unknown): Record<string, unknown> {
     metadata.requestId = error.requestId;
     metadata.jobId = error.jobId;
     metadata.provider = error.provider;
+    metadata.failures = error.failures;
+  } else if (error instanceof LocalBrowserStateRetentionError) {
     metadata.failures = error.failures;
   } else if (
     error instanceof LocalOperationalRetentionError &&
@@ -394,16 +480,20 @@ function retentionFailureMetadata(error: unknown): Record<string, unknown> {
 
 type PgLocalRetentionDependencies = {
   createPool?: (config: PoolConfig) => Pool;
+  inspectProcessIdentity?: typeof inspectBrowserStateProcessIdentity;
 };
 
 export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
   private readonly pool: Pool;
+  private readonly inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity;
   private closePromise: Promise<void> | undefined;
 
   constructor(
     connectionString: string,
     dependencies: PgLocalRetentionDependencies = {},
   ) {
+    this.inspectProcessIdentity =
+      dependencies.inspectProcessIdentity ?? inspectBrowserStateProcessIdentity;
     this.pool = (dependencies.createPool ?? (config => new Pool(config)))({
       connectionString,
       application_name: "firecrawl-local-retention",
@@ -460,13 +550,14 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     let released = false;
     try {
       const result = await client.query<BrowserStateFileRow>(
-        `SELECT kind, id, state_path, checksum, delete_after
+        `SELECT kind, id, state_path, checksum, delete_after, scrape_id
            FROM (
              SELECT 'profile-generation'::text AS kind,
                     generation.id,
                     generation.state_path,
                     generation.checksum,
-                    generation.expires_at AS delete_after
+                    generation.expires_at AS delete_after,
+                    NULL::uuid AS scrape_id
                FROM browser_profile_generations generation
                JOIN browser_profiles profile
                  ON profile.id = generation.profile_id
@@ -489,7 +580,8 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
                     checkpoint.id,
                     checkpoint.state_path,
                     checkpoint.checksum,
-                    request.dr_clean_by AS delete_after
+                    request.dr_clean_by AS delete_after,
+                    checkpoint.scrape_id
                FROM browser_replay_checkpoints checkpoint
                JOIN requests request ON request.id = checkpoint.request_id
               WHERE checkpoint.state_path IS NOT NULL
@@ -501,7 +593,51 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
           LIMIT $2`,
         [now, limit],
       );
-      return result.rows.map(toBrowserStateFile);
+      const candidates = result.rows.map(toBrowserStateFile);
+      let remaining = Math.max(0, limit - candidates.length);
+      if (remaining > 0) {
+        const cleanup = await client.query<BrowserCleanupIntentRow>(
+          `SELECT id, scrape_id, state_path, checksum, state, created_at,
+                  writer_lease, writer_pid, writer_boot_id, writer_start_time
+             FROM browser_replay_checkpoint_cleanup_intents
+            WHERE state = 'cleanup'
+            ORDER BY created_at, id
+            LIMIT $1`,
+          [remaining],
+        );
+        candidates.push(...cleanup.rows.map(toCleanupIntentFile));
+        remaining = Math.max(0, limit - candidates.length);
+      }
+      if (remaining > 0) {
+        const preparing = await client.query<BrowserCleanupIntentRow>(
+          `SELECT id, scrape_id, state_path, checksum, state, created_at,
+                  writer_lease, writer_pid, writer_boot_id, writer_start_time
+             FROM browser_replay_checkpoint_cleanup_intents
+            WHERE state = 'preparing'
+            ORDER BY created_at, id
+            LIMIT $1`,
+          [Math.max(remaining * 4, remaining)],
+        );
+        for (const intent of preparing.rows) {
+          if (candidates.length >= limit) break;
+          if (
+            intent.writer_pid === null ||
+            intent.writer_boot_id === null ||
+            intent.writer_start_time === null
+          ) {
+            continue;
+          }
+          const identity = await this.inspectProcessIdentity({
+            pid: intent.writer_pid,
+            bootId: intent.writer_boot_id,
+            startTime: intent.writer_start_time,
+          });
+          if (identity === "dead") {
+            candidates.push(toCleanupIntentFile(intent));
+          }
+        }
+      }
+      return candidates;
     } catch (error) {
       released = true;
       client.release(true);
@@ -516,37 +652,82 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     now: Date,
   ): Promise<BrowserStateFileClaim | null> {
     const client = await this.pool.connect();
-    let lockAcquired = false;
+    const acquiredLocks: string[] = [];
     let clientReleased = false;
     try {
       const lock = await client.query<{ acquired: boolean }>(
         `SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired`,
         [candidate.statePath],
       );
-      lockAcquired = lock.rows[0]?.acquired === true;
-      if (!lockAcquired) {
+      if (lock.rows[0]?.acquired !== true) {
         clientReleased = true;
         client.release();
         return null;
       }
+      acquiredLocks.push(candidate.statePath);
+      if (candidate.scrapeId) {
+        const scrapeLock = await client.query<{ acquired: boolean }>(
+          `SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired`,
+          [candidate.scrapeId],
+        );
+        if (scrapeLock.rows[0]?.acquired !== true) {
+          clientReleased = true;
+          await releaseBrowserStateLocks(client, acquiredLocks);
+          return null;
+        }
+        acquiredLocks.push(candidate.scrapeId);
+      }
 
-      const current = await selectBrowserStateFile(client, candidate, now);
-      if (!current) {
+      const selected = await selectBrowserStateFile(
+        client,
+        candidate,
+        now,
+        this.inspectProcessIdentity,
+      );
+      if (!selected) {
         clientReleased = true;
-        await releaseBrowserStateLock(client, candidate.statePath);
+        await releaseBrowserStateLocks(client, acquiredLocks);
         return null;
       }
+      const current = selected.file;
 
       let claimReleased = false;
       let destroyOnRelease = false;
       return {
         file: current,
+        deleteFile: selected.deleteFile,
         markFileDeleted: async () => {
           try {
             const result =
-              current.kind === "replay-checkpoint"
+              current.kind === "replay-cleanup-intent"
                 ? await client.query(
-                    `UPDATE browser_replay_checkpoints checkpoint
+                    `DELETE FROM browser_replay_checkpoint_cleanup_intents intent
+                      WHERE intent.id = $1
+                        AND intent.state_path = $2
+                        AND intent.checksum = $3
+                        AND intent.state = $4
+                        AND intent.writer_lease IS NOT DISTINCT FROM $5::uuid
+                        AND (
+                          $6::boolean = false
+                          OR NOT EXISTS (
+                            SELECT 1 FROM browser_replay_checkpoints checkpoint
+                             WHERE checkpoint.scrape_id = intent.scrape_id
+                               AND checkpoint.state_path = intent.state_path
+                               AND checkpoint.checksum = intent.checksum
+                          )
+                        )`,
+                    [
+                      current.id,
+                      current.statePath,
+                      current.checksum,
+                      selected.intentState,
+                      selected.writerLease,
+                      selected.deleteFile,
+                    ],
+                  )
+                : current.kind === "replay-checkpoint"
+                  ? await client.query(
+                      `UPDATE browser_replay_checkpoints checkpoint
                         SET state_path = NULL, file_deleted_at = $5
                       WHERE checkpoint.id = $1
                         AND checkpoint.state_path = $2
@@ -558,10 +739,16 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
                              AND request.dr_clean_by IS NOT NULL
                              AND request.dr_clean_by <= $4
                         )`,
-                    [current.id, current.statePath, current.checksum, now, now],
-                  )
-                : await client.query(
-                    `UPDATE browser_profile_generations generation
+                      [
+                        current.id,
+                        current.statePath,
+                        current.checksum,
+                        now,
+                        now,
+                      ],
+                    )
+                  : await client.query(
+                      `UPDATE browser_profile_generations generation
                         SET state_path = NULL, file_deleted_at = $5
                       WHERE generation.id = $1
                         AND generation.state_path = $2
@@ -582,8 +769,14 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
                                'stopping'
                              )
                         )`,
-                    [current.id, current.statePath, current.checksum, now, now],
-                  );
+                      [
+                        current.id,
+                        current.statePath,
+                        current.checksum,
+                        now,
+                        now,
+                      ],
+                    );
             return result.rowCount === 1;
           } catch (error) {
             destroyOnRelease = true;
@@ -596,16 +789,16 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
           if (destroyOnRelease) {
             client.release(true);
           } else {
-            await releaseBrowserStateLock(client, current.statePath);
+            await releaseBrowserStateLocks(client, acquiredLocks);
           }
         },
       };
     } catch (error) {
       if (clientReleased) {
         throw error;
-      } else if (lockAcquired) {
+      } else if (acquiredLocks.length > 0) {
         try {
-          await releaseBrowserStateLock(client, candidate.statePath);
+          await releaseBrowserStateLocks(client, acquiredLocks);
         } catch (cleanupError) {
           throw new LocalRetentionResourceError(error, cleanupError);
         }
@@ -756,6 +949,12 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
                WHERE artifact.request_id = requests.id
                  AND artifact.kind LIKE 'browser%'
             )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM browser_replay_checkpoint_cleanup_intents intent
+                JOIN scrapes scrape ON scrape.id = intent.scrape_id
+               WHERE scrape.request_id = requests.id
+            )
           ORDER BY dr_clean_by, id
           LIMIT $2
           FOR UPDATE SKIP LOCKED`,
@@ -843,7 +1042,57 @@ async function selectBrowserStateFile(
   client: PoolClient,
   candidate: ExpiredBrowserStateFile,
   now: Date,
-): Promise<ExpiredBrowserStateFile | null> {
+  inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity,
+): Promise<SelectedBrowserStateFile | null> {
+  if (candidate.kind === "replay-cleanup-intent") {
+    const result = await client.query<
+      BrowserCleanupIntentRow & {
+        current_state_path: string | null;
+        current_checksum: string | null;
+      }
+    >(
+      `SELECT intent.id, intent.scrape_id, intent.state_path,
+              intent.checksum, intent.state, intent.created_at,
+              intent.writer_lease, intent.writer_pid,
+              intent.writer_boot_id, intent.writer_start_time,
+              checkpoint.state_path AS current_state_path,
+              checkpoint.checksum AS current_checksum
+         FROM browser_replay_checkpoint_cleanup_intents intent
+         LEFT JOIN browser_replay_checkpoints checkpoint
+           ON checkpoint.scrape_id = intent.scrape_id
+        WHERE intent.id = $1
+          AND intent.state_path = $2
+          AND intent.checksum = $3`,
+      [candidate.id, candidate.statePath, candidate.checksum],
+    );
+    const intent = result.rows[0];
+    if (!intent) return null;
+    if (intent.state === "preparing") {
+      if (
+        intent.writer_pid === null ||
+        intent.writer_boot_id === null ||
+        intent.writer_start_time === null
+      ) {
+        return null;
+      }
+      const identity = await inspectProcessIdentity({
+        pid: intent.writer_pid,
+        bootId: intent.writer_boot_id,
+        startTime: intent.writer_start_time,
+      });
+      if (identity !== "dead") return null;
+    }
+    return {
+      file: toCleanupIntentFile(intent),
+      deleteFile: !(
+        intent.current_state_path === intent.state_path &&
+        intent.current_checksum === intent.checksum
+      ),
+      intentState: intent.state,
+      writerLease: intent.writer_lease,
+    };
+  }
+
   const result =
     candidate.kind === "replay-checkpoint"
       ? await client.query<BrowserStateFileRow>(
@@ -851,7 +1100,8 @@ async function selectBrowserStateFile(
                   checkpoint.id,
                   checkpoint.state_path,
                   checkpoint.checksum,
-                  request.dr_clean_by AS delete_after
+                  request.dr_clean_by AS delete_after,
+                  checkpoint.scrape_id
              FROM browser_replay_checkpoints checkpoint
              JOIN requests request ON request.id = checkpoint.request_id
             WHERE checkpoint.id = $1
@@ -867,7 +1117,8 @@ async function selectBrowserStateFile(
                   generation.id,
                   generation.state_path,
                   generation.checksum,
-                  generation.expires_at AS delete_after
+                  generation.expires_at AS delete_after,
+                  NULL::uuid AS scrape_id
              FROM browser_profile_generations generation
              JOIN browser_profiles profile
                ON profile.id = generation.profile_id
@@ -887,17 +1138,21 @@ async function selectBrowserStateFile(
               )`,
           [candidate.id, candidate.statePath, candidate.checksum, now],
         );
-  return result.rows[0] ? toBrowserStateFile(result.rows[0]) : null;
+  return result.rows[0]
+    ? { file: toBrowserStateFile(result.rows[0]), deleteFile: true }
+    : null;
 }
 
-async function releaseBrowserStateLock(
+async function releaseBrowserStateLocks(
   client: PoolClient,
-  statePath: string,
+  lockKeys: string[],
 ): Promise<void> {
   try {
-    await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
-      statePath,
-    ]);
+    for (const lockKey of [...lockKeys].reverse()) {
+      await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+        lockKey,
+      ]);
+    }
   } catch (error) {
     client.release(true);
     throw error;
@@ -930,6 +1185,9 @@ export async function runLocalRetentionIteration(
     artifactCandidates: 0,
     artifactsDeleted: 0,
     artifactFailures: 0,
+    browserStateCandidates: 0,
+    browserStateFilesDeleted: 0,
+    browserStateFailures: 0,
     requestsDeleted: 0,
     dependentRowsDeleted: 0,
     requestIds: [],
@@ -938,6 +1196,10 @@ export async function runLocalRetentionIteration(
     failure: ArtifactRetentionFailure;
     causes: unknown[];
     blocksOperationalCleanup: boolean;
+  }> = [];
+  const browserFailureRecords: Array<{
+    failure: BrowserStateRetentionFailure;
+    causes: unknown[];
   }> = [];
 
   if (options.artifactStore && !options.signal?.aborted) {
@@ -1074,18 +1336,53 @@ export async function runLocalRetentionIteration(
       now,
       RETENTION_BATCH_SIZE,
     );
+    result.browserStateCandidates = candidates.length;
     for (const candidate of candidates) {
       if (options.signal?.aborted) break;
-      const claim = await options.database.tryClaimBrowserStateFile(
-        candidate,
-        now,
-      );
+      let claim: BrowserStateFileClaim | null;
+      try {
+        claim = await options.database.tryClaimBrowserStateFile(candidate, now);
+      } catch (error) {
+        result.browserStateFailures += 1;
+        const source =
+          error instanceof LocalRetentionResourceError ? error.cause : error;
+        const failure: BrowserStateRetentionFailure = {
+          fileKind: candidate.kind,
+          operation: "claim",
+          ...errorMetadata(source),
+          ...(error instanceof LocalRetentionResourceError
+            ? { cleanupError: error.cleanupError }
+            : {}),
+        };
+        browserFailureRecords.push({ failure, causes: [error] });
+        logger.error("Local browser state retention candidate failed", failure);
+        continue;
+      }
       if (!claim) continue;
       let primaryError: unknown;
+      let primaryOperation: BrowserStateFailureOperation | undefined;
+      let interrupted = false;
       try {
-        await options.browserStateFilesystem.delete(claim.file.statePath);
-        if (!options.signal?.aborted && !(await claim.markFileDeleted())) {
-          throw new BrowserStateFileClaimLostError();
+        if (claim.deleteFile) {
+          try {
+            await options.browserStateFilesystem.delete(claim.file.statePath);
+          } catch (error) {
+            primaryOperation = "filesystem-delete";
+            throw error;
+          }
+        }
+        if (options.signal?.aborted) {
+          interrupted = true;
+        } else {
+          try {
+            if (!(await claim.markFileDeleted())) {
+              throw new BrowserStateFileClaimLostError();
+            }
+            if (claim.deleteFile) result.browserStateFilesDeleted += 1;
+          } catch (error) {
+            primaryOperation = "metadata-cas";
+            throw error;
+          }
         }
       } catch (error) {
         primaryError = error;
@@ -1097,19 +1394,27 @@ export async function runLocalRetentionIteration(
         cleanupError = error;
       }
       if (primaryError || cleanupError) {
-        const cause =
-          primaryError && cleanupError
-            ? new AggregateError(
-                [primaryError, cleanupError],
-                "Browser state delete and claim cleanup failed",
-              )
-            : (primaryError ?? cleanupError);
-        throw new LocalBrowserStateRetentionError(
-          claim.file.kind,
-          claim.file.statePath,
-          cause,
-        );
+        result.browserStateFailures += 1;
+        const failure: BrowserStateRetentionFailure = {
+          fileKind: claim.file.kind,
+          operation: primaryError
+            ? (primaryOperation ?? "metadata-cas")
+            : "claim-release",
+          ...errorMetadata(primaryError ?? cleanupError),
+          ...(primaryError && cleanupError
+            ? { cleanupError: errorMetadata(cleanupError) }
+            : {}),
+        };
+        browserFailureRecords.push({
+          failure,
+          causes: [primaryError, cleanupError].filter(
+            (error): error is NonNullable<typeof error> => error != null,
+          ),
+        });
+        logger.error("Local browser state retention candidate failed", failure);
+        continue;
       }
+      if (interrupted) break;
     }
   }
 
@@ -1147,17 +1452,18 @@ export async function runLocalRetentionIteration(
         error instanceof LocalOperationalRetentionError ? error.requestIds : [];
       const operationalCause =
         error instanceof LocalOperationalRetentionError ? error.cause : error;
+      const priorCauses = [
+        ...artifactFailureRecords.flatMap(record => record.causes),
+        ...browserFailureRecords.flatMap(record => record.causes),
+      ];
       throw new LocalOperationalRetentionError({
         requestIds,
         cause:
-          artifactFailureRecords.length === 0
+          priorCauses.length === 0
             ? operationalCause
             : new AggregateError(
-                [
-                  ...artifactFailureRecords.flatMap(record => record.causes),
-                  operationalCause,
-                ],
-                "Local artifact and operational retention failed",
+                [...priorCauses, operationalCause],
+                "Local file and operational retention failed",
               ),
         cleanupError:
           error instanceof LocalOperationalRetentionError
@@ -1168,6 +1474,18 @@ export async function runLocalRetentionIteration(
         durationMs: Date.now() - startedAt,
       });
     }
+  }
+
+  if (browserFailureRecords.length > 0) {
+    throw new LocalBrowserStateRetentionError({
+      ...result,
+      durationMs: Date.now() - startedAt,
+      failures: browserFailureRecords.map(record => record.failure),
+      cause: new AggregateError(
+        browserFailureRecords.flatMap(record => record.causes),
+        "Browser state retention candidates failed",
+      ),
+    });
   }
 
   if (artifactFailureRecords.length > 0) {
@@ -1194,6 +1512,8 @@ export async function runLocalRetentionIteration(
   if (
     result.artifactsDeleted > 0 ||
     result.artifactFailures > 0 ||
+    result.browserStateFilesDeleted > 0 ||
+    result.browserStateFailures > 0 ||
     result.requestsDeleted > 0 ||
     result.dependentRowsDeleted > 0
   ) {

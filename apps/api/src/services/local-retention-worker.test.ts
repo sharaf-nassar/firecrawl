@@ -118,6 +118,7 @@ class FakeDatabase implements LocalRetentionDatabase {
     if (!file) return null;
     return {
       file,
+      deleteFile: true,
       markFileDeleted: async () => {
         if (!this.browserMarkResult) return false;
         this.events.push(`metadata:${file.statePath}`);
@@ -237,9 +238,10 @@ describe("runLocalRetentionIteration", () => {
     ).rejects.toThrow("Browser state retention delete failed");
 
     expect(database.browserStateFiles).toHaveLength(1);
-    expect(database.operationalRuns).toBe(0);
+    expect(database.operationalRuns).toBe(1);
     expect(database.events).toEqual([
       "file-release:replay/owner/scrape/checkpoint-0.json",
+      "operational",
     ]);
   });
 
@@ -259,7 +261,140 @@ describe("runLocalRetentionIteration", () => {
     ).rejects.toThrow("Browser state retention delete failed");
 
     expect(database.browserStateFiles).toHaveLength(1);
-    expect(database.operationalRuns).toBe(0);
+    expect(database.operationalRuns).toBe(1);
+  });
+
+  it("continues after a poison browser file and cleans unrelated rows", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = browserStateFiles(2);
+    database.operationalResult = {
+      requestsDeleted: 1,
+      dependentRowsDeleted: 2,
+      requestIds: ["safe-request"],
+    };
+    const filesystem = {
+      delete: vi.fn(async (statePath: string) => {
+        database.events.push(`file:${statePath}`);
+        if (statePath.endsWith("checkpoint-0.json")) {
+          throw Object.assign(new Error("poison secret=do-not-log"), {
+            code: "EIO",
+          });
+        }
+      }),
+    };
+
+    const failure = await runLocalRetentionIteration({
+      database,
+      artifactStore: null,
+      browserStateFilesystem: filesystem,
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    }).catch(error => error);
+
+    expect(failure).toMatchObject({
+      name: "LocalBrowserStateRetentionError",
+      browserStateCandidates: 2,
+      browserStateFilesDeleted: 1,
+      browserStateFailures: 1,
+      requestsDeleted: 1,
+      dependentRowsDeleted: 2,
+      requestIds: ["safe-request"],
+    });
+    expect(database.browserStateFiles.map(file => file.id)).toEqual([
+      "checkpoint-0",
+    ]);
+    expect(database.events).toEqual([
+      "file:replay/owner/scrape/checkpoint-0.json",
+      "file-release:replay/owner/scrape/checkpoint-0.json",
+      "file:replay/owner/scrape/checkpoint-1.json",
+      "metadata:replay/owner/scrape/checkpoint-1.json",
+      "file-release:replay/owner/scrape/checkpoint-1.json",
+      "operational",
+    ]);
+  });
+
+  it("logs sanitized browser failure stages without durable paths", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = browserStateFiles(4).map((file, index) => ({
+      ...file,
+      statePath: `replay/owner/scrape/secret-do-not-log-${index}.json`,
+    }));
+    const originalClaim = database.tryClaimBrowserStateFile.bind(database);
+    database.tryClaimBrowserStateFile = vi.fn(async (candidate, now) => {
+      if (candidate.id === "checkpoint-0") {
+        throw Object.assign(new Error("claim secret=do-not-log"), {
+          code: "55P03",
+        });
+      }
+      const claim = await originalClaim(candidate, now);
+      if (!claim) return null;
+      return {
+        ...claim,
+        markFileDeleted:
+          candidate.id === "checkpoint-3"
+            ? async () => false
+            : claim.markFileDeleted,
+        release:
+          candidate.id === "checkpoint-1"
+            ? async () => {
+                throw Object.assign(new Error("release secret=do-not-log"), {
+                  code: "ECONNRESET",
+                });
+              }
+            : claim.release,
+      };
+    });
+
+    await expect(
+      runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: {
+          delete: vi.fn(async statePath => {
+            if (statePath.endsWith("-2.json")) {
+              throw Object.assign(new Error("delete secret=do-not-log"), {
+                code: "EIO",
+              });
+            }
+          }),
+        },
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      }),
+    ).rejects.toMatchObject({ browserStateFailures: 4 });
+
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      "Local browser state retention candidate failed",
+      expect.objectContaining({
+        fileKind: "replay-checkpoint",
+        operation: "claim",
+        errorCode: "55P03",
+      }),
+    );
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      "Local browser state retention candidate failed",
+      expect.objectContaining({
+        operation: "claim-release",
+        errorCode: "ECONNRESET",
+      }),
+    );
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      "Local browser state retention candidate failed",
+      expect.objectContaining({
+        operation: "filesystem-delete",
+        errorCode: "EIO",
+      }),
+    );
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      "Local browser state retention candidate failed",
+      expect.objectContaining({
+        operation: "metadata-cas",
+        errorCode: "browser_state_file_claim_lost",
+      }),
+    );
+    expect(
+      JSON.stringify(vi.mocked(silentLogger.error).mock.calls),
+    ).not.toContain("secret=do-not-log");
   });
 
   it("deletes at most 50 objects before their manifests", async () => {
@@ -810,6 +945,9 @@ describe("runLocalRetentionLoop", () => {
         artifactCandidates: 1,
         artifactsDeleted: 1,
         artifactFailures: 0,
+        browserStateCandidates: 0,
+        browserStateFilesDeleted: 0,
+        browserStateFailures: 0,
         requestsDeleted: 0,
         dependentRowsDeleted: 0,
         requestIds: ["request-claimed"],
@@ -858,6 +996,9 @@ describe("runLocalRetentionLoop", () => {
         artifactCandidates: 2,
         artifactsDeleted: 1,
         artifactFailures: 1,
+        browserStateCandidates: 0,
+        browserStateFilesDeleted: 0,
+        browserStateFailures: 0,
         requestsDeleted: 0,
         dependentRowsDeleted: 0,
         requestIds: [],
@@ -1383,6 +1524,181 @@ describeWithDatabase("PostgreSQL local retention", () => {
       [scrapeId, requestId, ownerId],
     );
   }
+
+  async function insertCleanupIntent(
+    scrapeId: string,
+    file: { pathId: string; checksum: string },
+    state: "cleanup" | "preparing",
+    writerPid?: number,
+  ): Promise<string> {
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoint_cleanup_intents (
+         id, scrape_id, owner_id, state_path, checksum, state,
+         writer_lease, writer_pid, writer_boot_id, writer_start_time,
+         heartbeat_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6,
+         CASE WHEN $6 = 'preparing' THEN $7::uuid ELSE NULL END,
+         CASE WHEN $6 = 'preparing' THEN $8::integer ELSE NULL END,
+         CASE WHEN $6 = 'preparing' THEN $9 ELSE NULL END,
+         CASE WHEN $6 = 'preparing' THEN $10 ELSE NULL END,
+         CASE WHEN $6 = 'preparing' THEN now() ELSE NULL END
+       )`,
+      [
+        id,
+        scrapeId,
+        ownerId,
+        file.pathId,
+        file.checksum,
+        state,
+        randomUUID(),
+        writerPid ?? 101,
+        "a".repeat(32),
+        "1",
+      ],
+    );
+    return id;
+  }
+
+  it("retains a failed cleanup intent and clears it after a missing-file retry", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "retention-intent-"));
+    const filesystem = new BrowserStateFilesystem(root);
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const old = await filesystem.writeCheckpoint(ownerId, scrapeId, {
+      cookies: [],
+      origins: [],
+    });
+    const intentId = await insertCleanupIntent(scrapeId, old, "cleanup");
+    const fullPath = path.join(root, old.pathId);
+    try {
+      await expect(
+        runLocalRetentionIteration({
+          database,
+          artifactStore: null,
+          browserStateFilesystem: {
+            delete: vi.fn().mockRejectedValue(
+              Object.assign(new Error("filesystem secret=do-not-log"), {
+                code: "EIO",
+              }),
+            ),
+          },
+          now: new Date("2026-07-18T00:00:00.000Z"),
+          logger: silentLogger,
+        }),
+      ).rejects.toMatchObject({ browserStateFailures: 1 });
+      const retained = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM requests WHERE id = $1) AS requests,
+           (SELECT count(*)::int
+              FROM browser_replay_checkpoint_cleanup_intents
+             WHERE id = $2) AS intents`,
+        [requestId, intentId],
+      );
+      expect(retained.rows[0]).toEqual({ requests: 1, intents: 1 });
+      await expect(access(fullPath)).resolves.toBeUndefined();
+
+      await rm(fullPath);
+      await runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: filesystem,
+        now: new Date("2026-07-18T00:00:01.000Z"),
+        logger: silentLogger,
+      });
+      const cleared = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM requests WHERE id = $1) AS requests,
+           (SELECT count(*)::int
+              FROM browser_replay_checkpoint_cleanup_intents
+             WHERE id = $2) AS intents`,
+        [requestId, intentId],
+      );
+      expect(cleared.rows[0]).toEqual({ requests: 0, intents: 0 });
+      await expect(access(fullPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains live and unknown preparing writers but recovers a dead writer", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "retention-intent-"));
+    const filesystem = new BrowserStateFilesystem(root);
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const live = await filesystem.writeCheckpoint(ownerId, scrapeId, {
+      writer: "live",
+    });
+    const unknown = await filesystem.writeCheckpoint(ownerId, scrapeId, {
+      writer: "unknown",
+    });
+    const dead = await filesystem.writeCheckpoint(ownerId, scrapeId, {
+      writer: "dead",
+    });
+    const liveId = await insertCleanupIntent(scrapeId, live, "preparing", 101);
+    const unknownId = await insertCleanupIntent(
+      scrapeId,
+      unknown,
+      "preparing",
+      102,
+    );
+    const deadId = await insertCleanupIntent(scrapeId, dead, "preparing", 103);
+    const identityDatabase = new PgLocalRetentionDatabase(
+      integrationDatabaseUrl ?? "postgresql://disabled",
+      {
+        inspectProcessIdentity: async identity =>
+          identity.pid === 101
+            ? "live"
+            : identity.pid === 102
+              ? "unknown"
+              : "dead",
+      },
+    );
+    try {
+      await runLocalRetentionIteration({
+        database: identityDatabase,
+        artifactStore: null,
+        browserStateFilesystem: filesystem,
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      });
+
+      const retained = await pool.query<{ id: string }>(
+        `SELECT id FROM browser_replay_checkpoint_cleanup_intents
+          WHERE id = ANY($1::uuid[]) ORDER BY id`,
+        [[liveId, unknownId, deadId]],
+      );
+      expect(retained.rows.map(row => row.id).sort()).toEqual(
+        [liveId, unknownId].sort(),
+      );
+      await expect(
+        access(path.join(root, live.pathId)),
+      ).resolves.toBeUndefined();
+      await expect(
+        access(path.join(root, unknown.pathId)),
+      ).resolves.toBeUndefined();
+      await expect(access(path.join(root, dead.pathId))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const request = await pool.query("SELECT 1 FROM requests WHERE id = $1", [
+        requestId,
+      ]);
+      expect(request.rows).toHaveLength(1);
+    } finally {
+      await identityDatabase.close();
+      await pool.query(
+        `DELETE FROM browser_replay_checkpoint_cleanup_intents
+          WHERE id = ANY($1::uuid[])`,
+        [[liveId, unknownId, deadId]],
+      );
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   it("lists only expired unprotected browser state files", async () => {
     const now = new Date("2026-07-18T00:00:00.000Z");
