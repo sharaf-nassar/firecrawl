@@ -88,6 +88,9 @@ interface BrowserStateCheckpointPlan {
 
 interface BrowserStateFilesystemOptions {
   syncDirectory?: (directory: string) => Promise<void>;
+  beforeCheckpointWrite?: (
+    checkpoint: BrowserStateCheckpointPlan,
+  ) => Promise<void>;
 }
 
 interface ProcessIdentity {
@@ -110,6 +113,9 @@ async function syncDirectory(directory: string): Promise<void> {
 export class BrowserStateFilesystem {
   readonly #root: string;
   readonly #syncDirectory: (directory: string) => Promise<void>;
+  readonly #beforeCheckpointWrite?: (
+    checkpoint: BrowserStateCheckpointPlan,
+  ) => Promise<void>;
 
   constructor(root: string, options: BrowserStateFilesystemOptions = {}) {
     if (
@@ -122,6 +128,7 @@ export class BrowserStateFilesystem {
     }
     this.#root = path.resolve(root);
     this.#syncDirectory = options.syncDirectory ?? syncDirectory;
+    this.#beforeCheckpointWrite = options.beforeCheckpointWrite;
   }
 
   async #ensureRoot(): Promise<string> {
@@ -302,7 +309,6 @@ export class BrowserStateFilesystem {
     ownerId: string,
     scrapeId: string,
     storageState: unknown,
-    plan = this.planCheckpoint(ownerId, scrapeId, storageState),
   ): Promise<{ pathId: string; byteSize: number; checksum: string }> {
     validateSegment(ownerId, "owner ID");
     validateSegment(scrapeId, "scrape ID");
@@ -310,28 +316,21 @@ export class BrowserStateFilesystem {
     if (bytes.byteLength > CHECKPOINT_MAX_BYTES) {
       throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
     }
-    const expectedPath = path.posix.join(
-      "replay",
-      ownerId,
-      scrapeId,
-      `${plan.generationId}.json`,
-    );
-    if (
-      !/^[a-f0-9-]{36}$/.test(plan.generationId) ||
-      plan.pathId !== expectedPath ||
-      plan.byteSize !== bytes.byteLength ||
-      plan.checksum !== checksum(bytes)
-    ) {
-      throw new BrowserStateUnavailableError("checkpoint plan is invalid");
-    }
+    const generationId = randomUUID();
+    const filename = `${generationId}.json`;
+    const plan = {
+      generationId,
+      pathId: path.posix.join("replay", ownerId, scrapeId, filename),
+      byteSize: bytes.byteLength,
+      checksum: checksum(bytes),
+    } satisfies BrowserStateCheckpointPlan;
+    await this.#beforeCheckpointWrite?.(plan);
 
     const root = await this.#ensureRoot();
     const replay = await this.#ensureDirectory(root, "replay");
     const owner = await this.#ensureDirectory(replay, ownerId);
     const scrape = await this.#ensureDirectory(owner, scrapeId);
     await this.#removeStaleStaging(scrape);
-    const generationId = plan.generationId;
-    const filename = `${generationId}.json`;
     const target = path.join(scrape, filename);
     const identity = await readProcessIdentity(process.pid);
     const staging = path.join(
@@ -387,34 +386,9 @@ export class BrowserStateFilesystem {
     }
 
     return {
-      pathId: path.posix.join("replay", ownerId, scrapeId, filename),
-      byteSize: bytes.byteLength,
-      checksum: checksum(bytes),
-    };
-  }
-
-  planCheckpoint(
-    ownerId: string,
-    scrapeId: string,
-    storageState: unknown,
-  ): BrowserStateCheckpointPlan {
-    validateSegment(ownerId, "owner ID");
-    validateSegment(scrapeId, "scrape ID");
-    const bytes = Buffer.from(stableJson(storageState), "utf8");
-    if (bytes.byteLength > CHECKPOINT_MAX_BYTES) {
-      throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
-    }
-    const generationId = randomUUID();
-    return {
-      generationId,
-      pathId: path.posix.join(
-        "replay",
-        ownerId,
-        scrapeId,
-        `${generationId}.json`,
-      ),
-      byteSize: bytes.byteLength,
-      checksum: checksum(bytes),
+      pathId: plan.pathId,
+      byteSize: plan.byteSize,
+      checksum: plan.checksum,
     };
   }
 

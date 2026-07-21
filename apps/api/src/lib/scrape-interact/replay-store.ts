@@ -95,6 +95,36 @@ class ReplayOwnershipError extends Error {
   }
 }
 
+class ReplayCheckpointValidationError extends Error {
+  readonly category = "replay_checkpoint_unavailable";
+
+  constructor() {
+    super("Replay checkpoint is unavailable");
+    this.name = "ReplayCheckpointValidationError";
+  }
+}
+
+class ReplayCheckpointPreparationError extends Error {
+  readonly category = "replay_checkpoint_preparation_failed";
+
+  constructor() {
+    super("Replay checkpoint preparation did not complete");
+    this.name = "ReplayCheckpointPreparationError";
+  }
+}
+
+type PreparedCheckpoint = {
+  cleanupIntentId: string;
+  validated: Extract<ReplayResolution, { kind: "checkpoint" }>;
+};
+
+function requirePreparedCheckpoint(
+  prepared: PreparedCheckpoint | undefined,
+): PreparedCheckpoint {
+  if (!prepared) throw new ReplayCheckpointPreparationError();
+  return prepared;
+}
+
 const cleanupLogger = rootLogger.child({ module: "scrape-replay-store" });
 const PREPARING_INTENT_STALE_MS = 60 * 60 * 1000;
 type ReplayTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -268,78 +298,86 @@ export async function persistScrapeReplayState(
     return { persisted: false, reason: "checkpoint_unavailable" };
   }
 
-  const filesystem = new BrowserStateFilesystem(runtime.root);
-  const plan = filesystem.planCheckpoint(
-    input.ownerId,
-    input.scrapeId,
-    input.replayCheckpoint.storageState,
-  );
-  const checkpoint: StoredReplayCheckpoint = {
-    version: 1,
-    statePath: plan.pathId,
-    storageState: input.replayCheckpoint.storageState,
-    finalUrl: input.replayCheckpoint.finalUrl,
-    fingerprint: input.replayCheckpoint.fingerprint,
-    checksum: plan.checksum,
-    byteSize: plan.byteSize,
-  };
-  const validated = resolveReplayEnvelope({
-    url: input.url,
-    options: input.options,
-    callerOrigin: input.callerOrigin,
-    browserSettings: input.replayCheckpoint.browserSettings,
-    checkpoint,
-  });
-  if (validated.kind !== "checkpoint") {
-    return { persisted: false, reason: "checkpoint_unavailable" };
-  }
+  let prepared: PreparedCheckpoint | undefined;
+  const filesystem = new BrowserStateFilesystem(runtime.root, {
+    beforeCheckpointWrite: async plan => {
+      const checkpoint: StoredReplayCheckpoint = {
+        version: 1,
+        statePath: plan.pathId,
+        storageState: input.replayCheckpoint!.storageState,
+        finalUrl: input.replayCheckpoint!.finalUrl,
+        fingerprint: input.replayCheckpoint!.fingerprint,
+        checksum: plan.checksum,
+        byteSize: plan.byteSize,
+      };
+      const validated = resolveReplayEnvelope({
+        url: input.url,
+        options: input.options,
+        callerOrigin: input.callerOrigin,
+        browserSettings: input.replayCheckpoint!.browserSettings,
+        checkpoint,
+      });
+      if (validated.kind !== "checkpoint") {
+        throw new ReplayCheckpointValidationError();
+      }
 
-  const cleanupIntentId = randomUUID();
-  await db.transaction(async tx => {
-    await lockScrape(tx, input.scrapeId);
-    const [ownedScrape] = await tx
-      .select({ id: schema.scrapes.id })
-      .from(schema.scrapes)
-      .innerJoin(
-        schema.requests,
-        eq(schema.requests.id, schema.scrapes.request_id),
-      )
-      .where(
-        and(
-          eq(schema.scrapes.id, input.scrapeId),
-          eq(schema.scrapes.request_id, input.requestId),
-          eq(schema.scrapes.team_id, input.ownerId),
-          eq(schema.requests.id, input.requestId),
-          eq(schema.requests.team_id, input.ownerId),
-        ),
-      )
-      .limit(1);
-    if (!ownedScrape) throw new ReplayOwnershipError();
-    await tx.insert(schema.browser_replay_checkpoint_cleanup_intents).values({
-      id: cleanupIntentId,
-      scrape_id: input.scrapeId,
-      owner_id: input.ownerId,
-      state_path: plan.pathId,
-      checksum: plan.checksum,
-      state: "preparing",
-    });
+      const cleanupIntentId = randomUUID();
+      await db.transaction(async tx => {
+        await lockScrape(tx, input.scrapeId);
+        const [ownedScrape] = await tx
+          .select({ id: schema.scrapes.id })
+          .from(schema.scrapes)
+          .innerJoin(
+            schema.requests,
+            eq(schema.requests.id, schema.scrapes.request_id),
+          )
+          .where(
+            and(
+              eq(schema.scrapes.id, input.scrapeId),
+              eq(schema.scrapes.request_id, input.requestId),
+              eq(schema.scrapes.team_id, input.ownerId),
+              eq(schema.requests.id, input.requestId),
+              eq(schema.requests.team_id, input.ownerId),
+            ),
+          )
+          .limit(1);
+        if (!ownedScrape) throw new ReplayOwnershipError();
+        await tx
+          .insert(schema.browser_replay_checkpoint_cleanup_intents)
+          .values({
+            id: cleanupIntentId,
+            scrape_id: input.scrapeId,
+            owner_id: input.ownerId,
+            state_path: plan.pathId,
+            checksum: plan.checksum,
+            state: "preparing",
+          });
+      });
+      prepared = { cleanupIntentId, validated };
+    },
   });
+
+  let written: Awaited<ReturnType<BrowserStateFilesystem["writeCheckpoint"]>>;
 
   try {
-    await filesystem.writeCheckpoint(
+    written = await filesystem.writeCheckpoint(
       input.ownerId,
       input.scrapeId,
       input.replayCheckpoint.storageState,
-      plan,
     );
   } catch (error) {
+    if (error instanceof ReplayCheckpointValidationError) {
+      return { persisted: false, reason: "checkpoint_unavailable" };
+    }
+    if (!prepared) throw error;
     return recoverWithoutMaskingPrimary(
       filesystem,
       input.scrapeId,
-      cleanupIntentId,
+      prepared.cleanupIntentId,
       error,
     );
   }
+  const { cleanupIntentId, validated } = requirePreparedCheckpoint(prepared);
 
   try {
     await db.transaction(async tx => {
@@ -378,8 +416,8 @@ export async function persistScrapeReplayState(
         .limit(1);
       if (
         existing?.statePath &&
-        (existing.statePath !== plan.pathId ||
-          existing.checksum !== plan.checksum)
+        (existing.statePath !== written.pathId ||
+          existing.checksum !== written.checksum)
       ) {
         await tx
           .insert(schema.browser_replay_checkpoint_cleanup_intents)
@@ -427,11 +465,11 @@ export async function persistScrapeReplayState(
           request_id: input.requestId,
           owner_id: input.ownerId,
           envelope_version: 1,
-          state_path: plan.pathId,
+          state_path: written.pathId,
           final_url: validated.checkpoint.finalUrl,
           fingerprint: validated.checkpoint.fingerprint,
-          checksum: plan.checksum,
-          byte_size: plan.byteSize,
+          checksum: written.checksum,
+          byte_size: written.byteSize,
           expires_at: expiresAt,
         })
         .onConflictDoUpdate({
@@ -440,11 +478,11 @@ export async function persistScrapeReplayState(
             request_id: input.requestId,
             owner_id: input.ownerId,
             envelope_version: 1,
-            state_path: plan.pathId,
+            state_path: written.pathId,
             final_url: validated.checkpoint.finalUrl,
             fingerprint: validated.checkpoint.fingerprint,
-            checksum: plan.checksum,
-            byte_size: plan.byteSize,
+            checksum: written.checksum,
+            byte_size: written.byteSize,
             expires_at: expiresAt,
             file_deleted_at: null,
           },
