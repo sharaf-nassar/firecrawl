@@ -1,5 +1,11 @@
 # Local Browser Interact Runtime Design
 
+> **Version-selection supersession:** Exact Codex `0.144.5` Gate requirements
+> are superseded by the
+> [rolling-version design](2026-07-21-codex-browser-gate-rolling-version-design.md).
+> Model, reasoning effort, protocol, safety, lifecycle, and live-behavior
+> requirements remain authoritative.
+
 ## Goal
 
 Make Firecrawl Browser and Interact fully functional in this local deployment.

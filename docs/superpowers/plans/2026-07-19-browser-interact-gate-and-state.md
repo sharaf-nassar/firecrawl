@@ -1,5 +1,11 @@
 # Browser Interact Gate and Durable State Implementation Plan
 
+> **Version-selection supersession:** Exact Codex `0.144.5` Gate requirements
+> are superseded by the
+> [rolling-version design](../specs/2026-07-21-codex-browser-gate-rolling-version-design.md).
+> Model, reasoning effort, protocol, safety, lifecycle, and live-behavior
+> requirements remain authoritative.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prove installed Codex app-server can complete a deterministic two-turn structured-action loop, then add the disabled-by-default PostgreSQL action ledger, replay-envelope, checkpoint, ZDR, recovery, and retention foundation needed by local Browser Interact.

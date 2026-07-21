@@ -1,5 +1,11 @@
 # Codex Browser Gate Modularization Implementation Plan
 
+> **Version-selection supersession:** Exact Codex `0.144.5` Gate requirements
+> are superseded by the
+> [rolling-version design](../specs/2026-07-21-codex-browser-gate-rolling-version-design.md).
+> Model, reasoning effort, protocol, safety, lifecycle, and live-behavior
+> requirements remain authoritative.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Split the Gate0 executable into focused modules while preserving every observable CLI, protocol, lifecycle, hashing, and live-loop behavior.
