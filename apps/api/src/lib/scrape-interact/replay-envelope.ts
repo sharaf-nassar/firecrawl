@@ -504,13 +504,6 @@ const indexedDBRecordSchema = z
     valueEncoded: z.json().optional(),
   })
   .superRefine((record, context) => {
-    if ((record.key === undefined) === (record.keyEncoded === undefined)) {
-      context.addIssue({
-        code: "custom",
-        path: ["key"],
-        message: "Invalid IndexedDB key",
-      });
-    }
     if ((record.value === undefined) === (record.valueEncoded === undefined)) {
       context.addIssue({
         code: "custom",
@@ -520,22 +513,92 @@ const indexedDBRecordSchema = z
     }
   });
 
-const indexedDBIndexSchema = z.strictObject({
-  name: z.string(),
-  keyPath: z.string().optional(),
-  keyPathArray: z.array(z.string()).optional(),
-  multiEntry: z.boolean(),
-  unique: z.boolean(),
-});
+const indexedDBIndexSchema = z
+  .strictObject({
+    name: z.string(),
+    keyPath: z.string().optional(),
+    keyPathArray: z.array(z.string()).optional(),
+    multiEntry: z.boolean(),
+    unique: z.boolean(),
+  })
+  .superRefine((index, context) => {
+    const hasKeyPath = index.keyPath !== undefined;
+    const hasKeyPathArray = index.keyPathArray !== undefined;
+    if (!hasKeyPath && !hasKeyPathArray) {
+      context.addIssue({
+        code: "custom",
+        path: ["keyPath"],
+        message: "IndexedDB index requires a key path",
+      });
+    } else if (hasKeyPath && hasKeyPathArray) {
+      for (const path of ["keyPath", "keyPathArray"]) {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: "IndexedDB index key path is ambiguous",
+        });
+      }
+    }
+  });
 
-const indexedDBStoreSchema = z.strictObject({
-  name: z.string(),
-  autoIncrement: z.boolean(),
-  keyPath: z.string().optional(),
-  keyPathArray: z.array(z.string()).optional(),
-  records: z.array(indexedDBRecordSchema),
-  indexes: z.array(indexedDBIndexSchema),
-});
+const indexedDBStoreSchema = z
+  .strictObject({
+    name: z.string(),
+    autoIncrement: z.boolean(),
+    keyPath: z.string().optional(),
+    keyPathArray: z.array(z.string()).optional(),
+    records: z.array(indexedDBRecordSchema),
+    indexes: z.array(indexedDBIndexSchema),
+  })
+  .superRefine((store, context) => {
+    const hasKeyPath = store.keyPath !== undefined;
+    const hasKeyPathArray = store.keyPathArray !== undefined;
+    if (hasKeyPath && hasKeyPathArray) {
+      for (const path of ["keyPath", "keyPathArray"]) {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: "IndexedDB store key path is ambiguous",
+        });
+      }
+    }
+
+    const usesInlineKeys = hasKeyPath || hasKeyPathArray;
+    for (const [index, record] of store.records.entries()) {
+      const hasKey = record.key !== undefined;
+      const hasKeyEncoded = record.keyEncoded !== undefined;
+      if (usesInlineKeys) {
+        if (hasKey) {
+          context.addIssue({
+            code: "custom",
+            path: ["records", index, "key"],
+            message: "Inline IndexedDB record must omit its key",
+          });
+        }
+        if (hasKeyEncoded) {
+          context.addIssue({
+            code: "custom",
+            path: ["records", index, "keyEncoded"],
+            message: "Inline IndexedDB record must omit its encoded key",
+          });
+        }
+      } else if (!hasKey && !hasKeyEncoded) {
+        context.addIssue({
+          code: "custom",
+          path: ["records", index, "key"],
+          message: "Out-of-line IndexedDB record requires a key",
+        });
+      } else if (hasKey && hasKeyEncoded) {
+        for (const path of ["key", "keyEncoded"]) {
+          context.addIssue({
+            code: "custom",
+            path: ["records", index, path],
+            message: "Out-of-line IndexedDB record key is ambiguous",
+          });
+        }
+      }
+    }
+  });
 
 const indexedDBDatabaseSchema = z.strictObject({
   name: z.string(),
@@ -758,42 +821,50 @@ function legacyUnrepresentableActionFields(options: unknown): string[] {
 export function normalizeReplayEnvelope(
   source: ReplayEnvelopeSource,
 ): ReplayEnvelopeNormalization {
-  if (source.zeroDataRetention) {
-    return error("replay_unavailable", ["options", "url"]);
-  }
-
   const unavailable: string[] = [];
-  if (
-    typeof source.url !== "string" ||
-    source.url.trim().length === 0 ||
-    isRedacted(source.url)
-  ) {
-    unavailable.push("url");
-  }
-  if (!isRecord(source.options) || isRedacted(source.options)) {
-    unavailable.push("options");
-  }
-  if (unavailable.length > 0) {
-    return error("replay_unavailable", unavailable);
+  const retainedUrl =
+    !source.zeroDataRetention &&
+    typeof source.url === "string" &&
+    source.url.trim().length > 0 &&
+    !isRedacted(source.url)
+      ? source.url
+      : undefined;
+  if (source.zeroDataRetention) {
+    unavailable.push("options", "url");
+  } else {
+    if (!retainedUrl) unavailable.push("url");
+    if (!isRecord(source.options) || isRedacted(source.options)) {
+      unavailable.push("options");
+    }
   }
 
   const unsupported: string[] = [];
-  const rawOptions = source.options as Record<string, unknown>;
-  for (const key of Object.keys(rawOptions)) {
-    if (!knownOptionKeys.has(key)) unsupported.push(key);
+  const rawOptions =
+    !source.zeroDataRetention && isRecord(source.options)
+      ? source.options
+      : undefined;
+  if (rawOptions) {
+    for (const key of Object.keys(rawOptions)) {
+      if (!knownOptionKeys.has(key)) unsupported.push(key);
+    }
   }
 
-  const parsedOptions = optionsSchema.safeParse(rawOptions);
-  if (!parsedOptions.success) {
+  const parsedOptions = rawOptions
+    ? optionsSchema.safeParse(rawOptions)
+    : undefined;
+  if (parsedOptions && !parsedOptions.success) {
     unsupported.push(
       ...fieldsFromIssues(undefined, parsedOptions.error.issues),
     );
-  } else if (aggregateWaitMs(parsedOptions.data) > 60_000) {
+  } else if (
+    parsedOptions?.success &&
+    aggregateWaitMs(parsedOptions.data) > 60_000
+  ) {
     unsupported.push("actions", "waitFor");
   }
 
-  const targetUrl = canonicalUrl(source.url as string);
-  if (!targetUrl) unsupported.push("url");
+  const targetUrl = retainedUrl ? canonicalUrl(retainedUrl) : undefined;
+  if (retainedUrl && !targetUrl) unsupported.push("url");
   if (
     typeof source.callerOrigin !== "string" ||
     source.callerOrigin.trim().length === 0 ||
@@ -814,7 +885,7 @@ export function normalizeReplayEnvelope(
         ...fieldsFromIssues("browserSettings", parsedSettings.error.issues),
       );
     }
-  } else if (parsedOptions.success) {
+  } else if (parsedOptions?.success) {
     browserSettings = deriveBrowserSettings(parsedOptions.data);
   }
 
@@ -828,14 +899,19 @@ export function normalizeReplayEnvelope(
   }
   if (
     typeof source.profileGenerationId === "string" &&
+    rawOptions !== undefined &&
     rawOptions.profile === undefined
   ) {
     unsupported.push("profile.generationId");
   }
 
+  if (unavailable.length > 0) {
+    return error("replay_unavailable", [...unavailable, ...unsupported]);
+  }
+
   if (
     unsupported.length > 0 ||
-    !parsedOptions.success ||
+    !parsedOptions?.success ||
     !targetUrl ||
     !browserSettings
   ) {

@@ -93,7 +93,6 @@ function checkpoint(
                   keyPath: "id",
                   records: [
                     {
-                      key: "primary",
                       value: { token: "idb-secret" },
                     },
                   ],
@@ -122,6 +121,10 @@ function checkpoint(
     byteSize: 321,
     ...overrides,
   } as StoredReplayCheckpoint;
+}
+
+function firstCheckpointStore(storedCheckpoint: StoredReplayCheckpoint) {
+  return storedCheckpoint.storageState.origins[0].indexedDB![0].stores[0];
 }
 
 describe("replay envelope normalization", () => {
@@ -289,6 +292,67 @@ describe("replay envelope normalization", () => {
       );
     },
   );
+
+  it("aggregates independent fields when retained inputs are unavailable", () => {
+    const secretUrl = "<redacted:proxy-password>";
+    const result = resolveReplayEnvelope(
+      source({
+        url: secretUrl,
+        options: null,
+        callerOrigin: "",
+        browserSettings: {
+          ...allBrowserSettings,
+          viewport: { ...allBrowserSettings.viewport, hasTouch: "yes" },
+          proxy: { kind: "basic", username: "proxy-password" },
+        },
+        profileGenerationId: "",
+        checkpoint: checkpoint({ checksum: "checkpoint-secret" }),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+      fields: [
+        "browserSettings.proxy.username",
+        "browserSettings.viewport.hasTouch",
+        "callerOrigin",
+        "checkpoint.checksum",
+        "options",
+        "profile.generationId",
+        "url",
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("proxy-password");
+    expect(JSON.stringify(result)).not.toContain("checkpoint-secret");
+  });
+
+  it("keeps unsupported precedence for present but malformed inputs", () => {
+    expect(
+      normalizeReplayEnvelope(
+        source({
+          url: "https://internal/path",
+          options: { futureOption: true },
+          callerOrigin: "",
+          browserSettings: {
+            ...allBrowserSettings,
+            viewport: { ...allBrowserSettings.viewport, hasTouch: "yes" },
+          },
+          profileGenerationId: "",
+        }),
+      ),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unsupported",
+      fields: [
+        "browserSettings.viewport.hasTouch",
+        "callerOrigin",
+        "futureOption",
+        "profile.generationId",
+        "url",
+      ],
+    });
+  });
 
   it("rejects a non-ISO location country", () => {
     expect(
@@ -651,6 +715,140 @@ describe("replay resolution", () => {
     expect(Object.isFrozen(result.checkpoint.storageState.cookies[0])).toBe(
       true,
     );
+  });
+
+  it("preserves valid inline and out-of-line IndexedDB record keys", () => {
+    const storedCheckpoint = checkpoint();
+    const store = firstCheckpointStore(storedCheckpoint);
+    delete store.records[0].key;
+    store.indexes = [
+      {
+        name: "by-user",
+        keyPath: "userId",
+        multiEntry: false,
+        unique: true,
+      },
+      {
+        name: "by-tenant-user",
+        keyPathArray: ["tenantId", "userId"],
+        multiEntry: false,
+        unique: false,
+      },
+    ];
+    const inlineArrayStore = {
+      ...structuredClone(store),
+      name: "inline-array",
+      keyPath: undefined,
+      keyPathArray: ["tenantId", "id"],
+    };
+    const outOfLineStore = {
+      ...structuredClone(store),
+      name: "out-of-line",
+      keyPath: undefined,
+      records: [
+        { key: "plain-key", value: { token: "plain" } },
+        {
+          keyEncoded: { s: "encoded-key" },
+          valueEncoded: { s: "encoded-value" },
+        },
+      ],
+    };
+    storedCheckpoint.storageState.origins[0].indexedDB![0].stores = [
+      store,
+      inlineArrayStore,
+      outOfLineStore,
+    ];
+
+    const result = resolveReplayEnvelope(
+      source({ checkpoint: storedCheckpoint }),
+    );
+    expect(result.kind).toBe("checkpoint");
+    if (result.kind !== "checkpoint") return;
+
+    inlineArrayStore.keyPathArray[0] = "mutated";
+    outOfLineStore.records[0].key = "mutated";
+
+    const resolvedStores =
+      result.checkpoint.storageState.origins[0].indexedDB![0].stores;
+    expect(resolvedStores[1].keyPathArray).toEqual(["tenantId", "id"]);
+    expect(resolvedStores[2].records[0].key).toBe("plain-key");
+    expect(Object.isFrozen(resolvedStores[1].keyPathArray)).toBe(true);
+    expect(Object.isFrozen(resolvedStores[2].records[0])).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "inline record key",
+      configure: (store: ReturnType<typeof firstCheckpointStore>) => {
+        store.keyPath = "id";
+        store.records[0].key = "unexpected-key";
+      },
+      fields: [
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.records.0.key",
+      ],
+    },
+    {
+      name: "missing out-of-line record key",
+      configure: (store: ReturnType<typeof firstCheckpointStore>) => {
+        delete store.keyPath;
+        delete store.records[0].key;
+      },
+      fields: [
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.records.0.key",
+      ],
+    },
+    {
+      name: "duplicate out-of-line record keys",
+      configure: (store: ReturnType<typeof firstCheckpointStore>) => {
+        delete store.keyPath;
+        store.records[0].key = "plain-key";
+        store.records[0].keyEncoded = { s: "encoded-key" };
+      },
+      fields: [
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.records.0.key",
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.records.0.keyEncoded",
+      ],
+    },
+    {
+      name: "ambiguous store key paths",
+      configure: (store: ReturnType<typeof firstCheckpointStore>) => {
+        store.keyPathArray = ["tenantId", "id"];
+      },
+      fields: [
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.keyPath",
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.keyPathArray",
+      ],
+    },
+    {
+      name: "missing index key path",
+      configure: (store: ReturnType<typeof firstCheckpointStore>) => {
+        delete store.indexes[0].keyPath;
+      },
+      fields: [
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.indexes.0.keyPath",
+      ],
+    },
+    {
+      name: "ambiguous index key paths",
+      configure: (store: ReturnType<typeof firstCheckpointStore>) => {
+        store.indexes[0].keyPathArray = ["tenantId", "userId"];
+      },
+      fields: [
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.indexes.0.keyPath",
+        "checkpoint.storageState.origins.0.indexedDB.0.stores.0.indexes.0.keyPathArray",
+      ],
+    },
+  ])("rejects $name", ({ configure, fields }) => {
+    const storedCheckpoint = checkpoint();
+    configure(firstCheckpointStore(storedCheckpoint));
+
+    expect(
+      resolveReplayEnvelope(source({ checkpoint: storedCheckpoint })),
+    ).toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+      fields,
+    });
   });
 
   it.each([
