@@ -1557,17 +1557,16 @@ export async function runLocalRetentionLoop(
     options.artifactStore === undefined
       ? getArtifactStore()
       : options.artifactStore;
-  const runtimeSource = (options.configSource ??
-    config) as LocalRuntimeConfigSource & {
-    LOCAL_BROWSER_STATE_ROOT?: string;
-  };
+  const runtimeSource = options.configSource ?? config;
   const browserStateFilesystem =
-    options.browserStateFilesystem === undefined
-      ? new BrowserStateFilesystem(
-          runtimeSource.LOCAL_BROWSER_STATE_ROOT ??
-            "/var/lib/firecrawl-browser",
-        )
-      : options.browserStateFilesystem;
+    runtimeSource.LOCAL_BROWSER_SERVICE_ENABLED === true
+      ? options.browserStateFilesystem === undefined
+        ? new BrowserStateFilesystem(
+            runtimeSource.LOCAL_BROWSER_STATE_ROOT ??
+              "/var/lib/firecrawl-browser",
+          )
+        : options.browserStateFilesystem
+      : null;
   const database =
     options.database ??
     new PgLocalRetentionDatabase(localConfig.applicationDatabaseUrl);

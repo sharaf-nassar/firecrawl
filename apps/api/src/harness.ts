@@ -6,7 +6,10 @@ import * as net from "net";
 import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
-import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
+import {
+  clearLocalPersistenceExternalSettings,
+  createLocalBrowserStateStartup,
+} from "./harness-local-persistence";
 import { createSharedShutdown } from "./harness-shutdown";
 import { BrowserStateFilesystem } from "./lib/browser-state/filesystem-store";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
@@ -43,6 +46,15 @@ let fixtureServerPort: number | null = null;
 const localRetentionService = createLocalRetentionService(signal =>
   runLocalRetentionLoop({ signal }),
 );
+const localBrowserStateStartup = createLocalBrowserStateStartup({
+  health: (root: string) => BrowserStateFilesystem.health(root),
+  recover: async (now: Date) => {
+    const { interruptUnfinishedBrowserWork } = await import(
+      "./lib/browser-state/store.js"
+    );
+    return await interruptUnfinishedBrowserWork(now);
+  },
+});
 
 // Get the monorepo root for both tsx source execution and compiled dist execution.
 // __dirname is available in CommonJS (which this compiles to)
@@ -679,15 +691,6 @@ async function setupApplicationPostgres(): Promise<void> {
 
   await runApplicationMigrations(config);
   logger.success("Application database migrations applied");
-
-  if (config.LOCAL_BROWSER_SERVICE_ENABLED) {
-    await BrowserStateFilesystem.health(config.LOCAL_BROWSER_STATE_ROOT);
-    const { interruptUnfinishedBrowserWork } = await import(
-      "./lib/browser-state/store.js"
-    );
-    const recovered = await interruptUnfinishedBrowserWork(new Date());
-    applicationLogger.info("Recovered durable browser state", recovered);
-  }
 }
 
 async function buildNuqPostgresImage(runtime: string): Promise<void> {
@@ -1077,6 +1080,13 @@ async function installDependencies() {
 
 async function startServices(command?: string[]): Promise<Services> {
   await setupApplicationPostgres();
+  const recovered = await localBrowserStateStartup({
+    enabled: config.LOCAL_BROWSER_SERVICE_ENABLED,
+    root: config.LOCAL_BROWSER_STATE_ROOT,
+  });
+  if (recovered) {
+    applicationLogger.info("Recovered durable browser state", recovered);
+  }
   const localRuntime = resolveLocalRuntimeConfig(config);
   if (localRuntime.enabled) {
     const retentionLoop = localRetentionService.start();

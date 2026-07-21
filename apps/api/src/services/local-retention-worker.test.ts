@@ -865,6 +865,26 @@ describe("runLocalRetentionLoop", () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
+  it("does not touch the browser state root while browser service is disabled", async () => {
+    const database = new FakeDatabase();
+    const controller = new AbortController();
+
+    await runLocalRetentionLoop({
+      configSource: {
+        ...localConfig,
+        LOCAL_BROWSER_SERVICE_ENABLED: false,
+        LOCAL_BROWSER_STATE_ROOT: "relative/unusable-root",
+      },
+      database,
+      artifactStore: null,
+      signal: controller.signal,
+      sleep: async () => controller.abort(),
+      logger: silentLogger,
+    });
+
+    expect(database.operationalRuns).toBe(1);
+  });
+
   it("uses a bounded one-second idle backoff between iterations", async () => {
     const database = new FakeDatabase();
     const controller = new AbortController();

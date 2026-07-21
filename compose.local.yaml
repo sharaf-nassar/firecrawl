@@ -5,6 +5,11 @@ x-local-api-image: &local-api-image
 services:
   api:
     <<: *local-api-image
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - 'chmod 0700 /var/lib/firecrawl-browser && exec "$$@"'
+      - --
     ports: !override
       - "127.0.0.1:${PORT:-3002}:${INTERNAL_PORT:-3002}"
     restart: unless-stopped

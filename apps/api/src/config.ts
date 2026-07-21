@@ -32,7 +32,7 @@ const ethereumAddress = z
   .optional();
 
 /* Schema */
-const configSchema = z.object({
+export const configSchema = z.object({
   // Application
   ENV: z.string().optional(),
   HOST: z.string().default("localhost"),

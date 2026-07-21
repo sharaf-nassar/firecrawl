@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { configSchema } from "../config";
 import { BrowserStateFilesystem } from "./browser-state/filesystem-store";
 import {
   LocalRuntimeConfigurationError,
@@ -191,6 +192,27 @@ describe("resolveLocalRuntimeConfig", () => {
       recordRetentionDays: 7,
       artifactRetentionDays: 14,
       artifactProvider: "none",
+    });
+  });
+});
+
+describe("configSchema browser settings", () => {
+  it("defaults browser service off with a private state root", () => {
+    expect(configSchema.parse({})).toMatchObject({
+      LOCAL_BROWSER_SERVICE_ENABLED: false,
+      LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser",
+    });
+  });
+
+  it("decodes string environment values", () => {
+    expect(
+      configSchema.parse({
+        LOCAL_BROWSER_SERVICE_ENABLED: "true",
+        LOCAL_BROWSER_STATE_ROOT: "/srv/firecrawl-browser",
+      }),
+    ).toMatchObject({
+      LOCAL_BROWSER_SERVICE_ENABLED: true,
+      LOCAL_BROWSER_STATE_ROOT: "/srv/firecrawl-browser",
     });
   });
 });

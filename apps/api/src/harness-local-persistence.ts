@@ -15,6 +15,31 @@ export const localPersistenceExternalSettings = [
 type LocalPersistenceExternalSetting =
   (typeof localPersistenceExternalSettings)[number];
 
+type LocalBrowserStateStartupSource = {
+  enabled: boolean;
+  root: string;
+};
+
+type LocalBrowserStateStartupDependencies<T> = {
+  health(root: string): Promise<void>;
+  recover(now: Date): Promise<T>;
+};
+
+export function createLocalBrowserStateStartup<T>(
+  dependencies: LocalBrowserStateStartupDependencies<T>,
+): (source: LocalBrowserStateStartupSource) => Promise<T | undefined> {
+  let startup: Promise<T> | undefined;
+
+  return source => {
+    if (!source.enabled) return Promise.resolve(undefined);
+    startup ??= (async () => {
+      await dependencies.health(source.root);
+      return await dependencies.recover(new Date());
+    })();
+    return startup;
+  };
+}
+
 export function clearLocalPersistenceExternalSettings(
   env: NodeJS.ProcessEnv,
   mutableConfig: Partial<Record<LocalPersistenceExternalSetting, unknown>>,
