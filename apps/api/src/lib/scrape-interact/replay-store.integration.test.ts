@@ -4,6 +4,7 @@ import {
   lstat,
   mkdtemp,
   mkdir,
+  open,
   readFile,
   readdir,
   rm,
@@ -11,6 +12,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -18,6 +20,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -32,9 +35,25 @@ import { BrowserStateFilesystem } from "../browser-state/filesystem-store";
 const databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
 const describeWithDatabase = databaseUrl ? describe : describe.skip;
 const ownerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
+const cleanupError = vi.fn();
 
 function checksum(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+async function processIdentity(pid: number): Promise<{
+  bootId: string;
+  startTime: string;
+}> {
+  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8"))
+    .trim()
+    .replaceAll("-", "");
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+  const endOfName = stat.lastIndexOf(")");
+  return {
+    bootId,
+    startTime: stat.slice(endOfName + 2).split(" ")[19]!,
+  };
 }
 
 const storageState = {
@@ -152,20 +171,30 @@ describeWithDatabase("scrape replay checkpoint store", () => {
       },
     }));
     vi.doMock("../../db/connection", () => ({ db: database }));
+    vi.doMock("../logger", () => ({
+      logger: { child: () => ({ error: cleanupError }) },
+    }));
     replayStore = await import("./replay-store.js");
   });
 
   beforeEach(async () => {
     await pool.query(
-      `TRUNCATE browser_replay_checkpoints, browser_replay_envelopes,
+      `TRUNCATE browser_replay_checkpoint_cleanup_intents,
+                browser_replay_checkpoints, browser_replay_envelopes,
                 scrapes, requests RESTART IDENTITY CASCADE`,
     );
     await rm(path.join(root, "replay"), { recursive: true, force: true });
+    cleanupError.mockClear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   afterAll(async () => {
     vi.doUnmock("../../config");
     vi.doUnmock("../../db/connection");
+    vi.doUnmock("../logger");
     await pool.end();
     await rm(root, { recursive: true, force: true });
   });
@@ -212,6 +241,37 @@ describeWithDatabase("scrape replay checkpoint store", () => {
         checksum: rows.rows[0]!.checksum,
       },
     });
+  });
+
+  it("records the cleanup handoff before writing a generation", async () => {
+    const fixture = await createFixture();
+    const originalWrite = BrowserStateFilesystem.prototype.writeCheckpoint;
+    let observed = false;
+    vi.spyOn(
+      BrowserStateFilesystem.prototype,
+      "writeCheckpoint",
+    ).mockImplementation(async function (owner, scrape, state, plan) {
+      if (!plan) throw new Error("checkpoint plan was not handed off");
+      const intents = await pool.query<{
+        state_path: string;
+        checksum: string;
+      }>(
+        `SELECT state_path, checksum
+           FROM browser_replay_checkpoint_cleanup_intents
+          WHERE scrape_id = $1`,
+        [fixture.scrapeId],
+      );
+      expect(intents.rows).toEqual([
+        { state_path: plan.pathId, checksum: plan.checksum },
+      ]);
+      observed = true;
+      return originalWrite.call(this, owner, scrape, state, plan);
+    });
+
+    await expect(
+      replayStore.persistScrapeReplayState(input(fixture)),
+    ).resolves.toEqual({ persisted: true });
+    expect(observed).toBe(true);
   });
 
   it("atomically replaces metadata without staging debris", async () => {
@@ -322,6 +382,278 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     expect(entries[0]).toMatch(/^[a-f0-9-]{36}\.json$/);
   });
 
+  it("returns committed success and durably retries failed old-generation cleanup", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const old = await pool.query<{ state_path: string }>(
+      `SELECT state_path FROM browser_replay_checkpoints WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    const originalDelete = BrowserStateFilesystem.prototype.delete;
+    const deleteFailure = vi
+      .spyOn(BrowserStateFilesystem.prototype, "delete")
+      .mockRejectedValueOnce(new Error("injected delete failure"));
+    const replacement = {
+      cookies: [],
+      origins: [{ origin: "https://example.com", localStorage: [] }],
+    };
+
+    await expect(
+      replayStore.persistScrapeReplayState(
+        input(fixture, { replayCheckpoint: replayCheckpoint(replacement) }),
+      ),
+    ).resolves.toEqual({ persisted: true });
+    deleteFailure.mockRestore();
+
+    const pending = await pool.query<{
+      state_path: string;
+      attempts: number;
+      last_error_category: string | null;
+    }>(
+      `SELECT state_path, attempts, last_error_category
+         FROM browser_replay_checkpoint_cleanup_intents
+        WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    expect(pending.rows).toEqual([
+      {
+        state_path: old.rows[0]!.state_path,
+        attempts: 1,
+        last_error_category: "filesystem_delete_failed",
+      },
+    ]);
+    expect(cleanupError).toHaveBeenCalledWith(
+      "Replay checkpoint cleanup deferred",
+      expect.objectContaining({
+        category: "replay_checkpoint_cleanup_deferred",
+        scrapeId: fixture.scrapeId,
+      }),
+    );
+    expect(JSON.stringify(cleanupError.mock.calls)).not.toContain(
+      old.rows[0]!.state_path,
+    );
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "checkpoint",
+      checkpoint: { storageState: replacement },
+    });
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count
+           FROM browser_replay_checkpoint_cleanup_intents`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    await expect(
+      originalDelete.call(
+        new BrowserStateFilesystem(root),
+        old.rows[0]!.state_path,
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("keeps the typed primary failure when rollback cleanup is deferred", async () => {
+    const fixture = await createFixture();
+    const other = await createFixture();
+    const originalWrite = BrowserStateFilesystem.prototype.writeCheckpoint;
+    vi.spyOn(
+      BrowserStateFilesystem.prototype,
+      "writeCheckpoint",
+    ).mockImplementation(async function (owner, scrape, state, plan) {
+      const written = await originalWrite.call(
+        this,
+        owner,
+        scrape,
+        state,
+        plan,
+      );
+      await pool.query("UPDATE scrapes SET request_id = $2 WHERE id = $1", [
+        fixture.scrapeId,
+        other.requestId,
+      ]);
+      return written;
+    });
+    vi.spyOn(BrowserStateFilesystem.prototype, "delete").mockRejectedValue(
+      new Error("injected rollback delete failure"),
+    );
+
+    await expect(
+      replayStore.persistScrapeReplayState(input(fixture)),
+    ).rejects.toMatchObject({ category: "replay_ownership_mismatch" });
+    await expect(
+      pool.query<{
+        attempts: number;
+        last_error_category: string;
+      }>(
+        `SELECT attempts, last_error_category
+           FROM browser_replay_checkpoint_cleanup_intents
+          WHERE scrape_id = $1`,
+        [fixture.scrapeId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          attempts: 1,
+          last_error_category: "filesystem_delete_failed",
+        },
+      ],
+    });
+    expect(cleanupError).toHaveBeenCalledWith(
+      "Replay checkpoint cleanup deferred",
+      expect.objectContaining({
+        category: "replay_checkpoint_cleanup_deferred",
+        scrapeId: fixture.scrapeId,
+      }),
+    );
+  });
+
+  it("recovers rollback and commit crash intents from authoritative metadata", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const filesystem = new BrowserStateFilesystem(root);
+    const committed = await pool.query<{
+      state_path: string;
+      checksum: string;
+    }>(
+      `SELECT state_path, checksum FROM browser_replay_checkpoints
+        WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    const rolledBackState = {
+      cookies: [],
+      origins: [
+        {
+          origin: "https://example.com",
+          localStorage: [{ name: "crash", value: "rollback" }],
+        },
+      ],
+    };
+    const rolledBack = await filesystem.writeCheckpoint(
+      ownerId,
+      fixture.scrapeId,
+      rolledBackState,
+    );
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoint_cleanup_intents
+         (id, scrape_id, owner_id, state_path, checksum, state, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'preparing',
+               now() - interval '2 hours')`,
+      [
+        randomUUID(),
+        fixture.scrapeId,
+        ownerId,
+        rolledBack.pathId,
+        rolledBack.checksum,
+      ],
+    );
+
+    await replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId);
+    await expect(
+      lstat(path.join(root, rolledBack.pathId)),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const replacementState = {
+      cookies: [],
+      origins: [
+        {
+          origin: "https://example.com",
+          localStorage: [{ name: "crash", value: "commit" }],
+        },
+      ],
+    };
+    const replacement = await filesystem.writeCheckpoint(
+      ownerId,
+      fixture.scrapeId,
+      replacementState,
+    );
+    await pool.query("BEGIN");
+    try {
+      await pool.query(
+        `INSERT INTO browser_replay_checkpoint_cleanup_intents
+           (id, scrape_id, owner_id, state_path, checksum)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          randomUUID(),
+          fixture.scrapeId,
+          ownerId,
+          committed.rows[0]!.state_path,
+          committed.rows[0]!.checksum,
+        ],
+      );
+      await pool.query(
+        `UPDATE browser_replay_checkpoints
+            SET state_path = $2, checksum = $3, byte_size = $4
+          WHERE scrape_id = $1`,
+        [
+          fixture.scrapeId,
+          replacement.pathId,
+          replacement.checksum,
+          replacement.byteSize,
+        ],
+      );
+      await pool.query("COMMIT");
+    } catch (error) {
+      await pool.query("ROLLBACK");
+      throw error;
+    }
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "checkpoint",
+      checkpoint: { storageState: replacementState },
+    });
+    await expect(
+      lstat(path.join(root, committed.rows[0]!.state_path)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count
+           FROM browser_replay_checkpoint_cleanup_intents`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+
+  it("holds the scrape lock through checkpoint reads", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const originalRead = BrowserStateFilesystem.prototype.readCheckpoint;
+    let entered!: () => void;
+    let release!: () => void;
+    const readEntered = new Promise<void>(resolve => {
+      entered = resolve;
+    });
+    const releaseRead = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const readSpy = vi
+      .spyOn(BrowserStateFilesystem.prototype, "readCheckpoint")
+      .mockImplementation(async function (pathId, expectedChecksum) {
+        const state = await originalRead.call(this, pathId, expectedChecksum);
+        entered();
+        await releaseRead;
+        return state;
+      });
+    const load = replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId);
+    await readEntered;
+
+    let replacementSettled = false;
+    const replacement = replayStore
+      .persistScrapeReplayState(input(fixture))
+      .finally(() => {
+        replacementSettled = true;
+      });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(replacementSettled).toBe(false);
+    release();
+    await expect(load).resolves.toMatchObject({ kind: "checkpoint" });
+    await expect(replacement).resolves.toEqual({ persisted: true });
+    readSpy.mockRestore();
+  });
+
   it("rejects traversal, absolute paths, and symlinked descendants", async () => {
     const filesystem = new BrowserStateFilesystem(root);
     await expect(
@@ -376,13 +708,14 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     const scrapeId = randomUUID();
     const directory = path.join(root, "replay", ownerId, scrapeId);
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    const identity = await processIdentity(process.pid);
     const stale = path.join(
       directory,
-      `.checkpoint-${randomUUID()}-99999999.staging`,
+      `.checkpoint-${randomUUID()}-99999999-${identity.bootId}-1.staging`,
     );
     const live = path.join(
       directory,
-      `.checkpoint-${randomUUID()}-${process.pid}.staging`,
+      `.checkpoint-${randomUUID()}-${process.pid}-${identity.bootId}-${identity.startTime}.staging`,
     );
     await writeFile(stale, "stale", { mode: 0o600 });
     await writeFile(live, "live", { mode: 0o600 });
@@ -393,6 +726,134 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     const entries = await readdir(directory);
     expect(entries).not.toContain(path.basename(stale));
     expect(entries).toContain(path.basename(live));
+  });
+
+  it("does not trust a stale pid 1 staging owner from another process lifetime", async () => {
+    const filesystem = new BrowserStateFilesystem(root);
+    const scrapeId = randomUUID();
+    const directory = path.join(root, "replay", ownerId, scrapeId);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8"))
+      .trim()
+      .replaceAll("-", "");
+    const stat = await readFile("/proc/1/stat", "utf8");
+    const endOfName = stat.lastIndexOf(")");
+    const startTime = BigInt(stat.slice(endOfName + 2).split(" ")[19]!);
+    const stale = path.join(
+      directory,
+      `.checkpoint-${randomUUID()}-1-${bootId}-${startTime + 1n}.staging`,
+    );
+    await writeFile(stale, "stale pid one", { mode: 0o600 });
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(stale, old, old);
+
+    await filesystem.writeCheckpoint(ownerId, scrapeId, storageState);
+    expect(await readdir(directory)).not.toContain(path.basename(stale));
+  });
+
+  it("removes the renamed generation when directory fsync fails", async () => {
+    const scrapeId = randomUUID();
+    const scrapeDirectory = path.join(root, "replay", ownerId, scrapeId);
+    let injected = false;
+    const filesystem = new BrowserStateFilesystem(root, {
+      syncDirectory: async directory => {
+        const entries = await readdir(directory).catch(() => []);
+        if (
+          directory === scrapeDirectory &&
+          entries.some(entry => /^[a-f0-9-]{36}\.json$/.test(entry)) &&
+          !injected
+        ) {
+          injected = true;
+          throw new Error("injected post-rename directory sync failure");
+        }
+        const handle = await open(
+          directory,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+        try {
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      },
+    });
+
+    await expect(
+      filesystem.writeCheckpoint(ownerId, scrapeId, storageState),
+    ).rejects.toThrow(/browser_state_unavailable/);
+    expect(injected).toBe(true);
+    await expect(readdir(scrapeDirectory)).resolves.toEqual([]);
+  });
+
+  it("retries parent durability after a delete sync failure", async () => {
+    const scrapeId = randomUUID();
+    const scrapeDirectory = path.join(root, "replay", ownerId, scrapeId);
+    let target = "";
+    let missingTargetSyncs = 0;
+    const filesystem = new BrowserStateFilesystem(root, {
+      syncDirectory: async directory => {
+        if (directory === scrapeDirectory && target) {
+          const targetMissing = await lstat(target).then(
+            () => false,
+            error => {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                return true;
+              }
+              throw error;
+            },
+          );
+          if (targetMissing) {
+            missingTargetSyncs += 1;
+            if (missingTargetSyncs === 1) {
+              throw new Error("injected delete directory sync failure");
+            }
+          }
+        }
+        const handle = await open(
+          directory,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+        try {
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      },
+    });
+    const written = await filesystem.writeCheckpoint(
+      ownerId,
+      scrapeId,
+      storageState,
+    );
+    target = path.join(root, written.pathId);
+
+    await expect(filesystem.delete(written.pathId)).rejects.toThrow(
+      /injected delete directory sync failure/,
+    );
+    await expect(filesystem.delete(written.pathId)).resolves.toBeUndefined();
+    expect(missingTargetSyncs).toBe(2);
+  });
+
+  it("bounds oversized reads without growing opened handles", async () => {
+    const filesystem = new BrowserStateFilesystem(root);
+    const scrapeId = randomUUID();
+    await filesystem.writeCheckpoint(ownerId, scrapeId, storageState);
+    const filename = `${randomUUID()}.json`;
+    const directory = path.join(root, "replay", ownerId, scrapeId);
+    await writeFile(path.join(directory, filename), Buffer.alloc(2_097_153), {
+      mode: 0o600,
+    });
+    const pathId = path.posix.join("replay", ownerId, scrapeId, filename);
+    const before = (await readdir("/proc/self/fd")).length;
+
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      await expect(
+        filesystem.readCheckpoint(pathId, "0".repeat(64)),
+      ).rejects.toThrow(/browser_state_unavailable/);
+    }
+
+    const after = (await readdir("/proc/self/fd")).length;
+    expect(after).toBeLessThanOrEqual(before + 1);
   });
 
   it("rejects request, scrape, and owner mismatches", async () => {

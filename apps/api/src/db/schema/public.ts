@@ -275,6 +275,44 @@ export const browser_replay_checkpoints = pgTable(
   ],
 );
 
+/** @public Durable handoff for replay checkpoint file cleanup. */
+export const browser_replay_checkpoint_cleanup_intents = pgTable(
+  "browser_replay_checkpoint_cleanup_intents",
+  {
+    id: uuid("id").primaryKey(),
+    scrape_id: uuid("scrape_id")
+      .notNull()
+      .references((): AnyPgColumn => scrapes.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id")
+      .notNull()
+      .references(() => local_owners.id, { onDelete: "cascade" }),
+    state_path: text("state_path").notNull().unique(),
+    checksum: text("checksum").notNull(),
+    state: text("state").notNull().default("cleanup"),
+    attempts: integer("attempts").notNull().default(0),
+    last_error_category: text("last_error_category"),
+    last_attempted_at: ts("last_attempted_at"),
+    created_at: ts("created_at").notNull().defaultNow(),
+  },
+  table => [
+    check(
+      "browser_replay_checkpoint_cleanup_intents_checksum_check",
+      sql`${table.checksum} ~ '^[a-f0-9]{64}$'`,
+    ),
+    check(
+      "browser_replay_checkpoint_cleanup_intents_attempts_check",
+      sql`${table.attempts} >= 0`,
+    ),
+    check(
+      "browser_replay_checkpoint_cleanup_intents_state_check",
+      sql`${table.state} IN ('preparing', 'cleanup')`,
+    ),
+    index("browser_replay_checkpoint_cleanup_intents_scrape_id_idx").on(
+      table.scrape_id,
+    ),
+  ],
+);
+
 export const browser_sessions = pgTable(
   "browser_sessions",
   {

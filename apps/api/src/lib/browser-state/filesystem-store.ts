@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   readdir,
   realpath,
   rename,
@@ -17,7 +18,8 @@ const CHECKPOINT_READ_CHUNK_BYTES = 64 * 1024;
 const STAGING_STALE_MS = 60 * 60 * 1000;
 const SAFE_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CHECKPOINT_FILENAME = /^[a-f0-9-]{36}\.json$/;
-const STAGING_FILENAME = /^\.checkpoint-([a-f0-9-]{36})-(\d+)\.staging$/;
+const STAGING_FILENAME =
+  /^\.checkpoint-([a-f0-9-]{36})-(\d+)-([a-f0-9]{32})-(\d+)\.staging$/;
 
 class BrowserStateUnavailableError extends Error {
   readonly category = "browser_state_unavailable";
@@ -77,10 +79,39 @@ function validatePathId(value: string): string[] {
   return segments;
 }
 
+interface BrowserStateCheckpointPlan {
+  generationId: string;
+  pathId: string;
+  byteSize: number;
+  checksum: string;
+}
+
+interface BrowserStateFilesystemOptions {
+  syncDirectory?: (directory: string) => Promise<void>;
+}
+
+interface ProcessIdentity {
+  bootId: string;
+  startTime: string;
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(
+    directory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 export class BrowserStateFilesystem {
   readonly #root: string;
+  readonly #syncDirectory: (directory: string) => Promise<void>;
 
-  constructor(root: string) {
+  constructor(root: string, options: BrowserStateFilesystemOptions = {}) {
     if (
       !path.isAbsolute(root) ||
       path.resolve(root) === path.parse(root).root
@@ -90,10 +121,39 @@ export class BrowserStateFilesystem {
       );
     }
     this.#root = path.resolve(root);
+    this.#syncDirectory = options.syncDirectory ?? syncDirectory;
   }
 
   async #ensureRoot(): Promise<string> {
-    await mkdir(this.#root, { recursive: true, mode: 0o700 });
+    const filesystemRoot = path.parse(this.#root).root;
+    const segments = path.relative(filesystemRoot, this.#root).split(path.sep);
+    let current = filesystemRoot;
+    for (const segment of segments) {
+      const candidate = path.join(current, segment);
+      let created = false;
+      try {
+        await mkdir(candidate, { mode: 0o700 });
+        created = true;
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+      }
+      const candidateStat = await lstat(candidate);
+      if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink()) {
+        throw new BrowserStateUnavailableError(
+          "configured root path contains a symlink",
+        );
+      }
+      if ((await realpath(candidate)) !== candidate) {
+        throw new BrowserStateUnavailableError(
+          "configured root path contains a symlink",
+        );
+      }
+      if (created) {
+        await this.#syncDirectory(candidate);
+        await this.#syncDirectory(current);
+      }
+      current = candidate;
+    }
     const stat = await lstat(this.#root);
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw new BrowserStateUnavailableError(
@@ -115,8 +175,10 @@ export class BrowserStateFilesystem {
   async #ensureDirectory(parent: string, segment: string): Promise<string> {
     validateSegment(segment, "directory");
     const candidate = path.join(parent, segment);
+    let created = false;
     try {
       await mkdir(candidate, { mode: 0o700 });
+      created = true;
     } catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") throw error;
     }
@@ -135,17 +197,28 @@ export class BrowserStateFilesystem {
         "state directory permissions must be 0700",
       );
     }
+    if (created) {
+      await this.#syncDirectory(candidate);
+      await this.#syncDirectory(parent);
+    }
     return candidate;
   }
 
   async #removeStaleStaging(directory: string): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true });
     const currentUid = process.getuid?.();
+    const bootId = await readBootId();
     for (const entry of entries) {
       const match = STAGING_FILENAME.exec(entry.name);
       if (!match || !entry.isFile()) continue;
       const candidate = path.join(directory, entry.name);
-      const stat = await lstat(candidate);
+      let stat: Awaited<ReturnType<typeof lstat>>;
+      try {
+        stat = await lstat(candidate);
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") continue;
+        throw error;
+      }
       if (
         stat.isSymbolicLink() ||
         !stat.isFile() ||
@@ -153,7 +226,12 @@ export class BrowserStateFilesystem {
         (stat.mode & 0o777) !== 0o600 ||
         (currentUid !== undefined && stat.uid !== currentUid) ||
         Date.now() - stat.mtimeMs < STAGING_STALE_MS ||
-        isProcessAlive(Number(match[2]))
+        (await isSameProcessIdentity(
+          Number(match[2]),
+          match[3],
+          match[4],
+          bootId,
+        ))
       ) {
         continue;
       }
@@ -190,10 +268,41 @@ export class BrowserStateFilesystem {
     return current;
   }
 
+  async #syncNearestExistingParent(pathId: string): Promise<void> {
+    const segments = validatePathId(pathId);
+    segments.pop();
+    let current = await this.#ensureRoot();
+    for (const segment of segments) {
+      const candidate = path.join(current, segment);
+      let stat: Awaited<ReturnType<typeof lstat>>;
+      try {
+        stat = await lstat(candidate);
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          await this.#syncDirectory(current);
+          return;
+        }
+        throw error;
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new BrowserStateUnavailableError("state path contains a symlink");
+      }
+      const canonical = await realpath(candidate);
+      if (canonical !== candidate || !this.#isBelowRoot(canonical)) {
+        throw new BrowserStateUnavailableError(
+          "state path escapes configured root",
+        );
+      }
+      current = candidate;
+    }
+    await this.#syncDirectory(current);
+  }
+
   async writeCheckpoint(
     ownerId: string,
     scrapeId: string,
     storageState: unknown,
+    plan = this.planCheckpoint(ownerId, scrapeId, storageState),
   ): Promise<{ pathId: string; byteSize: number; checksum: string }> {
     validateSegment(ownerId, "owner ID");
     validateSegment(scrapeId, "scrape ID");
@@ -201,20 +310,36 @@ export class BrowserStateFilesystem {
     if (bytes.byteLength > CHECKPOINT_MAX_BYTES) {
       throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
     }
+    const expectedPath = path.posix.join(
+      "replay",
+      ownerId,
+      scrapeId,
+      `${plan.generationId}.json`,
+    );
+    if (
+      !/^[a-f0-9-]{36}$/.test(plan.generationId) ||
+      plan.pathId !== expectedPath ||
+      plan.byteSize !== bytes.byteLength ||
+      plan.checksum !== checksum(bytes)
+    ) {
+      throw new BrowserStateUnavailableError("checkpoint plan is invalid");
+    }
 
     const root = await this.#ensureRoot();
     const replay = await this.#ensureDirectory(root, "replay");
     const owner = await this.#ensureDirectory(replay, ownerId);
     const scrape = await this.#ensureDirectory(owner, scrapeId);
     await this.#removeStaleStaging(scrape);
-    const generationId = randomUUID();
+    const generationId = plan.generationId;
     const filename = `${generationId}.json`;
     const target = path.join(scrape, filename);
+    const identity = await readProcessIdentity(process.pid);
     const staging = path.join(
       scrape,
-      `.checkpoint-${generationId}-${process.pid}.staging`,
+      `.checkpoint-${generationId}-${process.pid}-${identity.bootId}-${identity.startTime}.staging`,
     );
     let handle: Awaited<ReturnType<typeof open>> | undefined;
+    let renamedGeneration = false;
     try {
       handle = await open(staging, "wx", 0o600);
       await handle.writeFile(bytes);
@@ -231,26 +356,63 @@ export class BrowserStateFilesystem {
       await handle.close();
       handle = undefined;
       await rename(staging, target);
-      const directory = await open(
-        scrape,
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      renamedGeneration = true;
+      await this.#syncDirectory(scrape);
     } catch (error) {
-      if (handle) await handle.close().catch(() => undefined);
-      await rm(staging, { force: true }).catch(() => undefined);
-      if (error instanceof BrowserStateUnavailableError) throw error;
-      throw new BrowserStateUnavailableError("checkpoint write failed", {
-        cause: error,
-      });
+      const primary =
+        error instanceof BrowserStateUnavailableError
+          ? error
+          : new BrowserStateUnavailableError("checkpoint write failed", {
+              cause: error,
+            });
+      const cleanupErrors: unknown[] = [];
+      if (handle) {
+        await handle
+          .close()
+          .catch(closeError => cleanupErrors.push(closeError));
+      }
+      await rm(renamedGeneration ? target : staging, { force: true }).catch(
+        removeError => cleanupErrors.push(removeError),
+      );
+      await this.#syncDirectory(scrape).catch(syncError =>
+        cleanupErrors.push(syncError),
+      );
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [primary, ...cleanupErrors],
+          "Checkpoint write and durability cleanup failed",
+        );
+      }
+      throw primary;
     }
 
     return {
       pathId: path.posix.join("replay", ownerId, scrapeId, filename),
+      byteSize: bytes.byteLength,
+      checksum: checksum(bytes),
+    };
+  }
+
+  planCheckpoint(
+    ownerId: string,
+    scrapeId: string,
+    storageState: unknown,
+  ): BrowserStateCheckpointPlan {
+    validateSegment(ownerId, "owner ID");
+    validateSegment(scrapeId, "scrape ID");
+    const bytes = Buffer.from(stableJson(storageState), "utf8");
+    if (bytes.byteLength > CHECKPOINT_MAX_BYTES) {
+      throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
+    }
+    const generationId = randomUUID();
+    return {
+      generationId,
+      pathId: path.posix.join(
+        "replay",
+        ownerId,
+        scrapeId,
+        `${generationId}.json`,
+      ),
       byteSize: bytes.byteLength,
       checksum: checksum(bytes),
     };
@@ -341,27 +503,40 @@ export class BrowserStateFilesystem {
     try {
       file = await this.#resolveExisting(pathId);
     } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return;
+      if (isNodeError(error) && error.code === "ENOENT") {
+        await this.#syncNearestExistingParent(pathId);
+        return;
+      }
       if (
         error instanceof BrowserStateUnavailableError &&
         isNodeError(error.cause) &&
         error.cause.code === "ENOENT"
       ) {
+        await this.#syncNearestExistingParent(pathId);
         return;
       }
       throw error;
     }
     await rm(file);
     const scrapeDirectory = path.dirname(file);
-    await rmdir(scrapeDirectory).catch(error => {
-      if (
-        !isNodeError(error) ||
-        typeof error.code !== "string" ||
-        !["ENOTEMPTY", "ENOENT"].includes(error.code)
-      ) {
-        throw error;
-      }
-    });
+    await this.#syncDirectory(scrapeDirectory);
+    let removedDirectory = false;
+    await rmdir(scrapeDirectory)
+      .then(() => {
+        removedDirectory = true;
+      })
+      .catch(error => {
+        if (
+          !isNodeError(error) ||
+          typeof error.code !== "string" ||
+          !["ENOTEMPTY", "ENOENT"].includes(error.code)
+        ) {
+          throw error;
+        }
+      });
+    if (removedDirectory) {
+      await this.#syncDirectory(path.dirname(scrapeDirectory));
+    }
   }
 }
 
@@ -369,15 +544,48 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+async function readBootId(): Promise<string> {
+  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8"))
+    .trim()
+    .replaceAll("-", "");
+  if (!/^[a-f0-9]{32}$/.test(bootId)) {
+    throw new BrowserStateUnavailableError("process boot identity is invalid");
+  }
+  return bootId;
+}
+
+async function readProcessIdentity(pid: number): Promise<ProcessIdentity> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new BrowserStateUnavailableError("process identity is invalid");
+  }
+  const bootId = await readBootId();
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+  const endOfName = stat.lastIndexOf(")");
+  const startTime = stat.slice(endOfName + 2).split(" ")[19];
+  if (endOfName < 0 || !startTime || !/^\d+$/.test(startTime)) {
+    throw new BrowserStateUnavailableError("process start identity is invalid");
+  }
+  return { bootId, startTime };
+}
+
+async function isSameProcessIdentity(
+  pid: number,
+  expectedBootId: string,
+  expectedStartTime: string,
+  currentBootId: string,
+): Promise<boolean> {
+  if (expectedBootId !== currentBootId) return false;
   try {
-    process.kill(pid, 0);
-    return true;
+    const identity = await readProcessIdentity(pid);
+    return (
+      identity.bootId === expectedBootId &&
+      identity.startTime === expectedStartTime
+    );
   } catch (error) {
-    if (!isNodeError(error)) throw error;
-    if (error.code === "ESRCH") return false;
-    if (error.code === "EPERM") return true;
+    if (isNodeError(error) && error.code === "ENOENT") return false;
+    if (isNodeError(error) && ["EACCES", "EPERM"].includes(error.code ?? "")) {
+      return true;
+    }
     throw error;
   }
 }

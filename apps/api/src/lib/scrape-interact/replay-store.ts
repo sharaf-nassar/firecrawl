@@ -6,6 +6,7 @@ import { config } from "../../config";
 import { db } from "../../db/connection";
 import * as schema from "../../db/schema";
 import { BrowserStateFilesystem } from "../browser-state/filesystem-store";
+import { logger as rootLogger } from "../logger";
 import {
   normalizeReplayEnvelope,
   resolveReplayEnvelope,
@@ -94,6 +95,125 @@ class ReplayOwnershipError extends Error {
   }
 }
 
+const cleanupLogger = rootLogger.child({ module: "scrape-replay-store" });
+const PREPARING_INTENT_STALE_MS = 60 * 60 * 1000;
+type ReplayTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+async function lockScrape(
+  tx: ReplayTransaction,
+  scrapeId: string,
+): Promise<void> {
+  await tx.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtextextended(${scrapeId}, 0))`,
+  );
+}
+
+async function recoverCleanupIntents(
+  tx: ReplayTransaction,
+  filesystem: BrowserStateFilesystem,
+  scrapeId: string,
+  excludedIntentId?: string,
+): Promise<void> {
+  const [current] = await tx
+    .select({
+      statePath: schema.browser_replay_checkpoints.state_path,
+      checksum: schema.browser_replay_checkpoints.checksum,
+    })
+    .from(schema.browser_replay_checkpoints)
+    .where(eq(schema.browser_replay_checkpoints.scrape_id, scrapeId))
+    .limit(1);
+  const intents = await tx
+    .select({
+      id: schema.browser_replay_checkpoint_cleanup_intents.id,
+      statePath: schema.browser_replay_checkpoint_cleanup_intents.state_path,
+      checksum: schema.browser_replay_checkpoint_cleanup_intents.checksum,
+      state: schema.browser_replay_checkpoint_cleanup_intents.state,
+      createdAt: schema.browser_replay_checkpoint_cleanup_intents.created_at,
+    })
+    .from(schema.browser_replay_checkpoint_cleanup_intents)
+    .where(
+      eq(schema.browser_replay_checkpoint_cleanup_intents.scrape_id, scrapeId),
+    );
+
+  for (const intent of intents) {
+    if (intent.id === excludedIntentId) continue;
+    const isCurrent =
+      intent.statePath === current?.statePath &&
+      intent.checksum === current?.checksum;
+    if (
+      !isCurrent &&
+      intent.state === "preparing" &&
+      Date.now() - Date.parse(intent.createdAt) < PREPARING_INTENT_STALE_MS
+    ) {
+      continue;
+    }
+    try {
+      if (!isCurrent) await filesystem.delete(intent.statePath);
+      await tx
+        .delete(schema.browser_replay_checkpoint_cleanup_intents)
+        .where(
+          eq(schema.browser_replay_checkpoint_cleanup_intents.id, intent.id),
+        );
+    } catch {
+      await tx
+        .update(schema.browser_replay_checkpoint_cleanup_intents)
+        .set({
+          attempts: sql`${schema.browser_replay_checkpoint_cleanup_intents.attempts} + 1`,
+          last_error_category: "filesystem_delete_failed",
+          last_attempted_at: new Date().toISOString(),
+        })
+        .where(
+          eq(schema.browser_replay_checkpoint_cleanup_intents.id, intent.id),
+        );
+      cleanupLogger.error("Replay checkpoint cleanup deferred", {
+        category: "replay_checkpoint_cleanup_deferred",
+        cleanupIntentId: intent.id,
+        scrapeId,
+      });
+    }
+  }
+}
+
+async function recoverScrapeCleanup(
+  filesystem: BrowserStateFilesystem,
+  scrapeId: string,
+  excludedIntentId?: string,
+): Promise<void> {
+  await db.transaction(async tx => {
+    await lockScrape(tx, scrapeId);
+    await recoverCleanupIntents(tx, filesystem, scrapeId, excludedIntentId);
+  });
+}
+
+async function recoverWithoutMaskingPrimary(
+  filesystem: BrowserStateFilesystem,
+  scrapeId: string,
+  cleanupIntentId: string,
+  primary: unknown,
+): Promise<never> {
+  try {
+    await db.transaction(async tx => {
+      await lockScrape(tx, scrapeId);
+      await tx
+        .update(schema.browser_replay_checkpoint_cleanup_intents)
+        .set({ state: "cleanup" })
+        .where(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            cleanupIntentId,
+          ),
+        );
+      await recoverCleanupIntents(tx, filesystem, scrapeId);
+    });
+  } catch {
+    cleanupLogger.error("Replay checkpoint cleanup recovery failed", {
+      category: "replay_checkpoint_cleanup_recovery_failed",
+      scrapeId,
+    });
+  }
+  throw primary;
+}
+
 type BrowserRuntimeConfig = typeof config & {
   LOCAL_BROWSER_SERVICE_ENABLED?: boolean;
   LOCAL_BROWSER_STATE_ROOT?: string;
@@ -149,19 +269,19 @@ export async function persistScrapeReplayState(
   }
 
   const filesystem = new BrowserStateFilesystem(runtime.root);
-  const written = await filesystem.writeCheckpoint(
+  const plan = filesystem.planCheckpoint(
     input.ownerId,
     input.scrapeId,
     input.replayCheckpoint.storageState,
   );
   const checkpoint: StoredReplayCheckpoint = {
     version: 1,
-    statePath: written.pathId,
+    statePath: plan.pathId,
     storageState: input.replayCheckpoint.storageState,
     finalUrl: input.replayCheckpoint.finalUrl,
     fingerprint: input.replayCheckpoint.fingerprint,
-    checksum: written.checksum,
-    byteSize: written.byteSize,
+    checksum: plan.checksum,
+    byteSize: plan.byteSize,
   };
   const validated = resolveReplayEnvelope({
     url: input.url,
@@ -171,15 +291,64 @@ export async function persistScrapeReplayState(
     checkpoint,
   });
   if (validated.kind !== "checkpoint") {
-    await filesystem.delete(written.pathId);
     return { persisted: false, reason: "checkpoint_unavailable" };
   }
 
-  let oldPath: string | null;
+  const cleanupIntentId = randomUUID();
+  await db.transaction(async tx => {
+    await lockScrape(tx, input.scrapeId);
+    const [ownedScrape] = await tx
+      .select({ id: schema.scrapes.id })
+      .from(schema.scrapes)
+      .innerJoin(
+        schema.requests,
+        eq(schema.requests.id, schema.scrapes.request_id),
+      )
+      .where(
+        and(
+          eq(schema.scrapes.id, input.scrapeId),
+          eq(schema.scrapes.request_id, input.requestId),
+          eq(schema.scrapes.team_id, input.ownerId),
+          eq(schema.requests.id, input.requestId),
+          eq(schema.requests.team_id, input.ownerId),
+        ),
+      )
+      .limit(1);
+    if (!ownedScrape) throw new ReplayOwnershipError();
+    await tx.insert(schema.browser_replay_checkpoint_cleanup_intents).values({
+      id: cleanupIntentId,
+      scrape_id: input.scrapeId,
+      owner_id: input.ownerId,
+      state_path: plan.pathId,
+      checksum: plan.checksum,
+      state: "preparing",
+    });
+  });
+
   try {
-    oldPath = await db.transaction(async tx => {
-      await tx.execute(
-        sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.scrapeId}, 0))`,
+    await filesystem.writeCheckpoint(
+      input.ownerId,
+      input.scrapeId,
+      input.replayCheckpoint.storageState,
+      plan,
+    );
+  } catch (error) {
+    return recoverWithoutMaskingPrimary(
+      filesystem,
+      input.scrapeId,
+      cleanupIntentId,
+      error,
+    );
+  }
+
+  try {
+    await db.transaction(async tx => {
+      await lockScrape(tx, input.scrapeId);
+      await recoverCleanupIntents(
+        tx,
+        filesystem,
+        input.scrapeId,
+        cleanupIntentId,
       );
       const [ownedScrape] = await tx
         .select({ drCleanBy: schema.requests.dr_clean_by })
@@ -200,10 +369,30 @@ export async function persistScrapeReplayState(
         .limit(1);
       if (!ownedScrape) throw new ReplayOwnershipError();
       const [existing] = await tx
-        .select({ statePath: schema.browser_replay_checkpoints.state_path })
+        .select({
+          statePath: schema.browser_replay_checkpoints.state_path,
+          checksum: schema.browser_replay_checkpoints.checksum,
+        })
         .from(schema.browser_replay_checkpoints)
         .where(eq(schema.browser_replay_checkpoints.scrape_id, input.scrapeId))
         .limit(1);
+      if (
+        existing?.statePath &&
+        (existing.statePath !== plan.pathId ||
+          existing.checksum !== plan.checksum)
+      ) {
+        await tx
+          .insert(schema.browser_replay_checkpoint_cleanup_intents)
+          .values({
+            id: randomUUID(),
+            scrape_id: input.scrapeId,
+            owner_id: input.ownerId,
+            state_path: existing.statePath,
+            checksum: existing.checksum,
+            state: "cleanup",
+          })
+          .onConflictDoNothing();
+      }
 
       const expiresAt =
         ownedScrape.drCleanBy ??
@@ -238,11 +427,11 @@ export async function persistScrapeReplayState(
           request_id: input.requestId,
           owner_id: input.ownerId,
           envelope_version: 1,
-          state_path: written.pathId,
+          state_path: plan.pathId,
           final_url: validated.checkpoint.finalUrl,
           fingerprint: validated.checkpoint.fingerprint,
-          checksum: written.checksum,
-          byte_size: written.byteSize,
+          checksum: plan.checksum,
+          byte_size: plan.byteSize,
           expires_at: expiresAt,
         })
         .onConflictDoUpdate({
@@ -251,31 +440,40 @@ export async function persistScrapeReplayState(
             request_id: input.requestId,
             owner_id: input.ownerId,
             envelope_version: 1,
-            state_path: written.pathId,
+            state_path: plan.pathId,
             final_url: validated.checkpoint.finalUrl,
             fingerprint: validated.checkpoint.fingerprint,
-            checksum: written.checksum,
-            byte_size: written.byteSize,
+            checksum: plan.checksum,
+            byte_size: plan.byteSize,
             expires_at: expiresAt,
             file_deleted_at: null,
           },
         });
-      return existing?.statePath ?? null;
+      await tx
+        .delete(schema.browser_replay_checkpoint_cleanup_intents)
+        .where(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            cleanupIntentId,
+          ),
+        );
     });
   } catch (error) {
-    try {
-      await filesystem.delete(written.pathId);
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "Replay transaction and new-generation cleanup failed",
-      );
-    }
-    throw error;
+    return recoverWithoutMaskingPrimary(
+      filesystem,
+      input.scrapeId,
+      cleanupIntentId,
+      error,
+    );
   }
 
-  if (oldPath && oldPath !== written.pathId) {
-    await filesystem.delete(oldPath);
+  try {
+    await recoverScrapeCleanup(filesystem, input.scrapeId);
+  } catch {
+    cleanupLogger.error("Replay checkpoint cleanup recovery failed", {
+      category: "replay_checkpoint_cleanup_recovery_failed",
+      scrapeId: input.scrapeId,
+    });
   }
 
   return { persisted: true };
@@ -289,70 +487,80 @@ export async function loadScrapeReplayState(
   const runtime = runtimeConfig();
   if (!runtime.enabled) return unavailable(["browserService"]);
 
-  const [row] = await db
-    .select({
-      envelope: schema.browser_replay_envelopes.envelope,
-      statePath: schema.browser_replay_checkpoints.state_path,
-      finalUrl: schema.browser_replay_checkpoints.final_url,
-      fingerprint: schema.browser_replay_checkpoints.fingerprint,
-      checksum: schema.browser_replay_checkpoints.checksum,
-      byteSize: schema.browser_replay_checkpoints.byte_size,
-      expiresAt: schema.browser_replay_checkpoints.expires_at,
-      fileDeletedAt: schema.browser_replay_checkpoints.file_deleted_at,
-    })
-    .from(schema.browser_replay_envelopes)
-    .innerJoin(
-      schema.browser_replay_checkpoints,
-      eq(
-        schema.browser_replay_checkpoints.scrape_id,
-        schema.browser_replay_envelopes.scrape_id,
-      ),
-    )
-    .innerJoin(
-      schema.scrapes,
-      eq(schema.scrapes.id, schema.browser_replay_envelopes.scrape_id),
-    )
-    .innerJoin(
-      schema.requests,
-      eq(schema.requests.id, schema.scrapes.request_id),
-    )
-    .where(
-      and(
-        eq(schema.browser_replay_envelopes.owner_id, ownerId),
-        eq(schema.browser_replay_envelopes.scrape_id, scrapeId),
-        eq(schema.browser_replay_checkpoints.owner_id, ownerId),
+  const loaded = await db.transaction(async tx => {
+    await lockScrape(tx, scrapeId);
+    const filesystem = new BrowserStateFilesystem(runtime.root);
+    await recoverCleanupIntents(tx, filesystem, scrapeId);
+    const [row] = await tx
+      .select({
+        envelope: schema.browser_replay_envelopes.envelope,
+        statePath: schema.browser_replay_checkpoints.state_path,
+        finalUrl: schema.browser_replay_checkpoints.final_url,
+        fingerprint: schema.browser_replay_checkpoints.fingerprint,
+        checksum: schema.browser_replay_checkpoints.checksum,
+        byteSize: schema.browser_replay_checkpoints.byte_size,
+        expiresAt: schema.browser_replay_checkpoints.expires_at,
+        fileDeletedAt: schema.browser_replay_checkpoints.file_deleted_at,
+      })
+      .from(schema.browser_replay_envelopes)
+      .innerJoin(
+        schema.browser_replay_checkpoints,
         eq(
-          schema.browser_replay_checkpoints.request_id,
-          schema.browser_replay_envelopes.request_id,
+          schema.browser_replay_checkpoints.scrape_id,
+          schema.browser_replay_envelopes.scrape_id,
         ),
-        eq(schema.browser_replay_checkpoints.scrape_id, schema.scrapes.id),
-        eq(
-          schema.browser_replay_envelopes.request_id,
-          schema.scrapes.request_id,
-        ),
-        eq(schema.scrapes.team_id, ownerId),
+      )
+      .innerJoin(
+        schema.scrapes,
+        eq(schema.scrapes.id, schema.browser_replay_envelopes.scrape_id),
+      )
+      .innerJoin(
+        schema.requests,
         eq(schema.requests.id, schema.scrapes.request_id),
-        eq(schema.requests.team_id, ownerId),
-      ),
-    )
-    .limit(1);
-  if (
-    !row ||
-    !row.statePath ||
-    row.fileDeletedAt !== null ||
-    Date.parse(row.expiresAt) <= Date.now()
-  ) {
+      )
+      .where(
+        and(
+          eq(schema.browser_replay_envelopes.owner_id, ownerId),
+          eq(schema.browser_replay_envelopes.scrape_id, scrapeId),
+          eq(schema.browser_replay_checkpoints.owner_id, ownerId),
+          eq(
+            schema.browser_replay_checkpoints.request_id,
+            schema.browser_replay_envelopes.request_id,
+          ),
+          eq(schema.browser_replay_checkpoints.scrape_id, schema.scrapes.id),
+          eq(
+            schema.browser_replay_envelopes.request_id,
+            schema.scrapes.request_id,
+          ),
+          eq(schema.scrapes.team_id, ownerId),
+          eq(schema.requests.id, schema.scrapes.request_id),
+          eq(schema.requests.team_id, ownerId),
+        ),
+      )
+      .limit(1);
+    if (
+      !row ||
+      !row.statePath ||
+      row.fileDeletedAt !== null ||
+      Date.parse(row.expiresAt) <= Date.now()
+    ) {
+      return;
+    }
+    const statePath = row.statePath;
+    try {
+      const storageState = await filesystem.readCheckpoint(
+        statePath,
+        row.checksum,
+      );
+      return { row: { ...row, statePath }, storageState };
+    } catch {
+      return;
+    }
+  });
+  if (!loaded) {
     return unavailable(["checkpoint"]);
   }
-
-  let storageState: unknown;
-  try {
-    storageState = await new BrowserStateFilesystem(
-      runtime.root,
-    ).readCheckpoint(row.statePath, row.checksum);
-  } catch {
-    return unavailable(["checkpoint"]);
-  }
+  const { row, storageState } = loaded;
 
   if (
     row.envelope === null ||

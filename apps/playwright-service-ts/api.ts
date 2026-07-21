@@ -1,5 +1,13 @@
 import express, { Request, Response } from 'express';
-import { chromium, Browser, BrowserContext, Route, Request as PlaywrightRequest, Page } from 'playwright';
+import {
+  chromium,
+  Browser,
+  BrowserContext,
+  CDPSession,
+  Route,
+  Request as PlaywrightRequest,
+  Page,
+} from 'playwright';
 import dotenv from 'dotenv';
 import UserAgent from 'user-agents';
 import { getError } from './helpers/get_error';
@@ -19,6 +27,7 @@ const MAX_CONCURRENT_PAGES = Math.max(1, Number.parseInt(process.env.MAX_CONCURR
 const ALLOW_LOCAL_WEBHOOKS = (process.env.ALLOW_LOCAL_WEBHOOKS || 'False').toUpperCase() === 'TRUE';
 const DNS_CACHE_TTL_MS = 30_000;
 const REPLAY_CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
+const REPLAY_CHECKPOINT_MAX_ORIGINS = 128;
 
 const PROXY_SERVER = process.env.PROXY_SERVER || null;
 const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
@@ -153,6 +162,8 @@ const assertSafeTargetUrl = async (urlString: string): Promise<void> => {
 
 type ContextSecurityState = {
   blockedNavigationRequestUrl: string | null;
+  storageOrigins: Set<string>;
+  storageOriginsOverflow: boolean;
 };
 class Semaphore {
   private permits: number;
@@ -365,6 +376,8 @@ const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<
   const browserSettings = resolveAppliedBrowserSettings(model, userAgent);
   const securityState: ContextSecurityState = {
     blockedNavigationRequestUrl: null,
+    storageOrigins: new Set(),
+    storageOriginsOverflow: false,
   };
 
   const contextOptions: any = {
@@ -418,6 +431,13 @@ const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<
     }
 
     const requestUrl = new URL(requestUrlString);
+    if (securityState.storageOrigins.size >= REPLAY_CHECKPOINT_MAX_ORIGINS) {
+      if (!securityState.storageOrigins.has(requestUrl.origin)) {
+        securityState.storageOriginsOverflow = true;
+      }
+    } else {
+      securityState.storageOrigins.add(requestUrl.origin);
+    }
     const hostname = normalizeHostname(requestUrl.hostname);
 
     if (browserSettings.blockAds && AD_SERVING_DOMAINS.some(domain => hostname.includes(domain))) {
@@ -440,23 +460,46 @@ const sha256 = (value: string): string =>
 export async function captureWithDeadline<T>(
   capture: Promise<T>,
   timeoutMs: number,
+  cancelCapture: () => Promise<void> = async () => undefined,
 ): Promise<T> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10_000) {
     throw new CheckpointUnrepresentableError(
       'Replay checkpoint timeout must be between 1 and 10000 milliseconds',
     );
   }
-  let timeout: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      capture,
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new CheckpointTimeoutError()), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout) clearTimeout(timeout);
-  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(async () => {
+      if (settled) return;
+      settled = true;
+      const primary = new CheckpointTimeoutError();
+      try {
+        await cancelCapture();
+        reject(primary);
+      } catch (cleanupError) {
+        reject(
+          new RuntimeAggregateError(
+            [primary, cleanupError],
+            'Checkpoint timeout and cancellation failed',
+          ),
+        );
+      }
+    }, timeoutMs);
+    capture.then(
+      value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
 }
 
 type Closeable = { close(): Promise<unknown> };
@@ -492,10 +535,11 @@ export async function settleScrapeResources(
   }
 }
 
-const captureReplayCheckpoint = async (
+export const captureReplayCheckpoint = async (
   context: BrowserContext,
   page: Page,
   browserSettings: ReplayBrowserSettingsV1,
+  storageOrigins: ReadonlySet<string>,
 ): Promise<ReplayCheckpointCaptureV1> => {
   const runtimeViewport = page.viewportSize();
   if (
@@ -505,6 +549,66 @@ const captureReplayCheckpoint = async (
   ) {
     throw new Error('Replay checkpoint viewport does not match runtime context');
   }
+  if (context.serviceWorkers().length > 0) {
+    throw new CheckpointUnrepresentableError(
+      'Replay checkpoint cannot freeze unexpected service-worker writers',
+    );
+  }
+  if (storageOrigins.size > REPLAY_CHECKPOINT_MAX_ORIGINS) {
+    throw new CheckpointUnrepresentableError(
+      'Replay checkpoint has too many storage origins',
+    );
+  }
+  const pages = context.pages();
+  if (pages.length === 0 || !pages.includes(page)) {
+    throw new CheckpointUnrepresentableError(
+      'Replay checkpoint page set changed before capture',
+    );
+  }
+  const sessions: CDPSession[] = [];
+  try {
+    for (const contextPage of pages) {
+      const session = await context.newCDPSession(contextPage);
+      sessions.push(session);
+      await session.send('Page.setWebLifecycleState', { state: 'frozen' });
+    }
+    if (
+      context.pages().length !== pages.length ||
+      context.pages().some(contextPage => !pages.includes(contextPage))
+    ) {
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint page set changed during writer freeze',
+      );
+    }
+    let totalUsage = 0;
+    for (const origin of storageOrigins) {
+      const usage = await sessions[0]!.send('Storage.getUsageAndQuota', {
+        origin,
+      });
+      if (!Number.isFinite(usage.usage) || usage.usage < 0) {
+        throw new CheckpointUnrepresentableError(
+          'Chromium returned invalid storage usage',
+        );
+      }
+      totalUsage += usage.usage;
+      if (totalUsage > REPLAY_CHECKPOINT_MAX_BYTES) {
+        throw new CheckpointTooLargeError();
+      }
+    }
+  } catch (error) {
+    if (
+      error instanceof CheckpointTooLargeError ||
+      error instanceof CheckpointUnrepresentableError
+    ) {
+      throw error;
+    }
+    throw new CheckpointUnrepresentableError(
+      'Chromium could not establish a bounded checkpoint capture',
+    );
+  } finally {
+    await Promise.allSettled(sessions.map(session => session.detach()));
+  }
+
   const storageState = await context.storageState({ indexedDB: true });
   const serializedBytes = Buffer.byteLength(
     JSON.stringify({ storageState, browserSettings }),
@@ -721,14 +825,21 @@ app.post('/scrape', async (req: Request, res: Response) => {
       console.log(`🚨 Scrape failed with status code: ${result.status} ${pageError}`);
     }
 
+    if (capture_replay_checkpoint && securityState.storageOriginsOverflow) {
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint has too many storage origins',
+      );
+    }
     const replayCheckpoint = capture_replay_checkpoint
       ? await captureWithDeadline(
           captureReplayCheckpoint(
             requestContext,
             page,
             contextBundle.browserSettings,
+            securityState.storageOrigins,
           ),
           model.capture_replay_timeout_ms ?? 5_000,
+          async () => requestContext?.close(),
         )
       : undefined;
 
@@ -759,6 +870,14 @@ app.post('/scrape', async (req: Request, res: Response) => {
         ? primaryError.errors
         : [primaryError];
     const primary = orderedErrors[0];
+    if (orderedErrors.length > 1) {
+      console.error('Scrape cleanup deferred errors', {
+        category: 'scrape_cleanup_failed',
+        errorNames: orderedErrors.slice(1).map(error =>
+          error instanceof Error ? error.name : 'UnknownError',
+        ),
+      });
+    }
     if (primary instanceof InsecureConnectionError) {
       return res.json({
         content: '',
