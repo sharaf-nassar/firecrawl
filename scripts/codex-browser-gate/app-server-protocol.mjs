@@ -228,9 +228,11 @@ export async function schemaHash(schemaDir) {
   }
 
   try {
+    const SCHEMA_LOGICAL_PREFIX =
+      "host/browser-runtime/protocol/codex-app-server/";
     return hashCanonicalSchemaBundle(
       rawFiles.map(([relativePath, raw]) => [
-        `host/browser-runtime/protocol/codex-app-server-0.144.5/${relativePath}`,
+        `${SCHEMA_LOGICAL_PREFIX}${relativePath}`,
         raw,
       ]),
     );

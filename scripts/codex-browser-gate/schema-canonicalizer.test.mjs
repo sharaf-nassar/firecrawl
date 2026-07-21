@@ -124,15 +124,16 @@ equal(
   '{"\\r":"Carriage Return","1":"One","":"Control","ö":"Latin Small Letter O With Diaeresis","€":"Euro Sign","😀":"Emoji: Grinning Face","דּ":"Hebrew Letter Dalet With Dagesh"}',
 );
 
+const SCHEMA_PREFIX = "host/browser-runtime/protocol/codex-app-server/";
 const bundleOne = [
-  ["host/browser-runtime/protocol/codex-app-server-0.144.5/z.json", bytes('{"b":2,"a":1}')],
-  ["host/browser-runtime/protocol/codex-app-server-0.144.5/2.json", bytes('[1,2]')],
-  ["host/browser-runtime/protocol/codex-app-server-0.144.5/10.json", bytes('9007199254740993')],
+  [`${SCHEMA_PREFIX}z.json`, bytes('{"b":2,"a":1}')],
+  [`${SCHEMA_PREFIX}2.json`, bytes('[1,2]')],
+  [`${SCHEMA_PREFIX}10.json`, bytes('9007199254740993')],
 ];
 const bundleTwo = [
-  ["host\\browser-runtime\\protocol\\codex-app-server-0.144.5\\10.json", bytes('9007199254740993')],
-  ["host/browser-runtime/protocol/codex-app-server-0.144.5/z.json", bytes('{"a":1,"b":2}')],
-  ["host/browser-runtime/protocol/codex-app-server-0.144.5/2.json", bytes('[1,2]')],
+  ["host\\browser-runtime\\protocol\\codex-app-server\\10.json", bytes('9007199254740993')],
+  [`${SCHEMA_PREFIX}z.json`, bytes('{"a":1,"b":2}')],
+  [`${SCHEMA_PREFIX}2.json`, bytes('[1,2]')],
 ];
 equal(
   hashCanonicalSchemaBundle(bundleOne),
@@ -169,6 +170,53 @@ for (const [path, raw] of bundleOne.toSorted(([left], [right]) => {
   framed.update(Buffer.from([0]));
 }
 equal(hashCanonicalSchemaBundle(bundleOne), framed.digest("hex"));
+
+const releaseBundle = (release, entries) =>
+  entries.map(([relativePath, raw]) => ({
+    release,
+    relativePath,
+    raw,
+  }));
+const neutralEntries = entries =>
+  entries.map(({ relativePath, raw }) => [
+    `${SCHEMA_PREFIX}${relativePath}`,
+    raw,
+  ]);
+
+const release1445 = releaseBundle("0.144.5", [
+  ["v2/A.json", bytes('{"a":1}')],
+  ["bundle.json", bytes('{"b":2}')],
+]);
+const release1446 = releaseBundle("0.144.6", [
+  ["v2/A.json", bytes('{"a":1}')],
+  ["bundle.json", bytes('{"b":2}')],
+]);
+equal(
+  hashCanonicalSchemaBundle(neutralEntries(release1445)),
+  hashCanonicalSchemaBundle(neutralEntries(release1446)),
+);
+differs(
+  hashCanonicalSchemaBundle(neutralEntries(release1445)),
+  hashCanonicalSchemaBundle(
+    neutralEntries(
+      releaseBundle("0.144.6", [
+        ["v2/A.json", bytes('{"a":2}')],
+        ["bundle.json", bytes('{"b":2}')],
+      ]),
+    ),
+  ),
+);
+differs(
+  hashCanonicalSchemaBundle(neutralEntries(release1445)),
+  hashCanonicalSchemaBundle(
+    neutralEntries(
+      releaseBundle("0.144.6", [
+        ["v2/Renamed.json", bytes('{"a":1}')],
+        ["bundle.json", bytes('{"b":2}')],
+      ]),
+    ),
+  ),
+);
 
 cases += 1;
 assert.throws(

@@ -1194,6 +1194,18 @@ assert.doesNotMatch(
   productionSources["app-server-protocol.mjs"],
   /["']\.\/decision-wire\.mjs["']/,
 );
+assert.match(
+  productionSources["app-server-protocol.mjs"],
+  /"host\/browser-runtime\/protocol\/codex-app-server\/"/,
+);
+assert.match(
+  productionSources["app-server-protocol.mjs"],
+  /`\$\{SCHEMA_LOGICAL_PREFIX\}\$\{relativePath\}`/,
+);
+assert.doesNotMatch(
+  productionSources["app-server-protocol.mjs"],
+  /codex-app-server-0\.144\.5/,
+);
 for (const source of Object.values(productionSources)) {
   assert.doesNotMatch(source, /\bimport\s*\(/);
 }
