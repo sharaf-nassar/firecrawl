@@ -221,6 +221,9 @@ Health and reconciliation are private too. Before reconciliation,
 with strict `{ version: 1, status: "unready", processNonce, category }`.
 After one successful snapshot, ready returns strict
 `{ version: 1, status: "ready", processNonce, snapshotDigest }`.
+During ordered shutdown, live remains 200 with strict
+`{ version: 1, status: "draining", processNonce }` while ready is 503 with
+category `browser_service_draining`. All work and reconciliation are rejected.
 `processNonce` is one unpadded base64url encoding of 32 cryptographically
 random bytes and is never persisted or logged.
 
@@ -343,7 +346,124 @@ marks an action `executing` is never converted to that state.
 - Create: `apps/browser-service/src/auth.ts`
 - Create: `apps/browser-service/src/auth.test.ts`
 
-- [ ] **Step 1: Write failing closed-schema and auth tests**
+- [ ] **Step 1: Select Node and write dependency-free preflight test**
+
+Select installed runtime first. Then create only
+`src/runtime-preflight.test.mjs`:
+
+```js
+import assert from "node:assert/strict";
+import test from "node:test";
+import { assertBrowserServiceRuntime } from "./runtime-preflight.mjs";
+
+test("accepts only Node 22.22.1", () => {
+  assert.doesNotThrow(() => assertBrowserServiceRuntime("v22.22.1"));
+  for (const version of ["v22.22.0", "v23.0.0", "v25.8.2"]) {
+    assert.throws(
+      () => assertBrowserServiceRuntime(version),
+      { category: "browser_service_runtime_mismatch" },
+    );
+  }
+});
+```
+
+- [ ] **Step 2: Run dependency-free preflight test and verify red**
+
+Run:
+
+```bash
+export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node --version
+node --test apps/browser-service/src/runtime-preflight.test.mjs
+```
+
+Expected: version prints `v22.22.1`; test FAIL because
+`runtime-preflight.mjs` does not exist. Do not invoke Corepack, pnpm, `tsx`, or
+`tsc` yet.
+
+- [ ] **Step 3: Add exact package metadata and runtime preflight**
+
+Create package metadata with `engines.node: "22.22.1"`,
+`packageManager: "pnpm@10.33.0"`, exact `playwright: "1.61.1"`, and Node 22
+types. Use Express 5, `ws` 8, Zod 4, `ipaddr.js` 2, TypeScript 5.9, and `tsx`
+4. Every lifecycle script runs the preflight first:
+
+```json
+{
+  "scripts": {
+    "preinstall": "node src/runtime-preflight.mjs",
+    "prebuild": "node src/runtime-preflight.mjs",
+    "build": "tsc -p tsconfig.json",
+    "prestart": "node src/runtime-preflight.mjs",
+    "start": "node dist/index.js",
+    "pretest": "node src/runtime-preflight.mjs",
+    "test": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs && node --import tsx --test src/*.test.ts"
+  },
+  "engines": { "node": "22.22.1" },
+  "packageManager": "pnpm@10.33.0"
+}
+```
+
+`runtime-preflight.mjs` keeps its assertion dependency-free and exposes it for
+the Node test:
+
+```js
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export function assertBrowserServiceRuntime(version = process.version) {
+  if (version !== "v22.22.1") {
+    const error = new Error(
+      `browser_service_runtime_mismatch: expected v22.22.1, received ${version}`,
+    );
+    error.category = "browser_service_runtime_mismatch";
+    throw error;
+  }
+}
+
+if (
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  assertBrowserServiceRuntime();
+}
+```
+
+Test `v22.22.1` success and `v22.22.0`, `v23.0.0`, and `v25.8.2` category
+failure. Configure `NodeNext`, `strict`, `noUncheckedIndexedAccess`, and
+`exactOptionalPropertyTypes`.
+
+`lockfile.test.mjs` copies only `package.json` and `pnpm-lock.yaml` to a
+temporary directory. One case adds dependency `lockfile-mismatch-probe:
+"0.0.0"`; another removes the copied lock. Each invokes
+`corepack pnpm install --frozen-lockfile --ignore-scripts` with argument arrays
+and asserts nonzero exit before deleting its temporary root.
+
+- [ ] **Step 4: Generate and prove the frozen dependency graph**
+
+Run inside the package so Corepack reads its exact `packageManager`. Corepack
+may acquire pnpm `10.33.0`; this project-scoped acquisition is authorized.
+
+```bash
+export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node --version
+cd apps/browser-service
+node src/runtime-preflight.mjs
+corepack pnpm --version
+corepack pnpm install --lockfile-only
+rm -rf node_modules
+corepack pnpm install --frozen-lockfile
+corepack pnpm install --frozen-lockfile --lockfile-only
+node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs
+```
+
+Expected: `v22.22.1`, `10.33.0`, both frozen commands and lockfile tests pass,
+and lockfile resolves Playwright exactly `1.61.1`.
+
+- [ ] **Step 5: Write failing closed-schema and auth tests**
+
+Only after frozen install succeeds, create `contracts.test.ts` and
+`auth.test.ts`:
 
 ```ts
 test("action request rejects unknown fields and non-SHA hashes", () => {
@@ -388,12 +508,17 @@ test("reconciliation rejects malformed filesystem authority", () => {
   }).success).toBe(false);
 });
 
-test("health contracts distinguish live, unready, and ready", () => {
+test("health contracts distinguish live, draining, and ready", () => {
   expect(liveHealthV1Schema.parse({
     version: 1,
     status: "live_unreconciled",
     processNonce: VALID_NONCE,
   }).status).toBe("live_unreconciled");
+  expect(liveHealthV1Schema.parse({
+    version: 1,
+    status: "draining",
+    processNonce: VALID_NONCE,
+  }).status).toBe("draining");
   expect(readyHealthV1Schema.safeParse({
     version: 1,
     status: "ready",
@@ -404,91 +529,19 @@ test("health contracts distinguish live, unready, and ready", () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and verify red**
-
-Run:
+- [ ] **Step 6: Run contract/auth tests and verify red**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
-node --test apps/browser-service/src/runtime-preflight.test.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/contracts.test.ts src/auth.test.ts
-```
-
-Expected: FAIL because runtime preflight and service modules do not exist.
-
-- [ ] **Step 3: Add exact package metadata and runtime preflight**
-
-Create package metadata with `engines.node: "22.22.1"`,
-`packageManager: "pnpm@10.33.0"`, exact `playwright: "1.61.1"`, and Node 22
-types. Use Express 5, `ws` 8, Zod 4, `ipaddr.js` 2, TypeScript 5.9, and `tsx`
-4. Every lifecycle script runs the preflight first:
-
-```json
-{
-  "scripts": {
-    "preinstall": "node src/runtime-preflight.mjs",
-    "prebuild": "node src/runtime-preflight.mjs",
-    "build": "tsc -p tsconfig.json",
-    "prestart": "node src/runtime-preflight.mjs",
-    "start": "node dist/index.js",
-    "pretest": "node src/runtime-preflight.mjs",
-    "test": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs && node --import tsx --test src/*.test.ts"
-  },
-  "engines": { "node": "22.22.1" },
-  "packageManager": "pnpm@10.33.0"
-}
-```
-
-`runtime-preflight.mjs` keeps its assertion dependency-free and exposes it for
-the Node test:
-
-```js
-export function assertBrowserServiceRuntime(version = process.version) {
-  if (version !== "v22.22.1") {
-    const error = new Error(
-      `browser_service_runtime_mismatch: expected v22.22.1, received ${version}`,
-    );
-    error.category = "browser_service_runtime_mismatch";
-    throw error;
-  }
-}
-
-if (process.argv[1] === new URL(import.meta.url).pathname) {
-  assertBrowserServiceRuntime();
-}
-```
-
-Test `v22.22.1` success and `v22.22.0`, `v23.0.0`, and `v25.8.2` category
-failure. Configure `NodeNext`, `strict`, `noUncheckedIndexedAccess`, and
-`exactOptionalPropertyTypes`.
-
-`lockfile.test.mjs` copies only `package.json` and `pnpm-lock.yaml` to a
-temporary directory. One case adds dependency `lockfile-mismatch-probe:
-"0.0.0"`; another removes the copied lock. Each invokes
-`corepack pnpm install --frozen-lockfile --ignore-scripts` with argument arrays
-and asserts nonzero exit before deleting its temporary root.
-
-- [ ] **Step 4: Generate and prove the frozen dependency graph**
-
-Run inside the package so Corepack reads its exact `packageManager`. Corepack
-may acquire pnpm `10.33.0`; this project-scoped acquisition is authorized.
-
-```bash
-export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
-node --version
 cd apps/browser-service
-corepack pnpm --version
-corepack pnpm install --lockfile-only
-rm -rf node_modules
-corepack pnpm install --frozen-lockfile
-corepack pnpm install --frozen-lockfile --lockfile-only
-node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs
+node src/runtime-preflight.mjs
+corepack pnpm exec node --import tsx --test src/contracts.test.ts src/auth.test.ts
 ```
 
-Expected: `v22.22.1`, `10.33.0`, both frozen commands and lockfile tests pass,
-and lockfile resolves Playwright exactly `1.61.1`.
+Expected: preflight PASS, then tests FAIL because contracts and auth production
+modules do not exist.
 
-- [ ] **Step 5: Define strict operation, health, and reconciliation schemas**
+- [ ] **Step 7: Define strict operation, health, and reconciliation schemas**
 
 `browserOperationSchema` implements the prerequisite `BrowserOperation`
 without renaming fields or widening values. Every object is closed. JSON
@@ -622,14 +675,18 @@ export const reconciliationResultV1Schema = z.strictObject({
 
 export const liveHealthV1Schema = z.strictObject({
   version: z.literal(1),
-  status: z.enum(["live_unreconciled", "reconciling", "ready"]),
+  status: z.enum(["live_unreconciled", "reconciling", "ready", "draining"]),
   processNonce: processNonceSchema,
 });
 export const unreadyHealthV1Schema = z.strictObject({
   version: z.literal(1),
   status: z.literal("unready"),
   processNonce: processNonceSchema,
-  category: z.enum(["reconciliation_required", "reconciliation_in_progress"]),
+  category: z.enum([
+    "reconciliation_required",
+    "reconciliation_in_progress",
+    "browser_service_draining",
+  ]),
 });
 export const readyHealthV1Schema = z.strictObject({
   version: z.literal(1),
@@ -658,18 +715,19 @@ encoded request size, unique `(kind,id)`, and same-checksum path aliases with
 `errors.ts`. Task 1 does not mount routes, inspect files, start Chromium, or
 connect PostgreSQL.
 
-- [ ] **Step 6: Run tests and build through the frozen install**
+- [ ] **Step 8: Run tests and build through the frozen install**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node --test apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/contracts.test.ts src/auth.test.ts
 corepack pnpm --dir apps/browser-service build
 ```
 
 Expected: tests PASS; build emits `apps/browser-service/dist`.
 
-- [ ] **Step 7: Commit scaffold**
+- [ ] **Step 9: Commit scaffold**
 
 ```bash
 git add apps/browser-service/package.json apps/browser-service/pnpm-lock.yaml apps/browser-service/tsconfig.json apps/browser-service/src/runtime-preflight.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs apps/browser-service/src/contracts.ts apps/browser-service/src/contracts.test.ts apps/browser-service/src/config.ts apps/browser-service/src/errors.ts apps/browser-service/src/auth.ts apps/browser-service/src/auth.test.ts
@@ -715,6 +773,7 @@ test("pins the checked DNS answer", async () => {
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/network-policy.test.ts src/egress-proxy.test.ts
 ```
 
@@ -753,6 +812,7 @@ Bind `127.0.0.1` on an ephemeral port and apply bidirectional backpressure.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/network-policy.test.ts src/egress-proxy.test.ts
 ```
 
@@ -813,7 +873,9 @@ test("caches only an exact successful nonce and digest", async () => {
 
 Assert two process instances receive different 43-character nonces; a wrong
 nonce performs no callback; a failed callback returns to
-`live_unreconciled`; `beginDraining()` closes admission permanently; health
+`live_unreconciled`; `beginDraining()` closes admission permanently, changes
+live status to `draining`, and changes ready category to
+`browser_service_draining`; health
 objects contain no path, checksum, key, URL, public browser ID, or capability.
 
 - [ ] **Step 2: Write failing filesystem reconciliation tests**
@@ -863,6 +925,7 @@ request must prove no eligible entry changed.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/startup-state.test.ts src/reconciliation.test.ts
 ```
 
@@ -948,6 +1011,7 @@ identity, capability, or grant.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/startup-state.test.ts src/reconciliation.test.ts
 corepack pnpm --dir apps/browser-service build
 ```
@@ -1008,6 +1072,7 @@ test("cannot create a profile or Chromium session before reconciliation", async 
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/profile-store.test.ts src/session-registry.test.ts
 ```
 
@@ -1049,6 +1114,7 @@ idempotent and closes Chromium before preparing a writer profile.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/profile-store.test.ts src/session-registry.test.ts
 ```
 
@@ -1108,6 +1174,7 @@ test("direct navigation requires existing origin or allowed domain", async () =>
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
 ```
 
@@ -1152,6 +1219,7 @@ failure. Never retry an operation.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
 corepack pnpm --dir apps/browser-service test
 ```
@@ -1222,12 +1290,23 @@ test("live precedes reconciliation while all browser work stays closed", async (
     snapshotDigest: validSnapshot.snapshotDigest,
   });
 });
+
+test("draining stays live but becomes unready and rejects work", async () => {
+  await server.beginDraining();
+  expect((await getPrivate("/health/live")).body.status).toBe("draining");
+  expect((await getPrivate("/health/ready")).body).toMatchObject({
+    status: "unready",
+    category: "browser_service_draining",
+  });
+  expect((await postPrivate("/v1/sessions", validCreate)).status).toBe(503);
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
 ```
 
@@ -1269,7 +1348,8 @@ deadline capped at 60 seconds, nonce, schema, and digest before calling
 `reconcileBrowserState()`. Every create/action/grant/artifact/stream/profile
 route invokes `requireReady()` before touching registry or filesystem.
 
-`SIGTERM` calls `beginDraining()`, stops new creates/actions/reconciliation,
+`SIGTERM` calls `beginDraining()`, exposes live `draining` and ready 503
+`browser_service_draining`, stops new creates/actions/reconciliation,
 closes streams, closes Chromium with bounded profile save, then closes server
 and timers. Live remains process liveness; ready never performs a disposable
 session and never becomes true without current nonce/digest reconciliation.
@@ -1308,6 +1388,7 @@ install, preflight before start, and non-root user.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
 docker build --pull --no-cache -t firecrawl-local-browser-service:test-1 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-1 --version
@@ -1316,10 +1397,11 @@ docker image inspect firecrawl-local-browser-service:test-1 --format '{{.Config.
 docker build --pull --no-cache -t firecrawl-local-browser-service:test-2 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 --version
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 -p 'require("playwright/package.json").version'
+docker image inspect firecrawl-local-browser-service:test-2 --format '{{.Config.User}}'
 ```
 
 Expected: tests PASS; both builds succeed from committed digest; each image
-reports `v22.22.1` and `1.61.1`; first user is `pwuser`. Re-run the raw-manifest
+reports `v22.22.1`, `1.61.1`, and user `pwuser`. Re-run the raw-manifest
 hash and require it equals Dockerfile digest after both builds.
 
 - [ ] **Step 8: Commit service transport**
@@ -1350,6 +1432,30 @@ it("requires private URL and key when enabled", () => {
     BROWSER_SERVICE_URL: undefined,
     BROWSER_SERVICE_API_KEY: undefined,
   }))).toThrow(/BROWSER_SERVICE_URL.*BROWSER_SERVICE_API_KEY/s);
+});
+
+it("locks bounded reconciliation retry defaults", () => {
+  expect(resolveLocalRuntimeConfig(enabledBase({}))).toMatchObject({
+    browserReconciliationMaxAttempts: 4,
+    browserReconciliationInitialBackoffMs: 250,
+    browserReconciliationMaxBackoffMs: 2_000,
+    browserReconciliationStartupBudgetMs: 60_000,
+    browserReconciliationMonitorIntervalMs: 5_000,
+    browserReconciliationRetryCooldownMs: 30_000,
+  });
+});
+
+it("rejects unbounded reconciliation retry configuration", () => {
+  expect(() => resolveLocalRuntimeConfig(enabledBase({
+    BROWSER_RECONCILIATION_MAX_ATTEMPTS: "0",
+  }))).toThrow(/BROWSER_RECONCILIATION_MAX_ATTEMPTS/);
+  expect(() => resolveLocalRuntimeConfig(enabledBase({
+    BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS: "2000",
+    BROWSER_RECONCILIATION_MAX_BACKOFF_MS: "1000",
+  }))).toThrow(/BROWSER_RECONCILIATION_MAX_BACKOFF_MS/);
+  expect(() => resolveLocalRuntimeConfig(enabledBase({
+    BROWSER_RECONCILIATION_STARTUP_BUDGET_MS: "60001",
+  }))).toThrow(/BROWSER_RECONCILIATION_STARTUP_BUDGET_MS/);
 });
 
 it("posts exact action identity with auth and deadline", async () => {
@@ -1393,11 +1499,23 @@ absent.
 - [ ] **Step 3: Add enabled local configuration**
 
 Add `BROWSER_SERVICE_URL`, 32+ byte `BROWSER_SERVICE_API_KEY`, request timeout,
-reconciliation timeout capped at 60 seconds, ready-monitor interval, and
+reconciliation timeout capped at 60 seconds,
+`BROWSER_RECONCILIATION_MAX_ATTEMPTS=4`,
+`BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS=250`,
+`BROWSER_RECONCILIATION_MAX_BACKOFF_MS=2000`,
+`BROWSER_RECONCILIATION_STARTUP_BUDGET_MS=60000`,
+`BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS=5000`, and
+`BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS=30000`, plus
 absolute `BROWSER_ADAPTER_TOKEN_FILE`. Enabled mode requires local
 persistence, browser-state root, private HTTP service URL, and key. Adapter
 token absence keeps only host callbacks/prompt/code execution unavailable; it
 does not disable direct Browser create/list/delete.
+
+Validate attempts 1..8, initial backoff 100..5,000 ms, maximum backoff greater
+than or equal to initial and at most 10,000 ms, startup budget 5,000..60,000
+ms, monitor interval 1,000..60,000 ms, and cooldown 5,000..300,000 ms. Tests
+lock defaults and reject zero, negative, noninteger, reversed, or out-of-range
+values.
 
 - [ ] **Step 4: Implement closed typed client methods**
 
@@ -1419,9 +1537,11 @@ typed errors with Zod. Reject private redirects. Remove any generic
 caller-supplied method/path helper. Never include response bodies or private
 URLs in public errors.
 
-`getLive` accepts live states only, `getReady` accepts 200 ready or 503
-unready, and `reconcile` caps deadline and encoded body at 60 seconds and 16
-MiB. All three always send bearer key, correlation ID, and absolute deadline.
+`getLive` parses `live_unreconciled`, `reconciling`, `ready`, and `draining`;
+coordinator treats `draining` as unavailable and never reconciles it.
+`getReady` accepts 200 ready or 503 unready, and `reconcile` caps deadline and
+encoded body at 60 seconds and 16 MiB. All three always send bearer key,
+correlation ID, and absolute deadline.
 
 - [ ] **Step 5: Run tests and build**
 
@@ -1464,20 +1584,42 @@ Sanitize transport failures without leaking private endpoints."
 - [ ] **Step 1: Write failing closed-gate and snapshot tests**
 
 ```ts
-it("keeps browser work and filesystem mutators closed until exact binding", () => {
+it("closes admission synchronously and exposes mutation drain", async () => {
   const gate = createBrowserStartupGate();
   expect(() => gate.assertOpen()).toThrow(expect.objectContaining({
     category: "browser_state_unavailable",
   }));
-  gate.open({ processNonce: VALID_NONCE, snapshotDigest: VALID_DIGEST });
+  const initialDrain = gate.close("startup");
+  await initialDrain.drained;
+  gate.open(initialDrain, {
+    processNonce: VALID_NONCE,
+    snapshotDigest: VALID_DIGEST,
+  });
+  let releaseMutation!: () => void;
+  const mutation = gate.withBrowserStateMutationLease(
+    "filesystem_and_database",
+    () => new Promise<void>(resolve => { releaseMutation = resolve; }),
+  );
+  const restartDrain = gate.close("browser_service_restart");
+  expect(() => gate.assertOpen()).toThrow(expect.objectContaining({
+    category: "browser_state_unavailable",
+  }));
+  expect(await promiseState(restartDrain.drained)).toBe("pending");
+  await expect(gate.withBrowserStateMutationLease(
+    "filesystem_and_database",
+    async () => undefined,
+  )).rejects.toMatchObject({ category: "browser_state_unavailable" });
+  releaseMutation();
+  await mutation;
+  await restartDrain.drained;
+  gate.open(restartDrain, {
+    processNonce: VALID_NONCE,
+    snapshotDigest: VALID_DIGEST,
+  });
   expect(gate.assertOpen()).toEqual({
     processNonce: VALID_NONCE,
     snapshotDigest: VALID_DIGEST,
   });
-  gate.close("browser_service_restart");
-  expect(() => gate.assertOpen()).toThrow(expect.objectContaining({
-    category: "browser_state_unavailable",
-  }));
 });
 
 it("loads every nondeleted authority in one repeatable-read snapshot", async () => {
@@ -1508,7 +1650,9 @@ it("opens work and retention only after matching response and ready health", asy
   expect(events).toEqual([
     "gate:close",
     "retention:pause",
+    "mutations:drained",
     "recovery:interrupt",
+    "cleanup-intents:recover",
     "service:live",
     "snapshot:repeatable-read",
     "service:reconcile",
@@ -1526,9 +1670,53 @@ it("coalesces restart detection and never resumes old sessions", async () => {
     coordinator.checkNow(),
     coordinator.checkNow(),
   ]);
-  expect(recoverUnfinishedBrowserWork).toHaveBeenCalledTimes(2);
+  expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(2);
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(2);
   expect(resumeBrowserSession).not.toHaveBeenCalled();
+});
+
+it("recovers only dead cleanup-intent writers before snapshot", async () => {
+  inspectProcessIdentity
+    .mockResolvedValueOnce("live")
+    .mockResolvedValueOnce("unknown")
+    .mockResolvedValueOnce("dead")
+    .mockResolvedValueOnce("dead");
+  filesystem.delete
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(Object.assign(new Error("missing"), {
+      code: "ENOENT",
+    }));
+  const result = await recoverBrowserCleanupIntentsBeforeSnapshot(deps);
+  expect(result).toEqual({
+    liveRetained: 1,
+    unknownRetained: 1,
+    deadRecovered: 1,
+    missingConverged: 1,
+  });
+  expect(casDeleteIntent).toHaveBeenCalledTimes(2);
+});
+
+it("bounds retries, backoff, startup budget, and exhaustion", async () => {
+  serviceClient.reconcile.mockRejectedValue(new TransportClosedError());
+  await expect(coordinator.initialize()).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  expect(serviceClient.reconcile).toHaveBeenCalledTimes(4);
+  expect(fakeClock.sleeps).toEqual([250, 500, 1_000]);
+  expect(fakeClock.elapsedMs).toBeLessThanOrEqual(60_000);
+  expect(startBrowserRetention).not.toHaveBeenCalled();
+  expect(() => startupGate.assertOpen()).toThrow(expect.objectContaining({
+    category: "browser_state_unavailable",
+  }));
+});
+
+it("holds same failed runtime nonce for cooldown", async () => {
+  await exhaustRuntimeCycleForNonce(VALID_NONCE);
+  fakeClock.advanceBy(29_999);
+  await fakeClock.runDueTimers();
+  expect(serviceClient.reconcile).toHaveBeenCalledTimes(4);
+  await coordinator.checkNow();
+  expect(serviceClient.reconcile).toHaveBeenCalledTimes(8);
 });
 ```
 
@@ -1538,6 +1726,14 @@ failure cases. Each leaves gate closed and retention paused. Assert public
 mapping is only `browser_state_unavailable` and logs omit paths, IDs, hashes,
 nonce, bearer key, private/database URLs, profile/browser identity,
 capability, and grant.
+
+Add fake-clock retry tests. Attempts start immediately, then wait exactly 250,
+500, and 1,000 ms before attempts 2, 3, and 4. A 60,000 ms total budget caps
+every request deadline and cancels remaining backoff. Initial startup
+exhaustion throws sanitized `browser_state_unavailable` so API startup fails
+and registered cleanup runs. Runtime exhaustion keeps API alive but gate
+closed; same failed nonce cannot start another cycle for 30,000 ms. A changed
+nonce or explicit `checkNow()` starts one new coalesced bounded cycle.
 
 - [ ] **Step 3: Run focused tests and verify red**
 
@@ -1558,21 +1754,33 @@ export type BrowserStartupBinding = {
   snapshotDigest: string;
 };
 
+export type BrowserMutationDrain = {
+  epoch: number;
+  drained: Promise<void>;
+};
+
 export type BrowserStartupGate = {
   assertOpen(): BrowserStartupBinding;
-  close(reason: string): void;
-  open(binding: BrowserStartupBinding): void;
+  close(reason: string): BrowserMutationDrain;
+  open(drain: BrowserMutationDrain, binding: BrowserStartupBinding): void;
   waitUntilOpen(signal: AbortSignal): Promise<BrowserStartupBinding>;
-  runFilesystemMutation<T>(operation: () => Promise<T>): Promise<T>;
+  withBrowserStateMutationLease<T>(
+    scope: "filesystem_and_database",
+    operation: () => Promise<T>,
+  ): Promise<T>;
 };
 
 export function createBrowserStartupGate(): BrowserStartupGate;
 ```
 
-Gate starts closed. `close()` synchronously makes later admission fail and
-blocks new filesystem/database browser-state mutators. Existing mutations
-drain before snapshot capture through `runFilesystemMutation()`'s read/write
-barrier. `open()` accepts only coordinator's validated nonce/digest binding.
+Gate starts closed. `close()` synchronously makes later admission and mutation
+leases fail, increments epoch, and returns one drain whose promise settles only
+after every earlier lease releases. One lease covers filesystem side effect
+and matching database compare-and-set as one mutation; lease registration is
+synchronous before operation invocation and releases in `finally`. Never
+acquire separate filesystem and database leases. `open()` accepts only current
+drained epoch and
+coordinator's validated nonce/digest binding; stale drains cannot reopen gate.
 
 Expose snapshot loader:
 
@@ -1595,11 +1803,77 @@ invalid rows/caps/aliases, and compute the exact Task 1 digest before commit.
 Rollback on any error. Never send owner, scrape, profile, session, latest,
 active, database, or retention fields to Browser Service.
 
-- [ ] **Step 5: Implement recovery-first reconciliation coordinator**
+- [ ] **Step 5: Recover exact-process cleanup intents under the drain**
+
+Export this one-shot recovery boundary from `local-retention-worker.ts` so it
+reuses existing process-identity, advisory-lock, path-lock, current-path, and CAS
+rules without starting retention loop:
+
+```ts
+export type CleanupIntentStartupRecoveryResult = {
+  liveRetained: number;
+  unknownRetained: number;
+  deadRecovered: number;
+  missingConverged: number;
+};
+
+export async function recoverBrowserCleanupIntentsBeforeSnapshot(
+  deps: {
+    pool: Pick<Pool, "connect">;
+    filesystem: BrowserStateFilesystem;
+    inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity;
+    signal: AbortSignal;
+  },
+): Promise<CleanupIntentStartupRecoveryResult>;
+```
+
+Call only after current `BrowserMutationDrain.drained` resolves and before
+snapshot transaction begins. Select every `preparing` cleanup intent. Complete
+writer identity `(pid, bootId, startTime)` is classified with
+`inspectBrowserStateProcessIdentity`; retain `live` and `unknown` unchanged.
+For `dead`, acquire same scrape/path advisory locks, reselect exact intent by
+`id`, `state_path`, `checksum`, `state`, `writer_lease`, `writer_pid`,
+`writer_boot_id`, and `writer_start_time`, and recheck current checkpoint path.
+Delete noncurrent file; treat `ENOENT` as converged; then CAS-delete exact
+intent. Current-path intent deletes only intent row. Lock/CAS mismatch retries
+selection once inside same startup attempt; unexpected filesystem, database,
+or advisory failure aborts reconciliation and leaves gate closed.
+
+This function never calls `waitUntilOpen()`, starts retention, or acquires a
+normal mutation lease: coordinator already owns closed, drained epoch. This
+avoids deadlock while retention is paused. Snapshot then retains every live,
+unknown, cleanup-state, or failed-recovery intent still present.
+
+- [ ] **Step 6: Implement recovery-first reconciliation coordinator**
 
 Expose one lifecycle object:
 
 ```ts
+export type BrowserReconciliationRetryConfig = {
+  maxAttempts: number;
+  initialBackoffMs: number;
+  maxBackoffMs: number;
+  startupBudgetMs: number;
+  monitorIntervalMs: number;
+  retryCooldownMs: number;
+};
+
+export type BrowserReconciliationCoordinatorDependencies = {
+  gate: BrowserStartupGate;
+  serviceClient: Pick<BrowserServiceClient,
+    "getLive" | "getReady" | "reconcile">;
+  loadSnapshot: typeof loadBrowserReconciliationSnapshot;
+  interruptUnfinishedBrowserWork: typeof interruptUnfinishedBrowserWork;
+  recoverBrowserCleanupIntentsBeforeSnapshot:
+    typeof recoverBrowserCleanupIntentsBeforeSnapshot;
+  pauseBrowserRetention: () => Promise<void>;
+  startBrowserRetention: () => Promise<void>;
+  retry: BrowserReconciliationRetryConfig;
+  now: () => number;
+  sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  logger: Pick<Logger, "info" | "error">;
+};
+
 export type BrowserReconciliationCoordinator = {
   initialize(signal?: AbortSignal): Promise<BrowserStartupBinding>;
   checkNow(signal?: AbortSignal): Promise<void>;
@@ -1611,30 +1885,44 @@ export function createBrowserReconciliationCoordinator(
 ): BrowserReconciliationCoordinator;
 ```
 
-`initialize()` requires migrations already applied. Under one mutex: close
-gate, pause and drain browser retention/mutators, call
-`interruptUnfinishedBrowserWork(now)`, read authenticated live nonce, capture
+`BrowserReconciliationCoordinatorDependencies` requires `gate`, `serviceClient`,
+`loadSnapshot`, `interruptUnfinishedBrowserWork`,
+`recoverBrowserCleanupIntentsBeforeSnapshot`, `startBrowserRetention`,
+`pauseBrowserRetention`, clock/timer hooks, logger, and exact Task 7 retry
+configuration. No harness callback owns recovery or retention.
+
+`initialize()` requires migrations already applied. Under one mutex: call
+`gate.close()`, pause retention, await returned `drained`, call
+`interruptUnfinishedBrowserWork(now)`, run exact-process cleanup-intent
+recovery directly under drained epoch, read authenticated live nonce, capture
 the repeatable-read snapshot, post `{version:1, processNonce, snapshotDigest,
 references}`, validate the closed result, fetch ready health, and require both
-responses equal requested nonce/digest. Then open gate and start retention.
-Deadline is `min(configured, 60 seconds)`.
+responses equal requested nonce/digest. Then `gate.open(drain, binding)` and
+start retention. Deadline is `min(request timeout, remaining 60,000 ms startup
+budget)`.
 
 `checkNow()` fetches ready health. Any 503, changed nonce, changed digest,
 transport/auth/schema error, or process restart closes gate immediately and
 runs the same recovery sequence. Concurrent detections share one promise. Old
 runtime sessions, model threads, actions, grants, and Chromium processes are
-interrupted, never resumed. Failed attempts leave gate closed and schedule
-only bounded configured retry; no cloud/stateless fallback.
+interrupted, never resumed. One cycle has at most 4 attempts. Attempt 1 starts
+immediately; attempts 2..4 wait 250, 500, and 1,000 ms, each capped by remaining
+60,000 ms cycle budget. Startup exhaustion rejects initialization and API
+startup cleanup runs. Runtime exhaustion leaves gate closed, pauses retention,
+records failed nonce, and suppresses same-nonce automatic retry for 30,000 ms;
+nonce change or explicit `checkNow()` may start one new coalesced cycle. No
+cloud/stateless fallback.
 
 Wrap browser-state file creation, profile publication/discard, checkpoint
 materialization/cleanup, and retention deletion in
-`gate.runFilesystemMutation()`. Make the retention worker call
+`gate.withBrowserStateMutationLease("filesystem_and_database", ...)`. Make the
+retention worker call
 `waitUntilOpen(signal)` before each browser-state iteration; unrelated
 artifact retention may continue. `index.ts` starts coordinator after migrations
 and before browser routes admit work, and stops monitor before retention and
 database shutdown.
 
-- [ ] **Step 6: Run integration tests serially and build**
+- [ ] **Step 7: Run integration tests serially and build**
 
 ```bash
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/lib/browser-runtime/startup-gate.test.ts src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts src/lib/browser-state/store.integration.test.ts src/lib/scrape-interact/replay-store.integration.test.ts src/services/local-retention-worker.test.ts
@@ -1644,7 +1932,7 @@ pnpm --dir apps/api build
 Expected: tests PASS with one shared-schema worker; build PASS. Snapshot,
 recovery, gate, retention, restart, retry, and redaction order are locked.
 
-- [ ] **Step 7: Commit API startup reconciliation**
+- [ ] **Step 8: Commit API startup reconciliation**
 
 ```bash
 git add apps/api/src/lib/browser-runtime/startup-gate.ts apps/api/src/lib/browser-runtime/startup-gate.test.ts apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts apps/api/src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts apps/api/src/lib/browser-runtime/reconciliation-coordinator.test.ts apps/api/src/lib/browser-state/store.ts apps/api/src/lib/browser-state/store.integration.test.ts apps/api/src/lib/browser-state/filesystem-store.ts apps/api/src/lib/scrape-interact/replay-store.ts apps/api/src/lib/scrape-interact/replay-store.integration.test.ts apps/api/src/services/local-retention-worker.ts apps/api/src/services/local-retention-worker.test.ts apps/api/src/index.ts
@@ -2258,12 +2546,15 @@ Reject a repeated side-effecting normalized hash even after definite no
 effect; Codex must choose a materially different action. Repeated read-only
 operations remain allowed. Do not automatically retry any action.
 
-Extend Task 8's recovery callback, after migrations and before snapshot
-capture, to resolve every stale `prepared` action as `cancelled_no_effect`.
-Resolve every stale
-`executing` action as `outcome_unknown`, then terminate its run/session and
-revoke capability. Do not resume the adapter job, model thread, or action
-ledger. Preserve action rows for audit.
+Keep coordinator dependency
+`interruptUnfinishedBrowserWork(now): Promise<BrowserRecoveryResult>` exact.
+Extend that exported store transaction to resolve every stale `prepared`
+action as `cancelled_no_effect` and every stale `executing` action as
+`outcome_unknown`, then terminate affected run/session and revoke capability.
+Task 8 coordinator already invokes this dependency after mutation drain and
+before cleanup-intent recovery/snapshot. Do not add another startup callback,
+resume adapter job/model thread/action ledger, or change recovery ordering.
+Preserve action rows for audit.
 
 - [ ] **Step 6: Mount authenticated callbacks and exact error map**
 
@@ -2608,12 +2899,23 @@ expect(events).toEqual([
   "browser:start",
   "browser:live",
   "api:start",
-  "api:recover",
-  "api:reconcile",
+  "api-process:recovery",
+  "api-process:cleanup-intents",
+  "api-process:reconcile",
   "browser:ready",
   "api:admit",
+  "api-process:retention:start",
 ]);
+expect(harnessParent.interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
+expect(harnessParent.recoverCleanupIntents).not.toHaveBeenCalled();
+expect(harnessParent.startLocalRetentionService).not.toHaveBeenCalled();
 ```
+
+Add a blocked-reconciliation case and assert no
+`api-process:retention:start` event. Restart Browser Service once and assert
+one API-process recovery/reconciliation sequence, not one from harness parent
+plus one from API. These event assertions come from test-only API lifecycle
+notifications; harness never invokes those functions.
 
 - [ ] **Step 2: Run test and verify red**
 
@@ -2639,8 +2941,13 @@ Use argument arrays and existing container-runtime detection. Start Browser
 Service only for exact `pnpm test:snips:local-browser`; register cleanup before
 authenticated live wait. Return live handle and environment to harness, spawn
 API, then wait for authenticated ready whose nonce/digest equal coordinator's
-binding. Never wait ready before API spawn. Stop after API/workers and before
-disposable PostgreSQL. Configure API and service with same temporary state root
+binding. Remove existing harness-parent imports/calls that run
+`interruptUnfinishedBrowserWork`, cleanup-intent recovery, or
+`createLocalRetentionService`; API `index.ts` coordinator is sole recovery and
+browser-retention owner. Never wait ready before API spawn and never start
+retention from harness. On cleanup, signal API and wait while its coordinator
+stops monitor/retention, then remove Browser Service before disposable
+PostgreSQL. Configure API and service with same temporary state root
 mapping. Missing Docker or Podman uses existing missing-runtime error; do not
 install or start an unmanaged process.
 
@@ -2649,7 +2956,7 @@ install or start an unmanaged process.
 ```bash
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/harness-browser-service.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts
 docker compose --project-name firecrawl --project-directory . -f compose.yaml config --quiet
-docker compose --project-name firecrawl --project-directory . -f compose.yaml build browser-service
+docker compose --project-name firecrawl --project-directory . -f compose.yaml build browser-service api
 ```
 
 Expected: lifecycle tests PASS in live/API-reconcile/ready order, Compose
@@ -2810,7 +3117,9 @@ and zero model-tool events."
 - [ ] Resolve Playwright raw manifest again; expect digest equals committed
   Dockerfile digest. Build Browser Service twice with `--pull --no-cache`;
   expect Node `v22.22.1`, Playwright `1.61.1`, and `pwuser` both times.
-- [ ] Build `browser-service api`; expect exit 0.
+- [ ] Run
+  `docker compose --project-name firecrawl --project-directory . -f compose.yaml build browser-service api`;
+  expect exit 0.
 - [ ] Inspect Compose; expect only API published on `127.0.0.1:3002`.
 - [ ] With flag false, expect typed local unavailable behavior and no fallback.
 - [ ] With flag true and dependencies healthy, expect Browser lifecycle snips
@@ -2861,6 +3170,13 @@ and zero model-tool events."
   admits work until API recovery, one repeatable-read snapshot, reconciliation,
   and matching ready health succeed for current process nonce. Retention starts
   afterward and restart repeats same sequence.
+- Mutation drain: gate close rejects admission synchronously, then coordinator
+  awaits all unified filesystem/database mutation leases before recovery. Dead
+  cleanup-intent writers converge under exact process identity and CAS before
+  snapshot; live/unknown writers remain authoritative.
+- Ownership and retries: API process alone owns recovery and browser retention;
+  harness owns process/container lifecycle only. Each cycle has 4 attempts,
+  250/500/1,000 ms backoff, 60-second budget, and 30-second runtime cooldown.
 - Toolchain: every Browser Service install/test/build/start uses installed Node
   `22.22.1`, Corepack pnpm `10.33.0`, frozen lock, Playwright package/image
   `1.61.1`, and committed Noble digest; two no-cache builds verify identities.
