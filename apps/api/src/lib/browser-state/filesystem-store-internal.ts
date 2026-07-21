@@ -5,6 +5,10 @@ interface BrowserStateCheckpointPlan {
   pathId: string;
   byteSize: number;
   checksum: string;
+  writerLease: string;
+  writerPid: number;
+  writerBootId: string;
+  writerStartTime: string;
 }
 
 interface BrowserStateFilesystemContext {

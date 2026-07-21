@@ -41,6 +41,7 @@ const resolvedWebhookDeadlineFilename =
 const browserInteractFilename = "0004_browser_interact_foundation.sql";
 const replayCleanupHandoffFilename =
   "0005_replay_checkpoint_cleanup_handoff.sql";
+const replayWriterLeasesFilename = "0006_replay_checkpoint_writer_leases.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -109,6 +110,7 @@ const browserRequestIndexes = [
   "browser_replay_envelopes_request_id_idx",
   "browser_replay_checkpoints_request_id_idx",
   "browser_replay_checkpoint_cleanup_intents_scrape_id_idx",
+  "browser_replay_checkpoint_cleanup_intents_writer_lease_idx",
 ];
 
 async function insertEveryOperationalChildBeforeParent(
@@ -209,6 +211,7 @@ describeWithDatabase("application migrations", () => {
       resolvedWebhookDeadlineFilename,
       browserInteractFilename,
       replayCleanupHandoffFilename,
+      replayWriterLeasesFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
       true,
@@ -1437,15 +1440,19 @@ describeWithDatabase("application migrations", () => {
         join(__dirname, "migrations", replayCleanupHandoffFilename),
         join(migrationsDirectory, replayCleanupHandoffFilename),
       );
+      await copyFile(
+        join(__dirname, "migrations", replayWriterLeasesFilename),
+        join(migrationsDirectory, replayWriterLeasesFilename),
+      );
       await writeFile(
-        join(migrationsDirectory, "0006_failure.sql"),
+        join(migrationsDirectory, "0007_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
          SELECT missing_migration_function();`,
       );
 
       await expect(
         runApplicationMigrations(migrationConfig, { migrationsDirectory }),
-      ).rejects.toThrow(/0006_failure\.sql/);
+      ).rejects.toThrow(/0007_failure\.sql/);
 
       const result = await client.query<{
         table_name: string | null;
@@ -1456,7 +1463,7 @@ describeWithDatabase("application migrations", () => {
                 EXISTS (
                   SELECT 1
                     FROM application_schema_migrations
-                   WHERE filename = '0004_failure.sql'
+                   WHERE filename = '0007_failure.sql'
                 ) AS ledgered`,
       );
       expect(result.rows).toEqual([{ table_name: null, ledgered: false }]);

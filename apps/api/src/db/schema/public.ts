@@ -289,6 +289,11 @@ export const browser_replay_checkpoint_cleanup_intents = pgTable(
     state_path: text("state_path").notNull().unique(),
     checksum: text("checksum").notNull(),
     state: text("state").notNull().default("cleanup"),
+    writer_lease: uuid("writer_lease"),
+    writer_pid: integer("writer_pid"),
+    writer_boot_id: text("writer_boot_id"),
+    writer_start_time: text("writer_start_time"),
+    heartbeat_at: ts("heartbeat_at"),
     attempts: integer("attempts").notNull().default(0),
     last_error_category: text("last_error_category"),
     last_attempted_at: ts("last_attempted_at"),
@@ -307,9 +312,22 @@ export const browser_replay_checkpoint_cleanup_intents = pgTable(
       "browser_replay_checkpoint_cleanup_intents_state_check",
       sql`${table.state} IN ('preparing', 'cleanup')`,
     ),
+    check(
+      "browser_replay_checkpoint_cleanup_intents_writer_check",
+      sql`${table.state} = 'cleanup' OR (
+        ${table.writer_lease} IS NOT NULL
+        AND ${table.writer_pid} IS NOT NULL AND ${table.writer_pid} > 0
+        AND ${table.writer_boot_id} ~ '^[a-f0-9]{32}$'
+        AND ${table.writer_start_time} ~ '^[0-9]+$'
+        AND ${table.heartbeat_at} IS NOT NULL
+      )`,
+    ),
     index("browser_replay_checkpoint_cleanup_intents_scrape_id_idx").on(
       table.scrape_id,
     ),
+    uniqueIndex("browser_replay_checkpoint_cleanup_intents_writer_lease_idx")
+      .on(table.writer_lease)
+      .where(sql`${table.writer_lease} IS NOT NULL`),
   ],
 );
 

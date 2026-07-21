@@ -3,6 +3,7 @@ import {
   chromium,
   Browser,
   BrowserContext,
+  BrowserServer,
   CDPSession,
   Route,
   Request as PlaywrightRequest,
@@ -28,6 +29,7 @@ const ALLOW_LOCAL_WEBHOOKS = (process.env.ALLOW_LOCAL_WEBHOOKS || 'False').toUpp
 const DNS_CACHE_TTL_MS = 30_000;
 const REPLAY_CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
 const REPLAY_CHECKPOINT_MAX_ORIGINS = 128;
+const RESOURCE_CLEANUP_TIMEOUT_MS = 1_000;
 
 const PROXY_SERVER = process.env.PROXY_SERVER || null;
 const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
@@ -75,6 +77,117 @@ class CheckpointTimeoutError extends Error {
   constructor() {
     super('Replay checkpoint capture timed out');
     this.name = 'CheckpointTimeoutError';
+  }
+}
+
+class CleanupTimeoutError extends Error {
+  constructor() {
+    super('Browser resource cleanup timed out');
+    this.name = 'CleanupTimeoutError';
+  }
+}
+
+type BrowserRuntime<T> = {
+  browser: T;
+  terminate(): Promise<void>;
+};
+
+type BrowserGeneration<T> = {
+  runtime: BrowserRuntime<T>;
+  activeLeases: number;
+  retired: boolean;
+  terminationStarted: boolean;
+};
+
+export type BrowserLease<T> = {
+  browser: T;
+  retire(): void;
+  release(): void;
+};
+
+type BrowserLifecycleDiagnostic = {
+  category: 'browser_recycle_failed';
+  errorName: string;
+};
+
+export class SharedBrowserLifecycle<T> {
+  private current: BrowserGeneration<T> | undefined;
+  private starting: Promise<BrowserGeneration<T>> | undefined;
+
+  constructor(
+    private readonly start: () => Promise<BrowserRuntime<T>>,
+    private readonly report: (diagnostic: BrowserLifecycleDiagnostic) => void =
+      diagnostic => console.error('Browser lifecycle failure', diagnostic),
+  ) {}
+
+  async acquire(): Promise<BrowserLease<T>> {
+    let generation = this.current;
+    if (!generation || generation.retired) {
+      if (!this.starting) {
+        const starting = this.start().then(runtime => {
+          const created: BrowserGeneration<T> = {
+            runtime,
+            activeLeases: 0,
+            retired: false,
+            terminationStarted: false,
+          };
+          this.current = created;
+          return created;
+        });
+        this.starting = starting;
+        void starting
+          .finally(() => {
+            if (this.starting === starting) this.starting = undefined;
+          })
+          .catch(() => undefined);
+      }
+      generation = await this.starting;
+    }
+
+    generation.activeLeases += 1;
+    let released = false;
+    return {
+      browser: generation.runtime.browser,
+      retire: () => {
+        if (generation.retired) return;
+        generation.retired = true;
+        if (this.current === generation) this.current = undefined;
+        this.terminateWhenUnused(generation);
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        generation.activeLeases -= 1;
+        this.terminateWhenUnused(generation);
+      },
+    };
+  }
+
+  retireCurrent(): void {
+    const generation = this.current;
+    if (!generation || generation.retired) return;
+    generation.retired = true;
+    this.current = undefined;
+    this.terminateWhenUnused(generation);
+  }
+
+  private terminateWhenUnused(generation: BrowserGeneration<T>): void {
+    if (
+      !generation.retired ||
+      generation.activeLeases !== 0 ||
+      generation.terminationStarted
+    ) {
+      return;
+    }
+    generation.terminationStarted = true;
+    void Promise.resolve()
+      .then(() => generation.runtime.terminate())
+      .catch(error => {
+        this.report({
+          category: 'browser_recycle_failed',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        });
+      });
   }
 }
 
@@ -282,10 +395,11 @@ type ReplayCheckpointCaptureV1 = {
   browserSettings: ReplayBrowserSettingsV1;
 };
 
-let browser: Browser;
-
-const initializeBrowser = async () => {
-  browser = await chromium.launch({
+const startBrowserRuntime = async (): Promise<{
+  browser: Browser;
+  terminate(): Promise<void>;
+}> => {
+  const server: BrowserServer = await chromium.launchServer({
     headless: true,
     args: [
       '--no-sandbox',
@@ -297,6 +411,30 @@ const initializeBrowser = async () => {
       '--disable-gpu'
     ]
   });
+  try {
+    const connectedBrowser = await chromium.connect(server.wsEndpoint(), {
+      timeout: 30_000,
+    });
+    return {
+      browser: connectedBrowser,
+      terminate: () => server.kill(),
+    };
+  } catch (error) {
+    void server.kill().catch(killError => {
+      console.error('Browser lifecycle failure', {
+        category: 'browser_recycle_failed',
+        errorName: killError instanceof Error ? killError.name : 'UnknownError',
+      });
+    });
+    throw error;
+  }
+};
+
+const browserLifecycle = new SharedBrowserLifecycle(startBrowserRuntime);
+
+const initializeBrowser = async () => {
+  const lease = await browserLifecycle.acquire();
+  lease.release();
 };
 
 export function resolveAppliedBrowserSettings(
@@ -364,7 +502,10 @@ export function resolveAppliedBrowserSettings(
   };
 }
 
-const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<{
+const createContext = async (
+  activeBrowser: Browser,
+  model: UrlModel = { url: 'about:blank' },
+): Promise<{
   context: BrowserContext;
   securityState: ContextSecurityState;
   browserSettings: ReplayBrowserSettingsV1;
@@ -406,7 +547,7 @@ const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<
     };
   }
 
-  const newContext = await browser.newContext(contextOptions);
+  const newContext = await activeBrowser.newContext(contextOptions);
 
   if (BLOCK_MEDIA) {
     await newContext.route('**/*.{png,jpg,jpeg,gif,svg,mp3,mp4,avi,flac,ogg,wav,webm}', async (route: Route, request: PlaywrightRequest) => {
@@ -461,6 +602,8 @@ export async function captureWithDeadline<T>(
   capture: Promise<T>,
   timeoutMs: number,
   cancelCapture: () => Promise<void> = async () => undefined,
+  retireBrowser: () => Promise<void> = async () => undefined,
+  cleanupTimeoutMs: number = RESOURCE_CLEANUP_TIMEOUT_MS,
 ): Promise<T> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10_000) {
     throw new CheckpointUnrepresentableError(
@@ -474,9 +617,22 @@ export async function captureWithDeadline<T>(
       settled = true;
       const primary = new CheckpointTimeoutError();
       try {
-        await cancelCapture();
+        await withCleanupDeadline(cancelCapture, cleanupTimeoutMs);
         reject(primary);
       } catch (cleanupError) {
+        if (cleanupError instanceof CleanupTimeoutError) {
+          try {
+            await withCleanupDeadline(retireBrowser, cleanupTimeoutMs);
+          } catch (retirementError) {
+            reject(
+              new RuntimeAggregateError(
+                [primary, cleanupError, retirementError],
+                'Checkpoint timeout cleanup failed',
+              ),
+            );
+            return;
+          }
+        }
         reject(
           new RuntimeAggregateError(
             [primary, cleanupError],
@@ -504,22 +660,60 @@ export async function captureWithDeadline<T>(
 
 type Closeable = { close(): Promise<unknown> };
 
+const withCleanupDeadline = async <T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+): Promise<T> => {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new CleanupTimeoutError()), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
 export async function settleScrapeResources(
   page: Closeable | null,
   context: Closeable | null,
   release: () => void,
   primaryError?: unknown,
+  retireBrowser: () => Promise<void> = async () => undefined,
+  cleanupTimeoutMs: number = RESOURCE_CLEANUP_TIMEOUT_MS,
 ): Promise<void> {
-  const errors: unknown[] = primaryError === undefined ? [] : [primaryError];
+  const errors: unknown[] =
+    primaryError === undefined
+      ? []
+      : primaryError instanceof RuntimeAggregateError
+        ? [...primaryError.errors]
+        : [primaryError];
+  let cleanupTimedOut = false;
   try {
-    if (page) await page.close();
+    if (page) {
+      await withCleanupDeadline(() => page.close(), cleanupTimeoutMs);
+    }
   } catch (error) {
+    cleanupTimedOut ||= error instanceof CleanupTimeoutError;
     errors.push(error);
   }
   try {
-    if (context) await context.close();
+    if (context) {
+      await withCleanupDeadline(() => context.close(), cleanupTimeoutMs);
+    }
   } catch (error) {
+    cleanupTimedOut ||= error instanceof CleanupTimeoutError;
     errors.push(error);
+  }
+  if (cleanupTimedOut) {
+    try {
+      await withCleanupDeadline(retireBrowser, cleanupTimeoutMs);
+    } catch (error) {
+      errors.push(error);
+    }
   }
   try {
     release();
@@ -540,6 +734,7 @@ export const captureReplayCheckpoint = async (
   page: Page,
   browserSettings: ReplayBrowserSettingsV1,
   storageOrigins: ReadonlySet<string>,
+  hasStorageOriginsOverflow: () => boolean = () => false,
 ): Promise<ReplayCheckpointCaptureV1> => {
   const runtimeViewport = page.viewportSize();
   if (
@@ -549,16 +744,17 @@ export const captureReplayCheckpoint = async (
   ) {
     throw new Error('Replay checkpoint viewport does not match runtime context');
   }
-  if (context.serviceWorkers().length > 0) {
-    throw new CheckpointUnrepresentableError(
-      'Replay checkpoint cannot freeze unexpected service-worker writers',
-    );
-  }
-  if (storageOrigins.size > REPLAY_CHECKPOINT_MAX_ORIGINS) {
-    throw new CheckpointUnrepresentableError(
-      'Replay checkpoint has too many storage origins',
-    );
-  }
+  const assertOriginsBounded = () => {
+    if (
+      storageOrigins.size > REPLAY_CHECKPOINT_MAX_ORIGINS ||
+      hasStorageOriginsOverflow()
+    ) {
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint has too many storage origins',
+      );
+    }
+  };
+  assertOriginsBounded();
   const pages = context.pages();
   if (pages.length === 0 || !pages.includes(page)) {
     throw new CheckpointUnrepresentableError(
@@ -571,6 +767,7 @@ export const captureReplayCheckpoint = async (
       const session = await context.newCDPSession(contextPage);
       sessions.push(session);
       await session.send('Page.setWebLifecycleState', { state: 'frozen' });
+      assertOriginsBounded();
     }
     if (
       context.pages().length !== pages.length ||
@@ -580,9 +777,71 @@ export const captureReplayCheckpoint = async (
         'Replay checkpoint page set changed during writer freeze',
       );
     }
+    const frozenOrigins = new Set(storageOrigins);
+    const targetSession = sessions[0]!;
+    const { targetInfo } = await targetSession.send('Target.getTargetInfo');
+    if (!targetInfo.browserContextId) {
+      throw new CheckpointUnrepresentableError(
+        'Chromium did not identify the checkpoint browser context',
+      );
+    }
+    const writerTargetTypes = new Set([
+      'worker',
+      'shared_worker',
+      'service_worker',
+      'background_page',
+    ]);
+    const getWriterTargets = async () => {
+      const { targetInfos } = await targetSession.send('Target.getTargets');
+      return targetInfos.filter(
+        candidate =>
+          candidate.browserContextId === targetInfo.browserContextId &&
+          writerTargetTypes.has(candidate.type),
+      );
+    };
+    const terminateWriterTargets = async (
+      writerTargets: Awaited<ReturnType<typeof getWriterTargets>>,
+    ) => {
+      if (writerTargets.some(candidate => candidate.type === 'service_worker')) {
+        await targetSession.send('ServiceWorker.enable');
+        await targetSession.send('ServiceWorker.stopAllWorkers');
+      }
+      for (const writerTarget of writerTargets) {
+        if (
+          writerTarget.type === 'worker' ||
+          writerTarget.type === 'shared_worker'
+        ) {
+          const { sessionId } = await targetSession.send(
+            'Target.attachToTarget',
+            { targetId: writerTarget.targetId, flatten: false },
+          );
+          await targetSession.send('Target.sendMessageToTarget', {
+            sessionId,
+            message: JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: 'self.close()' },
+            }),
+          });
+        } else {
+          await targetSession.send('Target.closeTarget', {
+            targetId: writerTarget.targetId,
+          });
+        }
+      }
+    };
+    const initialWriterTargets = await getWriterTargets();
+    if (initialWriterTargets.length > 0) {
+      await terminateWriterTargets(initialWriterTargets);
+      await getWriterTargets();
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint cannot freeze unexpected background writers',
+      );
+    }
+    assertOriginsBounded();
     let totalUsage = 0;
-    for (const origin of storageOrigins) {
-      const usage = await sessions[0]!.send('Storage.getUsageAndQuota', {
+    for (const origin of frozenOrigins) {
+      const usage = await targetSession.send('Storage.getUsageAndQuota', {
         origin,
       });
       if (!Number.isFinite(usage.usage) || usage.usage < 0) {
@@ -594,6 +853,23 @@ export const captureReplayCheckpoint = async (
       if (totalUsage > REPLAY_CHECKPOINT_MAX_BYTES) {
         throw new CheckpointTooLargeError();
       }
+    }
+    const finalWriterTargets = await getWriterTargets();
+    if (finalWriterTargets.length > 0) {
+      await terminateWriterTargets(finalWriterTargets);
+      await getWriterTargets();
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint cannot freeze unexpected background writers',
+      );
+    }
+    assertOriginsBounded();
+    if (
+      storageOrigins.size !== frozenOrigins.size ||
+      [...storageOrigins].some(origin => !frozenOrigins.has(origin))
+    ) {
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint storage origins changed during capture',
+      );
     }
   } catch (error) {
     if (
@@ -644,9 +920,7 @@ export const captureReplayCheckpoint = async (
 };
 
 const shutdownBrowser = async () => {
-  if (browser) {
-    await browser.close();
-  }
+  browserLifecycle.retireCurrent();
 };
 
 const isValidUrl = (urlString: string): boolean => {
@@ -712,26 +986,42 @@ const scrapePage = async (
 };
 
 app.get('/health', async (req: Request, res: Response) => {
+  let lease: BrowserLease<Browser> | null = null;
+  let testContext: BrowserContext | null = null;
+  let testPage: Page | null = null;
+  let primaryError: unknown;
   try {
-    if (!browser) {
-      await initializeBrowser();
-    }
-    
-    const { context: testContext } = await createContext();
-    const testPage = await testContext.newPage();
-    await testPage.close();
-    await testContext.close();
-    
+    lease = await browserLifecycle.acquire();
+    ({ context: testContext } = await createContext(lease.browser));
+    testPage = await testContext.newPage();
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
+    await settleScrapeResources(
+      testPage,
+      testContext,
+      () => lease?.release(),
+      primaryError,
+      async () => lease?.retire(),
+    );
+  } catch (error) {
+    primaryError = error;
+  }
+  if (primaryError === undefined) {
     res.status(200).json({ 
       status: 'healthy',
       maxConcurrentPages: MAX_CONCURRENT_PAGES,
       activePages: MAX_CONCURRENT_PAGES - pageSemaphore.getAvailablePermits()
     });
-  } catch (error) {
-    console.error('Health check failed:', error);
+  } else {
+    console.error('Health check failed', {
+      category: 'browser_health_failed',
+      errorName: primaryError instanceof Error ? primaryError.name : 'UnknownError',
+    });
     res.status(503).json({ 
       status: 'unhealthy', 
-      error: error instanceof Error ? error.message : 'Unknown error occurred'
+      error: 'Browser health check failed',
     });
   }
 });
@@ -774,22 +1064,20 @@ app.post('/scrape', async (req: Request, res: Response) => {
     console.warn('⚠️ WARNING: No proxy server provided. Your IP address may be blocked.');
   }
 
-  if (!browser) {
-    await initializeBrowser();
-  }
-
   await pageSemaphore.acquire();
   
+  let browserLease: BrowserLease<Browser> | null = null;
   let requestContext: BrowserContext | null = null;
   let securityState: ContextSecurityState | null = null;
   let page: Page | null = null;
   let responsePayload: Record<string, unknown> | undefined;
   let primaryError: unknown;
   try {
+    browserLease = await browserLifecycle.acquire();
     // Extract user-agent from request headers (case-insensitive) so it can
     // be applied at the context level.  Playwright ignores user-agent in
     // setExtraHTTPHeaders when the context already defines one (#2802).
-    const contextBundle = await createContext({
+    const contextBundle = await createContext(browserLease.browser, {
       ...model,
       skip_tls_verification,
     });
@@ -837,9 +1125,11 @@ app.post('/scrape', async (req: Request, res: Response) => {
             page,
             contextBundle.browserSettings,
             securityState.storageOrigins,
+            () => securityState?.storageOriginsOverflow === true,
           ),
           model.capture_replay_timeout_ms ?? 5_000,
           async () => requestContext?.close(),
+          async () => browserLease?.retire(),
         )
       : undefined;
 
@@ -857,8 +1147,15 @@ app.post('/scrape', async (req: Request, res: Response) => {
     await settleScrapeResources(
       page,
       requestContext,
-      () => pageSemaphore.release(),
+      () => {
+        try {
+          browserLease?.release();
+        } finally {
+          pageSemaphore.release();
+        }
+      },
       primaryError,
+      async () => browserLease?.retire(),
     );
   } catch (error) {
     primaryError = error;

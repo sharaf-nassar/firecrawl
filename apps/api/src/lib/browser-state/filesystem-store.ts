@@ -3,7 +3,6 @@ import {
   lstat,
   mkdir,
   open,
-  readFile,
   readdir,
   realpath,
   rename,
@@ -17,6 +16,7 @@ import {
   prepareBrowserStateCheckpoint,
   syncBrowserStateDirectory,
 } from "./filesystem-store-internal";
+import { readBrowserStateProcessIdentity } from "./process-identity";
 
 const CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
 const CHECKPOINT_READ_CHUNK_BYTES = 64 * 1024;
@@ -24,7 +24,7 @@ const STAGING_STALE_MS = 60 * 60 * 1000;
 const SAFE_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CHECKPOINT_FILENAME = /^[a-f0-9-]{36}\.json$/;
 const STAGING_FILENAME =
-  /^\.checkpoint-([a-f0-9-]{36})-(\d+)-([a-f0-9]{32})-(\d+)\.staging$/;
+  /^\.checkpoint-([a-f0-9-]{36})-([a-f0-9-]{36})-(\d+)-([a-f0-9]{32})-(\d+)\.staging$/;
 
 class BrowserStateUnavailableError extends Error {
   readonly category = "browser_state_unavailable";
@@ -89,11 +89,10 @@ interface BrowserStateCheckpointPlan {
   pathId: string;
   byteSize: number;
   checksum: string;
-}
-
-interface ProcessIdentity {
-  bootId: string;
-  startTime: string;
+  writerLease: string;
+  writerPid: number;
+  writerBootId: string;
+  writerStartTime: string;
 }
 
 async function syncDirectory(directory: string): Promise<void> {
@@ -206,7 +205,6 @@ export class BrowserStateFilesystem {
   async #removeStaleStaging(directory: string): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true });
     const currentUid = process.getuid?.();
-    const bootId = await readBootId();
     for (const entry of entries) {
       const match = STAGING_FILENAME.exec(entry.name);
       if (!match || !entry.isFile()) continue;
@@ -225,12 +223,7 @@ export class BrowserStateFilesystem {
         (stat.mode & 0o777) !== 0o600 ||
         (currentUid !== undefined && stat.uid !== currentUid) ||
         Date.now() - stat.mtimeMs < STAGING_STALE_MS ||
-        (await isSameProcessIdentity(
-          Number(match[2]),
-          match[3],
-          match[4],
-          bootId,
-        ))
+        (await isSameProcessIdentity(Number(match[3]), match[4], match[5]))
       ) {
         continue;
       }
@@ -309,12 +302,18 @@ export class BrowserStateFilesystem {
       throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
     }
     const generationId = randomUUID();
+    const writerLease = randomUUID();
+    const writerIdentity = await readBrowserStateProcessIdentity();
     const filename = `${generationId}.json`;
     const plan = {
       generationId,
       pathId: path.posix.join("replay", ownerId, scrapeId, filename),
       byteSize: bytes.byteLength,
       checksum: checksum(bytes),
+      writerLease,
+      writerPid: writerIdentity.pid,
+      writerBootId: writerIdentity.bootId,
+      writerStartTime: writerIdentity.startTime,
     } satisfies BrowserStateCheckpointPlan;
     await prepareBrowserStateCheckpoint(plan);
 
@@ -324,10 +323,9 @@ export class BrowserStateFilesystem {
     const scrape = await this.#ensureDirectory(owner, scrapeId);
     await this.#removeStaleStaging(scrape);
     const target = path.join(scrape, filename);
-    const identity = await readProcessIdentity(process.pid);
     const staging = path.join(
       scrape,
-      `.checkpoint-${generationId}-${process.pid}-${identity.bootId}-${identity.startTime}.staging`,
+      `.checkpoint-${generationId}-${writerLease}-${writerIdentity.pid}-${writerIdentity.bootId}-${writerIdentity.startTime}.staging`,
     );
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     let renamedGeneration = false;
@@ -464,13 +462,66 @@ export class BrowserStateFilesystem {
     }
   }
 
+  async #removeMatchingStaging(pathId: string): Promise<string | undefined> {
+    const segments = validatePathId(pathId);
+    const filename = segments.pop();
+    const generationId = filename?.endsWith(".json")
+      ? filename.slice(0, -".json".length)
+      : undefined;
+    if (!generationId || !/^[a-f0-9-]{36}$/.test(generationId)) return;
+    let directory: string;
+    try {
+      directory = await this.#resolveExisting(segments.join("/"));
+    } catch (error) {
+      if (
+        (isNodeError(error) && error.code === "ENOENT") ||
+        (error instanceof BrowserStateUnavailableError &&
+          isNodeError(error.cause) &&
+          error.cause.code === "ENOENT")
+      ) {
+        return;
+      }
+      throw error;
+    }
+    const currentUid = process.getuid?.();
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const match = STAGING_FILENAME.exec(entry.name);
+      if (!match || match[1] !== generationId || !entry.isFile()) continue;
+      const candidate = path.join(directory, entry.name);
+      let stat: Awaited<ReturnType<typeof lstat>>;
+      try {
+        stat = await lstat(candidate);
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (
+        stat.isSymbolicLink() ||
+        !stat.isFile() ||
+        stat.nlink !== 1 ||
+        (stat.mode & 0o777) !== 0o600 ||
+        (currentUid !== undefined && stat.uid !== currentUid)
+      ) {
+        continue;
+      }
+      await rm(candidate, { force: true });
+    }
+    return directory;
+  }
+
   async delete(pathId: string): Promise<void> {
     let file: string;
     try {
       file = await this.#resolveExisting(pathId);
     } catch (error) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        await this.#syncNearestExistingParent(pathId);
+        const stagingDirectory = await this.#removeMatchingStaging(pathId);
+        if (stagingDirectory) {
+          await syncBrowserStateDirectory(stagingDirectory, syncDirectory);
+        } else {
+          await this.#syncNearestExistingParent(pathId);
+        }
         return;
       }
       if (
@@ -478,13 +529,19 @@ export class BrowserStateFilesystem {
         isNodeError(error.cause) &&
         error.cause.code === "ENOENT"
       ) {
-        await this.#syncNearestExistingParent(pathId);
+        const stagingDirectory = await this.#removeMatchingStaging(pathId);
+        if (stagingDirectory) {
+          await syncBrowserStateDirectory(stagingDirectory, syncDirectory);
+        } else {
+          await this.#syncNearestExistingParent(pathId);
+        }
         return;
       }
       throw error;
     }
     await rm(file);
     const scrapeDirectory = path.dirname(file);
+    await this.#removeMatchingStaging(pathId);
     await syncBrowserStateDirectory(scrapeDirectory, syncDirectory);
     let removedDirectory = false;
     await rmdir(scrapeDirectory)
@@ -513,39 +570,13 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
-async function readBootId(): Promise<string> {
-  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8"))
-    .trim()
-    .replaceAll("-", "");
-  if (!/^[a-f0-9]{32}$/.test(bootId)) {
-    throw new BrowserStateUnavailableError("process boot identity is invalid");
-  }
-  return bootId;
-}
-
-async function readProcessIdentity(pid: number): Promise<ProcessIdentity> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    throw new BrowserStateUnavailableError("process identity is invalid");
-  }
-  const bootId = await readBootId();
-  const stat = await readFile(`/proc/${pid}/stat`, "utf8");
-  const endOfName = stat.lastIndexOf(")");
-  const startTime = stat.slice(endOfName + 2).split(" ")[19];
-  if (endOfName < 0 || !startTime || !/^\d+$/.test(startTime)) {
-    throw new BrowserStateUnavailableError("process start identity is invalid");
-  }
-  return { bootId, startTime };
-}
-
 async function isSameProcessIdentity(
   pid: number,
   expectedBootId: string,
   expectedStartTime: string,
-  currentBootId: string,
 ): Promise<boolean> {
-  if (expectedBootId !== currentBootId) return false;
   try {
-    const identity = await readProcessIdentity(pid);
+    const identity = await readBrowserStateProcessIdentity(pid);
     return (
       identity.bootId === expectedBootId &&
       identity.startTime === expectedStartTime

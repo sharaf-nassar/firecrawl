@@ -262,6 +262,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
   const database = drizzle({ client: pool });
   let root: string;
   let replayStore: typeof import("./replay-store");
+  let processIdentityInspection: "live" | "dead" | "unknown" | undefined;
 
   async function createFixture(options?: { requestDeadline?: Date | null }) {
     const requestId = randomUUID();
@@ -321,6 +322,21 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     vi.doMock("../logger", () => ({
       logger: { child: () => ({ error: cleanupError }) },
     }));
+    vi.doMock("../browser-state/process-identity", async () => {
+      const actual = await vi.importActual<
+        typeof import("../browser-state/process-identity")
+      >("../browser-state/process-identity");
+      return {
+        ...actual,
+        inspectBrowserStateProcessIdentity: async (
+          expected: Parameters<
+            typeof actual.inspectBrowserStateProcessIdentity
+          >[0],
+        ) =>
+          processIdentityInspection ??
+          actual.inspectBrowserStateProcessIdentity(expected),
+      };
+    });
     replayStore = await import("./replay-store.js");
   });
 
@@ -332,6 +348,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     );
     await rm(path.join(root, "replay"), { recursive: true, force: true });
     cleanupError.mockClear();
+    processIdentityInspection = undefined;
   });
 
   afterEach(() => {
@@ -342,6 +359,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     vi.doUnmock("../../config");
     vi.doUnmock("../../db/connection");
     vi.doUnmock("../logger");
+    vi.doUnmock("../browser-state/process-identity");
     await pool.end();
     await rm(root, { recursive: true, force: true });
   });
@@ -670,6 +688,204 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     );
   });
 
+  it("never reclaims a stale preparing intent owned by this live process", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const filesystem = new BrowserStateFilesystem(root);
+    const pending = await filesystem.writeCheckpoint(
+      ownerId,
+      fixture.scrapeId,
+      {
+        cookies: [],
+        origins: [{ origin: "https://example.com", localStorage: [] }],
+      },
+    );
+    const identity = await processIdentity(process.pid);
+    const lease = randomUUID();
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoint_cleanup_intents
+         (id, scrape_id, owner_id, state_path, checksum, state,
+          writer_lease, writer_pid, writer_boot_id, writer_start_time,
+          heartbeat_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'preparing', $6, $7, $8, $9,
+               now() - interval '2 hours', now() - interval '2 hours')`,
+      [
+        randomUUID(),
+        fixture.scrapeId,
+        ownerId,
+        pending.pathId,
+        pending.checksum,
+        lease,
+        process.pid,
+        identity.bootId,
+        identity.startTime,
+      ],
+    );
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({ kind: "checkpoint" });
+    await expect(lstat(path.join(root, pending.pathId))).resolves.toBeTruthy();
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count
+           FROM browser_replay_checkpoint_cleanup_intents
+          WHERE writer_lease = $1`,
+        [lease],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  });
+
+  it("never age-reclaims a preparing intent with unknown liveness", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const filesystem = new BrowserStateFilesystem(root);
+    const pending = await filesystem.writeCheckpoint(
+      ownerId,
+      fixture.scrapeId,
+      {
+        cookies: [],
+        origins: [{ origin: "https://example.com", localStorage: [] }],
+      },
+    );
+    const identity = await processIdentity(process.pid);
+    const lease = randomUUID();
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoint_cleanup_intents
+         (id, scrape_id, owner_id, state_path, checksum, state,
+          writer_lease, writer_pid, writer_boot_id, writer_start_time,
+          heartbeat_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'preparing', $6, $7, $8, $9,
+               now() - interval '2 hours', now() - interval '2 hours')`,
+      [
+        randomUUID(),
+        fixture.scrapeId,
+        ownerId,
+        pending.pathId,
+        pending.checksum,
+        lease,
+        process.pid,
+        identity.bootId,
+        identity.startTime,
+      ],
+    );
+    processIdentityInspection = "unknown";
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({ kind: "checkpoint" });
+    await expect(lstat(path.join(root, pending.pathId))).resolves.toBeTruthy();
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count
+           FROM browser_replay_checkpoint_cleanup_intents
+          WHERE writer_lease = $1`,
+        [lease],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  });
+
+  it("refuses final publication when its preparing lease disappears", async () => {
+    const fixture = await createFixture();
+    let writtenPath: string | undefined;
+    const originalWrite = BrowserStateFilesystem.prototype.writeCheckpoint;
+    vi.spyOn(
+      BrowserStateFilesystem.prototype,
+      "writeCheckpoint",
+    ).mockImplementation(async function (owner, scrape, state) {
+      const written = await originalWrite.call(this, owner, scrape, state);
+      writtenPath = written.pathId;
+      await pool.query(
+        `DELETE FROM browser_replay_checkpoint_cleanup_intents
+          WHERE scrape_id = $1 AND state = 'preparing'`,
+        [fixture.scrapeId],
+      );
+      return written;
+    });
+
+    await expect(
+      replayStore.persistScrapeReplayState(input(fixture)),
+    ).rejects.toMatchObject({
+      category: "replay_checkpoint_preparation_failed",
+    });
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count FROM browser_replay_checkpoints`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    expect(writtenPath).toBeDefined();
+    await expect(lstat(path.join(root, writtenPath!))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("removes same-generation staging before completing cleanup intent", async () => {
+    const fixture = await createFixture();
+    const generation = randomUUID();
+    const lease = randomUUID();
+    const identity = await processIdentity(process.pid);
+    const directory = path.join(root, "replay", ownerId, fixture.scrapeId);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const staging = path.join(
+      directory,
+      `.checkpoint-${generation}-${lease}-${process.pid}-${identity.bootId}-${identity.startTime}.staging`,
+    );
+    await writeFile(staging, "private staging state", { mode: 0o600 });
+    const pathId = path.posix.join(
+      "replay",
+      ownerId,
+      fixture.scrapeId,
+      `${generation}.json`,
+    );
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoint_cleanup_intents
+         (id, scrape_id, owner_id, state_path, checksum, state)
+       VALUES ($1, $2, $3, $4, $5, 'cleanup')`,
+      [randomUUID(), fixture.scrapeId, ownerId, pathId, "0".repeat(64)],
+    );
+
+    await replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId);
+
+    await expect(lstat(staging)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count
+           FROM browser_replay_checkpoint_cleanup_intents`,
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+
+  it("never deletes the current path when an intent checksum disagrees", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const current = await pool.query<{ state_path: string }>(
+      `SELECT state_path FROM browser_replay_checkpoints WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoint_cleanup_intents
+         (id, scrape_id, owner_id, state_path, checksum, state)
+       VALUES ($1, $2, $3, $4, $5, 'cleanup')`,
+      [
+        randomUUID(),
+        fixture.scrapeId,
+        ownerId,
+        current.rows[0]!.state_path,
+        "0".repeat(64),
+      ],
+    );
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "checkpoint",
+      checkpoint: { storageState },
+    });
+    await expect(
+      lstat(path.join(root, current.rows[0]!.state_path)),
+    ).resolves.toBeTruthy();
+  });
+
   it("recovers rollback and commit crash intents from authoritative metadata", async () => {
     const fixture = await createFixture();
     await replayStore.persistScrapeReplayState(input(fixture));
@@ -696,10 +912,14 @@ describeWithDatabase("scrape replay checkpoint store", () => {
       fixture.scrapeId,
       rolledBackState,
     );
+    const abandonedIdentity = await processIdentity(process.pid);
     await pool.query(
       `INSERT INTO browser_replay_checkpoint_cleanup_intents
-         (id, scrape_id, owner_id, state_path, checksum, state, created_at)
-       VALUES ($1, $2, $3, $4, $5, 'preparing',
+         (id, scrape_id, owner_id, state_path, checksum, state,
+          writer_lease, writer_pid, writer_boot_id, writer_start_time,
+          heartbeat_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'preparing', $6, $7, $8, $9,
+               now() - interval '2 hours',
                now() - interval '2 hours')`,
       [
         randomUUID(),
@@ -707,6 +927,10 @@ describeWithDatabase("scrape replay checkpoint store", () => {
         ownerId,
         rolledBack.pathId,
         rolledBack.checksum,
+        randomUUID(),
+        process.pid,
+        abandonedIdentity.bootId,
+        (BigInt(abandonedIdentity.startTime) + 1n).toString(),
       ],
     );
 
@@ -873,11 +1097,11 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     const identity = await processIdentity(process.pid);
     const stale = path.join(
       directory,
-      `.checkpoint-${randomUUID()}-99999999-${identity.bootId}-1.staging`,
+      `.checkpoint-${randomUUID()}-${randomUUID()}-99999999-${identity.bootId}-1.staging`,
     );
     const live = path.join(
       directory,
-      `.checkpoint-${randomUUID()}-${process.pid}-${identity.bootId}-${identity.startTime}.staging`,
+      `.checkpoint-${randomUUID()}-${randomUUID()}-${process.pid}-${identity.bootId}-${identity.startTime}.staging`,
     );
     await writeFile(stale, "stale", { mode: 0o600 });
     await writeFile(live, "live", { mode: 0o600 });
@@ -903,7 +1127,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     const startTime = BigInt(stat.slice(endOfName + 2).split(" ")[19]!);
     const stale = path.join(
       directory,
-      `.checkpoint-${randomUUID()}-1-${bootId}-${startTime + 1n}.staging`,
+      `.checkpoint-${randomUUID()}-${randomUUID()}-1-${bootId}-${startTime + 1n}.staging`,
     );
     await writeFile(stale, "stale pid one", { mode: 0o600 });
     const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
