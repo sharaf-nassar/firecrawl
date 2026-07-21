@@ -299,6 +299,10 @@ function unavailable(fields: string[]): ReplayResolution {
   }) as ReplayResolution;
 }
 
+function isRedactedPersistedValue(value: unknown): boolean {
+  return typeof value === "string" && value.trim().startsWith("<redacted");
+}
+
 function runtimeConfig(): {
   enabled: boolean;
   root: string;
@@ -681,7 +685,8 @@ export async function loadScrapeReplayState(
       !row.statePath ||
       row.fileDeletedAt !== null ||
       typeof row.scrapeUrl !== "string" ||
-      row.scrapeUrl.trim().toLowerCase().includes("redacted") ||
+      isRedactedPersistedValue(row.scrapeUrl) ||
+      isRedactedPersistedValue(row.scrapeOptions) ||
       row.scrapeOptions === null ||
       typeof row.scrapeOptions !== "object" ||
       Array.isArray(row.scrapeOptions) ||

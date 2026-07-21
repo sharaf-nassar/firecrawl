@@ -1351,12 +1351,12 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     await expect(readdir(root)).resolves.toEqual([]);
   });
 
-  it("fails closed for a redacted scrape even when replay rows exist", async () => {
+  it("fails closed for a redacted scrape URL even when replay rows exist", async () => {
     const fixture = await createFixture();
     await replayStore.persistScrapeReplayState(input(fixture));
     await pool.query(
       `UPDATE scrapes
-          SET url = '<redacted due to zero data retention>', options = NULL
+          SET url = '<redacted due to zero data retention>'
         WHERE id = $1`,
       [fixture.scrapeId],
     );
@@ -1367,6 +1367,42 @@ describeWithDatabase("scrape replay checkpoint store", () => {
       kind: "error",
       category: "replay_unavailable",
     });
+  });
+
+  it("fails closed for redacted scrape options even when replay rows exist", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    await pool.query(
+      `UPDATE scrapes
+          SET options = $2::jsonb
+        WHERE id = $1`,
+      [
+        fixture.scrapeId,
+        JSON.stringify("<redacted due to zero data retention>"),
+      ],
+    );
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+    });
+  });
+
+  it("loads an ordinary scrape URL containing the word redacted", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    await pool.query(
+      `UPDATE scrapes
+          SET url = 'https://example.com/redacted-report'
+        WHERE id = $1`,
+      [fixture.scrapeId],
+    );
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({ kind: "checkpoint" });
   });
 
   it("fails closed when a scrape has no replay envelope", async () => {
