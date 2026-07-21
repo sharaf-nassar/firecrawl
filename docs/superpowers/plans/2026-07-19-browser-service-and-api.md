@@ -12,12 +12,16 @@ profiles, typed operations, live-view streams, and live action-ID
 deduplication. Prompt Interact submits one outer job to the host adapter; the
 adapter runs its bounded Codex observe/act loop and calls the API with strict
 action proposals, while only the API records, authorizes, and dispatches an
-action.
+action. A canonical V1 inventory is implemented independently on each side;
+Chromium can egress only through one DNS-validating manual proxy with direct
+UDP disabled; replay is accepted only after in-place Playwright storage-state
+round-trip verification. API owns all local retention, while the harness owns
+only fresh disposable runtime/database resources.
 
-**Tech Stack:** Node.js 22.22.1, pnpm 10.33.0, TypeScript 5.9, Express 5,
-`ws`, Zod 4,
-Playwright 1.61.1/Chromium, `ipaddr.js`, PostgreSQL-backed API state, Vitest,
-Node test runner, Docker Compose.
+**Tech Stack:** Node.js 22.22.1, pnpm 10.33.0, TypeScript 5.9.3,
+Express 5.2.1, `ws` 8.21.1, Zod 4.4.3, Playwright 1.61.1/Chromium,
+`ipaddr.js` 2.4.0, PostgreSQL-backed API state, Vitest 4.1.9, Node test
+runner for bootstrap tests only, Docker Compose.
 
 ---
 
@@ -81,10 +85,12 @@ Node `22.22.1` directory:
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node --version
-corepack pnpm --version
 ```
 
-Expected: `v22.22.1` and `10.33.0`. Do not scan for or install another Node,
+Expected: `v22.22.1`. Do not invoke Corepack or pnpm until Task 1 has created
+`apps/browser-service/package.json`; only then run Corepack from that package
+or with `--dir apps/browser-service` so it reads the committed
+`packageManager: "pnpm@10.33.0"`. Do not scan for or install another Node,
 change the user's default Node, or run Browser Service commands under active
 Node `25.8.2`. Corepack may acquire project-scoped pnpm `10.33.0` during Task
 1; that dependency acquisition and the package install are authorized. No
@@ -101,6 +107,8 @@ subject and every body line are at most 72 characters.
 
 ### Browser Service
 
+- `apps/browser-service/contracts/private-v1.contract.json` — canonical,
+  versioned, closed private-route inventory and schema fingerprint source.
 - `apps/browser-service/package.json` — standalone scripts and pinned runtime.
 - `apps/browser-service/pnpm-lock.yaml` — reproducible dependency graph.
 - `apps/browser-service/tsconfig.json` — strict NodeNext compilation.
@@ -114,10 +122,16 @@ subject and every body line are at most 72 characters.
 - `apps/browser-service/src/config.ts` — validated service configuration.
 - `apps/browser-service/src/contracts.ts` — strict session, operation, action,
   profile, artifact, grant, and health schemas.
+- `apps/browser-service/src/contract-inventory.ts` — service-owned normalized
+  V1 inventory and canonical fingerprint.
 - `apps/browser-service/src/errors.ts` — typed internal failures and HTTP map.
 - `apps/browser-service/src/auth.ts` — service identity, correlation, deadline.
 - `apps/browser-service/src/network-policy.ts` — URL/domain/IP normalization.
 - `apps/browser-service/src/egress-proxy.ts` — DNS-pinned HTTP/CONNECT proxy.
+- `apps/browser-service/src/chromium-launch-policy.ts` — exact manual proxy,
+  loopback-bypass subtraction, QUIC, and WebRTC launch policy.
+- `apps/browser-service/src/chromium-egress.integration.test.ts` — real bundled
+  Chromium TCP/UDP escape proof with positive controls.
 - `apps/browser-service/src/profile-store.ts` — working copies and immutable
   atomic profile generations.
 - `apps/browser-service/src/startup-state.ts` — process nonce, liveness,
@@ -130,6 +144,8 @@ subject and every body line are at most 72 characters.
 - `apps/browser-service/src/action-cache.ts` — live action-ID execute-once cache.
 - `apps/browser-service/src/session-registry.ts` — Chromium lifecycle, leases,
   origins, TTLs, replay, and close.
+- `apps/browser-service/src/replay-restore.ts` — in-place storage-state restore,
+  immediate export verification, and discard-on-failure boundary.
 - `apps/browser-service/src/streams.ts` — passive, interactive, and CDP streams.
 - `apps/browser-service/src/artifacts.ts` — bounded authenticated captures.
 - `apps/browser-service/src/server.ts` — authenticated HTTP/WS routes.
@@ -142,6 +158,8 @@ subject and every body line are at most 72 characters.
 - `apps/api/src/lib/local-runtime-config.ts` — fail-closed local validation.
 - `apps/api/src/lib/scrape-interact/browser-service-client.ts` — typed,
   deadline-aware Browser Service client.
+- `apps/api/src/lib/scrape-interact/browser-service-contracts.ts` — API-owned
+  closed V1 schemas and canonical-inventory fingerprint.
 - `apps/api/src/lib/browser-runtime/startup-gate.ts` — fail-closed browser work
   and browser-state mutator/retention gate.
 - `apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts` —
@@ -195,25 +213,284 @@ subject and every body line are at most 72 characters.
 Every private HTTP request carries
 `Authorization: Bearer <service key>`,
 `x-firecrawl-correlation-id`, and an ISO `x-firecrawl-deadline`. Unknown JSON
-fields fail with 400.
+fields fail with 400. Every UUID is canonical lowercase, every SHA-256 is 64
+lowercase hex characters, timestamps are canonical UTC ISO strings, URLs are
+absolute HTTP(S) strings at most 8,192 characters, relative state paths are
+root-confined UTF-8 strings at most 1,024 bytes, opaque tokens/nonces are
+unpadded base64url encodings of exactly 32 bytes, and JSON responses reject
+unknown fields. Unless stated otherwise, request JSON is at most 256 KiB and
+response JSON at most 128 KiB.
+Bearer header is at most 4,096 bytes; correlation ID is 1..128 printable ASCII
+characters; deadline is canonical UTC, strictly future, and at most 5 minutes
+ahead. Every non-stream error is strict
+`{version:1,category:string,message:string}` with category 1..128 printable
+ASCII characters, sanitized message at most 1,024 characters, and encoded size
+at most 4 KiB.
+Every `:runtimeSessionId`, `:grantId`, and `:generationId` route parameter is
+an `Id`; a body field repeating a route ID must equal it.
+
+The single source of contract truth is the checked-in, canonical JSON fixture
+`apps/browser-service/contracts/private-v1.contract.json`. It has exactly the
+top-level members `version:1`, `routes`, and `definitions`; fingerprint input
+uses recursively sorted object keys and no insignificant whitespace,
+and the following route inventory. Each route record locks method, path,
+request definition or `null`, success status, response definition, request
+byte cap, response byte cap, and streaming metadata. No endpoint may be added
+to either implementation without changing this fixture.
 
 ```text
-POST   /v1/sessions
-GET    /v1/sessions/:runtimeSessionId
-POST   /v1/sessions/:runtimeSessionId/actions
-POST   /v1/sessions/:runtimeSessionId/grants
-DELETE /v1/sessions/:runtimeSessionId/grants/:grantId
-POST   /v1/sessions/:runtimeSessionId/artifacts
-DELETE /v1/sessions/:runtimeSessionId
-POST   /v1/profile-generations/:generationId/finalize
-DELETE /v1/profile-generations/:generationId
-POST   /v1/reconciliation
+POST   /v1/sessions                                      CreateSessionV1 -> 201 SessionV1
+GET    /v1/sessions/:runtimeSessionId                    null -> 200 SessionV1
+DELETE /v1/sessions/:runtimeSessionId                    CloseSessionV1 -> 200 ClosedSessionV1
+POST   /v1/sessions/:runtimeSessionId/actions            BrowserActionExecutionV1 -> 200 BrowserActionExecutionResultV1
+POST   /v1/sessions/:runtimeSessionId/grants             CreateRelayGrantV1 -> 201 RelayGrantV1
+DELETE /v1/sessions/:runtimeSessionId/grants/:grantId    RevokeRelayGrantV1 -> 200 RevokedRelayGrantV1
+POST   /v1/sessions/:runtimeSessionId/artifacts          FetchArtifactV1 -> 200 binary + ArtifactMetadataV1 headers
+POST   /v1/profile-generations/:generationId/finalize    FinalizeProfileGenerationV1 -> 200 FinalizedProfileGenerationV1
+DELETE /v1/profile-generations/:generationId             DeleteProfileGenerationV1 -> 200 DeletedProfileGenerationV1
+POST   /v1/reconciliation                                ReconciliationRequestV1 -> 200 ReconciliationResultV1
 WS     /v1/sessions/:runtimeSessionId/streams/passive
 WS     /v1/sessions/:runtimeSessionId/streams/interactive
 WS     /v1/sessions/:runtimeSessionId/streams/cdp
-GET    /health/live
-GET    /health/ready
+GET    /health/live                                      null -> 200 LiveHealthV1
+GET    /health/ready                                     null -> 200 ReadyHealthV1 | 503 UnreadyHealthV1
 ```
+
+The fixture definitions lock these exact closed shapes and bounds:
+
+```ts
+type Id = string;              // canonical lowercase UUID
+type Sha256 = string;          // /^[a-f0-9]{64}$/
+type Token = string;           // 43-char canonical base64url, 32 decoded bytes
+type HttpUrl = string;         // absolute HTTP(S), 1..8_192 chars
+type Timestamp = string;       // canonical UTC ISO-8601
+type RelativeStatePath = string; // root-relative, 1..1_024 UTF-8 bytes
+
+type JsonSafe =
+  | null | boolean | number | string
+  | JsonSafe[] | { [key: string]: JsonSafe };
+// finite numbers only; depth <= 16; arrays <= 1_000 entries; objects <= 256
+// own enumerable keys; each key <= 256 chars; each string <= 64 KiB; no
+// cycles, sparse arrays, accessors, prototypes other than Object/null, symbol
+// keys, undefined, symbol, function, bigint, NaN, or infinities.
+
+type StorageStateV1 = {
+  cookies: Array<{ // <= 10_000
+    name: string;                 // 1..4_096
+    value: string;                // <= 65_536
+    domain: string;               // 1..4_096
+    path: string;                 // 1..4_096
+    expires: number;              // finite
+    httpOnly: boolean;
+    secure: boolean;
+    sameSite: "Strict" | "Lax" | "None";
+    partitionKey?: string;        // 1..4_096
+    _crHasCrossSiteAncestor?: boolean;
+  }>;
+  origins: Array<{               // <= 256
+    origin: HttpUrl;
+    localStorage: Array<{        // <= 10_000 per origin
+      name: string;              // <= 4_096
+      value: string;             // <= 65_536
+    }>;
+    indexedDB?: Array<{          // <= 256 per origin
+      name: string;              // 1..4_096
+      version: number;           // positive safe integer
+      stores: Array<{            // <= 256 per database
+        name: string;            // 1..4_096
+        autoIncrement: boolean;
+        keyPath?: string;        // <= 4_096; XOR keyPathArray
+        keyPathArray?: string[]; // <= 64, each <= 4_096
+        records: Array<{         // <= 10_000 per store
+          key?: JsonSafe; keyEncoded?: JsonSafe; // XOR when out-of-line
+          value?: JsonSafe; valueEncoded?: JsonSafe; // exactly one
+        }>;
+        indexes: Array<{         // <= 256 per store
+          name: string;          // 1..4_096
+          keyPath?: string;      // XOR keyPathArray
+          keyPathArray?: string[]; // <= 64, each <= 4_096
+          multiEntry: boolean;
+          unique: boolean;
+        }>;
+      }>;
+    }>;
+  }>;
+}; // canonical encoded StorageStateV1 <= 16 MiB
+
+type ReplayBrowserSettingsV1 = {
+  headers: Record<string, string>; // <= 256 valid HTTP fields, <= 64 KiB total
+  cookies: StorageStateV1["cookies"];
+  viewport: {
+    width: number; height: number; // integers 1..7_680 / 1..4_320
+    deviceScaleFactor: number;     // finite > 0 and <= 10
+    isMobile: boolean; hasTouch: boolean;
+  };
+  deviceName?: string;             // 1..256
+  userAgent: string;               // 1..4_096
+  locale: string;                  // valid language tag, 1..128
+  timezoneId?: string;             // valid IANA zone, 1..256
+  geolocation?: {
+    latitude: number;              // finite -90..90
+    longitude: number;             // finite -180..180
+    accuracy: number;              // finite >= 0 and <= 100_000
+  };
+  location: {
+    country: string;               // supported value, 1..64
+    languages: string[];           // <= 32 valid tags, each 1..128
+  };
+  proxy: {
+    kind: "basic" | "stealth" | "enhanced" | "auto";
+    country?: string;              // supported value, 1..64
+    credentialRef?: string;        // /^proxy-credential:[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/
+  };
+  skipTlsVerification: boolean; blockAds: boolean; lockdown: boolean;
+};
+
+type ReplayCheckpointV1 = {
+  checkpointId: Id;
+  statePath: RelativeStatePath;
+  checksum: Sha256;
+  byteSize: number;                // safe integer 1..16_777_216
+  storageState: StorageStateV1;
+  finalUrl: HttpUrl;
+  fingerprint: {
+    finalUrl: HttpUrl;             // must equal finalUrl
+    titleSha256: Sha256;
+    bodyTextSha256: Sha256;
+  };
+};
+
+type ProfileInputV1 = null | {
+  profileId: Id;
+  mode: "writer" | "snapshot";
+  generationId: Id | null;
+  statePath: RelativeStatePath | null;
+  checksum: Sha256 | null;
+}; // generationId/statePath/checksum are all null or all non-null
+
+type CreateSessionV1 = {
+  version: 1;
+  sessionId: Id;
+  initialUrl: HttpUrl;
+  allowedDomains: string[];        // <= 8 unique ASCII hostnames, each <= 253
+  ttlSeconds: number;              // integer 30..3_600
+  activityTtlSeconds: number;      // integer 10..600 and <= ttlSeconds
+  profile: ProfileInputV1;
+  replay: ReplayCheckpointV1 | null;
+  settings: ReplayBrowserSettingsV1;
+}; // <= 16 MiB only when replay is non-null, otherwise <= 256 KiB
+// replay != null forbids profile with non-null generationId.
+
+type BoundedPageState = {
+  url: HttpUrl;
+  title: string;                   // <= 4_096
+  snapshotExcerpt: string;         // <= 40_000
+};
+type SessionV1 = {
+  version: 1;
+  runtimeSessionId: Id;
+  state: "ready" | "executing" | "stopping";
+  sessionVersion: number;          // safe integer >= 0
+  page: BoundedPageState;
+  expiresAt: Timestamp;
+  idleExpiresAt: Timestamp;
+};
+type CloseSessionV1 = {
+  version: 1;
+  reason: "requested" | "expired" | "error" | "shutdown";
+  expectedSessionVersion: number;  // safe integer >= 0
+};
+type PreparedProfileV1 = {
+  profileId: Id; generationId: Id; checksum: Sha256;
+  byteSize: number;                // safe integer 1..268_435_456
+  prepareToken: Token;
+};
+type ClosedSessionV1 = {
+  version: 1; runtimeSessionId: Id; closed: true;
+  sessionVersion: number;          // safe integer >= 0
+  preparedProfile: PreparedProfileV1 | null;
+};
+```
+
+The action request remains the closed 12-operation union from Task 1. Its
+result is no longer `unknown`; it is a strict discriminated union:
+
+```ts
+type BrowserOperationResultV1 =
+  | { kind: "snapshot"; refCount: number }              // integer 0..500
+  | { kind: "click" | "fill" | "type" | "press" |
+      "select" | "scroll" | "navigate"; applied: true }
+  | { kind: "wait"; waitedMs: number }                  // integer 0..30_000
+  | { kind: "get_text"; text: string }                  // <= 40_000
+  | { kind: "get_url"; url: HttpUrl }
+  | { kind: "evaluate"; value: JsonSafe };              // value <= 32 KiB
+
+type BrowserActionExecutionV1 = {
+  version: 1; actionId: Id; runId: Id; sequence: number; // sequence 1..25
+  normalizedProposalHash: Sha256;
+  effect: "read_only" | "side_effecting";
+  expectedSessionVersion: number;                        // safe integer >= 0
+  operation: BrowserOperation;
+}; // operation <= 64 KiB
+type BrowserActionExecutionResultV1 =
+  | { version: 1; actionId: Id; sequence: number;
+      normalizedProposalHash: Sha256; outcome: "succeeded";
+      result: BrowserOperationResultV1; page: BoundedPageState;
+      sessionVersion: number } // sequence 1..25; version safe integer >=0
+  | { version: 1; actionId: Id; sequence: number;
+      normalizedProposalHash: Sha256; outcome: "failed_no_effect";
+      error: { category: string; message: string }; // 1..128 / <=1_024
+      page: BoundedPageState; sessionVersion: number }; // same bounds
+// Per-operation encoded result <= 64 KiB; complete action response <=128 KiB.
+```
+
+The remaining request/result contracts are exactly:
+
+```ts
+type FinalizeProfileGenerationV1 = {
+  version: 1; profileId: Id; generationId: Id;
+  checksum: Sha256; prepareToken: Token;
+};
+type FinalizedProfileGenerationV1 = {
+  version: 1; profileId: Id; generationId: Id;
+  checksum: Sha256; committed: true;
+};
+type DeleteProfileGenerationV1 = FinalizeProfileGenerationV1;
+type DeletedProfileGenerationV1 = {
+  version: 1; profileId: Id; generationId: Id;
+  checksum: Sha256; deleted: true;
+};
+type CreateRelayGrantV1 = {
+  version: 1; grantId: Id;
+  permission: "passive" | "interactive" | "cdp";
+  expiresAt: Timestamp; useLimit: 1;
+};
+type RelayGrantV1 = {
+  version: 1; grantId: Id; permission: CreateRelayGrantV1["permission"];
+  expiresAt: Timestamp; relayToken: Token;
+};
+type RevokeRelayGrantV1 = { version: 1; grantId: Id };
+type RevokedRelayGrantV1 = { version: 1; grantId: Id; revoked: true };
+type FetchArtifactV1 =
+  | { version: 1; artifactId: Id; kind: "screenshot";
+      format: "png" | "jpeg"; fullPage: boolean }
+  | { version: 1; artifactId: Id; kind: "trace" | "recording";
+      preset: "diagnostic-v1" };
+type ArtifactMetadataV1 = {
+  version: 1; artifactId: Id;
+  kind: "screenshot" | "trace" | "recording";
+  contentType: "image/png" | "image/jpeg" | "application/zip" |
+    "video/webm";
+  byteSize: number;                // safe integer 1..16_777_216
+  checksum: Sha256;
+};
+```
+
+Artifact fetch returns bytes, not JSON. Its five metadata values are carried
+in `x-firecrawl-artifact-version`, `-id`, `-kind`, `-byte-size`, and
+`-sha256`; `content-type` carries the locked media type, `content-length`
+must equal byte size, and streamed bytes must hash to the metadata checksum.
+The service rejects a ninth run artifact or aggregate bytes over 32 MiB.
 
 Health and reconciliation are private too. Before reconciliation,
 `GET /health/live` returns strict
@@ -235,22 +512,22 @@ export type ReconciliationReferenceV1 = {
     | "replay_checkpoint"
     | "profile_generation"
     | "replay_checkpoint_cleanup_intent";
-  id: string;
-  path: string;
-  checksum: string;
+  id: Id;
+  path: RelativeStatePath;
+  checksum: Sha256;
 };
 
 export type ReconciliationRequestV1 = {
   version: 1;
-  processNonce: string;
-  snapshotDigest: string;
+  processNonce: Token;
+  snapshotDigest: Sha256;
   references: ReconciliationReferenceV1[];
 };
 
 export type ReconciliationResultV1 = {
   version: 1;
-  processNonce: string;
-  snapshotDigest: string;
+  processNonce: Token;
+  snapshotDigest: Sha256;
   retained: number;
   removed: number;
   missing: 0;
@@ -267,48 +544,27 @@ cached success; another digest for that nonce fails
 `reconciliation_conflicting_replay`. Any stale nonce fails
 `reconciliation_nonce_mismatch` before filesystem access.
 
+`retained` and `removed` are integers 0..25,000. The request holds at most
+25,000 references and 16 MiB; its response is at most 4 KiB. Health responses
+are at most 4 KiB. Health `category` is exactly
+`reconciliation_required | reconciliation_in_progress`; all process nonces
+and digests use `Token`/`Sha256` above.
+
 Only API calls these endpoints. `runtimeSessionId` and Browser Service relay
-grants are never public. Browser Service action requests carry API-assigned
-identity and do not accept a public capability:
+grants are never public. Browser Service returns `failed_no_effect` only when
+it proves no page/browser effect occurred. Evaluate runs inside the page and
+may mutate before its value is inspected. Therefore cyclic, unsupported, or
+oversized evaluate output, serialization failure, timeout, Chromium crash, or
+transport loss after dispatch is terminal ambiguity: Browser Service closes
+the session and transport without a cache entry; API records
+`outcome_unknown`. It must never return `failed_no_effect` for that path.
 
-```ts
-export type BrowserActionExecutionV1 = {
-  version: 1;
-  actionId: string;
-  runId: string;
-  sequence: number;
-  normalizedProposalHash: string;
-  effect: BrowserOperationEffect;
-  expectedSessionVersion: number;
-  operation: BrowserOperation;
-};
-
-export type BrowserActionExecutionResultV1 =
-  | {
-      version: 1;
-      actionId: string;
-      sequence: number;
-      normalizedProposalHash: string;
-      outcome: "succeeded";
-      result: unknown;
-      page: BoundedPageState;
-      sessionVersion: number;
-    }
-  | {
-      version: 1;
-      actionId: string;
-      sequence: number;
-      normalizedProposalHash: string;
-      outcome: "failed_no_effect";
-      error: { category: string; message: string };
-      page: BoundedPageState;
-      sessionVersion: number;
-    };
-```
-
-Browser Service returns `failed_no_effect` only when it can prove no page or
-browser effect occurred. A transport interruption or process death after API
-marks an action `executing` is never converted to that state.
+Task 1 implements Browser Service schemas without importing API code, exports
+their normalized inventory and SHA-256 fingerprint, and compares both to the
+canonical fixture. Task 7 implements API schemas without importing Browser
+Service code and performs the same comparison. This prevents shared-code tests
+from hiding drift while making any field, type, bound, status, header, or
+route change fail independently in both packages.
 
 ## Verified references
 
@@ -321,11 +577,21 @@ marks an action `executing` is never converted to that state.
 - [Playwright Docker](https://playwright.dev/docs/docker): package and image
   versions must match and image references should be pinned.
 - [Playwright BrowserContext](https://playwright.dev/docs/api/class-browsercontext):
-  checkpoint export supports `storageState({ indexedDB: true })`; Browser
-  Service pins Playwright 1.61.1 for live restore.
+  Playwright 1.61.1 supports `setStorageState()` (added in 1.59) and checkpoint
+  export with `storageState({ indexedDB: true })`.
 - [Playwright BrowserType](https://playwright.dev/docs/api/class-browsertype):
+  browser launch/context proxy accepts `{server,bypass}`;
   `connectOverCDP()` is Chromium-only and lower fidelity than Playwright
-  protocol; typed operations use the owned Playwright context.
+  protocol, so typed operations use the owned Playwright context.
+- [Chromium proxy bypass rules](https://chromium.googlesource.com/chromium/src/+/312b6bf/net/docs/proxy.md):
+  Chromium implicitly bypasses localhost and link-local destinations;
+  `<-loopback>` subtracts that implicit bypass so the validating proxy sees
+  and rejects those requests.
+- [Chromium network switches](https://chromium.googlesource.com/chromium/src/+/master/components/network_session_configurator/common/network_switch_list.h):
+  `--disable-quic` disables QUIC transport.
+- [Chromium WebRTC IP policy switch](https://chromium.googlesource.com/chromium/src/+/c9d0bef66bb7b855634c1de68a19c48966412cc8/content/public/common/content_switches.cc)
+  and [policy value](https://chromium.googlesource.com/chromium/src/+/376fc41e87a058f7a7b300b0ec3a4982b4ec0960/components/policy/resources/templates/policy_definitions/Miscellaneous/WebRtcIPHandling.yaml):
+  force `disable_non_proxied_udp` so WebRTC cannot use non-proxied UDP.
 - Context routing misses service-worker-owned traffic unless service workers
   are blocked. Every context uses `serviceWorkers: "block"`; the DNS-pinning
   egress proxy remains the primary SSRF/rebinding boundary.
@@ -333,6 +599,7 @@ marks an action `executing` is never converted to that state.
 ### Task 1: Scaffold strict Browser Service contracts
 
 **Files:**
+- Create: `apps/browser-service/contracts/private-v1.contract.json`
 - Create: `apps/browser-service/package.json`
 - Create: `apps/browser-service/pnpm-lock.yaml`
 - Create: `apps/browser-service/tsconfig.json`
@@ -340,6 +607,7 @@ marks an action `executing` is never converted to that state.
 - Create: `apps/browser-service/src/runtime-preflight.test.mjs`
 - Create: `apps/browser-service/src/lockfile.test.mjs`
 - Create: `apps/browser-service/src/contracts.ts`
+- Create: `apps/browser-service/src/contract-inventory.ts`
 - Create: `apps/browser-service/src/contracts.test.ts`
 - Create: `apps/browser-service/src/config.ts`
 - Create: `apps/browser-service/src/errors.ts`
@@ -383,13 +651,17 @@ Expected: version prints `v22.22.1`; test FAIL because
 
 - [ ] **Step 3: Add exact package metadata and runtime preflight**
 
-Create package metadata with `engines.node: "22.22.1"`,
-`packageManager: "pnpm@10.33.0"`, exact `playwright: "1.61.1"`, and Node 22
-types. Use Express 5, `ws` 8, Zod 4, `ipaddr.js` 2, TypeScript 5.9, and `tsx`
-4. Every lifecycle script runs the preflight first:
+Create package metadata with no dependency ranges. Every direct dependency and
+dev dependency is exactly pinned. Every lifecycle script runs preflight first;
+`.mjs` bootstrap/lock tests stay on `node:test` and all TypeScript tests use
+Vitest 4.1.9:
 
 ```json
 {
+  "name": "@firecrawl/browser-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
   "scripts": {
     "preinstall": "node src/runtime-preflight.mjs",
     "prebuild": "node src/runtime-preflight.mjs",
@@ -397,7 +669,23 @@ types. Use Express 5, `ws` 8, Zod 4, `ipaddr.js` 2, TypeScript 5.9, and `tsx`
     "prestart": "node src/runtime-preflight.mjs",
     "start": "node dist/index.js",
     "pretest": "node src/runtime-preflight.mjs",
-    "test": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs && node --import tsx --test src/*.test.ts"
+    "test:bootstrap": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs",
+    "test": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs && vitest run"
+  },
+  "dependencies": {
+    "express": "5.2.1",
+    "ipaddr.js": "2.4.0",
+    "playwright": "1.61.1",
+    "ws": "8.21.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.1",
+    "@types/ws": "8.18.1",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
   },
   "engines": { "node": "22.22.1" },
   "packageManager": "pnpm@10.33.0"
@@ -454,19 +742,33 @@ corepack pnpm install --lockfile-only
 rm -rf node_modules
 corepack pnpm install --frozen-lockfile
 corepack pnpm install --frozen-lockfile --lockfile-only
+corepack pnpm exec playwright install chromium
+corepack pnpm list --depth 0
 node src/runtime-preflight.mjs
 node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs
 ```
 
 Expected: `v22.22.1`, `10.33.0`, both frozen commands and lockfile tests pass,
-and lockfile resolves Playwright exactly `1.61.1`.
+and list reports exactly Express `5.2.1`, `ipaddr.js` `2.4.0`, Playwright
+`1.61.1`, `ws` `8.21.1`, Zod `4.4.3`, `@types/express` `5.0.6`,
+`@types/node` `22.20.1`, `@types/ws` `8.18.1`, `tsx` `4.23.1`, TypeScript
+`5.9.3`, and Vitest `4.1.9` as direct dependencies. Playwright reports its
+1.61.1-pinned Chromium executable through `chromium.executablePath()`; Tasks 2
+and 4 fail if that exact executable is absent.
 
 - [ ] **Step 5: Write failing closed-schema and auth tests**
 
 Only after frozen install succeeds, create `contracts.test.ts` and
 `auth.test.ts`:
 
+Every `*.test.ts` created in Tasks 1-6 explicitly begins with
+`import { describe, expect, test, vi } from "vitest";`; use no global test
+APIs. Only `runtime-preflight.test.mjs` and `lockfile.test.mjs` import
+`node:test` and `node:assert/strict`.
+
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("action request rejects unknown fields and non-SHA hashes", () => {
   expect(actionExecutionRequestSchema.safeParse({
     version: 1,
@@ -533,6 +835,32 @@ test("health contracts distinguish live, reconciling, and ready", () => {
     extra: true,
   }).success).toBe(false);
 });
+
+test("service contracts exactly match the canonical V1 inventory", async () => {
+  const fixture = await readCanonicalPrivateV1Fixture();
+  expect(normalizePrivateV1Inventory(servicePrivateV1Inventory))
+    .toEqual(fixture);
+  expect(fingerprintPrivateV1Inventory(servicePrivateV1Inventory))
+    .toBe(sha256(canonicalJson(fixture)));
+});
+
+test("action results reject unsafe JSON and every encoded overflow", () => {
+  for (const result of [
+    evaluateResult(cyclicObject()), evaluateResult(undefined),
+    evaluateResult(Symbol("x")), evaluateResult(1n), evaluateResult(NaN),
+    getTextResult("x".repeat(40_001)),
+    evaluateResult("x".repeat(32 * 1024 + 1)),
+  ]) expect(actionExecutionResultSchema.safeParse(result).success).toBe(false);
+  expect(encodedBytes(maximalValidActionResponse))
+    .toBeLessThanOrEqual(128 * 1024);
+});
+
+test("all direct package versions are exact", async () => {
+  const packageJson = await readPackageJson();
+  for (const version of Object.values({
+    ...packageJson.dependencies, ...packageJson.devDependencies,
+  })) expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+});
 ```
 
 - [ ] **Step 6: Run contract/auth tests and verify red**
@@ -541,13 +869,20 @@ test("health contracts distinguish live, reconciling, and ready", () => {
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node src/runtime-preflight.mjs
-corepack pnpm exec node --import tsx --test src/contracts.test.ts src/auth.test.ts
+corepack pnpm exec vitest run src/contracts.test.ts src/auth.test.ts
 ```
 
 Expected: preflight PASS, then tests FAIL because contracts and auth production
 modules do not exist.
 
 - [ ] **Step 7: Define strict operation, health, and reconciliation schemas**
+
+First write the exact canonical fixture and `contract-inventory.ts` described
+under Locked private contracts. `contracts.test.ts` parses the fixture,
+deep-compares its normalized `routes` and `definitions` to the independently
+declared service inventory, and compares SHA-256 fingerprints. The test also
+walks `package.json` and asserts every direct dependency string is one exact
+version with no `^`, `~`, tag, workspace range, git reference, or URL.
 
 `browserOperationSchema` implements the prerequisite `BrowserOperation`
 without renaming fields or widening values. Every object is closed. JSON
@@ -701,16 +1036,23 @@ export const readyHealthV1Schema = z.strictObject({
 });
 ```
 
-Define the result union from the locked contract. Define strict create,
-close, profile-finalize, relay-grant, artifact, and health schemas. Create
-session validates 30..3600 seconds absolute, 10..600 seconds idle,
-`activityTtlSeconds <= ttlSeconds`, at most 8 origins, and the complete
-`ReplayBrowserSettingsV1` from the prerequisite plan.
+Define every result and request schema, field, refinement, encoded-size cap,
+HTTP status, and artifact metadata header from Locked private contracts.
+Create session validates 30..3600 seconds absolute, 10..600 seconds idle,
+`activityTtlSeconds <= ttlSeconds`, at most 8 allowed domains, the complete bounded
+`ReplayBrowserSettingsV1`, `StorageStateV1`, and checkpoint XOR invariants.
+`BrowserOperationResultV1` and its schema replace every service-side
+`unknown` result. The recursive JSON-safe validator enforces depth, entry,
+key, string, total-byte, prototype, accessor, cycle, finite-number, sparse
+array, symbol, undefined, function, and bigint rejection before encoding.
 
 `auth.ts` uses `timingSafeEqual`, rejects expired deadlines or deadlines over
 5 minutes away, and returns `{ correlationId, deadline: Date }`. `config.ts`
 validates `PORT`, `BROWSER_SERVICE_API_KEY`, `BROWSER_PROFILE_ROOT`,
-`LOCAL_BROWSER_STATE_ROOT`, `MAX_BROWSER_SESSIONS`, and every bound used below.
+`LOCAL_BROWSER_STATE_ROOT`, `BROWSER_STATE_NAMESPACE` as canonical lowercase
+UUID, `MAX_BROWSER_SESSIONS`, and every bound used below. Resolve all managed
+paths under `<canonical root>/<namespace>/`; reconciliation and cleanup never
+accept a request-supplied root or namespace.
 
 Add `processNonceSchema`, canonical lowercase UUID/path/SHA-256 reference
 schemas, `reconciliationRequestV1Schema`, `reconciliationResultV1Schema`, and
@@ -727,7 +1069,7 @@ export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
 node --test apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/contracts.test.ts src/auth.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/contracts.test.ts src/auth.test.ts
 corepack pnpm --dir apps/browser-service build
 ```
 
@@ -736,7 +1078,7 @@ Expected: tests PASS; build emits `apps/browser-service/dist`.
 - [ ] **Step 9: Commit scaffold**
 
 ```bash
-git add apps/browser-service/package.json apps/browser-service/pnpm-lock.yaml apps/browser-service/tsconfig.json apps/browser-service/src/runtime-preflight.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs apps/browser-service/src/contracts.ts apps/browser-service/src/contracts.test.ts apps/browser-service/src/config.ts apps/browser-service/src/errors.ts apps/browser-service/src/auth.ts apps/browser-service/src/auth.test.ts
+git add apps/browser-service/contracts/private-v1.contract.json apps/browser-service/package.json apps/browser-service/pnpm-lock.yaml apps/browser-service/tsconfig.json apps/browser-service/src/runtime-preflight.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs apps/browser-service/src/contracts.ts apps/browser-service/src/contract-inventory.ts apps/browser-service/src/contracts.test.ts apps/browser-service/src/config.ts apps/browser-service/src/errors.ts apps/browser-service/src/auth.ts apps/browser-service/src/auth.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: define browser service contracts" -m "Add strict private schemas for sessions, typed browser actions,
 profiles, streams, and health requests.
@@ -752,10 +1094,14 @@ configuration."
 - Create: `apps/browser-service/src/network-policy.test.ts`
 - Create: `apps/browser-service/src/egress-proxy.ts`
 - Create: `apps/browser-service/src/egress-proxy.test.ts`
+- Create: `apps/browser-service/src/chromium-launch-policy.ts`
+- Create: `apps/browser-service/src/chromium-egress.integration.test.ts`
 
 - [ ] **Step 1: Write hostile-address, redirect, and rebinding tests**
 
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("blocks every non-public address form", async () => {
   for (const target of [
     "http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/",
@@ -773,6 +1119,26 @@ test("pins the checked DNS answer", async () => {
   expect(dial.addresses).toEqual(["93.184.216.34"]);
   expect(lookup.calls).toBe(1);
 });
+
+test("bundled Chromium sends top-level and subresource traffic to proxy", async () => {
+  const result = await exerciseBundledChromiumThroughProxy();
+  expect(result.acceptedPublicRequests).toEqual([
+    "top-level", "script", "image", "fetch", "websocket",
+  ]);
+  expect(result.blockedTargets).toEqual(expect.arrayContaining([
+    "localhost", "127.0.0.2", "169.254.169.254", "::1", "fe80::1",
+    "private.test",
+  ]));
+  expect(result.privateOriginHits).toBe(0);
+});
+
+test("bundled Chromium cannot emit QUIC or WebRTC UDP", async () => {
+  const proof = await proveNoNonProxiedUdp();
+  expect(proof.baselineQuicPackets).toBeGreaterThan(0);
+  expect(proof.baselineWebRtcPackets).toBeGreaterThan(0);
+  expect(proof.hardenedQuicPackets).toBe(0);
+  expect(proof.hardenedWebRtcPackets).toBe(0);
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
@@ -780,7 +1146,7 @@ test("pins the checked DNS answer", async () => {
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/network-policy.test.ts src/egress-proxy.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/network-policy.test.ts src/egress-proxy.test.ts src/chromium-egress.integration.test.ts
 ```
 
 Expected: FAIL because policy and proxy do not exist.
@@ -814,21 +1180,68 @@ buffered HTTP body, 128 MiB each CONNECT direction, 32 tunnels, 60-second
 idle timeout, and `min(private deadline, now + 3600 seconds)` total lifetime.
 Bind `127.0.0.1` on an ephemeral port and apply bidirectional backpressure.
 
-- [ ] **Step 5: Run focused tests**
+- [ ] **Step 5: Lock manual Chromium proxy and direct-UDP defenses**
+
+`chromium-launch-policy.ts` returns the only proxy/argument configuration
+allowed for Browser Service contexts:
+
+```ts
+export function chromiumNetworkLaunchPolicy(loopbackProxyUrl: string) {
+  return {
+    proxy: { server: loopbackProxyUrl, bypass: "<-loopback>" },
+    args: [
+      "--disable-quic",
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    ],
+  } as const;
+}
+```
+
+Do not omit `bypass`, use an empty bypass string, depend on environment proxy
+variables, or route only Playwright page requests. Chromium's implicit bypass
+otherwise allows localhost and link-local traffic around the validating
+proxy. Task 4 must spread this exact policy into
+`chromium.launchPersistentContext()` and may not override either field.
+
+`chromium-egress.integration.test.ts` launches the Playwright 1.61.1 bundled
+Chromium executable, not a mocked browser. It serves a controlled public
+top-level document whose script creates image, `fetch`, WebSocket, iframe,
+worker, and navigation requests. For both top-level and every subresource
+class, request `localhost`, another 127/8 address, `169.254.169.254`, `[::1]`,
+`[fe80::1]`, and `private.test` whose injected proxy DNS answer is RFC1918.
+Record that the proxy receives and rejects every target before dial, while
+private HTTP/WS sinks record zero connections. A request absent from proxy
+logs or observed by a sink fails the test.
+
+Start two UDP packet sinks. The QUIC proof uses a test-only Chromium launch
+with a host-resolver mapping and forced-QUIC origin: first omit
+`--disable-quic` and require the sink to observe at least one baseline packet;
+then use the production policy and require zero. The WebRTC proof first uses a
+local STUN URL without the policy and requires at least one baseline UDP
+packet, then repeats with
+`--force-webrtc-ip-handling-policy=disable_non_proxied_udp` and requires zero.
+Use fixed fake clocks only outside these real-browser cases. If Chromium,
+IPv6, host resolution, QUIC forcing, STUN, packet capture, or the baseline
+positive control cannot prove the path, fail rather than skip or weaken the
+assertion.
+
+- [ ] **Step 6: Run focused and bundled-Chromium tests**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/network-policy.test.ts src/egress-proxy.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/network-policy.test.ts src/egress-proxy.test.ts src/chromium-egress.integration.test.ts
 ```
 
 Expected: PASS for alternate IP forms, rebinding, redirect revalidation,
-CONNECT smuggling, bounds, half-close, cancellation, and slot release.
+CONNECT smuggling, bounds, half-close, cancellation, slot release, complete
+top-level/subresource proxy observation, private-destination zero hits, and
+positive-control-proven QUIC/WebRTC UDP suppression.
 
-- [ ] **Step 6: Commit egress boundary**
+- [ ] **Step 7: Commit egress boundary**
 
 ```bash
-git add apps/browser-service/src/network-policy.ts apps/browser-service/src/network-policy.test.ts apps/browser-service/src/egress-proxy.ts apps/browser-service/src/egress-proxy.test.ts
+git add apps/browser-service/src/network-policy.ts apps/browser-service/src/network-policy.test.ts apps/browser-service/src/egress-proxy.ts apps/browser-service/src/egress-proxy.test.ts apps/browser-service/src/chromium-launch-policy.ts apps/browser-service/src/chromium-egress.integration.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: enforce browser egress policy" -m "Validate every browser destination, reject internal address ranges, and
 pin outbound connections to the checked DNS answer.
@@ -848,6 +1261,8 @@ content."
 - [ ] **Step 1: Write failing process-state and nonce tests**
 
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("starts live but rejects work until the current nonce is reconciled", () => {
   const state = createStartupState({
     randomBytes: () => Buffer.alloc(32, 7),
@@ -885,6 +1300,8 @@ objects contain no path, checksum, key, URL, public browser ID, or capability.
 - [ ] **Step 2: Write failing filesystem reconciliation tests**
 
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("validates all authorities before quarantining one old orphan", async () => {
   const fixture = await createStateFixture({
     referencedCheckpoint: true,
@@ -930,7 +1347,7 @@ request must prove no eligible entry changed.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/startup-state.test.ts src/reconciliation.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/startup-state.test.ts src/reconciliation.test.ts
 ```
 
 Expected: FAIL because startup state and reconciliation modules do not exist.
@@ -991,7 +1408,10 @@ export async function reconcileBrowserState(
 ```
 
 First parse the complete closed request, recompute digest, and validate every
-authority. Resolve only root-relative paths beneath a canonical root. Reject
+authority. `canonicalRoot` is constructed once at startup from configured
+`LOCAL_BROWSER_STATE_ROOT/BROWSER_STATE_NAMESPACE`; no route, snapshot, API,
+or harness request can replace it. Resolve only root-relative paths beneath
+that owned canonical namespace. Reject
 symlinks, root escapes, special files, hard-link ambiguity, unrecognized
 directory grammar, and checksum mismatch. Check checkpoint canonical JSON SHA
 and profile-generation canonical tree SHA by the foundation algorithms.
@@ -1016,7 +1436,7 @@ identity, capability, or grant.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/startup-state.test.ts src/reconciliation.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/startup-state.test.ts src/reconciliation.test.ts
 corepack pnpm --dir apps/browser-service build
 ```
 
@@ -1040,10 +1460,14 @@ Validate every retained file before quarantining recognized old orphans."
 - Create: `apps/browser-service/src/profile-store.test.ts`
 - Create: `apps/browser-service/src/session-registry.ts`
 - Create: `apps/browser-service/src/session-registry.test.ts`
+- Create: `apps/browser-service/src/replay-restore.ts`
+- Create: `apps/browser-service/src/replay-restore.integration.test.ts`
 
 - [ ] **Step 1: Write profile crash-boundary and TTL tests**
 
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("publishes a writer generation through prepare and finalize", async () => {
   const work = await store.createWorkingCopy(profileId, null, "writer", sessionId);
   await writeFile(join(work.path, "Cookies"), "state");
@@ -1070,6 +1494,26 @@ test("cannot create a profile or Chromium session before reconciliation", async 
   expect(launchPersistentContext).not.toHaveBeenCalled();
   expect(profileStore.createWorkingCopy).not.toHaveBeenCalled();
 });
+
+test("real Chromium restores storage before its first network request", async () => {
+  const restored = await restoreRealCheckpoint({
+    cookies: true, localStorage: true, indexedDB: true,
+  });
+  expect(restored.preRestoreNetworkRequests).toBe(0);
+  expect(restored.documentValues).toEqual(EXPECTED_STORAGE_VALUES);
+  expect(restored.exportedCanonicalBytes).toEqual(
+    restored.checkpointStorageCanonicalBytes,
+  );
+  expect(restored.exportedChecksum).toBe(restored.checkpointStorageChecksum);
+});
+
+test("restore crash discards work and never publishes a profile", async () => {
+  await expect(restoreRealCheckpoint({ crashAfterSetStorageState: true }))
+    .rejects.toMatchObject({ category: "replay_unavailable" });
+  expect(await profileStore.listStaging()).toEqual([]);
+  expect(await profileStore.listCommitted()).toEqual([]);
+  expect(await profileStore.listWorking()).toEqual([]);
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
@@ -1077,7 +1521,7 @@ test("cannot create a profile or Chromium session before reconciliation", async 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/profile-store.test.ts src/session-registry.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
 ```
 
 Expected: FAIL because profile store and registry do not exist.
@@ -1095,16 +1539,57 @@ or promotes an orphan generation.
 
 - [ ] **Step 4: Implement persistent Chromium sessions and replay**
 
-Launch one `launchPersistentContext()` per session with `headless: true`,
+Create a new UUID-derived isolated working profile for every session, then
+launch one `chromium.launchPersistentContext()` with `headless: true`,
 `acceptDownloads: false`, `serviceWorkers: "block"`, validated replay device,
-locale, timezone, geolocation, headers, TLS, and proxy settings, plus the
-session's validating egress proxy. Unknown device/timezone/proxy references
-return `replay_unsupported`.
+locale, timezone, geolocation, headers, TLS settings, and the exact Task 2
+policy `{proxy:{server:loopbackProxyUrl,bypass:"<-loopback>"},args:[
+"--disable-quic",
+"--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]}`. Unknown
+device/timezone/proxy references return `replay_unsupported` before creating a
+working copy or launching Chromium.
+
+An existing profile generation and a replay checkpoint are mutually
+exclusive. Reject that combination as `replay_unsupported` before filesystem,
+proxy, or Chromium side effects. Replay may use no profile or a new profile
+with null generation; the latter begins empty and may publish only after a
+successful session close.
 
 Restore checkpoints only from UUID-derived paths under
-`LOCAL_BROWSER_STATE_ROOT`; verify SHA-256, apply storage state, load final
-URL, and compare bounded final URL/title/body hashes. Do not replay saved
-side effects. A mismatch closes the runtime before execution.
+`LOCAL_BROWSER_STATE_ROOT`. Before launch, parse the exact closed checkpoint,
+re-encode fixed-key canonical JSON, verify `byteSize` and SHA-256, and derive
+the expected canonical storage-state bytes, byte count, and SHA-256. After
+launch, perform this exact order with no page creation, navigation, locator,
+script evaluation, listener that can initiate work, access to Chromium's
+automatic `about:blank` page, or other network-capable operation between
+steps:
+
+```ts
+const context = await chromium.launchPersistentContext(
+  isolatedWorkingProfile,
+  launchOptions,
+);
+await context.setStorageState(checkpoint.storageState);
+const accepted = await context.storageState({ indexedDB: true });
+verifyCanonicalStorageState(accepted, checkpoint.storageState);
+```
+
+`verifyCanonicalStorageState()` independently validates the bounded closed
+schema, sorts cookie/origin/localStorage/database/store/record/index arrays by
+their stable identity keys, preserves record order where identity is absent,
+omits absent optional fields, emits fixed-key whitespace-free UTF-8 JSON, and
+requires exact canonical bytes, byte count, and SHA-256 equal the expected
+checkpoint storage payload. It does not manually write cookies,
+`localStorage`, or IndexedDB. Only after equality may the registry select the
+automatic blank page or create one, load `finalUrl`, then compare exact final
+URL and bounded title/body hashes. Do not replay saved actions or side effects.
+
+Any parse, checksum, byte-size, `setStorageState`, immediate export,
+canonicalization, equality, navigation, or fingerprint mismatch; timeout; or
+Chromium crash closes context/browser and proxy, recursively discards the
+isolated working profile, leaves no session in registry, and never prepares,
+stages, finalizes, or publishes a profile generation. Cleanup failure is
+surfaced and remains reconciliation-owned; runtime work is never admitted.
 
 Registry accepts `StartupAdmission` and calls `requireReady()` before any path,
 working-copy, proxy, or Chromium side effect. Registry stores public/runtime
@@ -1119,17 +1604,20 @@ idempotent and closes Chromium before preparing a writer profile.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/profile-store.test.ts src/session-registry.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
 ```
 
 Expected: PASS for writer exclusion, snapshot isolation, every publication
-crash point, corrupt-reference readiness, replay verification, 600-second idle
-and 3600-second absolute maxima, shorter caller limits, and close idempotency.
+crash point, corrupt-reference readiness, 600-second idle and 3600-second
+absolute maxima, shorter caller limits, and close idempotency. Real bundled
+Chromium proves cookies, localStorage, and IndexedDB exist before first
+navigation; sinks prove no pre-restore request. Canonical byte/checksum
+mismatch, timeout, and forced crash leave no registry/profile publication.
 
 - [ ] **Step 6: Commit profile lifecycle**
 
 ```bash
-git add apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts
+git add apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts apps/browser-service/src/replay-restore.ts apps/browser-service/src/replay-restore.integration.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: persist browser profile generations" -m "Create isolated Chromium working copies and publish writable profile
 generations through a checksummed two-phase protocol.
@@ -1152,6 +1640,8 @@ absolute lifetime rules."
 - [ ] **Step 1: Write operation and deduplication tests**
 
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("returns a cached known result for matching action replay", async () => {
   const first = await executeAction(session, clickAction);
   const replay = await executeAction(session, clickAction);
@@ -1172,6 +1662,26 @@ test("direct navigation requires existing origin or allowed domain", async () =>
     kind: "navigate", url: "https://other.test/",
   })).rejects.toMatchObject({ category: "target_blocked" });
 });
+
+test("rejects every non-JSON-safe evaluate result as ambiguous", async () => {
+  for (const value of [cyclicObject(), undefined, Symbol("x"), 1n, NaN,
+    Infinity]) {
+    await expect(executeEvaluateResult(value)).rejects.toMatchObject({
+      category: "action_outcome_unknown",
+    });
+    expect(actionCache.has(evaluateAction.actionId)).toBe(false);
+    expect(session.closed).toBe(true);
+  }
+});
+
+test("bounds each result and complete action response", async () => {
+  await expect(executeGetText("x".repeat(40_001))).rejects.toMatchObject({
+    category: "action_outcome_unknown",
+  });
+  await expect(executeEvaluateResult({ value: "x".repeat(32 * 1024) }))
+    .rejects.toMatchObject({ category: "action_outcome_unknown" });
+  expect(byteLength(validatedActionResponse)).toBeLessThanOrEqual(128 * 1024);
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
@@ -1179,7 +1689,7 @@ test("direct navigation requires existing origin or allowed domain", async () =>
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
 ```
 
 Expected: FAIL because operation engine and action cache do not exist.
@@ -1192,8 +1702,14 @@ storage, dynamic code, workers, or navigation mutation. Permit explicit
 read/call members rooted at `document`, `location`, and `args`.
 
 Snapshots create server-held locator refs capped at 500 and return at most
-40,000 characters for `snapshotExcerpt`; full operation JSON stays within
-64 KiB. Clear refs on navigation. Never add reference attributes to DOM.
+40,000 characters for `snapshotExcerpt`; `get_text` returns at most 40,000
+characters; evaluate result JSON is at most 32 KiB; any operation result is at
+most 64 KiB; complete action response is at most 128 KiB. Use the Task 1
+`JsonSafe` validator before encoding and reject cyclic, sparse, accessor,
+custom-prototype, symbol-keyed, undefined, symbol, function, bigint,
+non-finite, depth, count, key, string, and byte-limit violations. Full
+operation JSON stays within 64 KiB. Clear refs on navigation. Never add
+reference attributes to DOM.
 
 - [ ] **Step 4: Implement operation dispatch and navigation policy**
 
@@ -1213,24 +1729,35 @@ A matching action ID/sequence/hash returns an existing `succeeded` or
 `failed_no_effect` result. Any identity or sequence collision with a different
 hash fails `model_protocol_error`. Keep one pending action per session.
 
-Store a known result only after operation completion. Map only validation,
+Match each success to the exact `BrowserOperationResultV1` discriminant from
+Locked private contracts; operation kind and result kind must agree. Validate
+and encode the operation result, page state, and complete response before
+inserting a terminal cache entry.
+
+Store a known result only after operation completion and complete bounded
+serialization. Map only validation,
 stale-ref, and browser failures that prove no effect to `failed_no_effect`.
 Do not catch disconnect, Chromium crash, timeout after dispatch, or unknown
-exceptions as no-effect. Let those failures reach API as ambiguous transport
-failure. Never retry an operation.
+exceptions as no-effect. Evaluate may mutate before returning: unsupported,
+cyclic, or oversized evaluate output and every result/response serialization
+failure are terminal ambiguity even when evaluation returned. Close the
+session, leave action cache empty, and let failure reach API as ambiguous
+transport failure. Never retry an operation.
 
 - [ ] **Step 6: Run operation tests**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
 corepack pnpm --dir apps/browser-service test
 ```
 
 Expected: PASS for all operations, stable/stale refs, payload bounds, origin
 expansion, SSRF, unsafe evaluate, matching replay without second dispatch,
-hash mismatch, proven no-effect failure, and ambiguous failure propagation.
+hash mismatch, proven no-effect failure, every JSON-safe rejection,
+per-operation/full-response caps, no caching after serialization failure, and
+ambiguous failure propagation.
 
 - [ ] **Step 7: Commit operation engine**
 
@@ -1260,6 +1787,8 @@ sequence collisions without retrying effects."
 - [ ] **Step 1: Write HTTP, action, stream, and artifact tests**
 
 ```ts
+import { describe, expect, test, vi } from "vitest";
+
 test("action route returns cached output without another effect", async () => {
   const first = await postAction(validAction);
   const replay = await postAction(validAction);
@@ -1279,6 +1808,14 @@ test("artifact capture is explicit and bounded", async () => {
   });
   expect(artifact.byteSize).toBeLessThanOrEqual(16 * 1024 * 1024);
   expect(artifact.checksum).toMatch(/^[a-f0-9]{64}$/);
+});
+
+test("serialization ambiguity closes transport without a terminal body", async () => {
+  operationSpy.mockResolvedValueOnce(cyclicObject());
+  const response = await postAction(evaluateAction);
+  expect(response.transportClosed).toBe(true);
+  expect(actionCache.has(evaluateAction.actionId)).toBe(false);
+  expect(registry.get(runtimeSessionId)).toBeUndefined();
 });
 
 test("live precedes reconciliation while all browser work stays closed", async () => {
@@ -1313,7 +1850,7 @@ test("shutdown closes health listener before draining admitted work", async () =
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
 ```
 
 Expected: FAIL because transport modules do not exist.
@@ -1345,6 +1882,14 @@ Mount the locked private routes. `POST /actions` parses
 Profile finalize/delete require profile ID, generation ID, checksum, and
 prepare token. Upgrade handling authenticates service identity and one-use
 relay grant before selecting stream permission.
+
+Every route uses the exact canonical inventory status, request/response byte
+cap, schema, and artifact header set. Before writing JSON, parse the complete
+response with the closed schema and enforce encoded length. An ambiguous
+action or result serialization failure destroys the session and closes the
+transport without a success or `failed_no_effect` body; it never enters the
+action cache. Artifact streaming verifies declared length and SHA-256 while
+writing and aborts on mismatch.
 
 Create `StartupAdmission` before listener bind. Mount authenticated
 `GET /health/live`, `GET /health/ready`, and `POST /v1/reconciliation` before
@@ -1390,6 +1935,11 @@ digest-pinned Noble Playwright reference, copies the exact Node `22.22.1`
 runtime from the Node stage, copies frozen production dependencies and build,
 and runs as `pwuser`. Only `/var/lib/firecrawl-browser` is writable.
 
+Add a named `browser-test` stage from the same digest-pinned Playwright base.
+It copies exact Node, full frozen dependencies, source, and tests, runs as
+`pwuser`, and exists only for the two real-browser verification commands.
+The final stage copies no tests or dev dependencies.
+
 `dockerfile.test.ts` parses every `FROM`, package metadata, and lockfile. It
 requires the Playwright tag `v1.61.1-noble`, an `@sha256:` plus 64 lowercase
 hex digest, exact package/lock Playwright `1.61.1`, Node base `22.22.1`, frozen
@@ -1400,11 +1950,17 @@ install, preflight before start, and non-root user.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec node --import tsx --test src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+corepack pnpm --dir apps/browser-service exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+docker build --pull --no-cache --target browser-test -t firecrawl-local-browser-service:browser-test-1 apps/browser-service
+docker run --rm --entrypoint node firecrawl-local-browser-service:browser-test-1 src/runtime-preflight.mjs
+docker run --rm --entrypoint corepack firecrawl-local-browser-service:browser-test-1 pnpm exec vitest run src/chromium-egress.integration.test.ts src/replay-restore.integration.test.ts
 docker build --pull --no-cache -t firecrawl-local-browser-service:test-1 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-1 --version
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-1 -p 'require("playwright/package.json").version'
 docker image inspect firecrawl-local-browser-service:test-1 --format '{{.Config.User}}'
+docker build --pull --no-cache --target browser-test -t firecrawl-local-browser-service:browser-test-2 apps/browser-service
+docker run --rm --entrypoint node firecrawl-local-browser-service:browser-test-2 src/runtime-preflight.mjs
+docker run --rm --entrypoint corepack firecrawl-local-browser-service:browser-test-2 pnpm exec vitest run src/chromium-egress.integration.test.ts src/replay-restore.integration.test.ts
 docker build --pull --no-cache -t firecrawl-local-browser-service:test-2 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 --version
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 -p 'require("playwright/package.json").version'
@@ -1413,7 +1969,9 @@ docker image inspect firecrawl-local-browser-service:test-2 --format '{{.Config.
 
 Expected: tests PASS; both builds succeed from committed digest; each image
 reports `v22.22.1`, `1.61.1`, and user `pwuser`. Re-run the raw-manifest
-hash and require it equals Dockerfile digest after both builds.
+hash and require it equals Dockerfile digest after both builds. Both images
+also pass positive-control-proven egress/UDP and storage-restore tests using
+their bundled Chromium; an unavailable proof fails the build gate.
 
 - [ ] **Step 8: Commit service transport**
 
@@ -1432,6 +1990,8 @@ Close streams, actions, and sessions in order during shutdown."
 - Modify: `apps/api/src/config.ts`
 - Modify: `apps/api/src/lib/local-runtime-config.ts`
 - Modify: `apps/api/src/lib/local-runtime-config.test.ts`
+- Create: `apps/api/src/lib/scrape-interact/browser-service-contracts.ts`
+- Create: `apps/api/src/lib/scrape-interact/browser-service-contracts.test.ts`
 - Modify: `apps/api/src/lib/scrape-interact/browser-service-client.ts`
 - Create: `apps/api/src/lib/scrape-interact/browser-service-client.test.ts`
 
@@ -1496,12 +2056,26 @@ it("binds reconciliation to current live nonce and closed result", async () => {
   );
   expect(await client.getReady(context)).toEqual(readyHealth);
 });
+
+it("matches the canonical V1 inventory without service imports", () => {
+  expect(apiPrivateV1Inventory).toEqual(canonicalPrivateV1Inventory);
+  expect(apiPrivateV1Fingerprint).toBe(canonicalPrivateV1Fingerprint);
+});
+
+it("rejects unsafe or oversized action results at the client boundary", async () => {
+  for (const body of [cyclicJsonFixture, undefinedResultFixture,
+    nonFiniteFixture, oversizedGetTextFixture, oversizedResponseFixture]) {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, body));
+    await expect(client.executeAction(runtimeId, action, context))
+      .rejects.toMatchObject({ category: "browser_service_protocol_error" });
+  }
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
 
 ```bash
-pnpm --dir apps/api exec vitest run src/lib/local-runtime-config.test.ts src/lib/scrape-interact/browser-service-client.test.ts
+pnpm --dir apps/api exec vitest run src/lib/local-runtime-config.test.ts src/lib/scrape-interact/browser-service-contracts.test.ts src/lib/scrape-interact/browser-service-client.test.ts
 ```
 
 Expected: FAIL because enabled-service validation and typed action client are
@@ -1518,7 +2092,8 @@ reconciliation timeout capped at 60 seconds,
 `BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS=5000`, and
 `BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS=30000`, plus
 absolute `BROWSER_ADAPTER_TOKEN_FILE`. Enabled mode requires local
-persistence, browser-state root, private HTTP service URL, and key. Adapter
+persistence, browser-state root, canonical lowercase UUID
+`BROWSER_STATE_NAMESPACE`, private HTTP service URL, and key. Adapter
 token absence keeps only host callbacks/prompt/code execution unavailable; it
 does not disable direct Browser create/list/delete.
 
@@ -1529,6 +2104,16 @@ lock defaults and reject zero, negative, noninteger, reversed, or out-of-range
 values.
 
 - [ ] **Step 4: Implement closed typed client methods**
+
+Implement the exact Locked private contracts again in
+`browser-service-contracts.ts`; do not import Browser Service TypeScript.
+Export `BrowserOperationResultV1` as `z.infer` of its one API-owned strict
+schema; later API modules import that type/schema instead of redeclaring it.
+Normalize the API inventory, compare it with
+`apps/browser-service/contracts/private-v1.contract.json`, and compute SHA-256 over
+the fixture's canonical bytes. Never import service schemas, types, inventory,
+or fingerprints. Fail on any route, method, status, field, type, bound,
+header, streaming rule, or body cap drift.
 
 Provide create/query, `executeAction`, grant create/revoke, artifact, close,
 profile finalize/discard, and these closed startup methods:
@@ -1553,10 +2138,17 @@ URLs in public errors.
 encoded body at 60 seconds and 16 MiB. All three always send bearer key,
 correlation ID, and absolute deadline.
 
+All other client methods lock literal method/path/status and parse the exact
+request/response schema before or after transport. Artifact fetch validates
+metadata headers, media type, declared length, 16 MiB cap, and streamed hash.
+Action success parses the operation-specific strict result and 64/128 KiB
+caps. A malformed/unsafe response is `browser_service_protocol_error`; after
+dispatch the caller must treat it as outcome ambiguity, not no-effect.
+
 - [ ] **Step 5: Run tests and build**
 
 ```bash
-pnpm --dir apps/api exec vitest run src/lib/local-runtime-config.test.ts src/lib/scrape-interact/browser-service-client.test.ts
+pnpm --dir apps/api exec vitest run src/lib/local-runtime-config.test.ts src/lib/scrape-interact/browser-service-contracts.test.ts src/lib/scrape-interact/browser-service-client.test.ts
 pnpm --dir apps/api build
 ```
 
@@ -1565,7 +2157,7 @@ Expected: tests and build PASS.
 - [ ] **Step 6: Commit client and gate**
 
 ```bash
-git add apps/api/src/config.ts apps/api/src/lib/local-runtime-config.ts apps/api/src/lib/local-runtime-config.test.ts apps/api/src/lib/scrape-interact/browser-service-client.ts apps/api/src/lib/scrape-interact/browser-service-client.test.ts
+git add apps/api/src/config.ts apps/api/src/lib/local-runtime-config.ts apps/api/src/lib/local-runtime-config.test.ts apps/api/src/lib/scrape-interact/browser-service-contracts.ts apps/api/src/lib/scrape-interact/browser-service-contracts.test.ts apps/api/src/lib/scrape-interact/browser-service-client.ts apps/api/src/lib/scrape-interact/browser-service-client.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: gate local browser service" -m "Require explicit private Browser Service configuration and add closed,
 deadline-aware client methods for its runtime contracts.
@@ -1680,7 +2272,7 @@ it("opens work and retention only after matching response and ready health", asy
   await coordinator.initialize();
   expect(events).toEqual([
     "gate:close",
-    "retention:pause",
+    "browser-retention:pause",
     "mutations:drained",
     "recovery:interrupt",
     "cleanup-intents:recover",
@@ -1689,7 +2281,7 @@ it("opens work and retention only after matching response and ready health", asy
     "service:reconcile",
     "service:ready",
     "gate:open",
-    "retention:start",
+    "browser-retention:start",
   ]);
 });
 
@@ -1748,6 +2340,16 @@ it("holds same failed runtime nonce for cooldown", async () => {
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(4);
   await coordinator.checkNow();
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(8);
+});
+
+it("runs non-browser retention once when browser feature is disabled", async () => {
+  const app = await startApi({ LOCAL_BROWSER_SERVICE_ENABLED: "false" });
+  await retentionClock.runOneIteration();
+  expect(operationalRetention).toHaveBeenCalledTimes(1);
+  expect(artifactRetention).toHaveBeenCalledTimes(1);
+  expect(browserStateRetention).not.toHaveBeenCalled();
+  expect(createBrowserReconciliationCoordinator).not.toHaveBeenCalled();
+  await app.stop();
 });
 ```
 
@@ -1940,15 +2542,15 @@ export function createBrowserReconciliationCoordinator(
 configuration. No harness callback owns recovery or retention.
 
 `initialize()` requires migrations already applied. Under one mutex: call
-`gate.close()`, pause retention, await returned `drained`, then call
+`gate.close()`, pause browser-state retention, await returned `drained`, then call
 `gate.withDrainedBrowserStateMutation(drain, ...)` once around
 `interruptUnfinishedBrowserWork(now)` and exact-process cleanup-intent
 recovery. After that wrapper resolves, read authenticated live nonce and capture
 the repeatable-read snapshot, post `{version:1, processNonce, snapshotDigest,
 references}`, validate the closed result, fetch ready health, and require both
 responses equal requested nonce/digest. Then `gate.open(drain, binding)` and
-start retention. Deadline is `min(request timeout, remaining 60,000 ms startup
-budget)`.
+start browser-state retention. Each request deadline is the smaller of its
+configured timeout and the remaining 60,000 ms startup budget.
 
 `checkNow()` fetches ready health. Any 503, changed nonce, changed digest,
 transport/auth/schema error, or process restart closes gate immediately and
@@ -1962,14 +2564,28 @@ records failed nonce, and suppresses same-nonce automatic retry for 30,000 ms;
 nonce change or explicit `checkNow()` may start one new coalesced cycle. No
 cloud/stateless fallback.
 
+Split the existing API-owned local retention loop into two explicit phases:
+`runOperationalAndArtifactRetentionIteration()` and
+`runBrowserStateRetentionIteration()`. `index.ts` constructs exactly one
+retention service for every local-persistence API process, regardless of
+`LOCAL_BROWSER_SERVICE_ENABLED`. It starts operational database/run cleanup
+and local artifact retention immediately after migrations. These phases never
+wait on browser reconciliation and continue during Browser Service outage or
+restart. No Browser Service process or harness parent runs them.
+
+When the browser feature is enabled, the same service registers its browser
+state phase with the coordinator. That phase waits on `waitUntilOpen(signal)`
+before every iteration and pauses/drains on gate close. When disabled, do not
+schedule browser-state recovery or retention; the one API retention service
+still runs the non-browser phases exactly once per interval. Shutdown stops
+coordinator/monitor first when present, then the single retention service,
+then database. Tests use call counts to reject duplicate timers/owners.
+
 Wrap browser-state file creation, profile publication/discard, checkpoint
 materialization/cleanup, and retention deletion in
 `gate.withBrowserStateMutationLease("filesystem_and_database", ...)`. Make the
-retention worker call
-`waitUntilOpen(signal)` before each browser-state iteration; unrelated
-artifact retention may continue. `index.ts` starts coordinator after migrations
-and before browser routes admit work, and stops monitor before retention and
-database shutdown.
+browser phase call `waitUntilOpen(signal)` before each iteration. `index.ts`
+starts coordinator after migrations and before browser routes admit work.
 
 This gate is mandatory dependency for later mutation boundaries: Task 9
 session/profile/run create, attach, transition, and stop; Task 10 action and
@@ -2008,6 +2624,7 @@ Close admission and coalesce reconciliation when service nonce changes."
 - Create: `apps/api/src/lib/browser-runtime/execution-adapter.test.ts`
 - Create: `apps/api/src/lib/browser-runtime/orchestrator.ts`
 - Create: `apps/api/src/lib/browser-runtime/orchestrator.test.ts`
+- Modify: `apps/api/src/lib/browser-state/types.ts`
 - Modify: `apps/api/src/lib/browser-state/store.ts`
 
 - [ ] **Step 1: Write adapter and orchestration tests**
@@ -2137,9 +2754,24 @@ Expected: FAIL because execution boundary and orchestrator do not exist.
 
 - [ ] **Step 3: Define exact prompt/code adapter types**
 
+In `browser-state/types.ts`, define `ObservationV1.result` through a type-only
+re-export of the API-owned Task 7 schema inference:
+
+```ts
+import type { BrowserOperationResultV1 } from
+  "../scrape-interact/browser-service-contracts";
+export type { BrowserOperationResultV1 };
+```
+
+Use this type for durable action rows, service results, and observations; do
+not add another result shape.
+
 ```ts
 import { z } from "zod";
-import type { BrowserOperation } from "../browser-state/types";
+import type {
+  BrowserOperation,
+  BrowserOperationResultV1,
+} from "../browser-state/types";
 
 const internalRefSchema = z.string().min(1).max(128);
 const internalTextSchema = z.string().max(20_000);
@@ -2211,7 +2843,7 @@ export type ObservationV1 =
       actionId: string;
       actionKind: BrowserOperation["kind"];
       outcome: "succeeded" | "rejected_no_effect" | "failed_no_effect";
-      result?: unknown;
+      result?: BrowserOperationResultV1;
       error?: { category: string; message: string };
       page: BoundedPageState;
     };
@@ -2448,7 +3080,10 @@ to `model_protocol_error`. `protocol.test.ts` locks every wire variant, both
 normalization special cases, all rejections, and proves internal evaluate args
 remain available to trusted API/Browser Service callers. `PromptRunInput`,
 `PromptRunResult`, action callbacks, ledger rows, and observations retain their
-existing shapes.
+existing shapes except that every action result now uses the strict bounded
+`BrowserOperationResultV1` from Locked private contracts. Protocol tests reject
+wrong kind/result pairs, cyclic/unsupported JSON-safe values, every bound
+overflow, and encoded observations over 64 KiB.
 
 Keep `CodeRunInput` restricted to run ID, language, source, deadline, and
 correlation ID. The public request cannot set model, effort, policy/schema
@@ -2500,7 +3135,7 @@ profile crash boundaries, and unavailable adapters.
 - [ ] **Step 6: Commit orchestration boundary**
 
 ```bash
-git add apps/api/src/lib/browser-runtime/protocol.ts apps/api/src/lib/browser-runtime/protocol.test.ts apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/lib/browser-runtime/orchestrator.test.ts apps/api/src/lib/browser-state/store.ts
+git add apps/api/src/lib/browser-runtime/protocol.ts apps/api/src/lib/browser-runtime/protocol.test.ts apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/lib/browser-runtime/orchestrator.test.ts apps/api/src/lib/browser-state/types.ts apps/api/src/lib/browser-state/store.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: coordinate local browser runs" -m "Create and stop durable browser sessions around one outer host adapter
 job with locked model, schema, observation, action, and turn policy.
@@ -2582,13 +3217,41 @@ it("drains in-flight callback mutation and rejects new capability issue", async 
   await callback;
   await drain.drained;
 });
+
+it("marks unsafe service output outcome unknown and never caches it", async () => {
+  browserClient.executeAction.mockRejectedValueOnce(
+    new BrowserServiceProtocolError("invalid bounded action result"),
+  );
+  await expect(coordinator.handleProposal(activeRun, evaluateProposal, context))
+    .rejects.toMatchObject({ category: "action_outcome_unknown" });
+  expect(await actionState(evaluateProposal.actionId)).toBe("outcome_unknown");
+  expect(await actionResult(evaluateProposal.actionId)).toBeNull();
+  expect(await runState(activeRun.id)).toBe("failed");
+  expect(await sessionState(activeRun.sessionId)).toBe("error");
+});
+
+it("persists only a validated bounded operation result", async () => {
+  browserClient.executeAction.mockResolvedValueOnce(validGetTextResult);
+  const observation = await coordinator.handleProposal(
+    activeRun, getTextProposal, context,
+  );
+  expect(observation.result).toEqual({ kind: "get_text", text: "bounded" });
+  expect(encodedBytes(observation)).toBeLessThanOrEqual(64 * 1024);
+  expect(await storedActionResult(getTextProposal.actionId))
+    .toEqual(observation.result);
+});
 ```
 
 Add tests for `prepared -> rejected_no_effect`, Browser Service proven
 `failed_no_effect`, pre-dispatch cancellation, same sequence/different hash,
 same action ID/different hash, duplicate side-effect hash after definite
 failure, repeated read-only hash, action 26, expired capability, owner/session/
-run/job/process mismatch, and callback cancellation.
+run/job/process mismatch, callback cancellation, wrong result discriminant,
+cyclic/undefined/symbol/bigint/non-finite values, 40,000-character `get_text`,
+32 KiB evaluate, 64 KiB result, 128 KiB service response, and 64 KiB
+observation boundaries. For every overflow/serialization failure after
+dispatch, assert `outcome_unknown`, no result cache, capability revocation,
+and terminal run/session.
 
 - [ ] **Step 2: Run tests and verify red**
 
@@ -2666,8 +3329,10 @@ For a new structurally valid proposal:
    `prepared -> executing`; release it before dispatch acquisition.
 4. Acquire a third mutation lease immediately before one
    `browserClient.executeAction()` call. Hold this bounded per-operation lease
-   through service result and `succeeded`/`failed_no_effect` completion, then
-   return matching observation.
+   through service result validation and `succeeded`/`failed_no_effect`
+   completion, then return matching observation. Parse operation-specific
+   `BrowserOperationResultV1`, enforce 64 KiB result, 128 KiB service response,
+   and 64 KiB observation before persisting any result.
 5. If gate closes after `executing` but before third lease, do not dispatch.
    Return `action_outcome_unknown`; drained startup recovery marks action/run/
    session terminal. This conservative state is required even though no effect
@@ -2676,6 +3341,12 @@ For a new structurally valid proposal:
    drained recovery as
    `outcome_unknown`, revoke capability, terminate run and browser session,
    and throw `action_outcome_unknown`. Never send that outcome to Codex.
+
+Malformed discriminants, cyclic/unsupported JSON-safe values, non-finite
+numbers, and any result/response/observation serialization or size failure
+after dispatch follow step 6. Evaluate is always potentially mutating even if
+its value serialization alone failed. These cases must never become
+`failed_no_effect` and must never populate service or API replay caches.
 
 Callback replay with matching identity/hash returns stored `succeeded`,
 `rejected_no_effect`, or `failed_no_effect` observation. A matching
@@ -2732,7 +3403,8 @@ pnpm --dir apps/api exec vitest run src/lib/browser-runtime/action-normalization
 Expected: PASS for every action transition, prepare-before-dispatch,
 execute-once, matching replay, mismatch, no-effect continuation, duplicate
 side-effect rejection, repeated read-only operations, cap, deadline,
-cancellation, unknown outcome termination, recovery, and redaction.
+cancellation, strict result validation/bounds, serialization ambiguity without
+caching, unknown outcome termination, recovery, and redaction.
 
 - [ ] **Step 8: Commit action coordinator**
 
@@ -3093,12 +3765,15 @@ Add restrictive viewer headers, origin checks, bounds, and revocation."
 - [ ] **Step 1: Write harness lifecycle tests**
 
 Prove the harness builds `firecrawl-local-browser-service:harness`, starts one
-unique container with generated service key and temporary state bind, exposes
-only a harness-only allocated loopback port, waits for authenticated liveness,
-passes exact API environment before API spawn, waits for API-confirmed matching
-readiness after API reconciliation, and removes its container/root
-on success, failure, or signal. If `TEST_BROWSER_SERVICE_URL` exists, require
-`TEST_BROWSER_SERVICE_API_KEY`, verify it, and never manage external resources.
+fresh uniquely named owned container per invocation with a generated service
+key, service-generated process nonce, generated state namespace, temporary
+state bind, disposable API database,
+and unique Compose/container project identity. Expose only a harness-owned
+allocated loopback port, wait for authenticated liveness, pass exact API
+environment before API spawn, wait for API-confirmed matching readiness after
+API reconciliation, and remove container/root/database on success, failure,
+or signal. Never reuse or attach to a pre-existing Browser Service, API
+database, state root, namespace, container, or port.
 
 ```ts
 it("registers cleanup before liveness wait", async () => {
@@ -3109,6 +3784,38 @@ it("registers cleanup before liveness wait", async () => {
     "remove-container", "remove-root",
   ]);
 });
+
+it("rejects every external Browser Service override", async () => {
+  for (const name of [
+    "TEST_BROWSER_SERVICE_URL",
+    "TEST_BROWSER_SERVICE_API_KEY",
+    "BROWSER_SERVICE_URL",
+    "BROWSER_SERVICE_API_KEY",
+    "LOCAL_BROWSER_STATE_ROOT",
+    "BROWSER_PROFILE_ROOT",
+    "BROWSER_STATE_NAMESPACE",
+    "TEST_APPLICATION_DATABASE_URL",
+    "APPLICATION_DATABASE_URL",
+  ]) {
+    await expect(startHarnessBrowserService(depsWithEnv({
+      [name]: "external-value",
+    }))).rejects.toMatchObject({
+      category: "harness_external_browser_override_rejected",
+    });
+    expect(containerRuntime.run).not.toHaveBeenCalled();
+  }
+});
+
+it("uses a fresh owned root namespace and API database each run", async () => {
+  const first = await startAndStopHarness();
+  const second = await startAndStopHarness();
+  expect(second.containerName).not.toBe(first.containerName);
+  expect(second.stateRoot).not.toBe(first.stateRoot);
+  expect(second.stateNamespace).not.toBe(first.stateNamespace);
+  expect(second.databaseName).not.toBe(first.databaseName);
+  expect(second.processNonce).not.toBe(first.processNonce);
+  expect(first.cleaned).toEqual({ container: true, root: true, database: true });
+});
 ```
 
 Add successful order assertion:
@@ -3118,23 +3825,25 @@ expect(events).toEqual([
   "browser:start",
   "browser:live",
   "api:start",
+  "api-process:operational-retention:start",
   "api-process:recovery",
   "api-process:cleanup-intents",
   "api-process:reconcile",
   "browser:ready",
   "api:admit",
-  "api-process:retention:start",
+  "api-process:browser-retention:start",
 ]);
 expect(harnessParent.interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
 expect(harnessParent.recoverCleanupIntents).not.toHaveBeenCalled();
 expect(harnessParent.startLocalRetentionService).not.toHaveBeenCalled();
 ```
 
-Add a blocked-reconciliation case and assert no
-`api-process:retention:start` event. Restart Browser Service once and assert
-one API-process recovery/reconciliation sequence, not one from harness parent
-plus one from API. These event assertions come from test-only API lifecycle
-notifications; harness never invokes those functions.
+Add a blocked-reconciliation case and assert operational/artifact retention
+started once but no `api-process:browser-retention:start` event. Restart
+Browser Service once and assert one API-process recovery/reconciliation
+sequence, not one from harness parent plus one from API. These event assertions
+come from test-only API lifecycle notifications; harness never invokes those
+functions.
 
 - [ ] **Step 2: Run test and verify red**
 
@@ -3150,37 +3859,60 @@ Build `apps/browser-service`, run on backend network with no published port,
 2 CPUs, 4 GiB memory/no swap, 1 GiB noexec/nosuid tmpfs, and shared
 `browser-state:/var/lib/firecrawl-browser`. Healthcheck authenticated live
 state only; API coordinator establishes ready state. Pass private URL/key and
-reconciliation limits to API. Keep `LOCAL_BROWSER_SERVICE_ENABLED=false` in
-both Compose and `.env.example.local`. Never mount Docker
+one operator-supplied canonical `BROWSER_STATE_NAMESPACE` to both API and
+Browser Service, plus reconciliation limits to API. Each namespace resolves
+below the volume root; neither process accepts a different root from a
+request. Keep `LOCAL_BROWSER_SERVICE_ENABLED=false` in both Compose and
+`.env.example.local`. Never mount Docker
 socket or adapter token in this task.
 
 - [ ] **Step 4: Implement exact harness lifecycle**
 
 Use argument arrays and existing container-runtime detection. Start Browser
 Service only for exact `pnpm test:snips:local-browser`; register cleanup before
-authenticated live wait. Return live handle and environment to harness, spawn
-API, then wait for authenticated ready whose nonce/digest equal coordinator's
-binding. Remove existing harness-parent imports/calls that run
+authenticated live wait. Before any build/run, reject the override variables
+listed in Step 1 when inherited from caller environment; the harness creates
+and overwrites none of them from external input. Generate cryptographically
+random invocation ID, service key, and state namespace. Create an empty
+mode-0700 temporary root owned by invocation and a fresh disposable PostgreSQL
+database; fail if root is not newly created, resolves outside harness temp
+parent, has unexpected entries, or database already exists. Container name,
+network/project identity, loopback port, bind source, API database URL, and
+namespace all derive from this invocation. Reconciliation is allowed only
+against this owned canonical root/namespace; never accept an arbitrary path or
+clean an unmanaged root.
+
+Browser Service alone generates its 32-byte process nonce. Harness reads it
+from authenticated live health, requires canonical 43-character base64url,
+requires it differs from every prior process in that invocation, and passes no
+nonce override. API reconciliation must bind that observed nonce.
+
+Return live handle and generated environment to harness, spawn API, then wait
+for authenticated ready whose nonce/digest equal coordinator's binding.
+Remove existing harness-parent imports/calls that run
 `interruptUnfinishedBrowserWork`, cleanup-intent recovery, or
-`createLocalRetentionService`; API `index.ts` coordinator is sole recovery and
-browser-retention owner. Never wait ready before API spawn and never start
-retention from harness. On cleanup, signal API and wait while its coordinator
-stops monitor/retention, then remove Browser Service before disposable
-PostgreSQL. Configure API and service with same temporary state root
-mapping. Missing Docker or Podman uses existing missing-runtime error; do not
-install or start an unmanaged process.
+`createLocalRetentionService`; API `index.ts` is sole operational, artifact,
+and browser-state retention owner. Never wait ready before API spawn and never
+start any retention from harness. On cleanup, signal API and wait while its
+coordinator stops monitor and its one retention service, remove Browser
+Service, remove owned root, then drop disposable PostgreSQL. Configure API and
+service with same generated state root mapping and namespace. Missing Docker
+or Podman uses existing missing-runtime error; do not install or start an
+unmanaged process.
 
 - [ ] **Step 5: Run harness and Compose checks**
 
 ```bash
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/harness-browser-service.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts
-docker compose --project-name firecrawl --project-directory . -f compose.yaml config --quiet
-docker compose --project-name firecrawl --project-directory . -f compose.yaml build browser-service api
+docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml config --quiet
+docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml build browser-service api
 ```
 
 Expected: lifecycle tests PASS in live/API-reconcile/ready order, Compose
 config exits 0, image builds from committed digest, Browser Service has no
-`ports`, feature remains false, and only API publishes `127.0.0.1:3002`.
+`ports`, feature remains false, only API publishes `127.0.0.1:3002`, override
+environment is rejected, two invocations share no identity/state/database,
+and cleanup removes only owned resources.
 
 - [ ] **Step 6: Commit runtime wiring**
 
@@ -3323,7 +4055,16 @@ and zero model-tool events."
 - [ ] Prepend installed Node `22.22.1`; assert `node --version` is
   `v22.22.1` and `corepack pnpm --version` is `10.33.0`.
 - [ ] Run Browser Service frozen install, test, and build through Corepack;
-  expect all PASS and no lockfile change.
+  expect all PASS and no lockfile change. `pnpm list --depth 0` must report the
+  11 exact direct versions from Task 1, including Vitest `4.1.9`; no direct
+  dependency may contain a range or tag.
+- [ ] Run Browser Service TypeScript tests only through `vitest run`; inspect
+  Tasks 1-6 files for explicit
+  `import { describe, expect, test, vi } from "vitest"`. Run only the two `.mjs`
+  bootstrap tests through `node --test`.
+- [ ] Run both independent private-contract inventory tests; expect Browser
+  Service and API normalized contracts/fingerprints equal the one canonical
+  V1 fixture and reject a one-field drift mutation.
 - [ ] Run `pnpm --dir apps/api build`; expect PASS.
 - [ ] Run Task 15 focused API tests; expect all PASS.
 - [ ] Run Task 8 database integration tests with `--no-file-parallelism`;
@@ -3331,16 +4072,29 @@ and zero model-tool events."
 - [ ] Run `pnpm --dir apps/api harness pnpm test:snips:local-browser`; expect
   lifecycle cases PASS and host execution unavailable until its plan lands.
 - [ ] Run
-  `docker compose --project-name firecrawl --project-directory . -f compose.yaml config --quiet`;
+  `docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml config --quiet`;
   expect exit 0.
 - [ ] Resolve Playwright raw manifest again; expect digest equals committed
   Dockerfile digest. Build Browser Service twice with `--pull --no-cache`;
   expect Node `v22.22.1`, Playwright `1.61.1`, and `pwuser` both times.
+- [ ] In both digest-pinned `browser-test` images, run real bundled-Chromium
+  egress tests. Require positive controls plus zero private HTTP/WS hits, proxy
+  observation/rejection for top-level and subresources across localhost,
+  127/8, link-local IPv4/IPv6, and DNS-private targets, and zero hardened
+  QUIC/WebRTC UDP packets. Missing proof is failure, never skip.
+- [ ] In both `browser-test` images, run replay restore tests. Require cookies,
+  localStorage, and IndexedDB equality immediately after `setStorageState`, no
+  pre-restore network, exact canonical byte/checksum equality, and zero profile
+  publication on mismatch/timeout/crash.
 - [ ] Run
-  `docker compose --project-name firecrawl --project-directory . -f compose.yaml build browser-service api`;
+  `docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml build browser-service api`;
   expect exit 0.
 - [ ] Inspect Compose; expect only API published on `127.0.0.1:3002`.
 - [ ] With flag false, expect typed local unavailable behavior and no fallback.
+- [ ] With browser flag false and local persistence enabled, advance one
+  retention interval; expect operational and artifact phases once, browser
+  phase zero, and no coordinator. With flag true, expect one API owner and no
+  harness/service retention owner.
 - [ ] With flag true and dependencies healthy, expect Browser lifecycle snips
   PASS; prompt/code remain typed unavailable until host adapter exists.
 - [ ] Restart Browser Service; expect nonce change closes API gate, old work is
@@ -3350,7 +4104,13 @@ and zero model-tool events."
   expect none.
 - [ ] Inspect action tests: every accepted proposal persists `prepared` before
   dispatch; matching known callback replays do not dispatch; hash mismatch
-  fails; `outcome_unknown` terminates run/session; no action auto-retries.
+  fails; each strict result/response cap is enforced; unsupported/cyclic/
+  non-finite/oversized post-dispatch output becomes uncached
+  `outcome_unknown` and terminates run/session; no action auto-retries.
+- [ ] Run harness twice with hostile inherited override variables. Expect
+  override rejection before container launch, then two clean runs with unique
+  container/project, nonce, namespace, root, port, key, and disposable API
+  database; cleanup removes only owned resources.
 - [ ] After host plan, run real Codex smoke three times; expect three PASS runs,
   contiguous ledgers, exact effect counts, zero tools/approvals, and cleanup.
 - [ ] Run `git status --short`; expect clean after each commit.
@@ -3381,7 +4141,9 @@ and zero model-tool events."
   implementation and tests.
 - Security: model receives no MCP, tools, browser transport, capability,
   endpoint, credential, shell, workspace, Docker, or arbitrary network;
-  Browser Service remains private and validates every egress destination.
+  Browser Service remains private, manually proxies Chromium with
+  `bypass:"<-loopback>"`, disables QUIC/non-proxied WebRTC UDP, and validates
+  every egress destination.
 - Rollout: real Codex smoke is defined here but cannot pass by skip; host plan
   must run it against active installed Codex under rolling capability gate
   before feature enablement.
@@ -3397,12 +4159,21 @@ and zero model-tool events."
   grants, artifact attachment, stop, and controller-facing writes all use
   short gate leases. Host execution and artifact streaming hold none; callback
   and gate-close races either drain known completion or recover conservatively.
-- Ownership and retries: API process alone owns recovery and browser retention;
-  harness owns process/container lifecycle only. Each cycle has 4 attempts,
+- Ownership and retries: API process alone owns operational, artifact, and
+  browser-state retention plus recovery; harness owns only fresh disposable
+  process/container/root/database lifecycle. Each cycle has 4 attempts,
   250/500/1,000 ms backoff, 60-second budget, and 30-second runtime cooldown.
 - Toolchain: every Browser Service install/test/build/start uses installed Node
   `22.22.1`, Corepack pnpm `10.33.0`, frozen lock, Playwright package/image
-  `1.61.1`, and committed Noble digest; two no-cache builds verify identities.
+  `1.61.1`, exact direct dependencies, Vitest `4.1.9`, and committed Noble
+  digest; two no-cache builds verify identities and real bundled Chromium.
+- Replay restore: existing generation plus checkpoint is rejected. Otherwise
+  `setStorageState` runs on an isolated egress-confined persistent context
+  immediately before export/network work; canonical accepted bytes/checksum
+  must match or all runtime/profile work is discarded without publication.
+- Contract drift: one canonical V1 inventory locks every route, field, type,
+  bound, status, header, and response cap; Browser Service and API consume and
+  fingerprint it independently.
 - Reconciliation safety: complete authority validates before deletion; only
   recognized old orphans enter same-root quarantine; exact retry is idempotent;
   wrong/conflicting nonce or corrupt/missing/unsafe state performs no deletion.
