@@ -1252,6 +1252,93 @@ assert.equal("CODEX_VERSION_OUTPUT" in contract, false);
 const primaryFailure = new Error("primary");
 const cleanupFailure = new Error("cleanup");
 assert.equal(combinePrimaryAndCleanup(primaryFailure), primaryFailure);
+for (const [code, detail, rendered] of [
+  [
+    "codex_version_changed",
+    "resolvedPath",
+    "codex_version_changed: resolvedPath\n",
+  ],
+  [
+    "codex_run_identity_reused",
+    "threadId",
+    "codex_run_identity_reused: threadId\n",
+  ],
+  [
+    "codex_protocol_schema_mismatch",
+    "ThreadStartParams",
+    "codex_protocol_schema_mismatch: ThreadStartParams\n",
+  ],
+  [
+    "codex_feature_surface_changed",
+    "browser_use",
+    "codex_feature_surface_changed: browser_use\n",
+  ],
+  [
+    "codex_turn_count_mismatch",
+    "1/2",
+    "codex_turn_count_mismatch: 1/2\n",
+  ],
+  [
+    "codex_forbidden_event",
+    "turn/tool-call",
+    "codex_forbidden_event: turn/tool-call\n",
+  ],
+  [
+    "codex_response_id_unknown",
+    "17",
+    "codex_response_id_unknown: 17\n",
+  ],
+  [
+    "codex_agent_message_count",
+    "2",
+    "codex_agent_message_count: 2\n",
+  ],
+  [
+    "codex_app_server_timeout",
+    "thread/start",
+    "codex_app_server_timeout: thread/start\n",
+  ],
+  [
+    "codex_forbidden_item",
+    "toolCall",
+    "codex_forbidden_item: toolCall\n",
+  ],
+  [
+    "codex_server_request",
+    "item/request",
+    "codex_server_request: item/request\n",
+  ],
+  [
+    "codex_app_server_exited",
+    "code=1 signal=null",
+    "codex_app_server_exited: code=1 signal=null\n",
+  ],
+  [
+    "codex_app_server_exited",
+    "stopped with pending requests=3",
+    "codex_app_server_exited: stopped with pending requests=3\n",
+  ],
+  [
+    "codex_spawn_failed",
+    "missing process group id",
+    "codex_spawn_failed: missing process group id\n",
+  ],
+  [
+    "codex_process_group_survived",
+    "801",
+    "codex_process_group_survived: 801\n",
+  ],
+  [
+    "codex_process_group_reused",
+    "802",
+    "codex_process_group_reused: 802\n",
+  ],
+  ["codex_gate_cancelled", "SIGTERM", "codex_gate_cancelled: SIGTERM\n"],
+]) {
+  const error = gateError(code, detail);
+  assert.equal(error.detail, detail);
+  assert.equal(lifecycle.renderGateFailure(error), rendered);
+}
 const sensitiveFailurePaths = [
   "/home/gate-user/.local/share/codex/0.144.6/bin/codex",
   "/home/gate-user/.codex",
@@ -1265,6 +1352,24 @@ assert.equal(
   lifecycle.renderGateFailure(sensitiveFailure),
   "codex_spawn_failed\n",
 );
+for (const code of [
+  "codex_command_timeout",
+  "codex_error_notification",
+  "codex_feature_surface_changed",
+  "codex_features_failed",
+  "codex_protocol_schema_mismatch",
+  "codex_response_error",
+  "codex_spawn_failed",
+  "codex_temp_root_survived",
+  "codex_version_changed",
+]) {
+  assert.equal(
+    lifecycle.renderGateFailure(
+      gateError(code, sensitiveFailurePaths.join(" ")),
+    ),
+    `${code}\n`,
+  );
+}
 assert.equal(
   lifecycle.renderGateFailure(
     new AggregateError(
@@ -1792,7 +1897,11 @@ assert.deepEqual(failedCalls, [
 
 const detailedError = gateError("code", "detail");
 assert.equal(detailedError.code, "code");
+assert.equal(detailedError.detail, "detail");
 assert.equal(detailedError.message, "code: detail");
+assert.throws(() => {
+  detailedError.detail = "mutated";
+}, TypeError);
 
 const disabledLines = contract.DISABLED_FEATURES.map(
   name => `${name}  experimental  false`,

@@ -231,6 +231,14 @@ export const ALLOWED_ITEM_TYPES = readonlySet(allowedItemTypes);
 export function gateError(code, detail) {
   const error = new Error(detail ? `${code}: ${detail}` : code);
   error.code = code;
+  if (detail !== undefined) {
+    Object.defineProperty(error, "detail", {
+      configurable: false,
+      enumerable: true,
+      value: detail,
+      writable: false,
+    });
+  }
   return error;
 }
 

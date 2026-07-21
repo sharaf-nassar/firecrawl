@@ -17,6 +17,7 @@ import {
   CLEANUP_TOTAL_GRACE_MS,
   gateError,
   MAX_OUTPUT_BYTES,
+  REQUIRED_SCHEMA_DEFINITIONS,
 } from "./gate-contract.mjs";
 
 const wait = milliseconds =>
@@ -315,6 +316,43 @@ const SAFE_AGGREGATE_CATEGORIES = new Set([
   "lifecycle_cleanup_failed",
   "operation_and_cleanup_failed",
 ]);
+const SAFE_SCHEMA_DETAILS = new Set(REQUIRED_SCHEMA_DEFINITIONS);
+const safeProtocolDetail = detail =>
+  detail.length <= 128 &&
+  /^[A-Za-z][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_.-]+)*$/.test(detail);
+const SAFE_DETAIL_VALIDATORS = Object.freeze({
+  codex_agent_message_count: detail => /^\d{1,10}$/.test(detail),
+  codex_app_server_exited: detail =>
+    /^(?:code=(?:null|-?\d{1,10}) signal=(?:null|SIG[A-Z0-9]{1,16})|stopped with pending requests=\d{1,10})$/.test(
+      detail,
+    ),
+  codex_app_server_timeout: safeProtocolDetail,
+  codex_feature_surface_changed: detail =>
+    /^[a-z][a-z0-9_-]{0,127}$/.test(detail),
+  codex_forbidden_event: safeProtocolDetail,
+  codex_forbidden_item: detail =>
+    /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(detail),
+  codex_gate_cancelled: detail =>
+    /^(?:SIGINT|SIGTERM|SIGHUP)$/.test(detail),
+  codex_process_group_reused: detail => /^\d{1,20}$/.test(detail),
+  codex_process_group_survived: detail => /^\d{1,20}$/.test(detail),
+  codex_protocol_schema_mismatch: detail => SAFE_SCHEMA_DETAILS.has(detail),
+  codex_response_id_unknown: detail => /^-?\d{1,20}$/.test(detail),
+  codex_run_identity_reused: detail =>
+    /^(?:root|markerPath|pid|threadId|actionId)$/.test(detail),
+  codex_server_request: safeProtocolDetail,
+  codex_spawn_failed: detail => detail === "missing process group id",
+  codex_turn_count_mismatch: detail => /^\d{1,10}\/\d{1,10}$/.test(detail),
+  codex_version_changed: detail =>
+    /^(?:executablePath|resolvedPath|device|inode|version)$/.test(detail),
+});
+
+function safeStructuredDetail(error) {
+  const validator = SAFE_DETAIL_VALIDATORS[error.code];
+  return typeof error.detail === "string" && validator?.(error.detail)
+    ? error.detail
+    : undefined;
+}
 
 export function renderGateFailure(error) {
   let category = "codex_gate_failed";
@@ -323,6 +361,8 @@ export function renderGateFailure(error) {
     /^[a-z][a-z0-9_]{0,127}$/.test(error.code)
   ) {
     category = error.code;
+    const detail = safeStructuredDetail(error);
+    if (detail !== undefined) category += `: ${detail}`;
   } else if (
     error instanceof AggregateError &&
     SAFE_AGGREGATE_CATEGORIES.has(error.message)
