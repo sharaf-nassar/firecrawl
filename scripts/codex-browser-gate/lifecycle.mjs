@@ -290,9 +290,7 @@ export function installSignalHandlers(registry, processLike = process) {
         await cleanupPromise;
       } catch (error) {
         if (processLike.stderr?.write) {
-          processLike.stderr.write(
-            `${error instanceof Error ? error.message : String(error)}\n`,
-          );
+          processLike.stderr.write(renderGateFailure(error));
         }
       } finally {
         restore();
@@ -309,6 +307,31 @@ export function installSignalHandlers(registry, processLike = process) {
     processLike.on(signal, listener);
   }
   return { restore };
+}
+
+const SAFE_AGGREGATE_CATEGORIES = new Set([
+  "cleanup_failed",
+  "gate_and_cleanup_failed",
+  "lifecycle_cleanup_failed",
+  "operation_and_cleanup_failed",
+]);
+
+export function renderGateFailure(error) {
+  let category = "codex_gate_failed";
+  if (
+    typeof error?.code === "string" &&
+    /^[a-z][a-z0-9_]{0,127}$/.test(error.code)
+  ) {
+    category = error.code;
+  } else if (
+    error instanceof AggregateError &&
+    SAFE_AGGREGATE_CATEGORIES.has(error.message)
+  ) {
+    category = error.message;
+  } else if (error instanceof AggregateError) {
+    category = "operation_and_cleanup_failed";
+  }
+  return `${category}\n`;
 }
 
 export function combinePrimaryAndCleanup(primary, cleanup) {
@@ -384,8 +407,8 @@ export function runCaptured(
       };
       void settle().catch(reject);
     };
-    child.on("error", error => {
-      finish(gateError("codex_spawn_failed", error.message), null, false);
+    child.on("error", () => {
+      finish(gateError("codex_spawn_failed"), null, false);
     });
     try {
       supervisor.ownProcessGroup(child, error => {
@@ -397,7 +420,7 @@ export function runCaptured(
       return;
     }
     watchdog = scheduleTimer(() => {
-      finish(gateError("codex_command_timeout", command), null, false);
+      finish(gateError("codex_command_timeout"), null, false);
     }, timeoutMs);
 
     const capture = target => chunk => {
@@ -607,8 +630,10 @@ export async function runLifecycleSelfTest({ silent = false } = {}) {
     },
   });
   const retainedPipeChild = fakeChild(801);
+  const sensitiveCommand =
+    "/home/gate-user/.local/share/codex/0.144.6/bin/codex";
   await assert.rejects(
-    runCaptured("fake-timeout", [], {
+    runCaptured(sensitiveCommand, [], {
       spawnChild: () => retainedPipeChild,
       supervisor: timeoutRegistry,
       timeoutMs: 1,
@@ -618,7 +643,12 @@ export async function runLifecycleSelfTest({ silent = false } = {}) {
       },
       cancelTimer() {},
     }),
-    /codex_command_timeout/,
+    error =>
+      error?.code === "codex_command_timeout" &&
+      error.message === "codex_command_timeout" &&
+      !error.message.includes(sensitiveCommand) &&
+      !error.message.includes("/home/gate-user") &&
+      !error.message.includes("/tmp/codex-browser-gate-secret"),
   );
   assert.deepEqual(timeoutGroups.alive, new Set());
   assert(timeoutGroups.signals.some(([, signal]) => signal === "SIGKILL"));
@@ -695,6 +725,40 @@ export async function runLifecycleSelfTest({ silent = false } = {}) {
     missingPidChild.emit("error", new Error("ENOENT"));
   });
   await assert.rejects(missingPidPromise, /codex_spawn_failed/);
+
+  const spawnGroups = createGroupHarness([809]);
+  const spawnRegistry = new LifecycleRegistry({
+    killProcess: spawnGroups.killProcess,
+    now: () => clock,
+    wait: async milliseconds => {
+      clock += milliseconds;
+    },
+  });
+  const spawnChild = fakeChild(809);
+  const spawnPromise = runCaptured(sensitiveCommand, [], {
+    cwd: "/tmp/codex-browser-gate-secret/work",
+    spawnChild: () => spawnChild,
+    supervisor: spawnRegistry,
+  });
+  queueMicrotask(() => {
+    spawnChild.emit(
+      "error",
+      new Error(
+        `spawn ${sensitiveCommand} from ` +
+          "/home/gate-user/.codex and /tmp/codex-browser-gate-secret",
+      ),
+    );
+  });
+  await assert.rejects(
+    spawnPromise,
+    error =>
+      error?.code === "codex_spawn_failed" &&
+      error.message === "codex_spawn_failed" &&
+      !error.message.includes(sensitiveCommand) &&
+      !error.message.includes("/home/gate-user") &&
+      !error.message.includes("/tmp/codex-browser-gate-secret"),
+  );
+  assert.deepEqual(spawnGroups.alive, new Set());
 
   const stubbornAlive = new Set([804]);
   const stubbornSignals = [];

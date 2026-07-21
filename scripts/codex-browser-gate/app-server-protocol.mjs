@@ -776,8 +776,8 @@ export class AppServerClient {
       this.handleLine(line);
     });
 
-    this.child.on("error", error => {
-      this.fail(gateError("codex_app_server_spawn_failed", error.message));
+    this.child.on("error", () => {
+      this.fail(gateError("codex_app_server_spawn_failed"));
     });
     try {
       this.supervisor.ownProcessGroup(this.child, error => this.fail(error));
@@ -2018,6 +2018,54 @@ export async function runTransportSelfTest({ silent = false } = {}) {
     };
     return fake;
   };
+  const sensitiveCommand =
+    "/home/gate-user/.local/share/codex/0.144.6/bin/codex";
+  const spawnErrorChild = appServerChild(608);
+  let spawnErrorGroupAlive = true;
+  const spawnErrorRegistry = new LifecycleRegistry({
+    killProcess(target, signal) {
+      assert.equal(target, -608);
+      if (signal === 0) {
+        if (!spawnErrorGroupAlive) {
+          const error = new Error("missing process group");
+          error.code = "ESRCH";
+          throw error;
+        }
+        return;
+      }
+      spawnErrorGroupAlive = false;
+    },
+  });
+  const spawnErrorClient = new AppServerClient({
+    command: sensitiveCommand,
+    cwd: "/tmp/codex-browser-gate-secret/work",
+    env: { CODEX_HOME: "/home/gate-user/.codex" },
+    eventsPath: "/tmp/codex-browser-gate-secret/events",
+    spawnChild: () => spawnErrorChild,
+    supervisor: spawnErrorRegistry,
+    scheduleTimer: () => 1,
+    cancelTimer() {},
+  });
+  spawnErrorChild.emit(
+    "error",
+    new Error(
+      `spawn ${sensitiveCommand} from ` +
+        "/home/gate-user/.codex and /tmp/codex-browser-gate-secret",
+    ),
+  );
+  spawnErrorChild.stdout.end();
+  spawnErrorChild.stderr.end();
+  spawnErrorChild.emit("close", null, null);
+  await assert.rejects(
+    spawnErrorClient.stop(),
+    error =>
+      error?.code === "codex_app_server_spawn_failed" &&
+      error.message === "codex_app_server_spawn_failed" &&
+      !error.message.includes(sensitiveCommand) &&
+      !error.message.includes("/home/gate-user") &&
+      !error.message.includes("/tmp/codex-browser-gate-secret"),
+  );
+  assert.equal(spawnErrorGroupAlive, false);
   const signalListenerCounts = ["SIGINT", "SIGTERM", "SIGHUP"].map(
     signal => process.listenerCount(signal),
   );

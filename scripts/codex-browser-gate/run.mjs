@@ -38,6 +38,7 @@ import {
   combinePrimaryAndCleanup,
   LifecycleRegistry,
   installSignalHandlers,
+  renderGateFailure,
   runCaptured,
   surfaceCleanupFailures,
 } from "./lifecycle.mjs";
@@ -49,6 +50,7 @@ import {
   hashFeatureInventory,
   MODEL,
 } from "./gate-contract.mjs";
+import { runGateWithStableCodex } from "./gate-orchestration.mjs";
 import { parseInvocation, runPreflight } from "./preflight.mjs";
 
 const INITIAL_OBSERVATION = {
@@ -406,32 +408,7 @@ async function runOne(runNumber, codexExecutablePath) {
   }
 }
 
-async function prepareGate(selection) {
-  await runPreflight();
-  return captureCodexIdentity({
-    ...selection,
-    supervisor: gateLifecycle,
-  });
-}
-
-async function main(runCount) {
-  const selection = {
-    pathValue: process.env.PATH,
-    cwd: process.cwd(),
-  };
-  const codexIdentity = await prepareGate(selection);
-
-  const results = [];
-  for (let runNumber = 1; runNumber <= runCount; runNumber += 1) {
-    results.push(await runOne(runNumber, codexIdentity.resolvedPath));
-  }
-  const postRunIdentity = await captureCodexIdentity({
-    ...selection,
-    supervisor: gateLifecycle,
-    failureCode: "codex_version_changed",
-  });
-  assertSameCodexIdentity(codexIdentity, postRunIdentity);
-
+function reportSuccess(runCount, codexIdentity, results) {
   for (const key of ["root", "markerPath", "pid", "threadId", "actionId"]) {
     if (new Set(results.map(result => result[key])).size !== results.length) {
       throw gateError("codex_run_identity_reused", key);
@@ -455,6 +432,24 @@ async function main(runCount) {
       `tools=${sum("tools")} approvals=${sum("approvals")} ` +
       `schema=${results[0].schemaHash} features=${results[0].featureHash}\n`,
   );
+}
+
+async function main(runCount) {
+  const selection = {
+    pathValue: process.env.PATH,
+    cwd: process.cwd(),
+  };
+  return runGateWithStableCodex({
+    selection,
+    supervisor: gateLifecycle,
+    runCount,
+    runPreflight,
+    captureCodexIdentity,
+    assertSameCodexIdentity,
+    runOne,
+    reportSuccess: (codexIdentity, results) =>
+      reportSuccess(runCount, codexIdentity, results),
+  });
 }
 
 const gateLifecycle = new LifecycleRegistry();
@@ -491,8 +486,6 @@ async function settleInvocation() {
 }
 
 settleInvocation().catch(error => {
-  process.stderr.write(
-    `${error instanceof Error ? error.message : String(error)}\n`,
-  );
+  process.stderr.write(renderGateFailure(error));
   process.exitCode = 1;
 });

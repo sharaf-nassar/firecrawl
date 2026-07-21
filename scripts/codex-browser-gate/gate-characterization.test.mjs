@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import * as contract from "./gate-contract.mjs";
 import * as codexExecutable from "./codex-executable.mjs";
 import * as decisionWire from "./decision-wire.mjs";
+import * as orchestration from "./gate-orchestration.mjs";
 import * as lifecycle from "./lifecycle.mjs";
 import * as protocol from "./app-server-protocol.mjs";
 import * as preflight from "./preflight.mjs";
@@ -33,6 +34,7 @@ const productionSourcePaths = [
   "codex-executable.mjs",
   "decision-wire.mjs",
   "gate-contract.mjs",
+  "gate-orchestration.mjs",
   "lifecycle.mjs",
   "preflight.mjs",
   "run.mjs",
@@ -1110,9 +1112,13 @@ assert.deepEqual(Object.keys(lifecycle).toSorted(), [
   "ProcessDeadline",
   "combinePrimaryAndCleanup",
   "installSignalHandlers",
+  "renderGateFailure",
   "runCaptured",
   "runLifecycleSelfTest",
   "surfaceCleanupFailures",
+]);
+assert.deepEqual(Object.keys(orchestration).toSorted(), [
+  "runGateWithStableCodex",
 ]);
 assert.deepEqual(Object.keys(protocol).toSorted(), [
   "AppServerClient",
@@ -1192,41 +1198,35 @@ for (const source of Object.values(productionSources)) {
   assert.doesNotMatch(source, /\bimport\s*\(/);
 }
 
-const prepareGateStart = runSource.indexOf("async function prepareGate");
-const prepareGateEnd = runSource.indexOf("async function main", prepareGateStart);
-assert.notEqual(prepareGateStart, -1);
-assert.notEqual(prepareGateEnd, -1);
-const prepareGateSource = runSource.slice(prepareGateStart, prepareGateEnd);
-const preflightCall = prepareGateSource.indexOf("await runPreflight()");
-const versionCall = prepareGateSource.indexOf(
-  "captureCodexIdentity({",
+const orchestrationSource = productionSources["gate-orchestration.mjs"];
+const preflightCall = orchestrationSource.indexOf("await runPreflight()");
+const versionCall = orchestrationSource.indexOf("captureCodexIdentity({");
+const firstRunCall = orchestrationSource.indexOf(
+  "runOne(runNumber, codexIdentity.resolvedPath)",
+);
+const postRunCapture = orchestrationSource.indexOf("const postRunIdentity");
+const identityAssertion = orchestrationSource.indexOf(
+  "assertSameCodexIdentity(codexIdentity, postRunIdentity)",
+);
+const reportCall = orchestrationSource.indexOf(
+  "return reportSuccess(codexIdentity, results)",
 );
 assert.notEqual(preflightCall, -1);
 assert.notEqual(versionCall, -1);
-assert.ok(preflightCall < versionCall);
-
-const mainSource = runSource.slice(prepareGateEnd);
-const firstRunCall = mainSource.indexOf(
-  "runOne(runNumber, codexIdentity.resolvedPath)",
-);
-const postRunCapture = mainSource.indexOf("const postRunIdentity");
-const identityAssertion = mainSource.indexOf(
-  "assertSameCodexIdentity(codexIdentity, postRunIdentity)",
-);
-const passWrite = mainSource.indexOf("process.stdout.write(");
 assert.notEqual(firstRunCall, -1);
 assert.notEqual(postRunCapture, -1);
 assert.notEqual(identityAssertion, -1);
-assert.notEqual(passWrite, -1);
+assert.notEqual(reportCall, -1);
+assert.ok(preflightCall < versionCall);
 assert.ok(firstRunCall < postRunCapture);
 assert.ok(postRunCapture < identityAssertion);
-assert.ok(identityAssertion < passWrite);
+assert.ok(identityAssertion < reportCall);
 assert.match(
-  mainSource.slice(postRunCapture, identityAssertion),
+  orchestrationSource.slice(postRunCapture, identityAssertion),
   /failureCode: "codex_version_changed"/,
 );
 assert.match(
-  mainSource.slice(postRunCapture, identityAssertion),
+  orchestrationSource.slice(postRunCapture, identityAssertion),
   /\.\.\.selection/,
 );
 assert.doesNotMatch(runSource, /runCaptured\("codex"/);
@@ -1235,7 +1235,9 @@ assert.doesNotMatch(
   /spawnChild\(\s*["']codex["']/,
 );
 assert.match(runSource, /command: codexExecutablePath/);
+assert.match(runSource, /runGateWithStableCodex\(\{/);
 assert.match(runSource, /version=\$\{codexIdentity\.version\}/);
+assert.match(runSource, /process\.stderr\.write\(renderGateFailure\(error\)\)/);
 assert.match(
   runSource,
   /runCaptured\(\s*codexExecutablePath,\s*\[\s*"app-server",\s*"generate-json-schema"/,
@@ -1250,6 +1252,43 @@ assert.equal("CODEX_VERSION_OUTPUT" in contract, false);
 const primaryFailure = new Error("primary");
 const cleanupFailure = new Error("cleanup");
 assert.equal(combinePrimaryAndCleanup(primaryFailure), primaryFailure);
+const sensitiveFailurePaths = [
+  "/home/gate-user/.local/share/codex/0.144.6/bin/codex",
+  "/home/gate-user/.codex",
+  "/tmp/codex-browser-gate-secret",
+];
+const sensitiveFailure = gateError(
+  "codex_spawn_failed",
+  sensitiveFailurePaths.join(" "),
+);
+assert.equal(
+  lifecycle.renderGateFailure(sensitiveFailure),
+  "codex_spawn_failed\n",
+);
+assert.equal(
+  lifecycle.renderGateFailure(
+    new AggregateError(
+      [sensitiveFailure],
+      `operation_and_cleanup_failed ${sensitiveFailurePaths.join(" ")}`,
+    ),
+  ),
+  "operation_and_cleanup_failed\n",
+);
+assert.equal(
+  lifecycle.renderGateFailure(new Error(sensitiveFailurePaths.join(" "))),
+  "codex_gate_failed\n",
+);
+for (const rendered of [
+  lifecycle.renderGateFailure(sensitiveFailure),
+  lifecycle.renderGateFailure(
+    new AggregateError([sensitiveFailure], "operation_and_cleanup_failed"),
+  ),
+  lifecycle.renderGateFailure(new Error(sensitiveFailurePaths.join(" "))),
+]) {
+  for (const path of sensitiveFailurePaths) {
+    assert.equal(rendered.includes(path), false);
+  }
+}
 assert.throws(
   () => surfaceCleanupFailures(primaryFailure, [cleanupFailure]),
   error =>
@@ -1630,6 +1669,106 @@ assert.deepEqual(calls, [
   ["hardening", { silent: true }],
   ["transport", { silent: true }],
   ["lifecycle", { silent: true }],
+]);
+
+const stableSelection = Object.freeze({
+  pathValue: "/selected/bin:/fallback/bin",
+  cwd: "/original/workspace",
+});
+const stableSupervisor = {};
+const initialIdentity = Object.freeze({
+  executablePath: "/selected/bin/codex",
+  resolvedPath: "/opt/codex/0.144.6/bin/codex",
+  device: "8",
+  inode: "1446",
+  version: "0.144.6",
+});
+const orchestrationCalls = [];
+let captureNumber = 0;
+const orchestrationResult = await orchestration.runGateWithStableCodex({
+  selection: stableSelection,
+  supervisor: stableSupervisor,
+  runCount: 2,
+  async runPreflight() {
+    orchestrationCalls.push("preflight");
+  },
+  async captureCodexIdentity(options) {
+    captureNumber += 1;
+    assert.equal(options.pathValue, stableSelection.pathValue);
+    assert.equal(options.cwd, stableSelection.cwd);
+    assert.equal(options.supervisor, stableSupervisor);
+    orchestrationCalls.push(
+      `capture:${options.failureCode ?? "initial"}`,
+    );
+    return { ...initialIdentity };
+  },
+  assertSameCodexIdentity(expected, actual) {
+    orchestrationCalls.push("compare");
+    assert.deepEqual(expected, initialIdentity);
+    assert.deepEqual(actual, initialIdentity);
+  },
+  async runOne(runNumber, command) {
+    orchestrationCalls.push(`run:${runNumber}:${command}`);
+    return { runNumber };
+  },
+  reportSuccess(identity, results) {
+    orchestrationCalls.push("report");
+    assert.deepEqual(identity, initialIdentity);
+    assert.deepEqual(results, [{ runNumber: 1 }, { runNumber: 2 }]);
+    return "reported";
+  },
+});
+assert.equal(captureNumber, 2);
+assert.equal(orchestrationResult, "reported");
+assert.deepEqual(orchestrationCalls, [
+  "preflight",
+  "capture:initial",
+  "run:1:/opt/codex/0.144.6/bin/codex",
+  "run:2:/opt/codex/0.144.6/bin/codex",
+  "capture:codex_version_changed",
+  "compare",
+  "report",
+]);
+
+const changedIdentityCalls = [];
+await assert.rejects(
+  orchestration.runGateWithStableCodex({
+    selection: stableSelection,
+    supervisor: stableSupervisor,
+    runCount: 1,
+    async runPreflight() {
+      changedIdentityCalls.push("preflight");
+    },
+    async captureCodexIdentity(options) {
+      changedIdentityCalls.push(
+        `capture:${options.failureCode ?? "initial"}`,
+      );
+      return options.failureCode
+        ? { ...initialIdentity, version: "0.144.7" }
+        : { ...initialIdentity };
+    },
+    assertSameCodexIdentity() {
+      changedIdentityCalls.push("compare");
+      throw gateError("codex_version_changed", "version");
+    },
+    async runOne() {
+      changedIdentityCalls.push("run");
+      return {};
+    },
+    reportSuccess() {
+      changedIdentityCalls.push("report");
+    },
+  }),
+  error =>
+    error?.code === "codex_version_changed" &&
+    error.message === "codex_version_changed: version",
+);
+assert.deepEqual(changedIdentityCalls, [
+  "preflight",
+  "capture:initial",
+  "run",
+  "capture:codex_version_changed",
+  "compare",
 ]);
 
 const failedCalls = [];
