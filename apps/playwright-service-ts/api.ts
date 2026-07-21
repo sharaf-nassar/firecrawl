@@ -23,6 +23,16 @@ const REPLAY_CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
 const PROXY_SERVER = process.env.PROXY_SERVER || null;
 const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD || null;
+const PROXY_COUNTRY = process.env.PROXY_COUNTRY?.toLowerCase() || undefined;
+type AggregateFailure = Error & { errors: unknown[] };
+const RuntimeAggregateError = (
+  globalThis as unknown as {
+    AggregateError: new (
+      errors: Iterable<unknown>,
+      message?: string,
+    ) => AggregateFailure;
+  }
+).AggregateError;
 const dnsLookupCache = new Map<string, { addresses: string[]; expiresAt: number }>();
 
 class InsecureConnectionError extends Error {
@@ -38,6 +48,24 @@ class CheckpointTooLargeError extends Error {
   constructor() {
     super('Replay checkpoint exceeds 2 MiB');
     this.name = 'CheckpointTooLargeError';
+  }
+}
+
+class CheckpointUnrepresentableError extends Error {
+  readonly category = 'checkpoint_unrepresentable';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckpointUnrepresentableError';
+  }
+}
+
+class CheckpointTimeoutError extends Error {
+  readonly category = 'checkpoint_timeout';
+
+  constructor() {
+    super('Replay checkpoint capture timed out');
+    this.name = 'CheckpointTimeoutError';
   }
 }
 
@@ -195,7 +223,15 @@ interface UrlModel {
   proxy_kind?: 'basic' | 'stealth' | 'enhanced' | 'auto';
   block_ads?: boolean;
   lockdown?: boolean;
+  capture_replay_timeout_ms?: number;
 }
+
+type AppliedProxyConfiguration = {
+  server: string | null;
+  username: string | null;
+  password: string | null;
+  country?: string;
+};
 
 type ReplayBrowserSettingsV1 = {
   headers: Record<string, string>;
@@ -252,6 +288,71 @@ const initializeBrowser = async () => {
   });
 };
 
+export function resolveAppliedBrowserSettings(
+  model: UrlModel,
+  userAgent: string,
+  proxyConfiguration: AppliedProxyConfiguration = {
+    server: PROXY_SERVER,
+    username: PROXY_USERNAME,
+    password: PROXY_PASSWORD,
+    country: PROXY_COUNTRY,
+  },
+): ReplayBrowserSettingsV1 {
+  const mobile = model.mobile === true;
+  const viewport = mobile
+    ? { width: 390, height: 844 }
+    : { width: 1280, height: 800 };
+  const requestedLanguages = model.location?.languages?.length
+    ? [...model.location.languages]
+    : ['en-US'];
+  const locale = requestedLanguages[0] ?? 'en-US';
+  const requestedCountry = model.location?.country?.toLowerCase();
+  const appliedCountry = proxyConfiguration.country?.toLowerCase();
+  if (
+    model.capture_replay_checkpoint &&
+    ((requestedLanguages.length > 1) ||
+      (requestedCountry !== undefined &&
+        requestedCountry !== 'us-generic' &&
+        requestedCountry !== appliedCountry) ||
+      model.lockdown === true)
+  ) {
+    throw new CheckpointUnrepresentableError(
+      'Requested settings are not exactly represented by applied browser context',
+    );
+  }
+  const deviceScaleFactor = mobile ? 3 : 1;
+  return {
+    headers: { ...(model.headers ?? {}) },
+    cookies: [],
+    viewport: {
+      ...viewport,
+      deviceScaleFactor,
+      isMobile: mobile,
+      hasTouch: mobile,
+    },
+    userAgent,
+    locale,
+    location: {
+      country: appliedCountry ?? 'us-generic',
+      languages: [locale],
+    },
+    proxy: {
+      // This service applies one static Playwright proxy. Requested auto,
+      // stealth, and enhanced modes cannot change that runtime truth.
+      kind: 'basic',
+      ...(appliedCountry ? { country: appliedCountry } : {}),
+      ...(proxyConfiguration.server &&
+      proxyConfiguration.username &&
+      proxyConfiguration.password
+        ? { credentialRef: 'proxy-credential:playwright-service' }
+        : {}),
+    },
+    skipTlsVerification: model.skip_tls_verification === true,
+    blockAds: model.block_ads !== false,
+    lockdown: false,
+  };
+}
+
 const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<{
   context: BrowserContext;
   securityState: ContextSecurityState;
@@ -261,27 +362,21 @@ const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<
     ? Object.entries(model.headers).find(([key]) => key.toLowerCase() === 'user-agent')?.[1]
     : undefined;
   const userAgent = userAgentOverride || new UserAgent().toString();
-  const mobile = model.mobile === true;
-  const viewport = mobile ? { width: 390, height: 844 } : { width: 1280, height: 800 };
-  const deviceScaleFactor = mobile ? 3 : 1;
-  const languages = model.location?.languages?.length
-    ? [...model.location.languages]
-    : ['en-US'];
-  const locale = languages[0] ?? 'en-US';
-  const country = model.location?.country?.toLowerCase() || 'us-generic';
-  const proxyKind = model.proxy_kind ?? 'basic';
-  const blockAds = model.block_ads !== false;
+  const browserSettings = resolveAppliedBrowserSettings(model, userAgent);
   const securityState: ContextSecurityState = {
     blockedNavigationRequestUrl: null,
   };
 
   const contextOptions: any = {
     userAgent,
-    viewport,
-    deviceScaleFactor,
-    isMobile: mobile,
-    hasTouch: mobile,
-    locale,
+    viewport: {
+      width: browserSettings.viewport.width,
+      height: browserSettings.viewport.height,
+    },
+    deviceScaleFactor: browserSettings.viewport.deviceScaleFactor,
+    isMobile: browserSettings.viewport.isMobile,
+    hasTouch: browserSettings.viewport.hasTouch,
+    locale: browserSettings.locale,
     ignoreHTTPSErrors: model.skip_tls_verification === true,
     serviceWorkers: 'block',
   };
@@ -325,7 +420,7 @@ const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<
     const requestUrl = new URL(requestUrlString);
     const hostname = normalizeHostname(requestUrl.hostname);
 
-    if (blockAds && AD_SERVING_DOMAINS.some(domain => hostname.includes(domain))) {
+    if (browserSettings.blockAds && AD_SERVING_DOMAINS.some(domain => hostname.includes(domain))) {
       console.log(hostname);
       return route.abort();
     }
@@ -335,34 +430,67 @@ const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<
   return {
     context: newContext,
     securityState,
-    browserSettings: {
-      headers: { ...(model.headers ?? {}) },
-      cookies: [],
-      viewport: {
-        ...viewport,
-        deviceScaleFactor,
-        isMobile: mobile,
-        hasTouch: mobile,
-      },
-      userAgent,
-      locale,
-      location: { country, languages },
-      proxy: {
-        kind: proxyKind,
-        ...(model.location?.country ? { country } : {}),
-        ...(PROXY_USERNAME && PROXY_PASSWORD
-          ? { credentialRef: 'proxy-credential:playwright-service' }
-          : {}),
-      },
-      skipTlsVerification: model.skip_tls_verification === true,
-      blockAds,
-      lockdown: model.lockdown === true,
-    },
+    browserSettings,
   };
 };
 
 const sha256 = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
+
+export async function captureWithDeadline<T>(
+  capture: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10_000) {
+    throw new CheckpointUnrepresentableError(
+      'Replay checkpoint timeout must be between 1 and 10000 milliseconds',
+    );
+  }
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      capture,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new CheckpointTimeoutError()), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+type Closeable = { close(): Promise<unknown> };
+
+export async function settleScrapeResources(
+  page: Closeable | null,
+  context: Closeable | null,
+  release: () => void,
+  primaryError?: unknown,
+): Promise<void> {
+  const errors: unknown[] = primaryError === undefined ? [] : [primaryError];
+  try {
+    if (page) await page.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    if (context) await context.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    release();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new RuntimeAggregateError(
+      errors,
+      'Scrape and resource cleanup failed',
+    );
+  }
+}
 
 const captureReplayCheckpoint = async (
   context: BrowserContext,
@@ -378,12 +506,6 @@ const captureReplayCheckpoint = async (
     throw new Error('Replay checkpoint viewport does not match runtime context');
   }
   const storageState = await context.storageState({ indexedDB: true });
-  const finalUrl = page.url();
-  const title = await page.title();
-  const bodyText = (await page.locator('body').innerText())
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 65_536);
   const serializedBytes = Buffer.byteLength(
     JSON.stringify({ storageState, browserSettings }),
     'utf8',
@@ -391,6 +513,19 @@ const captureReplayCheckpoint = async (
   if (serializedBytes > REPLAY_CHECKPOINT_MAX_BYTES) {
     throw new CheckpointTooLargeError();
   }
+  const finalUrl = page.url();
+  const title = await page.title();
+  if (Buffer.byteLength(title, 'utf8') > 65_536) {
+    throw new CheckpointTooLargeError();
+  }
+  const bodyText = await page.locator('body').evaluate(
+    (body, maximumLength) =>
+      (body as HTMLElement).innerText
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, maximumLength),
+    65_536,
+  );
   return {
     version: 1,
     storageState,
@@ -544,7 +679,8 @@ app.post('/scrape', async (req: Request, res: Response) => {
   let requestContext: BrowserContext | null = null;
   let securityState: ContextSecurityState | null = null;
   let page: Page | null = null;
-
+  let responsePayload: Record<string, unknown> | undefined;
+  let primaryError: unknown;
   try {
     // Extract user-agent from request headers (case-insensitive) so it can
     // be applied at the context level.  Playwright ignores user-agent in
@@ -586,51 +722,79 @@ app.post('/scrape', async (req: Request, res: Response) => {
     }
 
     const replayCheckpoint = capture_replay_checkpoint
-      ? await captureReplayCheckpoint(
-          requestContext,
-          page,
-          contextBundle.browserSettings,
+      ? await captureWithDeadline(
+          captureReplayCheckpoint(
+            requestContext,
+            page,
+            contextBundle.browserSettings,
+          ),
+          model.capture_replay_timeout_ms ?? 5_000,
         )
       : undefined;
 
-    res.json({
+    responsePayload = {
       content: result.content,
       pageStatusCode: result.status,
       contentType: result.contentType,
       ...(pageError && { pageError }),
       ...(replayCheckpoint ? { replayCheckpoint } : {}),
-    });
-
+    };
   } catch (error) {
-    if (error instanceof InsecureConnectionError) {
+    primaryError = error;
+  }
+  try {
+    await settleScrapeResources(
+      page,
+      requestContext,
+      () => pageSemaphore.release(),
+      primaryError,
+    );
+  } catch (error) {
+    primaryError = error;
+  }
+
+  if (primaryError !== undefined) {
+    const orderedErrors =
+      primaryError instanceof RuntimeAggregateError
+        ? primaryError.errors
+        : [primaryError];
+    const primary = orderedErrors[0];
+    if (primary instanceof InsecureConnectionError) {
       return res.json({
         content: '',
         pageStatusCode: 403,
-        pageError: error.message,
+        pageError: primary.message,
       });
     }
-    if (error instanceof CheckpointTooLargeError) {
-      return res.status(413).json({
-        errorCategory: error.category,
-        error: error.message,
+    if (
+      primary instanceof CheckpointTooLargeError ||
+      primary instanceof CheckpointUnrepresentableError ||
+      primary instanceof CheckpointTimeoutError
+    ) {
+      return res.status(primary instanceof CheckpointTooLargeError ? 413 : 422).json({
+        errorCategory: primary.category,
+        error: primary.message,
       });
     }
-    console.error('Scrape error:', error);
-    res.status(500).json({ error: 'An error occurred while fetching the page.' });
-  } finally {
-    if (page) await page.close();
-    if (requestContext) await requestContext.close();
-    pageSemaphore.release();
+    console.error('Scrape failed', {
+      categories: orderedErrors.map(error =>
+        error instanceof Error ? error.name : 'UnknownError',
+      ),
+    });
+    return res.status(500).json({
+      error: 'An error occurred while fetching the page.',
+    });
   }
-});
 
-app.listen(port, () => {
-  initializeBrowser().then(() => {
-    console.log(`Server is running on port ${port}`);
-  });
+  return res.json(responsePayload);
 });
 
 if (require.main === module) {
+  app.listen(port, () => {
+    initializeBrowser().then(() => {
+      console.log(`Server is running on port ${port}`);
+    });
+  });
   process.on('SIGINT', () => {
     shutdownBrowser().then(() => {
       console.log('Browser closed');

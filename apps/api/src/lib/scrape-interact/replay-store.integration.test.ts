@@ -8,6 +8,8 @@ import {
   readdir,
   rm,
   symlink,
+  utimes,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -224,30 +226,100 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     );
 
     const directory = path.join(root, "replay", ownerId, fixture.scrapeId);
-    expect(await readdir(directory)).toEqual(["storage-state.json"]);
-    expect(
-      JSON.parse(
-        await readFile(path.join(directory, "storage-state.json"), "utf8"),
-      ),
-    ).toEqual(replacement);
-    const rows = await pool.query(
-      "SELECT count(*)::int AS count FROM browser_replay_checkpoints",
+    const entries = await readdir(directory);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatch(/^[a-f0-9-]{36}\.json$/);
+    const rows = await pool.query<{ count: number; state_path: string }>(
+      `SELECT count(*)::int AS count, max(state_path) AS state_path
+       FROM browser_replay_checkpoints`,
     );
     expect(rows.rows[0].count).toBe(1);
+    expect(
+      JSON.parse(
+        await readFile(path.join(root, rows.rows[0]!.state_path), "utf8"),
+      ),
+    ).toEqual(replacement);
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "checkpoint",
+      checkpoint: { storageState: replacement },
+    });
   });
 
-  it("removes a newly written checkpoint when its transaction fails", async () => {
+  it("keeps the committed generation when a replacement transaction fails", async () => {
     const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    const before = await pool.query<{ state_path: string; checksum: string }>(
+      `SELECT state_path, checksum FROM browser_replay_checkpoints
+       WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
     const missingRequestId = randomUUID();
+    const failedReplacement = {
+      cookies: [],
+      origins: [{ origin: "https://example.com", localStorage: [] }],
+    };
 
     await expect(
       replayStore.persistScrapeReplayState(
-        input(fixture, { requestId: missingRequestId }),
+        input(fixture, {
+          requestId: missingRequestId,
+          replayCheckpoint: replayCheckpoint(failedReplacement),
+        }),
       ),
     ).rejects.toBeTruthy();
+    const after = await pool.query<{ state_path: string; checksum: string }>(
+      `SELECT state_path, checksum FROM browser_replay_checkpoints
+       WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    expect(after.rows[0]).toEqual(before.rows[0]);
     await expect(
-      lstat(path.join(root, "replay", ownerId, fixture.scrapeId)),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "checkpoint",
+      checkpoint: { storageState },
+    });
+    expect(
+      await readdir(path.join(root, "replay", ownerId, fixture.scrapeId)),
+    ).toHaveLength(1);
+  });
+
+  it("serializes concurrent replacements without orphaning generations", async () => {
+    const fixture = await createFixture();
+    const state = (value: string) => ({
+      cookies: [],
+      origins: [
+        {
+          origin: "https://example.com",
+          localStorage: [{ name: "winner", value }],
+        },
+      ],
+    });
+    const left = state("left");
+    const right = state("right");
+    await Promise.all([
+      replayStore.persistScrapeReplayState(
+        input(fixture, { replayCheckpoint: replayCheckpoint(left) }),
+      ),
+      replayStore.persistScrapeReplayState(
+        input(fixture, { replayCheckpoint: replayCheckpoint(right) }),
+      ),
+    ]);
+
+    const loaded = await replayStore.loadScrapeReplayState(
+      ownerId,
+      fixture.scrapeId,
+    );
+    expect(loaded.kind).toBe("checkpoint");
+    if (loaded.kind !== "checkpoint") throw new Error("checkpoint unavailable");
+    expect([left, right]).toContainEqual(loaded.checkpoint.storageState);
+    const entries = await readdir(
+      path.join(root, "replay", ownerId, fixture.scrapeId),
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatch(/^[a-f0-9-]{36}\.json$/);
   });
 
   it("rejects traversal, absolute paths, and symlinked descendants", async () => {
@@ -269,6 +341,93 @@ describeWithDatabase("scrape replay checkpoint store", () => {
       filesystem.writeCheckpoint(ownerId, randomUUID(), storageState),
     ).rejects.toThrow(/browser_state_unavailable/);
     await rm(outside, { recursive: true, force: true });
+  });
+
+  it("rejects symlink swaps and insecure existing directories", async () => {
+    const filesystem = new BrowserStateFilesystem(root);
+    const scrapeId = randomUUID();
+    const written = await filesystem.writeCheckpoint(
+      ownerId,
+      scrapeId,
+      storageState,
+    );
+    const target = path.join(root, written.pathId);
+    const outsideRoot = await mkdtemp(
+      path.join(tmpdir(), "firecrawl-replay-file-outside-"),
+    );
+    const outside = path.join(outsideRoot, "outside-state.json");
+    await writeFile(outside, JSON.stringify(storageState), { mode: 0o600 });
+    await rm(target);
+    await symlink(outside, target);
+    await expect(
+      filesystem.readCheckpoint(written.pathId, written.checksum),
+    ).rejects.toThrow(/browser_state_unavailable/);
+    await rm(outsideRoot, { recursive: true, force: true });
+
+    await rm(path.join(root, "replay"), { recursive: true, force: true });
+    await mkdir(path.join(root, "replay"), { mode: 0o755 });
+    await expect(
+      filesystem.writeCheckpoint(ownerId, randomUUID(), storageState),
+    ).rejects.toThrow(/browser_state_unavailable/);
+  });
+
+  it("removes only stale owned staging files", async () => {
+    const filesystem = new BrowserStateFilesystem(root);
+    const scrapeId = randomUUID();
+    const directory = path.join(root, "replay", ownerId, scrapeId);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const stale = path.join(
+      directory,
+      `.checkpoint-${randomUUID()}-99999999.staging`,
+    );
+    const live = path.join(
+      directory,
+      `.checkpoint-${randomUUID()}-${process.pid}.staging`,
+    );
+    await writeFile(stale, "stale", { mode: 0o600 });
+    await writeFile(live, "live", { mode: 0o600 });
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(stale, old, old);
+
+    await filesystem.writeCheckpoint(ownerId, scrapeId, storageState);
+    const entries = await readdir(directory);
+    expect(entries).not.toContain(path.basename(stale));
+    expect(entries).toContain(path.basename(live));
+  });
+
+  it("rejects request, scrape, and owner mismatches", async () => {
+    const fixture = await createFixture();
+    const other = await createFixture();
+    await expect(
+      replayStore.persistScrapeReplayState(
+        input(fixture, { requestId: other.requestId }),
+      ),
+    ).rejects.toThrow(/ownership/i);
+    await expect(
+      replayStore.persistScrapeReplayState(
+        input(fixture, { ownerId: randomUUID() }),
+      ),
+    ).rejects.toThrow(/ownership/i);
+    const rows = await pool.query(
+      "SELECT count(*)::int AS count FROM browser_replay_envelopes",
+    );
+    expect(rows.rows[0].count).toBe(0);
+  });
+
+  it("fails closed when durable ownership links disagree", async () => {
+    const fixture = await createFixture();
+    const other = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    await pool.query(
+      "UPDATE browser_replay_envelopes SET request_id = $2 WHERE scrape_id = $1",
+      [fixture.scrapeId, other.requestId],
+    );
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+    });
   });
 
   it("fails closed when the checkpoint checksum does not match", async () => {

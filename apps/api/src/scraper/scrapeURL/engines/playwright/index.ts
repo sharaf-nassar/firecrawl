@@ -5,12 +5,16 @@ import { Meta } from "../..";
 import { robustFetch } from "../../lib/fetch";
 import { getInnerJson } from "@mendable/firecrawl-rs";
 
-class CheckpointTooLargeError extends Error {
-  readonly category = "checkpoint_too_large";
-
-  constructor(message: string) {
+class CheckpointCaptureError extends Error {
+  constructor(
+    readonly category:
+      | "checkpoint_too_large"
+      | "checkpoint_unrepresentable"
+      | "checkpoint_timeout",
+    message: string,
+  ) {
     super(message);
-    this.name = "CheckpointTooLargeError";
+    this.name = "CheckpointCaptureError";
   }
 }
 
@@ -158,15 +162,20 @@ const scrapeResponseSchema = z.union([
     replayCheckpoint: replayCheckpointSchema.optional(),
   }),
   z.strictObject({
-    errorCategory: z.literal("checkpoint_too_large"),
+    errorCategory: z.enum([
+      "checkpoint_too_large",
+      "checkpoint_unrepresentable",
+      "checkpoint_timeout",
+    ]),
     error: z.string(),
   }),
 ]);
+const PLAYWRIGHT_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
 
 export async function scrapeURLWithPlaywright(
   meta: Meta,
 ): Promise<EngineScrapeResult> {
-  const rawResponse = await robustFetch({
+  const response = await robustFetch({
     url: config.PLAYWRIGHT_MICROSERVICE_URL!,
     headers: {
       "Content-Type": "application/json",
@@ -184,6 +193,7 @@ export async function scrapeURLWithPlaywright(
           }
         ).LOCAL_BROWSER_SERVICE_ENABLED === true &&
         !meta.internalOptions.zeroDataRetention,
+      capture_replay_timeout_ms: 5_000,
       mobile: meta.options.mobile,
       location: meta.options.location,
       proxy_kind: meta.options.proxy,
@@ -192,15 +202,16 @@ export async function scrapeURLWithPlaywright(
     },
     method: "POST",
     logger: meta.logger.child("scrapeURLWithPlaywright/robustFetch"),
-    schema: z.unknown(),
+    schema: scrapeResponseSchema,
     ignoreFailureStatus: true,
+    sensitiveResponse: true,
+    maxResponseBytes: PLAYWRIGHT_RESPONSE_MAX_BYTES,
     mock: meta.mock,
     abort: meta.abort.asSignal(),
   });
-  const response = scrapeResponseSchema.parse(rawResponse);
 
   if ("errorCategory" in response) {
-    throw new CheckpointTooLargeError(response.error);
+    throw new CheckpointCaptureError(response.errorCategory, response.error);
   }
 
   if (response.contentType?.includes("application/json")) {

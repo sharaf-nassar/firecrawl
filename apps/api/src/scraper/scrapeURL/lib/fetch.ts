@@ -25,7 +25,57 @@ type RobustFetchParams<Schema extends z.Schema<any>> = {
   mock: MockState | null;
   abort?: AbortSignal;
   useCacheableLookup?: boolean;
+  sensitiveResponse?: boolean;
+  maxResponseBytes?: number;
 };
+
+class ResponseTooLargeError extends Error {
+  readonly category = "response_too_large";
+
+  constructor(readonly status: number) {
+    super("Response exceeded configured byte limit");
+    this.name = "ResponseTooLargeError";
+  }
+}
+
+async function readResponseText(
+  response: Response,
+  maximumBytes: number | undefined,
+): Promise<string> {
+  if (maximumBytes === undefined) return response.text();
+  const contentLength = response.headers.get("content-length");
+  if (
+    contentLength !== null &&
+    Number.isSafeInteger(Number(contentLength)) &&
+    Number(contentLength) > maximumBytes
+  ) {
+    await response.body?.cancel();
+    throw new ResponseTooLargeError(response.status);
+  }
+  if (response.body === null) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel();
+        throw new ResponseTooLargeError(response.status);
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(
+    chunks.map(chunk => Buffer.from(chunk)),
+    total,
+  ).toString("utf8");
+}
 
 const robustAgent = new Agent({
   headersTimeout: 0,
@@ -62,8 +112,20 @@ export async function robustFetch<
   mock,
   abort,
   useCacheableLookup = true,
+  sensitiveResponse = false,
+  maxResponseBytes,
 }: RobustFetchParams<Schema>): Promise<Output> {
   abort?.throwIfAborted();
+  if (
+    sensitiveResponse &&
+    (maxResponseBytes === undefined ||
+      !Number.isSafeInteger(maxResponseBytes) ||
+      maxResponseBytes <= 0)
+  ) {
+    throw new TypeError(
+      "sensitiveResponse requires a positive maxResponseBytes",
+    );
+  }
 
   const params = {
     url,
@@ -78,25 +140,30 @@ export async function robustFetch<
     tryCount,
     tryCooldown,
     abort,
+    sensitiveResponse,
+    maxResponseBytes,
   };
 
   // omit pdf file content from logs
   const logParams = {
     ...params,
-    body: body?.input
-      ? {
-          ...body,
-          input: {
-            ...body.input,
-            file_content: undefined,
-          },
-        }
-      : body?.pdf
+    body: sensitiveResponse
+      ? "<redacted sensitive request>"
+      : body?.input
         ? {
             ...body,
-            pdf: undefined,
+            input: {
+              ...body.input,
+              file_content: undefined,
+            },
           }
-        : body,
+        : body?.pdf
+          ? {
+              ...body,
+              pdf: undefined,
+            }
+          : body,
+    headers: sensitiveResponse ? undefined : headers,
     logger: undefined,
   };
 
@@ -172,7 +239,18 @@ export async function robustFetch<
       return null as Output;
     }
 
-    const resp = await request.text();
+    let resp: string;
+    try {
+      resp = await readResponseText(request, maxResponseBytes);
+    } catch (error) {
+      if (error instanceof ResponseTooLargeError) {
+        logger.debug("Sensitive response exceeded byte limit", {
+          category: error.category,
+          status: error.status,
+        });
+      }
+      throw error;
+    }
     response = {
       status: request.status,
       headers: request.headers,
@@ -212,17 +290,33 @@ export async function robustFetch<
       ...matchingMocks[nextI].result,
       headers: new Headers(matchingMocks[nextI].result.headers),
     };
+    if (
+      maxResponseBytes !== undefined &&
+      Buffer.byteLength(response.body, "utf8") > maxResponseBytes
+    ) {
+      throw new ResponseTooLargeError(response.status);
+    }
   }
 
+  const responseDiagnostic = sensitiveResponse
+    ? { status: response.status }
+    : { status: response.status, body: response.body };
+
   if (response.status >= 300 && !ignoreFailureStatus) {
+    const failureDiagnostic = {
+      category: "response_status",
+      status: response.status,
+    };
     if (tryCount > 1) {
       logger.debug(
         "Request sent failure status, trying " + (tryCount - 1) + " more times",
-        {
-          params: logParams,
-          response: { status: response.status, body: response.body },
-          requestId,
-        },
+        sensitiveResponse
+          ? failureDiagnostic
+          : {
+              params: logParams,
+              response: responseDiagnostic,
+              requestId,
+            },
       );
       if (tryCooldown !== undefined) {
         let timeoutHandle: NodeJS.Timeout | null = null;
@@ -243,22 +337,29 @@ export async function robustFetch<
         mock,
       });
     } else {
-      logger.debug("Request sent failure status", {
-        params: logParams,
-        response: { status: response.status, body: response.body },
-        requestId,
-      });
+      logger.debug(
+        "Request sent failure status",
+        sensitiveResponse
+          ? failureDiagnostic
+          : {
+              params: logParams,
+              response: responseDiagnostic,
+              requestId,
+            },
+      );
       throw new Error("Request sent failure status", {
-        cause: {
-          params: logParams,
-          response: { status: response.status, body: response.body },
-          requestId,
-        },
+        cause: sensitiveResponse
+          ? failureDiagnostic
+          : {
+              params: logParams,
+              response: responseDiagnostic,
+              requestId,
+            },
       });
     }
   }
 
-  if (mock === null) {
+  if (mock === null && !sensitiveResponse) {
     await saveMock(
       {
         ...params,
@@ -273,18 +374,29 @@ export async function robustFetch<
   let data: Output;
   try {
     data = JSON.parse(response.body);
-  } catch (error) {
-    logger.debug("Request sent malformed JSON", {
-      params: logParams,
-      response: { status: response.status, body: response.body },
-      requestId,
-    });
+  } catch {
+    const malformedDiagnostic = {
+      category: "invalid_json",
+      status: response.status,
+    };
+    logger.debug(
+      "Request sent malformed JSON",
+      sensitiveResponse
+        ? malformedDiagnostic
+        : {
+            params: logParams,
+            response: responseDiagnostic,
+            requestId,
+          },
+    );
     throw new Error("Request sent malformed JSON", {
-      cause: {
-        params: logParams,
-        response,
-        requestId,
-      },
+      cause: sensitiveResponse
+        ? malformedDiagnostic
+        : {
+            params: logParams,
+            response: responseDiagnostic,
+            requestId,
+          },
     });
   }
 
@@ -292,10 +404,25 @@ export async function robustFetch<
     try {
       data = schema.parse(data);
     } catch (error) {
+      if (sensitiveResponse) {
+        const message =
+          error instanceof ZodError
+            ? "Response does not match provided schema"
+            : "Parsing response with provided schema failed";
+        const schemaDiagnostic = {
+          category:
+            error instanceof ZodError
+              ? "invalid_schema"
+              : "schema_parse_failed",
+          status: response.status,
+        };
+        logger.debug(message, schemaDiagnostic);
+        throw new Error(message, { cause: schemaDiagnostic });
+      }
       if (error instanceof ZodError) {
         logger.debug("Response does not match provided schema", {
           params: logParams,
-          response: { status: response.status, body: response.body },
+          response: responseDiagnostic,
           requestId,
           error,
           schema,
@@ -303,7 +430,7 @@ export async function robustFetch<
         throw new Error("Response does not match provided schema", {
           cause: {
             params: logParams,
-            response,
+            response: responseDiagnostic,
             requestId,
             error,
             schema,
@@ -312,7 +439,7 @@ export async function robustFetch<
       } else {
         logger.debug("Parsing response with provided schema failed", {
           params: logParams,
-          response: { status: response.status, body: response.body },
+          response: responseDiagnostic,
           requestId,
           error,
           schema,
@@ -320,7 +447,7 @@ export async function robustFetch<
         throw new Error("Parsing response with provided schema failed", {
           cause: {
             params: logParams,
-            response,
+            response: responseDiagnostic,
             requestId,
             error,
             schema,

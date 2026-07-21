@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import { config } from "../../config";
 import { db } from "../../db/connection";
@@ -85,6 +85,15 @@ interface PersistScrapeReplayStateInput {
   replayCheckpoint?: ReplayCheckpointCaptureV1;
 }
 
+class ReplayOwnershipError extends Error {
+  readonly category = "replay_ownership_mismatch";
+
+  constructor() {
+    super("Replay ownership does not match persisted scrape request");
+    this.name = "ReplayOwnershipError";
+  }
+}
+
 type BrowserRuntimeConfig = typeof config & {
   LOCAL_BROWSER_SERVICE_ENABLED?: boolean;
   LOCAL_BROWSER_STATE_ROOT?: string;
@@ -166,22 +175,38 @@ export async function persistScrapeReplayState(
     return { persisted: false, reason: "checkpoint_unavailable" };
   }
 
+  let oldPath: string | null;
   try {
-    await db.transaction(async tx => {
-      const [request] = await tx
+    oldPath = await db.transaction(async tx => {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.scrapeId}, 0))`,
+      );
+      const [ownedScrape] = await tx
         .select({ drCleanBy: schema.requests.dr_clean_by })
-        .from(schema.requests)
+        .from(schema.scrapes)
+        .innerJoin(
+          schema.requests,
+          eq(schema.requests.id, schema.scrapes.request_id),
+        )
         .where(
           and(
+            eq(schema.scrapes.id, input.scrapeId),
+            eq(schema.scrapes.request_id, input.requestId),
+            eq(schema.scrapes.team_id, input.ownerId),
             eq(schema.requests.id, input.requestId),
             eq(schema.requests.team_id, input.ownerId),
           ),
         )
         .limit(1);
-      if (!request) throw new Error("Replay request row is unavailable");
+      if (!ownedScrape) throw new ReplayOwnershipError();
+      const [existing] = await tx
+        .select({ statePath: schema.browser_replay_checkpoints.state_path })
+        .from(schema.browser_replay_checkpoints)
+        .where(eq(schema.browser_replay_checkpoints.scrape_id, input.scrapeId))
+        .limit(1);
 
       const expiresAt =
-        request.drCleanBy ??
+        ownedScrape.drCleanBy ??
         new Date(Date.now() + runtime.retentionDays * 86_400_000).toISOString();
       const now = new Date().toISOString();
       await tx
@@ -235,10 +260,22 @@ export async function persistScrapeReplayState(
             file_deleted_at: null,
           },
         });
+      return existing?.statePath ?? null;
     });
   } catch (error) {
-    await filesystem.delete(written.pathId);
+    try {
+      await filesystem.delete(written.pathId);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Replay transaction and new-generation cleanup failed",
+      );
+    }
     throw error;
+  }
+
+  if (oldPath && oldPath !== written.pathId) {
+    await filesystem.delete(oldPath);
   }
 
   return { persisted: true };
@@ -271,10 +308,31 @@ export async function loadScrapeReplayState(
         schema.browser_replay_envelopes.scrape_id,
       ),
     )
+    .innerJoin(
+      schema.scrapes,
+      eq(schema.scrapes.id, schema.browser_replay_envelopes.scrape_id),
+    )
+    .innerJoin(
+      schema.requests,
+      eq(schema.requests.id, schema.scrapes.request_id),
+    )
     .where(
       and(
         eq(schema.browser_replay_envelopes.owner_id, ownerId),
         eq(schema.browser_replay_envelopes.scrape_id, scrapeId),
+        eq(schema.browser_replay_checkpoints.owner_id, ownerId),
+        eq(
+          schema.browser_replay_checkpoints.request_id,
+          schema.browser_replay_envelopes.request_id,
+        ),
+        eq(schema.browser_replay_checkpoints.scrape_id, schema.scrapes.id),
+        eq(
+          schema.browser_replay_envelopes.request_id,
+          schema.scrapes.request_id,
+        ),
+        eq(schema.scrapes.team_id, ownerId),
+        eq(schema.requests.id, schema.scrapes.request_id),
+        eq(schema.requests.team_id, ownerId),
       ),
     )
     .limit(1);

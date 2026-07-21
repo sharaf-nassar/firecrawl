@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmod,
   lstat,
   mkdir,
   open,
+  readdir,
   realpath,
   rename,
   rmdir,
@@ -12,9 +12,12 @@ import {
 import { constants } from "node:fs";
 import path from "node:path";
 
-const CHECKPOINT_FILENAME = "storage-state.json";
 const CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
+const CHECKPOINT_READ_CHUNK_BYTES = 64 * 1024;
+const STAGING_STALE_MS = 60 * 60 * 1000;
 const SAFE_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const CHECKPOINT_FILENAME = /^[a-f0-9-]{36}\.json$/;
+const STAGING_FILENAME = /^\.checkpoint-([a-f0-9-]{36})-(\d+)\.staging$/;
 
 class BrowserStateUnavailableError extends Error {
   readonly category = "browser_state_unavailable";
@@ -62,7 +65,11 @@ function validatePathId(value: string): string[] {
     segments.some(
       (segment, index) =>
         !SAFE_PATH_SEGMENT.test(segment) &&
-        !(index === segments.length - 1 && segment === CHECKPOINT_FILENAME),
+        !(
+          index === segments.length - 1 &&
+          (CHECKPOINT_FILENAME.test(segment) ||
+            segment === "storage-state.json")
+        ),
     )
   ) {
     throw new BrowserStateUnavailableError("path ID contains unsafe segments");
@@ -93,6 +100,11 @@ export class BrowserStateFilesystem {
         "configured root is not a directory",
       );
     }
+    if ((stat.mode & 0o777) !== 0o700) {
+      throw new BrowserStateUnavailableError(
+        "configured root permissions must be 0700",
+      );
+    }
     const canonicalRoot = await realpath(this.#root);
     if (canonicalRoot !== this.#root) {
       throw new BrowserStateUnavailableError("configured root uses a symlink");
@@ -103,10 +115,8 @@ export class BrowserStateFilesystem {
   async #ensureDirectory(parent: string, segment: string): Promise<string> {
     validateSegment(segment, "directory");
     const candidate = path.join(parent, segment);
-    let created = false;
     try {
       await mkdir(candidate, { mode: 0o700 });
-      created = true;
     } catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") throw error;
     }
@@ -120,8 +130,35 @@ export class BrowserStateFilesystem {
         "state path escapes configured root",
       );
     }
-    if (created) await chmod(candidate, 0o700);
+    if ((stat.mode & 0o777) !== 0o700) {
+      throw new BrowserStateUnavailableError(
+        "state directory permissions must be 0700",
+      );
+    }
     return candidate;
+  }
+
+  async #removeStaleStaging(directory: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const currentUid = process.getuid?.();
+    for (const entry of entries) {
+      const match = STAGING_FILENAME.exec(entry.name);
+      if (!match || !entry.isFile()) continue;
+      const candidate = path.join(directory, entry.name);
+      const stat = await lstat(candidate);
+      if (
+        stat.isSymbolicLink() ||
+        !stat.isFile() ||
+        stat.nlink !== 1 ||
+        (stat.mode & 0o777) !== 0o600 ||
+        (currentUid !== undefined && stat.uid !== currentUid) ||
+        Date.now() - stat.mtimeMs < STAGING_STALE_MS ||
+        isProcessAlive(Number(match[2]))
+      ) {
+        continue;
+      }
+      await rm(candidate, { force: true });
+    }
   }
 
   #isBelowRoot(candidate: string): boolean {
@@ -169,28 +206,35 @@ export class BrowserStateFilesystem {
     const replay = await this.#ensureDirectory(root, "replay");
     const owner = await this.#ensureDirectory(replay, ownerId);
     const scrape = await this.#ensureDirectory(owner, scrapeId);
-    const target = path.join(scrape, CHECKPOINT_FILENAME);
-    const staging = path.join(scrape, `storage-state-${randomUUID()}.staging`);
+    await this.#removeStaleStaging(scrape);
+    const generationId = randomUUID();
+    const filename = `${generationId}.json`;
+    const target = path.join(scrape, filename);
+    const staging = path.join(
+      scrape,
+      `.checkpoint-${generationId}-${process.pid}.staging`,
+    );
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      try {
-        const existing = await lstat(target);
-        if (existing.isSymbolicLink() || !existing.isFile()) {
-          throw new BrowserStateUnavailableError(
-            "checkpoint target is not a regular file",
-          );
-        }
-      } catch (error) {
-        if (!isNodeError(error) || error.code !== "ENOENT") throw error;
-      }
-
       handle = await open(staging, "wx", 0o600);
       await handle.writeFile(bytes);
+      const staged = await handle.stat();
+      if (
+        !staged.isFile() ||
+        staged.nlink !== 1 ||
+        (staged.mode & 0o777) !== 0o600 ||
+        staged.size !== bytes.byteLength
+      ) {
+        throw new BrowserStateUnavailableError("staging file is invalid");
+      }
       await handle.sync();
       await handle.close();
       handle = undefined;
       await rename(staging, target);
-      const directory = await open(scrape, constants.O_RDONLY);
+      const directory = await open(
+        scrape,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
       try {
         await directory.sync();
       } finally {
@@ -206,7 +250,7 @@ export class BrowserStateFilesystem {
     }
 
     return {
-      pathId: path.posix.join("replay", ownerId, scrapeId, CHECKPOINT_FILENAME),
+      pathId: path.posix.join("replay", ownerId, scrapeId, filename),
       byteSize: bytes.byteLength,
       checksum: checksum(bytes),
     };
@@ -222,21 +266,56 @@ export class BrowserStateFilesystem {
     let file: string;
     try {
       file = await this.#resolveExisting(pathId);
-      const stat = await lstat(file);
-      if (
-        !stat.isFile() ||
-        (stat.mode & 0o777) !== 0o600 ||
-        stat.size > CHECKPOINT_MAX_BYTES
-      ) {
-        throw new BrowserStateUnavailableError("checkpoint file is invalid");
-      }
       const handle = await open(
         file,
         constants.O_RDONLY | constants.O_NOFOLLOW,
       );
       let bytes: Buffer;
       try {
-        bytes = await handle.readFile();
+        const before = await handle.stat();
+        if (
+          !before.isFile() ||
+          before.nlink !== 1 ||
+          (before.mode & 0o777) !== 0o600 ||
+          before.size > CHECKPOINT_MAX_BYTES
+        ) {
+          throw new BrowserStateUnavailableError("checkpoint file is invalid");
+        }
+        const chunks: Buffer[] = [];
+        let total = 0;
+        while (true) {
+          const buffer = Buffer.allocUnsafe(
+            Math.min(
+              CHECKPOINT_READ_CHUNK_BYTES,
+              CHECKPOINT_MAX_BYTES + 1 - total,
+            ),
+          );
+          const { bytesRead } = await handle.read(
+            buffer,
+            0,
+            buffer.length,
+            null,
+          );
+          if (bytesRead === 0) break;
+          total += bytesRead;
+          if (total > CHECKPOINT_MAX_BYTES) {
+            throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
+          }
+          chunks.push(buffer.subarray(0, bytesRead));
+        }
+        const after = await handle.stat();
+        if (
+          after.dev !== before.dev ||
+          after.ino !== before.ino ||
+          after.size !== before.size ||
+          after.mtimeMs !== before.mtimeMs ||
+          total !== before.size
+        ) {
+          throw new BrowserStateUnavailableError(
+            "checkpoint changed while being read",
+          );
+        }
+        bytes = Buffer.concat(chunks, total);
       } finally {
         await handle.close();
       }
@@ -288,4 +367,17 @@ export class BrowserStateFilesystem {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (!isNodeError(error)) throw error;
+    if (error.code === "ESRCH") return false;
+    if (error.code === "EPERM") return true;
+    throw error;
+  }
 }
