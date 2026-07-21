@@ -31,6 +31,7 @@ import {
 } from "vitest";
 
 import { runApplicationMigrations } from "../../db/migrate";
+import { runWithBrowserStateFilesystemContext } from "../browser-state/filesystem-store-internal";
 import { BrowserStateFilesystem } from "../browser-state/filesystem-store";
 
 const databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
@@ -113,6 +114,7 @@ function replayCheckpoint(state = storageState) {
 
 describe("BrowserStateFilesystem public interface", () => {
   it("exposes only the stable checkpoint methods and signatures", () => {
+    expect(BrowserStateFilesystem).toHaveLength(1);
     expect(
       Object.getOwnPropertyNames(BrowserStateFilesystem.prototype).sort(),
     ).toEqual(["constructor", "delete", "readCheckpoint", "writeCheckpoint"]);
@@ -127,6 +129,13 @@ describe("BrowserStateFilesystem public interface", () => {
     >().toEqualTypeOf<
       [ownerId: string, scrapeId: string, storageState: unknown]
     >();
+    expectTypeOf<
+      ConstructorParameters<typeof BrowserStateFilesystem>
+    >().toEqualTypeOf<[root: string]>();
+    if (false) {
+      // @ts-expect-error constructor intentionally accepts only the root
+      new BrowserStateFilesystem("/tmp/firecrawl-browser-state", {});
+    }
   });
 
   it("runs the internal handoff before the final generation is visible", async () => {
@@ -134,28 +143,111 @@ describe("BrowserStateFilesystem public interface", () => {
     const scrapeId = randomUUID();
     const marker = path.join(root, "durable-handoff.json");
     try {
-      const filesystem = new BrowserStateFilesystem(root, {
-        beforeCheckpointWrite: async checkpoint => {
-          await expect(
-            lstat(path.join(root, checkpoint.pathId)),
-          ).rejects.toMatchObject({ code: "ENOENT" });
-          const handle = await open(marker, "wx", 0o600);
-          try {
-            await handle.writeFile(JSON.stringify(checkpoint));
-            await handle.sync();
-          } finally {
-            await handle.close();
-          }
+      const filesystem = new BrowserStateFilesystem(root);
+      const written = await runWithBrowserStateFilesystemContext(
+        {
+          beforeCheckpointWrite: async checkpoint => {
+            await expect(
+              lstat(path.join(root, checkpoint.pathId)),
+            ).rejects.toMatchObject({ code: "ENOENT" });
+            const handle = await open(marker, "wx", 0o600);
+            try {
+              await handle.writeFile(JSON.stringify(checkpoint));
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          },
         },
-      });
-
-      const written = await filesystem.writeCheckpoint(
-        ownerId,
-        scrapeId,
-        storageState,
+        () => filesystem.writeCheckpoint(ownerId, scrapeId, storageState),
       );
 
       expect(JSON.parse(await readFile(marker, "utf8"))).toMatchObject(written);
+      await expect(
+        lstat(path.join(root, written.pathId)),
+      ).resolves.toBeTruthy();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates internal handoffs across concurrent checkpoint writes", async () => {
+    const leftRoot = await mkdtemp(path.join(tmpdir(), "firecrawl-left-"));
+    const rightRoot = await mkdtemp(path.join(tmpdir(), "firecrawl-right-"));
+    const leftScrapeId = randomUUID();
+    const rightScrapeId = randomUUID();
+    const observed = { left: [] as string[], right: [] as string[] };
+    let enterLeft!: () => void;
+    let releaseLeft!: () => void;
+    let observeLeftPlan!: () => void;
+    const leftEntered = new Promise<void>(resolve => {
+      enterLeft = resolve;
+    });
+    const leftReleased = new Promise<void>(resolve => {
+      releaseLeft = resolve;
+    });
+    const leftPlanObserved = new Promise<void>(resolve => {
+      observeLeftPlan = resolve;
+    });
+    const record =
+      (side: "left" | "right") => async (checkpoint: { pathId: string }) => {
+        observed[side].push(checkpoint.pathId);
+        if (checkpoint.pathId.includes(leftScrapeId)) observeLeftPlan();
+      };
+
+    try {
+      const leftFilesystem = new BrowserStateFilesystem(leftRoot);
+      const rightFilesystem = new BrowserStateFilesystem(rightRoot);
+      const left = runWithBrowserStateFilesystemContext(
+        { beforeCheckpointWrite: record("left") },
+        async () => {
+          enterLeft();
+          await leftReleased;
+          return leftFilesystem.writeCheckpoint(
+            ownerId,
+            leftScrapeId,
+            storageState,
+          );
+        },
+      );
+      await leftEntered;
+      const right = runWithBrowserStateFilesystemContext(
+        { beforeCheckpointWrite: record("right") },
+        async () => {
+          releaseLeft();
+          await leftPlanObserved;
+          return rightFilesystem.writeCheckpoint(
+            ownerId,
+            rightScrapeId,
+            storageState,
+          );
+        },
+      );
+
+      const [leftWritten, rightWritten] = await Promise.all([left, right]);
+      expect(observed).toEqual({
+        left: [leftWritten.pathId],
+        right: [rightWritten.pathId],
+      });
+    } finally {
+      releaseLeft?.();
+      observeLeftPlan?.();
+      await Promise.all([
+        rm(leftRoot, { recursive: true, force: true }),
+        rm(rightRoot, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  it("writes standalone checkpoints without internal coordination", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "firecrawl-standalone-"));
+    try {
+      const filesystem = new BrowserStateFilesystem(root);
+      const written = await filesystem.writeCheckpoint(
+        ownerId,
+        randomUUID(),
+        storageState,
+      );
       await expect(
         lstat(path.join(root, written.pathId)),
       ).resolves.toBeTruthy();
@@ -825,31 +917,34 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     const scrapeId = randomUUID();
     const scrapeDirectory = path.join(root, "replay", ownerId, scrapeId);
     let injected = false;
-    const filesystem = new BrowserStateFilesystem(root, {
-      syncDirectory: async directory => {
-        const entries = await readdir(directory).catch(() => []);
-        if (
-          directory === scrapeDirectory &&
-          entries.some(entry => /^[a-f0-9-]{36}\.json$/.test(entry)) &&
-          !injected
-        ) {
-          injected = true;
-          throw new Error("injected post-rename directory sync failure");
-        }
-        const handle = await open(
-          directory,
-          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-        );
-        try {
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-      },
-    });
+    const filesystem = new BrowserStateFilesystem(root);
 
     await expect(
-      filesystem.writeCheckpoint(ownerId, scrapeId, storageState),
+      runWithBrowserStateFilesystemContext(
+        {
+          syncDirectory: async directory => {
+            const entries = await readdir(directory).catch(() => []);
+            if (
+              directory === scrapeDirectory &&
+              entries.some(entry => /^[a-f0-9-]{36}\.json$/.test(entry)) &&
+              !injected
+            ) {
+              injected = true;
+              throw new Error("injected post-rename directory sync failure");
+            }
+            const handle = await open(
+              directory,
+              constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+            );
+            try {
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          },
+        },
+        () => filesystem.writeCheckpoint(ownerId, scrapeId, storageState),
+      ),
     ).rejects.toThrow(/browser_state_unavailable/);
     expect(injected).toBe(true);
     await expect(readdir(scrapeDirectory)).resolves.toEqual([]);
@@ -860,47 +955,54 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     const scrapeDirectory = path.join(root, "replay", ownerId, scrapeId);
     let target = "";
     let missingTargetSyncs = 0;
-    const filesystem = new BrowserStateFilesystem(root, {
-      syncDirectory: async directory => {
-        if (directory === scrapeDirectory && target) {
-          const targetMissing = await lstat(target).then(
-            () => false,
-            error => {
-              if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-                return true;
+    const filesystem = new BrowserStateFilesystem(root);
+    await runWithBrowserStateFilesystemContext(
+      {
+        syncDirectory: async directory => {
+          if (directory === scrapeDirectory && target) {
+            const targetMissing = await lstat(target).then(
+              () => false,
+              error => {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                  return true;
+                }
+                throw error;
+              },
+            );
+            if (targetMissing) {
+              missingTargetSyncs += 1;
+              if (missingTargetSyncs === 1) {
+                throw new Error("injected delete directory sync failure");
               }
-              throw error;
-            },
-          );
-          if (targetMissing) {
-            missingTargetSyncs += 1;
-            if (missingTargetSyncs === 1) {
-              throw new Error("injected delete directory sync failure");
             }
           }
-        }
-        const handle = await open(
-          directory,
-          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-        );
-        try {
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
+          const handle = await open(
+            directory,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
+          try {
+            await handle.sync();
+          } finally {
+            await handle.close();
+          }
+        },
       },
-    });
-    const written = await filesystem.writeCheckpoint(
-      ownerId,
-      scrapeId,
-      storageState,
-    );
-    target = path.join(root, written.pathId);
+      async () => {
+        const written = await filesystem.writeCheckpoint(
+          ownerId,
+          scrapeId,
+          storageState,
+        );
+        target = path.join(root, written.pathId);
 
-    await expect(filesystem.delete(written.pathId)).rejects.toThrow(
-      /injected delete directory sync failure/,
+        await expect(filesystem.delete(written.pathId)).rejects.toThrow(
+          /injected delete directory sync failure/,
+        );
+        await expect(
+          filesystem.delete(written.pathId),
+        ).resolves.toBeUndefined();
+      },
     );
-    await expect(filesystem.delete(written.pathId)).resolves.toBeUndefined();
     expect(missingTargetSyncs).toBe(2);
   });
 

@@ -13,6 +13,11 @@ import {
 import { constants } from "node:fs";
 import path from "node:path";
 
+import {
+  prepareBrowserStateCheckpoint,
+  syncBrowserStateDirectory,
+} from "./filesystem-store-internal";
+
 const CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
 const CHECKPOINT_READ_CHUNK_BYTES = 64 * 1024;
 const STAGING_STALE_MS = 60 * 60 * 1000;
@@ -86,13 +91,6 @@ interface BrowserStateCheckpointPlan {
   checksum: string;
 }
 
-interface BrowserStateFilesystemOptions {
-  syncDirectory?: (directory: string) => Promise<void>;
-  beforeCheckpointWrite?: (
-    checkpoint: BrowserStateCheckpointPlan,
-  ) => Promise<void>;
-}
-
 interface ProcessIdentity {
   bootId: string;
   startTime: string;
@@ -112,12 +110,8 @@ async function syncDirectory(directory: string): Promise<void> {
 
 export class BrowserStateFilesystem {
   readonly #root: string;
-  readonly #syncDirectory: (directory: string) => Promise<void>;
-  readonly #beforeCheckpointWrite?: (
-    checkpoint: BrowserStateCheckpointPlan,
-  ) => Promise<void>;
 
-  constructor(root: string, options: BrowserStateFilesystemOptions = {}) {
+  constructor(root: string) {
     if (
       !path.isAbsolute(root) ||
       path.resolve(root) === path.parse(root).root
@@ -127,8 +121,6 @@ export class BrowserStateFilesystem {
       );
     }
     this.#root = path.resolve(root);
-    this.#syncDirectory = options.syncDirectory ?? syncDirectory;
-    this.#beforeCheckpointWrite = options.beforeCheckpointWrite;
   }
 
   async #ensureRoot(): Promise<string> {
@@ -156,8 +148,8 @@ export class BrowserStateFilesystem {
         );
       }
       if (created) {
-        await this.#syncDirectory(candidate);
-        await this.#syncDirectory(current);
+        await syncBrowserStateDirectory(candidate, syncDirectory);
+        await syncBrowserStateDirectory(current, syncDirectory);
       }
       current = candidate;
     }
@@ -205,8 +197,8 @@ export class BrowserStateFilesystem {
       );
     }
     if (created) {
-      await this.#syncDirectory(candidate);
-      await this.#syncDirectory(parent);
+      await syncBrowserStateDirectory(candidate, syncDirectory);
+      await syncBrowserStateDirectory(parent, syncDirectory);
     }
     return candidate;
   }
@@ -286,7 +278,7 @@ export class BrowserStateFilesystem {
         stat = await lstat(candidate);
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
-          await this.#syncDirectory(current);
+          await syncBrowserStateDirectory(current, syncDirectory);
           return;
         }
         throw error;
@@ -302,7 +294,7 @@ export class BrowserStateFilesystem {
       }
       current = candidate;
     }
-    await this.#syncDirectory(current);
+    await syncBrowserStateDirectory(current, syncDirectory);
   }
 
   async writeCheckpoint(
@@ -324,7 +316,7 @@ export class BrowserStateFilesystem {
       byteSize: bytes.byteLength,
       checksum: checksum(bytes),
     } satisfies BrowserStateCheckpointPlan;
-    await this.#beforeCheckpointWrite?.(plan);
+    await prepareBrowserStateCheckpoint(plan);
 
     const root = await this.#ensureRoot();
     const replay = await this.#ensureDirectory(root, "replay");
@@ -356,7 +348,7 @@ export class BrowserStateFilesystem {
       handle = undefined;
       await rename(staging, target);
       renamedGeneration = true;
-      await this.#syncDirectory(scrape);
+      await syncBrowserStateDirectory(scrape, syncDirectory);
     } catch (error) {
       const primary =
         error instanceof BrowserStateUnavailableError
@@ -373,7 +365,7 @@ export class BrowserStateFilesystem {
       await rm(renamedGeneration ? target : staging, { force: true }).catch(
         removeError => cleanupErrors.push(removeError),
       );
-      await this.#syncDirectory(scrape).catch(syncError =>
+      await syncBrowserStateDirectory(scrape, syncDirectory).catch(syncError =>
         cleanupErrors.push(syncError),
       );
       if (cleanupErrors.length > 0) {
@@ -493,7 +485,7 @@ export class BrowserStateFilesystem {
     }
     await rm(file);
     const scrapeDirectory = path.dirname(file);
-    await this.#syncDirectory(scrapeDirectory);
+    await syncBrowserStateDirectory(scrapeDirectory, syncDirectory);
     let removedDirectory = false;
     await rmdir(scrapeDirectory)
       .then(() => {
@@ -509,7 +501,10 @@ export class BrowserStateFilesystem {
         }
       });
     if (removedDirectory) {
-      await this.#syncDirectory(path.dirname(scrapeDirectory));
+      await syncBrowserStateDirectory(
+        path.dirname(scrapeDirectory),
+        syncDirectory,
+      );
     }
   }
 }

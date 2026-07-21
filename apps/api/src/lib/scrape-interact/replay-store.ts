@@ -5,6 +5,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { config } from "../../config";
 import { db } from "../../db/connection";
 import * as schema from "../../db/schema";
+import { runWithBrowserStateFilesystemContext } from "../browser-state/filesystem-store-internal";
 import { BrowserStateFilesystem } from "../browser-state/filesystem-store";
 import { logger as rootLogger } from "../logger";
 import {
@@ -299,71 +300,75 @@ export async function persistScrapeReplayState(
   }
 
   let prepared: PreparedCheckpoint | undefined;
-  const filesystem = new BrowserStateFilesystem(runtime.root, {
-    beforeCheckpointWrite: async plan => {
-      const checkpoint: StoredReplayCheckpoint = {
-        version: 1,
-        statePath: plan.pathId,
-        storageState: input.replayCheckpoint!.storageState,
-        finalUrl: input.replayCheckpoint!.finalUrl,
-        fingerprint: input.replayCheckpoint!.fingerprint,
-        checksum: plan.checksum,
-        byteSize: plan.byteSize,
-      };
-      const validated = resolveReplayEnvelope({
-        url: input.url,
-        options: input.options,
-        callerOrigin: input.callerOrigin,
-        browserSettings: input.replayCheckpoint!.browserSettings,
-        checkpoint,
-      });
-      if (validated.kind !== "checkpoint") {
-        throw new ReplayCheckpointValidationError();
-      }
-
-      const cleanupIntentId = randomUUID();
-      await db.transaction(async tx => {
-        await lockScrape(tx, input.scrapeId);
-        const [ownedScrape] = await tx
-          .select({ id: schema.scrapes.id })
-          .from(schema.scrapes)
-          .innerJoin(
-            schema.requests,
-            eq(schema.requests.id, schema.scrapes.request_id),
-          )
-          .where(
-            and(
-              eq(schema.scrapes.id, input.scrapeId),
-              eq(schema.scrapes.request_id, input.requestId),
-              eq(schema.scrapes.team_id, input.ownerId),
-              eq(schema.requests.id, input.requestId),
-              eq(schema.requests.team_id, input.ownerId),
-            ),
-          )
-          .limit(1);
-        if (!ownedScrape) throw new ReplayOwnershipError();
-        await tx
-          .insert(schema.browser_replay_checkpoint_cleanup_intents)
-          .values({
-            id: cleanupIntentId,
-            scrape_id: input.scrapeId,
-            owner_id: input.ownerId,
-            state_path: plan.pathId,
-            checksum: plan.checksum,
-            state: "preparing",
-          });
-      });
-      prepared = { cleanupIntentId, validated };
-    },
-  });
+  const filesystem = new BrowserStateFilesystem(runtime.root);
 
   let written: Awaited<ReturnType<BrowserStateFilesystem["writeCheckpoint"]>>;
 
   try {
-    written = await filesystem.writeCheckpoint(
-      input.ownerId,
-      input.scrapeId,
-      input.replayCheckpoint.storageState,
+    written = await runWithBrowserStateFilesystemContext(
+      {
+        beforeCheckpointWrite: async plan => {
+          const checkpoint: StoredReplayCheckpoint = {
+            version: 1,
+            statePath: plan.pathId,
+            storageState: input.replayCheckpoint!.storageState,
+            finalUrl: input.replayCheckpoint!.finalUrl,
+            fingerprint: input.replayCheckpoint!.fingerprint,
+            checksum: plan.checksum,
+            byteSize: plan.byteSize,
+          };
+          const validated = resolveReplayEnvelope({
+            url: input.url,
+            options: input.options,
+            callerOrigin: input.callerOrigin,
+            browserSettings: input.replayCheckpoint!.browserSettings,
+            checkpoint,
+          });
+          if (validated.kind !== "checkpoint") {
+            throw new ReplayCheckpointValidationError();
+          }
+
+          const cleanupIntentId = randomUUID();
+          await db.transaction(async tx => {
+            await lockScrape(tx, input.scrapeId);
+            const [ownedScrape] = await tx
+              .select({ id: schema.scrapes.id })
+              .from(schema.scrapes)
+              .innerJoin(
+                schema.requests,
+                eq(schema.requests.id, schema.scrapes.request_id),
+              )
+              .where(
+                and(
+                  eq(schema.scrapes.id, input.scrapeId),
+                  eq(schema.scrapes.request_id, input.requestId),
+                  eq(schema.scrapes.team_id, input.ownerId),
+                  eq(schema.requests.id, input.requestId),
+                  eq(schema.requests.team_id, input.ownerId),
+                ),
+              )
+              .limit(1);
+            if (!ownedScrape) throw new ReplayOwnershipError();
+            await tx
+              .insert(schema.browser_replay_checkpoint_cleanup_intents)
+              .values({
+                id: cleanupIntentId,
+                scrape_id: input.scrapeId,
+                owner_id: input.ownerId,
+                state_path: plan.pathId,
+                checksum: plan.checksum,
+                state: "preparing",
+              });
+          });
+          prepared = { cleanupIntentId, validated };
+        },
+      },
+      () =>
+        filesystem.writeCheckpoint(
+          input.ownerId,
+          input.scrapeId,
+          input.replayCheckpoint!.storageState,
+        ),
     );
   } catch (error) {
     if (error instanceof ReplayCheckpointValidationError) {
