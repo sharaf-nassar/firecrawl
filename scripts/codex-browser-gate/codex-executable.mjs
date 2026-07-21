@@ -70,6 +70,14 @@ export async function captureCodexIdentity({
     } catch {
       throw gateError(failureCode);
     }
+    const verifiedStat = await statFile(selected.resolvedPath);
+    if (
+      !verifiedStat.isFile() ||
+      String(verifiedStat.dev) !== String(selected.executableStat.dev) ||
+      String(verifiedStat.ino) !== String(selected.executableStat.ino)
+    ) {
+      throw gateError(failureCode);
+    }
     return Object.freeze({
       executablePath: selected.executablePath,
       resolvedPath: selected.resolvedPath,

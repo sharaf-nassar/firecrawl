@@ -86,6 +86,7 @@ assert.deepEqual(calls, [
   ["realpath", "/active/codex"],
   ["stat", "/opt/codex/0.144.6/codex"],
   ["run", "/opt/codex/0.144.6/codex", ["--version"]],
+  ["stat", "/opt/codex/0.144.6/codex"],
 ]);
 assert.equal(calls.some(call => String(call[1]).includes("newer")), false);
 
@@ -113,6 +114,47 @@ const raceIdentity = await captureCodexIdentity({
 assert.equal(raceCommand, "/opt/codex/0.144.6/codex");
 assert.equal(raceIdentity.executablePath, "/active/codex");
 assert.equal(raceIdentity.resolvedPath, "/opt/codex/0.144.6/codex");
+
+for (const failureCode of [
+  "codex_version_mismatch",
+  "codex_version_changed",
+]) {
+  for (const [name, replacementStat] of [
+    ["non-file", { isFile: () => false, dev: 8n, ino: 1446n }],
+    ["device", { isFile: () => true, dev: 9n, ino: 1446n }],
+    ["inode", { isFile: () => true, dev: 8n, ino: 1447n }],
+  ]) {
+    const statResults = [
+      { isFile: () => true, dev: 8n, ino: 1446n },
+      replacementStat,
+    ];
+    let versionRuns = 0;
+    await assert.rejects(
+      captureCodexIdentity({
+        pathValue: "/active",
+        cwd: "/workspace",
+        supervisor: {},
+        failureCode,
+        async accessFile() {},
+        async realpathFile() {
+          return "/opt/codex/0.144.6/codex";
+        },
+        async statFile() {
+          return statResults.shift();
+        },
+        async runCommand() {
+          versionRuns += 1;
+          return { code: 0, stdout: "codex-cli 0.144.6\n", stderr: "" };
+        },
+      }),
+      error =>
+        error?.code === failureCode && error.message === failureCode,
+      `${name} replacement maps to ${failureCode}`,
+    );
+    assert.equal(statResults.length, 0);
+    assert.equal(versionRuns, 1);
+  }
+}
 
 function missingError(code = "ENOENT") {
   const error = new Error("private filesystem detail");
