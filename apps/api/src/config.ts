@@ -136,6 +136,10 @@ const configSchema = z.object({
 
   // Local application persistence and artifact storage
   LOCAL_PERSISTENCE_ENABLED: z.stringbool().default(false),
+  LOCAL_BROWSER_SERVICE_ENABLED: z.stringbool().default(false),
+  LOCAL_BROWSER_STATE_ROOT: emptyStringAsDefault(
+    z.string().default("/var/lib/firecrawl-browser"),
+  ),
   APPLICATION_DATABASE_URL: emptyStringAsUndefined(z.string().url()),
   LOCAL_OWNER_ID: emptyStringAsUndefined(z.string().uuid()),
   ARTIFACT_STORE_PROVIDER: emptyStringAsDefault(

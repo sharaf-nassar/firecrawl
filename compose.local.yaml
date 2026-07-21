@@ -34,6 +34,8 @@ services:
     environment:
       USE_DB_AUTHENTICATION: "false"
       LOCAL_PERSISTENCE_ENABLED: ${LOCAL_PERSISTENCE_ENABLED}
+      LOCAL_BROWSER_SERVICE_ENABLED: "false"
+      LOCAL_BROWSER_STATE_ROOT: ${LOCAL_BROWSER_STATE_ROOT:-/var/lib/firecrawl-browser}
       APPLICATION_DATABASE_URL: "postgresql://${APP_POSTGRES_USER}:${APP_POSTGRES_PASSWORD}@app-postgres:5432/${APP_POSTGRES_DB}"
       LOCAL_OWNER_ID: ${LOCAL_OWNER_ID}
       LOCAL_RECORD_RETENTION_DAYS: ${LOCAL_RECORD_RETENTION_DAYS}
@@ -44,6 +46,8 @@ services:
       ARTIFACT_MINIO_SECRET_KEY: ${ARTIFACT_MINIO_SECRET_KEY}
       ARTIFACT_MINIO_BUCKET: ${ARTIFACT_MINIO_BUCKET}
       ARTIFACT_MINIO_REGION: ${ARTIFACT_MINIO_REGION}
+    volumes:
+      - browser-state:/var/lib/firecrawl-browser
 
   app-postgres:
     image: postgres:17.10-bookworm
@@ -189,3 +193,4 @@ volumes:
   nuq-postgres-data:
   app-postgres-data:
   minio-data:
+  browser-state:

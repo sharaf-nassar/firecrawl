@@ -1,7 +1,11 @@
+import path from "node:path";
+
 import { z } from "zod";
 
 export type LocalRuntimeConfigSource = {
   LOCAL_PERSISTENCE_ENABLED?: boolean;
+  LOCAL_BROWSER_SERVICE_ENABLED?: boolean;
+  LOCAL_BROWSER_STATE_ROOT?: string;
   APPLICATION_DATABASE_URL?: string;
   LOCAL_OWNER_ID?: string;
   ARTIFACT_STORE_PROVIDER?: "none" | "minio" | "gcs";
@@ -60,6 +64,16 @@ const endpointUrlSchema = z.string().url();
 export function resolveLocalRuntimeConfig(
   source: LocalRuntimeConfigSource,
 ): LocalRuntimeConfig {
+  const browserServiceEnabled = source.LOCAL_BROWSER_SERVICE_ENABLED === true;
+  const browserStateRoot =
+    source.LOCAL_BROWSER_STATE_ROOT ?? "/var/lib/firecrawl-browser";
+
+  if (browserServiceEnabled && source.LOCAL_PERSISTENCE_ENABLED !== true) {
+    throw new LocalRuntimeConfigurationError([
+      "LOCAL_PERSISTENCE_ENABLED must be true when LOCAL_BROWSER_SERVICE_ENABLED=true",
+    ]);
+  }
+
   if (source.LOCAL_PERSISTENCE_ENABLED !== true) {
     return { enabled: false };
   }
@@ -70,6 +84,16 @@ export function resolveLocalRuntimeConfig(
   const recordRetentionDays = source.LOCAL_RECORD_RETENTION_DAYS ?? 30;
   const artifactRetentionDays = source.LOCAL_ARTIFACT_RETENTION_DAYS ?? 30;
   const artifactProvider = source.ARTIFACT_STORE_PROVIDER ?? "none";
+
+  if (
+    browserServiceEnabled &&
+    (!path.isAbsolute(browserStateRoot) ||
+      path.resolve(browserStateRoot) === path.parse(browserStateRoot).root)
+  ) {
+    issues.push(
+      "LOCAL_BROWSER_STATE_ROOT must be absolute and non-root when LOCAL_BROWSER_SERVICE_ENABLED=true",
+    );
+  }
 
   if (!applicationDatabaseUrl) {
     issues.push(

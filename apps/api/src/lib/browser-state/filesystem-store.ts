@@ -110,6 +110,69 @@ async function syncDirectory(directory: string): Promise<void> {
 export class BrowserStateFilesystem {
   readonly #root: string;
 
+  static async health(root: string): Promise<void> {
+    let filesystem: BrowserStateFilesystem;
+    try {
+      filesystem = new BrowserStateFilesystem(root);
+    } catch (error) {
+      if (error instanceof BrowserStateUnavailableError) throw error;
+      throw new BrowserStateUnavailableError("health check failed", {
+        cause: error,
+      });
+    }
+
+    let probe: string | undefined;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      const canonicalRoot = await filesystem.#ensureRoot();
+      probe = path.join(canonicalRoot, `.health-${randomUUID()}.probe`);
+      handle = await open(probe, "wx", 0o600);
+      await handle.chmod(0o600);
+      const probeStat = await handle.stat();
+      if (
+        !probeStat.isFile() ||
+        probeStat.nlink !== 1 ||
+        (probeStat.mode & 0o777) !== 0o600
+      ) {
+        throw new BrowserStateUnavailableError("health probe is invalid");
+      }
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await syncDirectory(canonicalRoot);
+      await rm(probe);
+      probe = undefined;
+      await syncDirectory(canonicalRoot);
+    } catch (error) {
+      const cleanupErrors: unknown[] = [];
+      if (handle) {
+        await handle
+          .close()
+          .catch(closeError => cleanupErrors.push(closeError));
+      }
+      if (probe) {
+        await rm(probe, { force: true }).catch(removeError =>
+          cleanupErrors.push(removeError),
+        );
+      }
+      if (
+        error instanceof BrowserStateUnavailableError &&
+        cleanupErrors.length === 0
+      ) {
+        throw error;
+      }
+      throw new BrowserStateUnavailableError("health check failed", {
+        cause:
+          cleanupErrors.length === 0
+            ? error
+            : new AggregateError(
+                [error, ...cleanupErrors],
+                "Browser state health check and cleanup failed",
+              ),
+      });
+    }
+  }
+
   constructor(root: string) {
     if (
       !path.isAbsolute(root) ||

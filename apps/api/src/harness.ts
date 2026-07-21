@@ -8,6 +8,7 @@ import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
 import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
 import { createSharedShutdown } from "./harness-shutdown";
+import { BrowserStateFilesystem } from "./lib/browser-state/filesystem-store";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
 import { logger as applicationLogger } from "./lib/logger";
 import {
@@ -679,10 +680,8 @@ async function setupApplicationPostgres(): Promise<void> {
   await runApplicationMigrations(config);
   logger.success("Application database migrations applied");
 
-  const browserServiceEnabled = (
-    config as typeof config & { LOCAL_BROWSER_SERVICE_ENABLED?: boolean }
-  ).LOCAL_BROWSER_SERVICE_ENABLED;
-  if (browserServiceEnabled === true) {
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED) {
+    await BrowserStateFilesystem.health(config.LOCAL_BROWSER_STATE_ROOT);
     const { interruptUnfinishedBrowserWork } = await import(
       "./lib/browser-state/store.js"
     );
