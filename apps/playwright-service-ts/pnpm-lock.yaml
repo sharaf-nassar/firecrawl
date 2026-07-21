@@ -23,7 +23,7 @@ importers:
         specifier: ^2.3.0
         version: 2.3.0
       playwright:
-        specifier: ^1.58.1
+        specifier: 1.58.1
         version: 1.58.1
       user-agents:
         specifier: ^1.1.669
