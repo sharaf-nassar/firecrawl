@@ -1297,11 +1297,11 @@ test("live precedes reconciliation while all browser work stays closed", async (
 
 test("shutdown closes health listener before draining admitted work", async () => {
   const accepted = pauseAfterAuthentication("/v1/sessions", validCreate);
-  await server.beginShutdown();
-  await expect(getPrivate("/health/live")).rejects.toMatchObject({
-    code: expect.stringMatching(/ECONNREFUSED|ECONNRESET/),
-  });
-  await expect(accepted.continueToAdmission()).resolves.toMatchObject({
+  const shutdown = server.beginShutdown();
+  await server.listenerClosed();
+  await accepted.continueToAdmission();
+  await shutdown;
+  expect(accepted.response()).toMatchObject({
     status: 503,
     body: { category: "reconciliation_required" },
   });
@@ -1354,11 +1354,16 @@ deadline capped at 60 seconds, nonce, schema, and digest before calling
 `reconcileBrowserState()`. Every create/action/grant/artifact/stream/profile
 route invokes `requireReady()` before touching registry or filesystem.
 
-`SIGTERM` closes listener first, then calls `beginDraining()` to reject
-already accepted but not admitted creates/actions/reconciliation,
-closes streams, closes Chromium with bounded profile save, then closes server
-and timers. Live remains process liveness; ready never performs a disposable
-session and never becomes true without current nonce/digest reconciliation.
+`beginShutdown()` synchronously closes admission and initiates listener close,
+then returns one idempotent full-shutdown promise. `listenerClosed()` resolves
+only after listener accepts no new connections. Previously accepted requests
+then reach closed `requireReady()` admission and settle; shutdown does not wait
+for them before they are released. After accepted requests settle, close
+streams, close Chromium with bounded profile save, stop timers, and resolve
+full-shutdown promise. `SIGTERM` invokes `beginShutdown()` once. Live remains
+process liveness only while listener serves it; ready never performs a
+disposable session and never becomes true without current nonce/digest
+reconciliation.
 
 - [ ] **Step 6: Resolve immutable Playwright base and add container image**
 
