@@ -17,6 +17,118 @@ function replaySettings() {
   );
 }
 
+function createPostStorageCaptureHarness(options: {
+  onStorageState?: () => void;
+  lateTargetType?: string;
+  omitLateTargetContext?: boolean;
+  failLateTargetInventory?: boolean;
+  writerReappearances?: number;
+  writerNeverTerminates?: boolean;
+  includeMixedUnknownTarget?: boolean;
+}) {
+  const commands: string[] = [];
+  let storageStateMaterialized = false;
+  let terminationAttempts = 0;
+  let fingerprintReads = 0;
+  const page = {
+    viewportSize: () => ({ width: 1280, height: 800 }),
+    url: () => 'https://example.com/final',
+    title: async () => {
+      fingerprintReads += 1;
+      return 'title';
+    },
+    locator: () => ({
+      evaluate: async () => {
+        fingerprintReads += 1;
+        return 'body';
+      },
+    }),
+  };
+  const session = {
+    send: async (method: string) => {
+      commands.push(method);
+      if (method === 'Target.getTargetInfo') {
+        return {
+          targetInfo: {
+            targetId: 'page-target',
+            type: 'page',
+            browserContextId: 'context-1',
+          },
+        };
+      }
+      if (method === 'Target.getTargets') {
+        if (storageStateMaterialized && options.failLateTargetInventory) {
+          throw new Error('secret target inventory failure');
+        }
+        const lateTargetVisible =
+          storageStateMaterialized &&
+          options.lateTargetType &&
+          (options.writerNeverTerminates ||
+            terminationAttempts <= (options.writerReappearances ?? 0));
+        return {
+          targetInfos: [
+            {
+              targetId: 'page-target',
+              type: 'page',
+              browserContextId: 'context-1',
+            },
+            ...(lateTargetVisible
+              ? [
+                  {
+                    targetId: 'late-target',
+                    type: options.lateTargetType,
+                    ...(!options.omitLateTargetContext
+                      ? { browserContextId: 'context-1' }
+                      : {}),
+                  },
+                ]
+              : []),
+            ...(storageStateMaterialized && options.includeMixedUnknownTarget
+              ? [
+                  {
+                    targetId: 'mixed-unknown-target',
+                    type: 'unknown_writer',
+                    browserContextId: 'context-1',
+                  },
+                ]
+              : []),
+          ],
+        };
+      }
+      if (method === 'Storage.getUsageAndQuota') return { usage: 0 };
+      if (method === 'Target.attachToTarget') {
+        return { sessionId: 'late-writer-session' };
+      }
+      if (
+        method === 'Target.sendMessageToTarget' ||
+        method === 'Target.closeTarget'
+      ) {
+        terminationAttempts += 1;
+        return { success: true };
+      }
+      return {};
+    },
+    detach: async () => undefined,
+  };
+  const context = {
+    pages: () => [page],
+    serviceWorkers: () => [],
+    newCDPSession: async () => session,
+    storageState: async () => {
+      options.onStorageState?.();
+      storageStateMaterialized = true;
+      return { cookies: [], origins: [] };
+    },
+  };
+  return {
+    commands,
+    context,
+    page,
+    fingerprintReads: () => fingerprintReads,
+    terminationAttempts: () => terminationAttempts,
+  };
+}
+
 test('records applied static proxy truth instead of requested proxy metadata', () => {
   const settings = resolveAppliedBrowserSettings(
     {
@@ -176,7 +288,17 @@ test('rejects trusted Chromium quota before materializing indexedDB', async () =
           },
         };
       }
-      if (method === 'Target.getTargets') return { targetInfos: [] };
+      if (method === 'Target.getTargets') {
+        return {
+          targetInfos: [
+            {
+              targetId: 'page-target',
+              type: 'page',
+              browserContextId: 'context-1',
+            },
+          ],
+        };
+      }
       if (method === 'Storage.getUsageAndQuota') {
         return {
           usage: 2_097_153,
@@ -243,6 +365,11 @@ test('rejects unexpected service-worker writers before storage capture', async (
         if (method === 'Target.getTargets') {
           return {
             targetInfos: [
+              {
+                targetId: 'page-target',
+                type: 'page',
+                browserContextId: 'context-1',
+              },
               {
                 targetId: 'service-worker-target',
                 type: 'service_worker',
@@ -321,6 +448,258 @@ test('rejects an origin overflow that races with page freezing', async () => {
   assert.equal(freezeCalls, 1);
 });
 
+test('rejects a 129th origin during storage-state materialization', async () => {
+  const origins = new Set(
+    Array.from({ length: 128 }, (_, index) => `https://origin-${index}.example`),
+  );
+  let overflow = false;
+  const harness = createPostStorageCaptureHarness({
+    onStorageState: () => {
+      overflow = true;
+    },
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      origins,
+      () => overflow,
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+test('rejects a new origin during storage-state materialization', async () => {
+  const origins = new Set(['https://example.com']);
+  const harness = createPostStorageCaptureHarness({
+    onStorageState: () => {
+      origins.add('https://late.example');
+    },
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      origins,
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+for (const targetType of [
+  'worker',
+  'shared_worker',
+  'service_worker',
+  'background_page',
+]) {
+  test(`terminates and rejects a late Chromium ${targetType} target`, async () => {
+    const harness = createPostStorageCaptureHarness({ lateTargetType: targetType });
+
+    await assert.rejects(
+      captureReplayCheckpoint(
+        harness.context as never,
+        harness.page as never,
+        replaySettings(),
+        new Set(['https://example.com']),
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        'category' in error &&
+        error.category === 'checkpoint_unrepresentable',
+    );
+    assert.equal(harness.fingerprintReads(), 0);
+    assert.ok(
+      harness.commands.includes(
+        targetType === 'worker' || targetType === 'shared_worker'
+          ? 'Target.sendMessageToTarget'
+          : 'Target.closeTarget',
+      ),
+    );
+  });
+}
+
+test('rejects an unknown target after storage-state materialization', async () => {
+  const harness = createPostStorageCaptureHarness({
+    lateTargetType: 'unknown_writer',
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+test('rejects a new page target after storage-state materialization', async () => {
+  const harness = createPostStorageCaptureHarness({ lateTargetType: 'page' });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+test('rejects an unattributable writer after storage-state materialization', async () => {
+  const harness = createPostStorageCaptureHarness({
+    lateTargetType: 'worker',
+    omitLateTargetContext: true,
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.fingerprintReads(), 0);
+  assert.equal(harness.terminationAttempts(), 0);
+});
+
+for (const targetType of ['page', 'unknown_writer']) {
+  test(`rejects an unattributable ${targetType} target`, async () => {
+    const harness = createPostStorageCaptureHarness({
+      lateTargetType: targetType,
+      omitLateTargetContext: true,
+    });
+
+    await assert.rejects(
+      captureReplayCheckpoint(
+        harness.context as never,
+        harness.page as never,
+        replaySettings(),
+        new Set(['https://example.com']),
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        'category' in error &&
+        error.category === 'checkpoint_unrepresentable',
+    );
+    assert.equal(harness.fingerprintReads(), 0);
+  });
+}
+
+test('terminates attributable writers before rejecting mixed targets', async () => {
+  const harness = createPostStorageCaptureHarness({
+    lateTargetType: 'worker',
+    includeMixedUnknownTarget: true,
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.terminationAttempts(), 1);
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+test('drains a respawned writer before rejecting the capture', async () => {
+  const harness = createPostStorageCaptureHarness({
+    lateTargetType: 'worker',
+    writerReappearances: 1,
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.terminationAttempts(), 2);
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+test('bounds cleanup of a surviving writer before rejecting capture', async () => {
+  const harness = createPostStorageCaptureHarness({
+    lateTargetType: 'worker',
+    writerNeverTerminates: true,
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable',
+  );
+  assert.equal(harness.terminationAttempts(), 3);
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
+test('fails closed when late target inventory cannot be verified', async () => {
+  const harness = createPostStorageCaptureHarness({
+    failLateTargetInventory: true,
+  });
+
+  await assert.rejects(
+    captureReplayCheckpoint(
+      harness.context as never,
+      harness.page as never,
+      replaySettings(),
+      new Set(['https://example.com']),
+    ),
+    (error: unknown) =>
+      error instanceof Error &&
+      'category' in error &&
+      error.category === 'checkpoint_unrepresentable' &&
+      !error.message.includes('secret target inventory failure'),
+  );
+  assert.equal(harness.fingerprintReads(), 0);
+});
+
 for (const targetType of [
   'worker',
   'shared_worker',
@@ -376,15 +755,22 @@ for (const targetType of [
         }
         if (method === 'Target.getTargets') {
           return {
-            targetInfos: targetTerminated
-              ? []
-              : [
+            targetInfos: [
+              {
+                targetId: 'page-target',
+                type: 'page',
+                browserContextId: 'context-1',
+              },
+              ...(!targetTerminated
+                ? [
                   {
                     targetId: 'writer-target',
                     type: targetType,
                     browserContextId: 'context-1',
                   },
-                ],
+                  ]
+                : []),
+            ],
           };
         }
         if (method === 'Storage.getUsageAndQuota') {

@@ -30,6 +30,7 @@ const DNS_CACHE_TTL_MS = 30_000;
 const REPLAY_CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
 const REPLAY_CHECKPOINT_MAX_ORIGINS = 128;
 const RESOURCE_CLEANUP_TIMEOUT_MS = 1_000;
+const TARGET_QUIESCENCE_MAX_ATTEMPTS = 3;
 
 const PROXY_SERVER = process.env.PROXY_SERVER || null;
 const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
@@ -754,6 +755,17 @@ export const captureReplayCheckpoint = async (
       );
     }
   };
+  const assertOriginsUnchanged = (expectedOrigins: ReadonlySet<string>) => {
+    assertOriginsBounded();
+    if (
+      storageOrigins.size !== expectedOrigins.size ||
+      [...storageOrigins].some(origin => !expectedOrigins.has(origin))
+    ) {
+      throw new CheckpointUnrepresentableError(
+        'Replay checkpoint storage origins changed during capture',
+      );
+    }
+  };
   assertOriginsBounded();
   const pages = context.pages();
   if (pages.length === 0 || !pages.includes(page)) {
@@ -762,6 +774,7 @@ export const captureReplayCheckpoint = async (
     );
   }
   const sessions: CDPSession[] = [];
+  let storageState!: Awaited<ReturnType<BrowserContext['storageState']>>;
   try {
     for (const contextPage of pages) {
       const session = await context.newCDPSession(contextPage);
@@ -779,28 +792,71 @@ export const captureReplayCheckpoint = async (
     }
     const frozenOrigins = new Set(storageOrigins);
     const targetSession = sessions[0]!;
-    const { targetInfo } = await targetSession.send('Target.getTargetInfo');
-    if (!targetInfo.browserContextId) {
+    const sessionTargetInfos = await Promise.all(
+      sessions.map(session => session.send('Target.getTargetInfo')),
+    );
+    const targetInfo = sessionTargetInfos[0]?.targetInfo;
+    if (!targetInfo?.browserContextId) {
       throw new CheckpointUnrepresentableError(
         'Chromium did not identify the checkpoint browser context',
       );
     }
+    if (
+      sessionTargetInfos.some(
+        result =>
+          result.targetInfo.type !== 'page' ||
+          result.targetInfo.browserContextId !== targetInfo.browserContextId,
+      )
+    ) {
+      throw new CheckpointUnrepresentableError(
+        'Chromium returned inconsistent checkpoint page targets',
+      );
+    }
+    const frozenPageTargetIds = new Set(
+      sessionTargetInfos.map(result => result.targetInfo.targetId),
+    );
     const writerTargetTypes = new Set([
       'worker',
       'shared_worker',
       'service_worker',
       'background_page',
     ]);
-    const getWriterTargets = async () => {
+    const safeGlobalTargetTypes = new Set(['browser']);
+    const getTargetInventory = async () => {
       const { targetInfos } = await targetSession.send('Target.getTargets');
-      return targetInfos.filter(
+      const contextTargets = targetInfos.filter(
         candidate =>
-          candidate.browserContextId === targetInfo.browserContextId &&
-          writerTargetTypes.has(candidate.type),
+          candidate.browserContextId === targetInfo.browserContextId,
       );
+      const observedPageTargetIds = new Set(
+        contextTargets
+          .filter(candidate => candidate.type === 'page')
+          .map(candidate => candidate.targetId),
+      );
+      return {
+        writerTargets: contextTargets.filter(candidate =>
+          writerTargetTypes.has(candidate.type),
+        ),
+        unattributableTargets: targetInfos.filter(
+          candidate =>
+            candidate.browserContextId === undefined &&
+            !safeGlobalTargetTypes.has(candidate.type),
+        ),
+        unverifiedTargets: contextTargets.filter(
+          candidate =>
+            !writerTargetTypes.has(candidate.type) &&
+            (candidate.type !== 'page' ||
+              !frozenPageTargetIds.has(candidate.targetId)),
+        ),
+        missingFrozenPage: [...frozenPageTargetIds].some(
+          targetId => !observedPageTargetIds.has(targetId),
+        ),
+      };
     };
     const terminateWriterTargets = async (
-      writerTargets: Awaited<ReturnType<typeof getWriterTargets>>,
+      writerTargets: Awaited<
+        ReturnType<typeof getTargetInventory>
+      >['writerTargets'],
     ) => {
       if (writerTargets.some(candidate => candidate.type === 'service_worker')) {
         await targetSession.send('ServiceWorker.enable');
@@ -830,14 +886,60 @@ export const captureReplayCheckpoint = async (
         }
       }
     };
-    const initialWriterTargets = await getWriterTargets();
-    if (initialWriterTargets.length > 0) {
-      await terminateWriterTargets(initialWriterTargets);
-      await getWriterTargets();
+    const assertNoWritableTargets = async () => {
+      let writerObserved = false;
+      for (
+        let attempt = 0;
+        attempt < TARGET_QUIESCENCE_MAX_ATTEMPTS;
+        attempt += 1
+      ) {
+        const inventory = await getTargetInventory();
+        const hasUnverifiedTarget =
+          inventory.unattributableTargets.length > 0 ||
+          inventory.unverifiedTargets.length > 0 ||
+          inventory.missingFrozenPage;
+        if (inventory.writerTargets.length > 0) {
+          writerObserved = true;
+          await terminateWriterTargets(inventory.writerTargets);
+          if (hasUnverifiedTarget) {
+            throw new CheckpointUnrepresentableError(
+              'Replay checkpoint found an unverified Chromium target',
+            );
+          }
+          continue;
+        }
+        if (hasUnverifiedTarget) {
+          throw new CheckpointUnrepresentableError(
+            'Replay checkpoint found an unverified Chromium target',
+          );
+        }
+        if (writerObserved) {
+          throw new CheckpointUnrepresentableError(
+            'Replay checkpoint cannot freeze unexpected background writers',
+          );
+        }
+        return;
+      }
+      const finalInventory = await getTargetInventory();
+      if (
+        finalInventory.unattributableTargets.length > 0 ||
+        finalInventory.unverifiedTargets.length > 0 ||
+        finalInventory.missingFrozenPage
+      ) {
+        throw new CheckpointUnrepresentableError(
+          'Replay checkpoint found an unverified Chromium target',
+        );
+      }
+      if (finalInventory.writerTargets.length > 0) {
+        throw new CheckpointUnrepresentableError(
+          'Replay checkpoint could not terminate background writers',
+        );
+      }
       throw new CheckpointUnrepresentableError(
         'Replay checkpoint cannot freeze unexpected background writers',
       );
-    }
+    };
+    await assertNoWritableTargets();
     assertOriginsBounded();
     let totalUsage = 0;
     for (const origin of frozenOrigins) {
@@ -854,23 +956,11 @@ export const captureReplayCheckpoint = async (
         throw new CheckpointTooLargeError();
       }
     }
-    const finalWriterTargets = await getWriterTargets();
-    if (finalWriterTargets.length > 0) {
-      await terminateWriterTargets(finalWriterTargets);
-      await getWriterTargets();
-      throw new CheckpointUnrepresentableError(
-        'Replay checkpoint cannot freeze unexpected background writers',
-      );
-    }
-    assertOriginsBounded();
-    if (
-      storageOrigins.size !== frozenOrigins.size ||
-      [...storageOrigins].some(origin => !frozenOrigins.has(origin))
-    ) {
-      throw new CheckpointUnrepresentableError(
-        'Replay checkpoint storage origins changed during capture',
-      );
-    }
+    await assertNoWritableTargets();
+    assertOriginsUnchanged(frozenOrigins);
+    storageState = await context.storageState({ indexedDB: true });
+    assertOriginsUnchanged(frozenOrigins);
+    await assertNoWritableTargets();
   } catch (error) {
     if (
       error instanceof CheckpointTooLargeError ||
@@ -885,7 +975,6 @@ export const captureReplayCheckpoint = async (
     await Promise.allSettled(sessions.map(session => session.detach()));
   }
 
-  const storageState = await context.storageState({ indexedDB: true });
   const serializedBytes = Buffer.byteLength(
     JSON.stringify({ storageState, browserSettings }),
     'utf8',
