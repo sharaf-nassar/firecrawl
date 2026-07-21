@@ -33,7 +33,7 @@ export async function captureCodexIdentity({
   failureCode = "codex_version_mismatch",
   accessFile = access,
   realpathFile = realpath,
-  statFile = stat,
+  statFile = path => stat(path, { bigint: true }),
   runCommand = runCaptured,
 }) {
   try {
@@ -57,7 +57,7 @@ export async function captureCodexIdentity({
     }
     if (!selected) throw gateError(failureCode);
     const versionResult = await runCommand(
-      selected.executablePath,
+      selected.resolvedPath,
       ["--version"],
       {
         supervisor,
@@ -85,7 +85,13 @@ export async function captureCodexIdentity({
 
 export function assertSameCodexIdentity(expected, actual) {
   for (const field of IDENTITY_FIELDS) {
-    if (expected?.[field] !== actual?.[field]) {
+    if (
+      typeof expected?.[field] !== "string" ||
+      expected[field] === "" ||
+      typeof actual?.[field] !== "string" ||
+      actual[field] === "" ||
+      expected[field] !== actual[field]
+    ) {
       throw gateError("codex_version_changed", field);
     }
   }
