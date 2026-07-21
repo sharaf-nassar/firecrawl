@@ -11,6 +11,7 @@ import {
 } from "../lib/local-runtime-config";
 
 const RETENTION_BATCH_SIZE = 50;
+const BROWSER_CLEANUP_INTENT_BATCH_DIVISOR = 5;
 const IDLE_BACKOFF_MS = 1_000;
 const RETENTION_CONNECTION_TIMEOUT_MS = 5_000;
 const RETENTION_LOCK_TIMEOUT_MS = 5_000;
@@ -549,53 +550,12 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     const client = await this.pool.connect();
     let released = false;
     try {
-      const result = await client.query<BrowserStateFileRow>(
-        `SELECT kind, id, state_path, checksum, delete_after, scrape_id
-           FROM (
-             SELECT 'profile-generation'::text AS kind,
-                    generation.id,
-                    generation.state_path,
-                    generation.checksum,
-                    generation.expires_at AS delete_after,
-                    NULL::uuid AS scrape_id
-               FROM browser_profile_generations generation
-               JOIN browser_profiles profile
-                 ON profile.id = generation.profile_id
-              WHERE generation.state_path IS NOT NULL
-                AND generation.file_deleted_at IS NULL
-                AND generation.expires_at IS NOT NULL
-                AND generation.expires_at <= $1
-                AND profile.latest_generation_id IS DISTINCT FROM generation.id
-                AND NOT EXISTS (
-                  SELECT 1
-                    FROM browser_sessions session
-                   WHERE session.profile_generation_id = generation.id
-                     AND session.state IN (
-                       'creating', 'replaying', 'ready', 'executing',
-                       'stopping'
-                     )
-                )
-             UNION ALL
-             SELECT 'replay-checkpoint'::text AS kind,
-                    checkpoint.id,
-                    checkpoint.state_path,
-                    checkpoint.checksum,
-                    request.dr_clean_by AS delete_after,
-                    checkpoint.scrape_id
-               FROM browser_replay_checkpoints checkpoint
-               JOIN requests request ON request.id = checkpoint.request_id
-              WHERE checkpoint.state_path IS NOT NULL
-                AND checkpoint.file_deleted_at IS NULL
-                AND request.dr_clean_by IS NOT NULL
-                AND request.dr_clean_by <= $1
-           ) expired
-          ORDER BY delete_after, kind, id
-          LIMIT $2`,
-        [now, limit],
+      const candidates: ExpiredBrowserStateFile[] = [];
+      const cleanupLimit = Math.min(
+        limit,
+        Math.max(1, Math.ceil(limit / BROWSER_CLEANUP_INTENT_BATCH_DIVISOR)),
       );
-      const candidates = result.rows.map(toBrowserStateFile);
-      let remaining = Math.max(0, limit - candidates.length);
-      if (remaining > 0) {
+      if (cleanupLimit > 0) {
         const cleanup = await client.query<BrowserCleanupIntentRow>(
           `SELECT id, scrape_id, state_path, checksum, state, created_at,
                   writer_lease, writer_pid, writer_boot_id, writer_start_time
@@ -603,12 +563,12 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
             WHERE state = 'cleanup'
             ORDER BY created_at, id
             LIMIT $1`,
-          [remaining],
+          [cleanupLimit],
         );
         candidates.push(...cleanup.rows.map(toCleanupIntentFile));
-        remaining = Math.max(0, limit - candidates.length);
       }
-      if (remaining > 0) {
+      const remainingCleanup = Math.max(0, cleanupLimit - candidates.length);
+      if (remainingCleanup > 0) {
         const preparing = await client.query<BrowserCleanupIntentRow>(
           `SELECT id, scrape_id, state_path, checksum, state, created_at,
                   writer_lease, writer_pid, writer_boot_id, writer_start_time
@@ -616,10 +576,10 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
             WHERE state = 'preparing'
             ORDER BY created_at, id
             LIMIT $1`,
-          [Math.max(remaining * 4, remaining)],
+          [Math.max(remainingCleanup * 4, remainingCleanup)],
         );
         for (const intent of preparing.rows) {
-          if (candidates.length >= limit) break;
+          if (candidates.length >= cleanupLimit) break;
           if (
             intent.writer_pid === null ||
             intent.writer_boot_id === null ||
@@ -636,6 +596,54 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
             candidates.push(toCleanupIntentFile(intent));
           }
         }
+      }
+      const remaining = Math.max(0, limit - candidates.length);
+      if (remaining > 0) {
+        const result = await client.query<BrowserStateFileRow>(
+          `SELECT kind, id, state_path, checksum, delete_after, scrape_id
+             FROM (
+               SELECT 'profile-generation'::text AS kind,
+                      generation.id,
+                      generation.state_path,
+                      generation.checksum,
+                      generation.expires_at AS delete_after,
+                      NULL::uuid AS scrape_id
+                 FROM browser_profile_generations generation
+                 JOIN browser_profiles profile
+                   ON profile.id = generation.profile_id
+                WHERE generation.state_path IS NOT NULL
+                  AND generation.file_deleted_at IS NULL
+                  AND generation.expires_at IS NOT NULL
+                  AND generation.expires_at <= $1
+                  AND profile.latest_generation_id IS DISTINCT FROM generation.id
+                  AND NOT EXISTS (
+                    SELECT 1
+                      FROM browser_sessions session
+                     WHERE session.profile_generation_id = generation.id
+                       AND session.state IN (
+                         'creating', 'replaying', 'ready', 'executing',
+                         'stopping'
+                       )
+                  )
+               UNION ALL
+               SELECT 'replay-checkpoint'::text AS kind,
+                      checkpoint.id,
+                      checkpoint.state_path,
+                      checkpoint.checksum,
+                      request.dr_clean_by AS delete_after,
+                      checkpoint.scrape_id
+                 FROM browser_replay_checkpoints checkpoint
+                 JOIN requests request ON request.id = checkpoint.request_id
+                WHERE checkpoint.state_path IS NOT NULL
+                  AND checkpoint.file_deleted_at IS NULL
+                  AND request.dr_clean_by IS NOT NULL
+                  AND request.dr_clean_by <= $1
+             ) expired
+            ORDER BY delete_after, kind, id
+            LIMIT $2`,
+          [now, remaining],
+        );
+        candidates.push(...result.rows.map(toBrowserStateFile));
       }
       return candidates;
     } catch (error) {
@@ -1084,10 +1092,7 @@ async function selectBrowserStateFile(
     }
     return {
       file: toCleanupIntentFile(intent),
-      deleteFile: !(
-        intent.current_state_path === intent.state_path &&
-        intent.current_checksum === intent.checksum
-      ),
+      deleteFile: intent.current_state_path !== intent.state_path,
       intentState: intent.state,
       writerLease: intent.writer_lease,
     };

@@ -1624,6 +1624,119 @@ describeWithDatabase("PostgreSQL local retention", () => {
     }
   });
 
+  it("preserves an authoritative checkpoint when a stale intent reuses its path", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "retention-intent-"));
+    const filesystem = new BrowserStateFilesystem(root);
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-19T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const current = await filesystem.writeCheckpoint(ownerId, scrapeId, {
+      current: true,
+    });
+    const checkpointId = await insertReplayCheckpoint(
+      requestId,
+      scrapeId,
+      current.pathId,
+    );
+    const intentId = await insertCleanupIntent(
+      scrapeId,
+      { pathId: current.pathId, checksum: "b".repeat(64) },
+      "cleanup",
+    );
+    const fullPath = path.join(root, current.pathId);
+    try {
+      const result = await runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: filesystem,
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      });
+
+      expect(result).toMatchObject({
+        browserStateCandidates: 1,
+        browserStateFilesDeleted: 0,
+        browserStateFailures: 0,
+      });
+      await expect(access(fullPath)).resolves.toBeUndefined();
+      const retained = await pool.query(
+        `SELECT
+           (SELECT state_path FROM browser_replay_checkpoints
+             WHERE id = $1) AS state_path,
+           (SELECT count(*)::int
+              FROM browser_replay_checkpoint_cleanup_intents
+             WHERE id = $2) AS intents`,
+        [checkpointId, intentId],
+      );
+      expect(retained.rows[0]).toEqual({
+        state_path: current.pathId,
+        intents: 0,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reserves batch capacity for cleanup intents behind poison checkpoints", async () => {
+    const requestId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    for (let index = 0; index < 50; index += 1) {
+      const scrapeId = randomUUID();
+      await insertScrape(requestId, scrapeId);
+      await insertReplayCheckpoint(
+        requestId,
+        scrapeId,
+        `replay/${ownerId}/${scrapeId}/poison-${index}.json`,
+      );
+    }
+    const cleanupScrapeId = randomUUID();
+    await insertScrape(requestId, cleanupScrapeId);
+    const cleanupPath = `replay/${ownerId}/${cleanupScrapeId}/cleanup-intent.json`;
+    const intentId = await insertCleanupIntent(
+      cleanupScrapeId,
+      { pathId: cleanupPath, checksum: "b".repeat(64) },
+      "cleanup",
+    );
+
+    try {
+      const failure = await runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: {
+          delete: vi.fn(async statePath => {
+            if (statePath !== cleanupPath) {
+              throw Object.assign(new Error("persistent poison"), {
+                code: "EIO",
+              });
+            }
+          }),
+        },
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      }).catch(error => error);
+
+      expect(failure).toMatchObject({
+        browserStateCandidates: 50,
+        browserStateFilesDeleted: 1,
+        browserStateFailures: 49,
+      });
+      const retained = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM browser_replay_checkpoints
+             WHERE request_id = $1 AND state_path IS NOT NULL) AS checkpoints,
+           (SELECT count(*)::int
+              FROM browser_replay_checkpoint_cleanup_intents
+             WHERE id = $2) AS intents`,
+        [requestId, intentId],
+      );
+      expect(retained.rows[0]).toEqual({ checkpoints: 50, intents: 0 });
+    } finally {
+      await pool.query("DELETE FROM requests WHERE id = $1", [requestId]);
+      fixtureIds.delete(requestId);
+    }
+  });
+
   it("retains live and unknown preparing writers but recovers a dead writer", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "retention-intent-"));
     const filesystem = new BrowserStateFilesystem(root);
