@@ -221,9 +221,9 @@ Health and reconciliation are private too. Before reconciliation,
 with strict `{ version: 1, status: "unready", processNonce, category }`.
 After one successful snapshot, ready returns strict
 `{ version: 1, status: "ready", processNonce, snapshotDigest }`.
-During ordered shutdown, live remains 200 with strict
-`{ version: 1, status: "draining", processNonce }` while ready is 503 with
-category `browser_service_draining`. All work and reconciliation are rejected.
+Ordered shutdown closes listener before draining work, so no new live or ready
+health response is served. Already accepted requests fail admission through
+`requireReady()` once shutdown starts.
 `processNonce` is one unpadded base64url encoding of 32 cryptographically
 random bytes and is never persisted or logged.
 
@@ -454,6 +454,7 @@ corepack pnpm install --lockfile-only
 rm -rf node_modules
 corepack pnpm install --frozen-lockfile
 corepack pnpm install --frozen-lockfile --lockfile-only
+node src/runtime-preflight.mjs
 node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs
 ```
 
@@ -508,7 +509,7 @@ test("reconciliation rejects malformed filesystem authority", () => {
   }).success).toBe(false);
 });
 
-test("health contracts distinguish live, draining, and ready", () => {
+test("health contracts distinguish live, reconciling, and ready", () => {
   expect(liveHealthV1Schema.parse({
     version: 1,
     status: "live_unreconciled",
@@ -516,9 +517,14 @@ test("health contracts distinguish live, draining, and ready", () => {
   }).status).toBe("live_unreconciled");
   expect(liveHealthV1Schema.parse({
     version: 1,
+    status: "reconciling",
+    processNonce: VALID_NONCE,
+  }).status).toBe("reconciling");
+  expect(liveHealthV1Schema.safeParse({
+    version: 1,
     status: "draining",
     processNonce: VALID_NONCE,
-  }).status).toBe("draining");
+  }).success).toBe(false);
   expect(readyHealthV1Schema.safeParse({
     version: 1,
     status: "ready",
@@ -675,7 +681,7 @@ export const reconciliationResultV1Schema = z.strictObject({
 
 export const liveHealthV1Schema = z.strictObject({
   version: z.literal(1),
-  status: z.enum(["live_unreconciled", "reconciling", "ready", "draining"]),
+  status: z.enum(["live_unreconciled", "reconciling", "ready"]),
   processNonce: processNonceSchema,
 });
 export const unreadyHealthV1Schema = z.strictObject({
@@ -685,7 +691,6 @@ export const unreadyHealthV1Schema = z.strictObject({
   category: z.enum([
     "reconciliation_required",
     "reconciliation_in_progress",
-    "browser_service_draining",
   ]),
 });
 export const readyHealthV1Schema = z.strictObject({
@@ -719,6 +724,7 @@ connect PostgreSQL.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
+node apps/browser-service/src/runtime-preflight.mjs
 node --test apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs
 node apps/browser-service/src/runtime-preflight.mjs
 corepack pnpm --dir apps/browser-service exec node --import tsx --test src/contracts.test.ts src/auth.test.ts
@@ -873,9 +879,7 @@ test("caches only an exact successful nonce and digest", async () => {
 
 Assert two process instances receive different 43-character nonces; a wrong
 nonce performs no callback; a failed callback returns to
-`live_unreconciled`; `beginDraining()` closes admission permanently, changes
-live status to `draining`, and changes ready category to
-`browser_service_draining`; health
+`live_unreconciled`; `beginDraining()` closes admission permanently; health
 objects contain no path, checksum, key, URL, public browser ID, or capability.
 
 - [ ] **Step 2: Write failing filesystem reconciliation tests**
@@ -1291,14 +1295,16 @@ test("live precedes reconciliation while all browser work stays closed", async (
   });
 });
 
-test("draining stays live but becomes unready and rejects work", async () => {
-  await server.beginDraining();
-  expect((await getPrivate("/health/live")).body.status).toBe("draining");
-  expect((await getPrivate("/health/ready")).body).toMatchObject({
-    status: "unready",
-    category: "browser_service_draining",
+test("shutdown closes health listener before draining admitted work", async () => {
+  const accepted = pauseAfterAuthentication("/v1/sessions", validCreate);
+  await server.beginShutdown();
+  await expect(getPrivate("/health/live")).rejects.toMatchObject({
+    code: expect.stringMatching(/ECONNREFUSED|ECONNRESET/),
   });
-  expect((await postPrivate("/v1/sessions", validCreate)).status).toBe(503);
+  await expect(accepted.continueToAdmission()).resolves.toMatchObject({
+    status: 503,
+    body: { category: "reconciliation_required" },
+  });
 });
 ```
 
@@ -1348,8 +1354,8 @@ deadline capped at 60 seconds, nonce, schema, and digest before calling
 `reconcileBrowserState()`. Every create/action/grant/artifact/stream/profile
 route invokes `requireReady()` before touching registry or filesystem.
 
-`SIGTERM` calls `beginDraining()`, exposes live `draining` and ready 503
-`browser_service_draining`, stops new creates/actions/reconciliation,
+`SIGTERM` closes listener first, then calls `beginDraining()` to reject
+already accepted but not admitted creates/actions/reconciliation,
 closes streams, closes Chromium with bounded profile save, then closes server
 and timers. Live remains process liveness; ready never performs a disposable
 session and never becomes true without current nonce/digest reconciliation.
@@ -1537,8 +1543,7 @@ typed errors with Zod. Reject private redirects. Remove any generic
 caller-supplied method/path helper. Never include response bodies or private
 URLs in public errors.
 
-`getLive` parses `live_unreconciled`, `reconciling`, `ready`, and `draining`;
-coordinator treats `draining` as unavailable and never reconciles it.
+`getLive` parses only `live_unreconciled`, `reconciling`, and `ready`.
 `getReady` accepts 200 ready or 503 unready, and `reconcile` caps deadline and
 encoded body at 60 seconds and 16 MiB. All three always send bearer key,
 correlation ID, and absolute deadline.
@@ -1633,6 +1638,27 @@ it("loads every nondeleted authority in one repeatable-read snapshot", async () 
     "replay_checkpoint_cleanup_intent",
   ]);
   expect(snapshot.snapshotDigest).toMatch(/^[a-f0-9]{64}$/);
+});
+
+it("snapshots only after an in-flight database mutation drains", async () => {
+  await openGateForTest(gate);
+  const mutation = gate.withBrowserStateMutationLease(
+    "filesystem_and_database",
+    async lease => persistCheckpointAndIntent(pool, filesystem, lease),
+  );
+  await mutationReachedDatabaseBarrier();
+  const drain = gate.close("restart");
+  await expect(newCheckpointMutation(gate)).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  releaseDatabaseBarrier();
+  await mutation;
+  await drain.drained;
+  const snapshot = await loadBrowserReconciliationSnapshot(pool);
+  expect(snapshot.references).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: "replay_checkpoint" }),
+    expect.objectContaining({ kind: "replay_checkpoint_cleanup_intent" }),
+  ]));
 });
 ```
 
@@ -1759,6 +1785,11 @@ export type BrowserMutationDrain = {
   drained: Promise<void>;
 };
 
+export type BrowserStateMutationLease = {
+  readonly epoch: number;
+  readonly scope: "filesystem_and_database";
+};
+
 export type BrowserStartupGate = {
   assertOpen(): BrowserStartupBinding;
   close(reason: string): BrowserMutationDrain;
@@ -1766,7 +1797,11 @@ export type BrowserStartupGate = {
   waitUntilOpen(signal: AbortSignal): Promise<BrowserStartupBinding>;
   withBrowserStateMutationLease<T>(
     scope: "filesystem_and_database",
-    operation: () => Promise<T>,
+    operation: (lease: BrowserStateMutationLease) => Promise<T>,
+  ): Promise<T>;
+  withDrainedBrowserStateMutation<T>(
+    drain: BrowserMutationDrain,
+    operation: (lease: BrowserStateMutationLease) => Promise<T>,
   ): Promise<T>;
 };
 
@@ -1781,6 +1816,13 @@ synchronous before operation invocation and releases in `finally`. Never
 acquire separate filesystem and database leases. `open()` accepts only current
 drained epoch and
 coordinator's validated nonce/digest binding; stale drains cannot reopen gate.
+`withDrainedBrowserStateMutation()` accepts only current fully drained token,
+runs coordinator recovery while admission remains closed, and resolves before
+snapshot may start. It cannot overlap a normal lease or be called by routes.
+Every later API mutator receives this gate as an explicit constructor or
+function dependency. No browser-state filesystem or database mutator is
+exported to controllers as an unleased callback. Read-only operations may use
+`assertOpen()`; `assertOpen()` alone never authorizes a mutation.
 
 Expose snapshot loader:
 
@@ -1827,8 +1869,9 @@ export async function recoverBrowserCleanupIntentsBeforeSnapshot(
 ): Promise<CleanupIntentStartupRecoveryResult>;
 ```
 
-Call only after current `BrowserMutationDrain.drained` resolves and before
-snapshot transaction begins. Select every `preparing` cleanup intent. Complete
+Call only inside `withDrainedBrowserStateMutation()` after current
+`BrowserMutationDrain.drained` resolves and before snapshot transaction begins.
+Select every `preparing` cleanup intent. Complete
 writer identity `(pid, bootId, startTime)` is classified with
 `inspectBrowserStateProcessIdentity`; retain `live` and `unknown` unchanged.
 For `dead`, acquire same scrape/path advisory locks, reselect exact intent by
@@ -1892,9 +1935,10 @@ export function createBrowserReconciliationCoordinator(
 configuration. No harness callback owns recovery or retention.
 
 `initialize()` requires migrations already applied. Under one mutex: call
-`gate.close()`, pause retention, await returned `drained`, call
-`interruptUnfinishedBrowserWork(now)`, run exact-process cleanup-intent
-recovery directly under drained epoch, read authenticated live nonce, capture
+`gate.close()`, pause retention, await returned `drained`, then call
+`gate.withDrainedBrowserStateMutation(drain, ...)` once around
+`interruptUnfinishedBrowserWork(now)` and exact-process cleanup-intent
+recovery. After that wrapper resolves, read authenticated live nonce and capture
 the repeatable-read snapshot, post `{version:1, processNonce, snapshotDigest,
 references}`, validate the closed result, fetch ready health, and require both
 responses equal requested nonce/digest. Then `gate.open(drain, binding)` and
@@ -1921,6 +1965,13 @@ retention worker call
 artifact retention may continue. `index.ts` starts coordinator after migrations
 and before browser routes admit work, and stops monitor before retention and
 database shutdown.
+
+This gate is mandatory dependency for later mutation boundaries: Task 9
+session/profile/run create, attach, transition, and stop; Task 10 action and
+capability state; Task 11 grants and artifact manifest/run attachment; Tasks
+12-13 controller-facing operations. Each later task adds its race tests. No
+constructor accepts an optional gate, and no enabled-local-mode test may use a
+pass-through mutation executor.
 
 - [ ] **Step 7: Run integration tests serially and build**
 
@@ -1993,6 +2044,38 @@ it("rejects runtime creation while startup reconciliation is closed", async () =
   });
   expect(browserClient.createSession).not.toHaveBeenCalled();
   expect(createDurableSession).not.toHaveBeenCalled();
+});
+
+it("drains an in-flight session transaction and rejects the next create", async () => {
+  createDurableSession.pauseAfterInsert();
+  const create = orchestrator.createDirectSession(input);
+  await createDurableSession.reachedPause();
+  const drain = startupGate.close("service_restart");
+  expect(await promiseState(drain.drained)).toBe("pending");
+  await expect(orchestrator.createDirectSession(input)).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  createDurableSession.release();
+  await create;
+  await drain.drained;
+  expect(events).toEqual([
+    "session:insert",
+    "gate:close",
+    "session:commit",
+    "mutations:drained",
+  ]);
+});
+
+it("does not hold mutation lease across host execution", async () => {
+  adapter.executePromptRun.mockReturnValue(hostResult.promise);
+  const execution = orchestrator.executePrompt(interactInput);
+  await adapterStarted();
+  const drain = startupGate.close("service_restart");
+  await expect(drain.drained).resolves.toBeUndefined();
+  hostResult.reject(new Error("interrupted"));
+  await expect(execution).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
 });
 
 it("separates strict model wire operations from trusted internal operations", () => {
@@ -2369,23 +2452,32 @@ network. The unavailable adapter throws typed 503 categories.
 
 - [ ] **Step 4: Implement durable session create, replay, and stop**
 
-Call `startupGate.assertOpen()` before durable session, profile, replay, grant,
-artifact, or Browser Service work. A closed gate returns sanitized
-`browser_state_unavailable`. After admission, create durable session before
-Browser Service runtime. Acquire writer lease,
-create service session, attach runtime with compare-and-set, transition through
-`replaying` to `ready`, and roll back exact resources on failure. Direct
+Inject `BrowserStartupGate`; never use one-time `assertOpen()` to authorize a
+mutation. Wrap each atomic setup segment in
+`withBrowserStateMutationLease("filesystem_and_database", ...)`: durable
+session/profile-writer creation; Browser Service create plus runtime attach;
+replay checkpoint/profile materialization plus state transition; and rollback
+of each exact resource. A closed gate returns sanitized
+`browser_state_unavailable`. Create durable session before Browser Service
+runtime, transition through `replaying` to `ready`, and roll back exact
+resources on failure. Direct
 sessions default 600/300; Interact uses 3600/600 and reserves that lifetime.
 
-Prompt execution creates run/capability, obtains an initial bounded snapshot,
-marks session/run executing, and calls `executePromptRun` once. Validate output
+Prompt execution uses short leases for run/capability creation and the
+session/run executing transition, then releases every lease before obtaining
+initial observation and calling `executePromptRun` once. Never hold a mutation
+lease across the up-to-300-second host job. Action callbacks take their own
+Task 10 leases. After host return, acquire fresh leases for validated output,
+usage/count persistence, capability revocation, and terminal run/session
+transitions. Validate output
 <=256 KiB, `turnCount <= 26`, `actionCount <= 25`, zero tool/approval counts,
 and counts equal durable action ledger totals before success. Revoke capability
 in `finally`. Persist sanitized usage/counts and terminal state.
 
-Stop claims one cleanup owner, cancels adapter, revokes capabilities/grants,
-closes service session, finalizes a prepared writer generation, atomically
-advances profile pointer, and records one terminal result. A failed generation
+Stop uses one short lease to claim cleanup owner, releases it while cancelling
+adapter, then uses bounded leases for capability/grant revocation, Browser
+Service close plus prepared-generation capture, profile finalize/pointer CAS,
+and terminal result. A failed generation
 database commit leaves prior pointer authoritative and discards that exact
 orphan best-effort. Service failure still leaves durable terminal state.
 
@@ -2397,7 +2489,8 @@ pnpm --dir apps/api exec vitest run src/lib/browser-runtime/protocol.test.ts src
 
 Expected: PASS for create rollback, profile lock, replay failure, one outer
 prompt call, exact loop policy, count verification, duplicate stop,
-execution/stop race, profile crash boundaries, and unavailable adapters.
+execution/stop/reconciliation races, mutation drain, no host-held lease,
+profile crash boundaries, and unavailable adapters.
 
 - [ ] **Step 6: Commit orchestration boundary**
 
@@ -2454,6 +2547,35 @@ it("terminates run and session for unresolved executing outcome", async () => {
   expect(await actionState(proposal.actionId)).toBe("outcome_unknown");
   expect(await runState(activeRun.id)).toBe("failed");
   expect(await sessionState(activeRun.sessionId)).toBe("error");
+});
+
+it("recovers executing action when gate closes before dispatch lease", async () => {
+  pauseAfterMarkExecuting();
+  const callback = coordinator.handleProposal(activeRun, proposal, context);
+  await reachedExecutingPause();
+  const drain = startupGate.close("service_restart");
+  releaseExecutingPause();
+  await expect(callback).rejects.toMatchObject({
+    category: "action_outcome_unknown",
+  });
+  expect(browserClient.executeAction).not.toHaveBeenCalled();
+  await drain.drained;
+  await runStartupRecovery(drain);
+  expect(await actionState(proposal.actionId)).toBe("outcome_unknown");
+});
+
+it("drains in-flight callback mutation and rejects new capability issue", async () => {
+  completeBrowserAction.pauseBeforeCommit();
+  const callback = coordinator.handleProposal(activeRun, proposal, context);
+  await completeBrowserAction.reachedPause();
+  const drain = startupGate.close("service_restart");
+  expect(await promiseState(drain.drained)).toBe("pending");
+  await expect(capabilities.issue(input)).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  completeBrowserAction.release();
+  await callback;
+  await drain.drained;
 });
 ```
 
@@ -2518,21 +2640,35 @@ origins, navigation version, byte/call/action limits, wall/per-operation
 deadlines, and timestamps. Redemption never returns a raw token and is
 available only to the coordinator.
 
+Inject `BrowserStartupGate` into action and capability stores. Wrap each
+`prepareBrowserAction`, policy/capability redemption, `mark...Executing`,
+`completeBrowserAction`, capability issue/redeem/revoke, and terminal
+run/session transition in
+`withBrowserStateMutationLease("filesystem_and_database", ...)`. Reads may use
+`assertOpen()`, but no write follows a bare assertion. Startup action recovery
+runs only inside Task 8 `withDrainedBrowserStateMutation()`.
+
 - [ ] **Step 5: Implement coordinator state machine**
 
 For a new structurally valid proposal:
 
 1. Load active prompt run/session, require its adapter job to equal
    `adapterJobId`, and recompute hash/effect.
-2. Persist `prepared`; this consumes one action budget even if policy rejects.
-3. Authorize capability, writer state, origins, deadline, bytes, and duplicate
-   side-effect hash. Policy denial transitions to `rejected_no_effect` and
-   returns one bounded `ObservationV1`.
-4. Transition `prepared -> executing` immediately before one
-   `browserClient.executeAction()` call.
-5. Persist a bounded service result as `succeeded` or `failed_no_effect`, then
-   return the matching observation.
-6. If the result cannot be proven after dispatch, transition to
+2. Under one short mutation lease, persist `prepared`, authorize/redeem
+   capability, and persist `rejected_no_effect` for policy denial. Prepared
+   consumes one action budget even if policy rejects.
+3. Under a second short lease, revalidate gate/capability and transition
+   `prepared -> executing`; release it before dispatch acquisition.
+4. Acquire a third mutation lease immediately before one
+   `browserClient.executeAction()` call. Hold this bounded per-operation lease
+   through service result and `succeeded`/`failed_no_effect` completion, then
+   return matching observation.
+5. If gate closes after `executing` but before third lease, do not dispatch.
+   Return `action_outcome_unknown`; drained startup recovery marks action/run/
+   session terminal. This conservative state is required even though no effect
+   was observed, because dispatch boundary was not durably proven.
+6. If result cannot be proven after dispatch, persist under current lease or
+   drained recovery as
    `outcome_unknown`, revoke capability, terminate run and browser session,
    and throw `action_outcome_unknown`. Never send that outcome to Codex.
 
@@ -2551,8 +2687,9 @@ Keep coordinator dependency
 Extend that exported store transaction to resolve every stale `prepared`
 action as `cancelled_no_effect` and every stale `executing` action as
 `outcome_unknown`, then terminate affected run/session and revoke capability.
-Task 8 coordinator already invokes this dependency after mutation drain and
-before cleanup-intent recovery/snapshot. Do not add another startup callback,
+Task 8 coordinator already invokes this dependency inside
+`withDrainedBrowserStateMutation()` before cleanup-intent recovery/snapshot.
+Do not add another startup callback,
 resume adapter job/model thread/action ledger, or change recovery ordering.
 Preserve action rows for audit.
 
@@ -2640,6 +2777,33 @@ it("rejects artifact bytes that differ from declared hash", async () => {
   });
   expect(attachRunArtifact).not.toHaveBeenCalled();
 });
+
+it("drains grant redemption and rejects issue after gate close", async () => {
+  grantStore.pauseRedeemBeforeCommit();
+  const redeem = grantStore.redeem(token, "passive");
+  await grantStore.redeemReachedPause();
+  const drain = startupGate.close("service_restart");
+  expect(await promiseState(drain.drained)).toBe("pending");
+  await expect(grantStore.issue(validGrantInput)).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  grantStore.releaseRedeem();
+  await redeem;
+  await drain.drained;
+});
+
+it("removes uploaded artifact when gate closes before attachment", async () => {
+  artifactStore.pauseAfterVerifiedUpload();
+  const ingest = ingestBrowserArtifact(activeRun, validHeaders, pngBytes);
+  await artifactStore.uploadReachedPause();
+  startupGate.close("service_restart");
+  artifactStore.releaseUpload();
+  await expect(ingest).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  expect(deleteUploadedObject).toHaveBeenCalledTimes(1);
+  expect(attachRunArtifact).not.toHaveBeenCalled();
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
@@ -2664,6 +2828,12 @@ expiry, one connection, owner/session binding, and hash-only storage. Return:
 }
 ```
 
+Inject `BrowserStartupGate` into proxy grant store. Issue, atomic redeem/use
+increment, and revoke each run inside one
+`withBrowserStateMutationLease("filesystem_and_database", ...)`. Stop-all
+revocation uses one bounded lease. Never mutate a grant after bare
+`assertOpen()`.
+
 - [ ] **Step 4: Implement artifact ingestion**
 
 Authenticate active non-ZDR run. Require exact `Content-Length`, maximum
@@ -2671,8 +2841,16 @@ Authenticate active non-ZDR run. Require exact `Content-Length`, maximum
 `-Byte-Size`, and `-Sha256`; reject duplicate/unknown namespaced headers,
 chunking, EOF/trailing bytes, and digest mismatch. Cap 8 objects and 32 MiB
 per run. Store under stable owner/request/scrape/session/run prefix, persist
-manifest, then append bounded run reference with compare-and-set. Extend old
+verified bytes before acquiring lease; then use one mutation lease to persist
+manifest and append bounded run reference with compare-and-set. If gate closes
+before lease acquisition or manifest/attachment fails, delete exact uploaded
+object best-effort and leave no manifest/run attachment. Extend old
 artifact manifest checksum as nullable; browser artifacts always require it.
+
+Inject same gate into internal artifact controller and artifact service.
+Capability check and final manifest/run DB mutations use leases; streaming and
+hashing up to 16 MiB occur without a lease. Grant and artifact reads may assert
+open, but every issue/redeem/revoke/attach mutation uses lease.
 
 - [ ] **Step 5: Run tests**
 
@@ -2681,7 +2859,8 @@ pnpm --dir apps/api exec vitest run src/lib/browser-state/proxy-grant-store.test
 ```
 
 Expected: PASS for expiry, replay, permission, cross-owner, revocation,
-artifact budgets, checksums, ZDR, rollback, and redaction.
+grant/reconciliation races, artifact attach/gate race, budgets, checksums, ZDR,
+rollback, and redaction.
 
 - [ ] **Step 6: Commit grants and artifacts**
 
@@ -2728,6 +2907,20 @@ it("submits one full prompt job and returns action/turn counts", async () => {
   expect(adapter.executePromptRun).toHaveBeenCalledTimes(1);
   expect(response.body.output).toBe("done");
 });
+
+it("rejects controller mutations after startup gate closes", async () => {
+  startupGate.close("service_restart");
+  for (const invoke of [
+    () => invokeBrowserCreate({}),
+    () => invokeBrowserExecute(browserId, { code: "1" }),
+    () => invokeBrowserDelete(browserId),
+    () => invokeInteract({ prompt: "read" }),
+    () => invokeInteractStop(scrapeId),
+  ]) {
+    expect((await invoke()).status).toBe(503);
+  }
+  expect(directBrowserStateStoreMutation).not.toHaveBeenCalled();
+});
 ```
 
 Add tests for exact prompt/code XOR, `allowedDomains`, 8-origin cap, ownership,
@@ -2754,6 +2947,13 @@ union with navigation origins <=8. Execute creates one durable code run.
 Unavailable code adapter returns typed 503 without destroying ready browser.
 List mints fresh URLs; delete is idempotent.
 
+Inject `BrowserStartupGate` for read admission, but route every mutation only
+through Task 9 orchestrator or Task 10 action coordinator. Controllers never
+call browser-state store, capability store, grant store, artifact attachment,
+or filesystem mutators directly. List/read may use `assertOpen()`; create,
+execute, delete, Interact, and stop rely on service-level mutation leases and
+map lease rejection to sanitized `browser_state_unavailable` 503.
+
 - [ ] **Step 4: Replace local scrape Interact loop**
 
 Enforce exactly one of prompt/code. Load owned replay state before session
@@ -2766,6 +2966,8 @@ loop policy, and <=300-second caller deadline. The adapter performs subsequent
 turns by action callback. API does not run a model loop inside controller.
 Persist final output, usage, turn/action counts, and terminal state. Reject
 count mismatch or nonzero tool/approval events as `model_protocol_error`.
+If gate closes during host execution, coordinator interruption owns terminal
+recovery; controller does not persist output through an unleased fallback.
 
 Code path keeps existing output/stdout/result/stderr/exit fields through the
 same adapter abstraction. Stop cancels current execution, revokes authority
@@ -2819,6 +3021,14 @@ it("passive grant cannot open input or CDP", async () => {
   await expect(openProxy(passiveToken, "cdp"))
     .rejects.toMatchObject({ code: 1008 });
 });
+
+it("does not open private stream when gate closes before redeem", async () => {
+  startupGate.close("service_restart");
+  await expect(openProxy(passiveToken, "passive"))
+    .rejects.toMatchObject({ code: 1013 });
+  expect(browserClient.createRelayGrant).not.toHaveBeenCalled();
+  expect(browserClient.openStream).not.toHaveBeenCalled();
+});
 ```
 
 - [ ] **Step 2: Run test and verify red**
@@ -2836,7 +3046,11 @@ Serve fixed same-origin HTML/JS/CSS with no token/page interpolation and
 `frame-ancestors 'none'`, `no-store`, `no-referrer`, and `nosniff`.
 
 Hash and atomically redeem token, verify permission/session/expiry/use, mint a
-one-use private relay grant, and connect with service identity. Cap messages
+one-use private relay grant, and connect with service identity. Proxy
+controller injects Task 11 leased grant store; redeem/use mutation and bounded
+private relay-grant creation share one mutation lease. If gate closes before
+lease acquisition, close WebSocket 1013 and make no Browser Service call. Cap
+messages
 at 64 KiB; apply backpressure and bidirectional close/cancellation. Require
 configured API Origin for view streams; CDP may omit Origin but needs CDP
 grant. Never log tokens, private URLs, CDP payloads, or page input.
@@ -3174,6 +3388,10 @@ and zero model-tool events."
   awaits all unified filesystem/database mutation leases before recovery. Dead
   cleanup-intent writers converge under exact process identity and CAS before
   snapshot; live/unknown writers remain authoritative.
+- Mutation coverage: session/profile/run transitions, actions, capabilities,
+  grants, artifact attachment, stop, and controller-facing writes all use
+  short gate leases. Host execution and artifact streaming hold none; callback
+  and gate-close races either drain known completion or recover conservatively.
 - Ownership and retries: API process alone owns recovery and browser retention;
   harness owns process/container lifecycle only. Each cycle has 4 attempts,
   250/500/1,000 ms backoff, 60-second budget, and 30-second runtime cooldown.
