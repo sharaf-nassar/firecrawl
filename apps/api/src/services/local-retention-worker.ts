@@ -2,6 +2,7 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 
 import { config } from "../config";
 import { getArtifactStore, type ArtifactStore } from "../lib/artifacts";
+import { BrowserStateFilesystem } from "../lib/browser-state/filesystem-store";
 import { logger as defaultLogger } from "../lib/logger";
 import {
   resolveLocalRuntimeConfig,
@@ -34,15 +35,30 @@ const operationalTables = [
 
 export type ExpiredArtifactManifest = {
   objectKey: string;
+  kind: string;
   requestId: string | null;
   jobId: string | null;
-  deleteAfter: Date;
-  deleteAfterToken: string;
+  deleteAfter: Date | null;
+  deleteAfterToken: string | null;
 };
 
 export type ArtifactManifestClaim = {
   manifest: ExpiredArtifactManifest;
   deleteManifest(): Promise<boolean>;
+  release(): Promise<void>;
+};
+
+export type ExpiredBrowserStateFile = {
+  kind: "replay-checkpoint" | "profile-generation";
+  id: string;
+  statePath: string;
+  checksum: string;
+  deleteAfter: Date;
+};
+
+export type BrowserStateFileClaim = {
+  file: ExpiredBrowserStateFile;
+  markFileDeleted(): Promise<boolean>;
   release(): Promise<void>;
 };
 
@@ -194,6 +210,15 @@ class LocalRetentionResourceError extends Error {
   }
 }
 
+class BrowserStateFileClaimLostError extends Error {
+  readonly code = "browser_state_file_claim_lost";
+
+  constructor() {
+    super("Browser state file metadata changed before retention CAS");
+    this.name = "BrowserStateFileClaimLostError";
+  }
+}
+
 export class LocalRetentionShutdownTimeoutError extends Error {
   readonly code = "retention_shutdown_timeout";
 
@@ -203,7 +228,28 @@ export class LocalRetentionShutdownTimeoutError extends Error {
   }
 }
 
+export class LocalBrowserStateRetentionError extends Error {
+  readonly code = "browser_state_delete_failed";
+
+  constructor(
+    readonly kind: ExpiredBrowserStateFile["kind"],
+    readonly statePath: string,
+    cause: unknown,
+  ) {
+    super("Browser state retention delete failed", { cause });
+    this.name = "LocalBrowserStateRetentionError";
+  }
+}
+
 export interface LocalRetentionDatabase {
+  listExpiredBrowserStateFiles(
+    now: Date,
+    limit: number,
+  ): Promise<ExpiredBrowserStateFile[]>;
+  tryClaimBrowserStateFile(
+    candidate: ExpiredBrowserStateFile,
+    now: Date,
+  ): Promise<BrowserStateFileClaim | null>;
   listExpiredArtifactManifests(
     now: Date,
     limit: number,
@@ -227,6 +273,7 @@ export type RetentionLogger = Pick<
 type IterationOptions = {
   database: LocalRetentionDatabase;
   artifactStore: ArtifactStore | null;
+  browserStateFilesystem?: Pick<BrowserStateFilesystem, "delete"> | null;
   now?: Date;
   signal?: AbortSignal;
   logger?: RetentionLogger;
@@ -243,6 +290,7 @@ type LoopOptions = {
   configSource?: LocalRuntimeConfigSource;
   database?: LocalRetentionDatabase;
   artifactStore?: ArtifactStore | null;
+  browserStateFilesystem?: Pick<BrowserStateFilesystem, "delete"> | null;
   logger?: RetentionLogger;
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -262,19 +310,39 @@ export type LocalRetentionService = {
 
 type ArtifactManifestRow = {
   object_key: string;
+  kind: string;
   request_id: string | null;
   job_id: string | null;
+  delete_after: Date | null;
+  delete_after_token: string | null;
+};
+
+type BrowserStateFileRow = {
+  kind: ExpiredBrowserStateFile["kind"];
+  id: string;
+  state_path: string;
+  checksum: string;
   delete_after: Date;
-  delete_after_token: string;
 };
 
 function toManifest(row: ArtifactManifestRow): ExpiredArtifactManifest {
   return {
     objectKey: row.object_key,
+    kind: row.kind,
     requestId: row.request_id,
     jobId: row.job_id,
     deleteAfter: row.delete_after,
     deleteAfterToken: row.delete_after_token,
+  };
+}
+
+function toBrowserStateFile(row: BrowserStateFileRow): ExpiredBrowserStateFile {
+  return {
+    kind: row.kind,
+    id: row.id,
+    statePath: row.state_path,
+    checksum: row.checksum,
+    deleteAfter: row.delete_after,
   };
 }
 
@@ -362,12 +430,15 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
     let released = false;
     try {
       const result = await client.query<ArtifactManifestRow>(
-        `SELECT object_key, request_id, job_id, delete_after,
-                delete_after::text AS delete_after_token
-           FROM local_artifacts
-          WHERE delete_after IS NOT NULL
-            AND delete_after <= $1
-          ORDER BY delete_after, object_key
+        `SELECT artifact.object_key, artifact.kind, artifact.request_id,
+                artifact.job_id,
+                artifact.delete_after,
+                artifact.delete_after::text AS delete_after_token
+           FROM local_artifacts artifact
+           LEFT JOIN requests request ON request.id = artifact.request_id
+          WHERE LEAST(artifact.delete_after, request.dr_clean_by) <= $1
+          ORDER BY LEAST(artifact.delete_after, request.dr_clean_by),
+                   artifact.object_key
           LIMIT $2`,
         [now, limit],
       );
@@ -378,6 +449,170 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       throw error;
     } finally {
       if (!released) client.release();
+    }
+  }
+
+  async listExpiredBrowserStateFiles(
+    now: Date,
+    limit: number,
+  ): Promise<ExpiredBrowserStateFile[]> {
+    const client = await this.pool.connect();
+    let released = false;
+    try {
+      const result = await client.query<BrowserStateFileRow>(
+        `SELECT kind, id, state_path, checksum, delete_after
+           FROM (
+             SELECT 'profile-generation'::text AS kind,
+                    generation.id,
+                    generation.state_path,
+                    generation.checksum,
+                    generation.expires_at AS delete_after
+               FROM browser_profile_generations generation
+               JOIN browser_profiles profile
+                 ON profile.id = generation.profile_id
+              WHERE generation.state_path IS NOT NULL
+                AND generation.file_deleted_at IS NULL
+                AND generation.expires_at IS NOT NULL
+                AND generation.expires_at <= $1
+                AND profile.latest_generation_id IS DISTINCT FROM generation.id
+                AND NOT EXISTS (
+                  SELECT 1
+                    FROM browser_sessions session
+                   WHERE session.profile_generation_id = generation.id
+                     AND session.state IN (
+                       'creating', 'replaying', 'ready', 'executing',
+                       'stopping'
+                     )
+                )
+             UNION ALL
+             SELECT 'replay-checkpoint'::text AS kind,
+                    checkpoint.id,
+                    checkpoint.state_path,
+                    checkpoint.checksum,
+                    request.dr_clean_by AS delete_after
+               FROM browser_replay_checkpoints checkpoint
+               JOIN requests request ON request.id = checkpoint.request_id
+              WHERE checkpoint.state_path IS NOT NULL
+                AND checkpoint.file_deleted_at IS NULL
+                AND request.dr_clean_by IS NOT NULL
+                AND request.dr_clean_by <= $1
+           ) expired
+          ORDER BY delete_after, kind, id
+          LIMIT $2`,
+        [now, limit],
+      );
+      return result.rows.map(toBrowserStateFile);
+    } catch (error) {
+      released = true;
+      client.release(true);
+      throw error;
+    } finally {
+      if (!released) client.release();
+    }
+  }
+
+  async tryClaimBrowserStateFile(
+    candidate: ExpiredBrowserStateFile,
+    now: Date,
+  ): Promise<BrowserStateFileClaim | null> {
+    const client = await this.pool.connect();
+    let lockAcquired = false;
+    let clientReleased = false;
+    try {
+      const lock = await client.query<{ acquired: boolean }>(
+        `SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired`,
+        [candidate.statePath],
+      );
+      lockAcquired = lock.rows[0]?.acquired === true;
+      if (!lockAcquired) {
+        clientReleased = true;
+        client.release();
+        return null;
+      }
+
+      const current = await selectBrowserStateFile(client, candidate, now);
+      if (!current) {
+        clientReleased = true;
+        await releaseBrowserStateLock(client, candidate.statePath);
+        return null;
+      }
+
+      let claimReleased = false;
+      let destroyOnRelease = false;
+      return {
+        file: current,
+        markFileDeleted: async () => {
+          try {
+            const result =
+              current.kind === "replay-checkpoint"
+                ? await client.query(
+                    `UPDATE browser_replay_checkpoints checkpoint
+                        SET state_path = NULL, file_deleted_at = $5
+                      WHERE checkpoint.id = $1
+                        AND checkpoint.state_path = $2
+                        AND checkpoint.checksum = $3
+                        AND checkpoint.file_deleted_at IS NULL
+                        AND EXISTS (
+                          SELECT 1 FROM requests request
+                           WHERE request.id = checkpoint.request_id
+                             AND request.dr_clean_by IS NOT NULL
+                             AND request.dr_clean_by <= $4
+                        )`,
+                    [current.id, current.statePath, current.checksum, now, now],
+                  )
+                : await client.query(
+                    `UPDATE browser_profile_generations generation
+                        SET state_path = NULL, file_deleted_at = $5
+                      WHERE generation.id = $1
+                        AND generation.state_path = $2
+                        AND generation.checksum = $3
+                        AND generation.file_deleted_at IS NULL
+                        AND generation.expires_at IS NOT NULL
+                        AND generation.expires_at <= $4
+                        AND NOT EXISTS (
+                          SELECT 1 FROM browser_profiles profile
+                           WHERE profile.id = generation.profile_id
+                             AND profile.latest_generation_id = generation.id
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM browser_sessions session
+                           WHERE session.profile_generation_id = generation.id
+                             AND session.state IN (
+                               'creating', 'replaying', 'ready', 'executing',
+                               'stopping'
+                             )
+                        )`,
+                    [current.id, current.statePath, current.checksum, now, now],
+                  );
+            return result.rowCount === 1;
+          } catch (error) {
+            destroyOnRelease = true;
+            throw error;
+          }
+        },
+        release: async () => {
+          if (claimReleased) return;
+          claimReleased = true;
+          if (destroyOnRelease) {
+            client.release(true);
+          } else {
+            await releaseBrowserStateLock(client, current.statePath);
+          }
+        },
+      };
+    } catch (error) {
+      if (clientReleased) {
+        throw error;
+      } else if (lockAcquired) {
+        try {
+          await releaseBrowserStateLock(client, candidate.statePath);
+        } catch (cleanupError) {
+          throw new LocalRetentionResourceError(error, cleanupError);
+        }
+      } else {
+        client.release(true);
+      }
+      throw error;
     }
   }
 
@@ -403,12 +638,19 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       }
 
       const current = await client.query<ArtifactManifestRow>(
-        `SELECT object_key, request_id, job_id, delete_after,
+        `SELECT object_key, kind, request_id, job_id, delete_after,
                 delete_after::text AS delete_after_token
-           FROM local_artifacts
+           FROM local_artifacts artifact
           WHERE object_key = $1
-            AND delete_after IS NOT NULL
-            AND delete_after <= $2`,
+            AND (
+              artifact.delete_after <= $2
+              OR EXISTS (
+                SELECT 1 FROM requests request
+                 WHERE request.id = artifact.request_id
+                   AND request.dr_clean_by IS NOT NULL
+                   AND request.dr_clean_by <= $2
+              )
+            )`,
         [candidate.objectKey, now],
       );
       if (!current.rows[0]) {
@@ -427,8 +669,16 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
             const result = await client.query(
               `DELETE FROM local_artifacts
                 WHERE object_key = $1
-                  AND delete_after = $2::timestamptz
-                  AND delete_after <= $3`,
+                  AND delete_after IS NOT DISTINCT FROM $2::timestamptz
+                  AND (
+                    delete_after <= $3
+                    OR EXISTS (
+                      SELECT 1 FROM requests request
+                       WHERE request.id = local_artifacts.request_id
+                         AND request.dr_clean_by IS NOT NULL
+                         AND request.dr_clean_by <= $3
+                    )
+                  )`,
               [manifest.objectKey, manifest.deleteAfterToken, now],
             );
             return result.rowCount === 1;
@@ -493,6 +743,19 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
            FROM requests
           WHERE dr_clean_by IS NOT NULL
             AND dr_clean_by <= $1
+            AND NOT EXISTS (
+              SELECT 1
+                FROM browser_replay_checkpoints checkpoint
+               WHERE checkpoint.request_id = requests.id
+                 AND checkpoint.state_path IS NOT NULL
+                 AND checkpoint.file_deleted_at IS NULL
+            )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM local_artifacts artifact
+               WHERE artifact.request_id = requests.id
+                 AND artifact.kind LIKE 'browser%'
+            )
           ORDER BY dr_clean_by, id
           LIMIT $2
           FOR UPDATE SKIP LOCKED`,
@@ -576,6 +839,72 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
   }
 }
 
+async function selectBrowserStateFile(
+  client: PoolClient,
+  candidate: ExpiredBrowserStateFile,
+  now: Date,
+): Promise<ExpiredBrowserStateFile | null> {
+  const result =
+    candidate.kind === "replay-checkpoint"
+      ? await client.query<BrowserStateFileRow>(
+          `SELECT 'replay-checkpoint'::text AS kind,
+                  checkpoint.id,
+                  checkpoint.state_path,
+                  checkpoint.checksum,
+                  request.dr_clean_by AS delete_after
+             FROM browser_replay_checkpoints checkpoint
+             JOIN requests request ON request.id = checkpoint.request_id
+            WHERE checkpoint.id = $1
+              AND checkpoint.state_path = $2
+              AND checkpoint.checksum = $3
+              AND checkpoint.file_deleted_at IS NULL
+              AND request.dr_clean_by IS NOT NULL
+              AND request.dr_clean_by <= $4`,
+          [candidate.id, candidate.statePath, candidate.checksum, now],
+        )
+      : await client.query<BrowserStateFileRow>(
+          `SELECT 'profile-generation'::text AS kind,
+                  generation.id,
+                  generation.state_path,
+                  generation.checksum,
+                  generation.expires_at AS delete_after
+             FROM browser_profile_generations generation
+             JOIN browser_profiles profile
+               ON profile.id = generation.profile_id
+            WHERE generation.id = $1
+              AND generation.state_path = $2
+              AND generation.checksum = $3
+              AND generation.file_deleted_at IS NULL
+              AND generation.expires_at IS NOT NULL
+              AND generation.expires_at <= $4
+              AND profile.latest_generation_id IS DISTINCT FROM generation.id
+              AND NOT EXISTS (
+                SELECT 1 FROM browser_sessions session
+                 WHERE session.profile_generation_id = generation.id
+                   AND session.state IN (
+                     'creating', 'replaying', 'ready', 'executing', 'stopping'
+                   )
+              )`,
+          [candidate.id, candidate.statePath, candidate.checksum, now],
+        );
+  return result.rows[0] ? toBrowserStateFile(result.rows[0]) : null;
+}
+
+async function releaseBrowserStateLock(
+  client: PoolClient,
+  statePath: string,
+): Promise<void> {
+  try {
+    await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+      statePath,
+    ]);
+  } catch (error) {
+    client.release(true);
+    throw error;
+  }
+  client.release();
+}
+
 async function releaseArtifactLock(
   client: PoolClient,
   objectKey: string,
@@ -608,6 +937,7 @@ export async function runLocalRetentionIteration(
   const artifactFailureRecords: Array<{
     failure: ArtifactRetentionFailure;
     causes: unknown[];
+    blocksOperationalCleanup: boolean;
   }> = [];
 
   if (options.artifactStore && !options.signal?.aborted) {
@@ -624,7 +954,11 @@ export async function runLocalRetentionIteration(
       );
       if (!claim) continue;
       let failureRecord:
-        | { failure: ArtifactRetentionFailure; causes: unknown[] }
+        | {
+            failure: ArtifactRetentionFailure;
+            causes: unknown[];
+            blocksOperationalCleanup: boolean;
+          }
         | undefined;
       let primaryError: unknown;
       let interrupted = false;
@@ -645,6 +979,9 @@ export async function runLocalRetentionIteration(
           failureRecord = {
             failure: failure.failures[0]!,
             causes: [error],
+            blocksOperationalCleanup:
+              claim.manifest.kind === "browser-run" ||
+              claim.manifest.kind.startsWith("browser-"),
           };
         }
         if (failureRecord) {
@@ -730,6 +1067,70 @@ export async function runLocalRetentionIteration(
       }
       if (interrupted) break;
     }
+  }
+
+  if (options.browserStateFilesystem && !options.signal?.aborted) {
+    const candidates = await options.database.listExpiredBrowserStateFiles(
+      now,
+      RETENTION_BATCH_SIZE,
+    );
+    for (const candidate of candidates) {
+      if (options.signal?.aborted) break;
+      const claim = await options.database.tryClaimBrowserStateFile(
+        candidate,
+        now,
+      );
+      if (!claim) continue;
+      let primaryError: unknown;
+      try {
+        await options.browserStateFilesystem.delete(claim.file.statePath);
+        if (!options.signal?.aborted && !(await claim.markFileDeleted())) {
+          throw new BrowserStateFileClaimLostError();
+        }
+      } catch (error) {
+        primaryError = error;
+      }
+      let cleanupError: unknown;
+      try {
+        await claim.release();
+      } catch (error) {
+        cleanupError = error;
+      }
+      if (primaryError || cleanupError) {
+        const cause =
+          primaryError && cleanupError
+            ? new AggregateError(
+                [primaryError, cleanupError],
+                "Browser state delete and claim cleanup failed",
+              )
+            : (primaryError ?? cleanupError);
+        throw new LocalBrowserStateRetentionError(
+          claim.file.kind,
+          claim.file.statePath,
+          cause,
+        );
+      }
+    }
+  }
+
+  const blockingArtifactFailure = artifactFailureRecords.find(
+    record => record.blocksOperationalCleanup,
+  );
+  if (blockingArtifactFailure) {
+    const first = blockingArtifactFailure.failure;
+    throw new LocalArtifactRetentionError({
+      ...result,
+      durationMs: Date.now() - startedAt,
+      objectKey: first.objectKey,
+      requestId: first.requestId,
+      jobId: first.jobId,
+      provider: first.provider,
+      failures: artifactFailureRecords.map(record => record.failure),
+      cause: new AggregateError(
+        artifactFailureRecords.flatMap(record => record.causes),
+        "Local browser artifact retention deletes failed",
+      ),
+    });
   }
 
   if (!options.signal?.aborted) {
@@ -831,6 +1232,17 @@ export async function runLocalRetentionLoop(
     options.artifactStore === undefined
       ? getArtifactStore()
       : options.artifactStore;
+  const runtimeSource = (options.configSource ??
+    config) as LocalRuntimeConfigSource & {
+    LOCAL_BROWSER_STATE_ROOT?: string;
+  };
+  const browserStateFilesystem =
+    options.browserStateFilesystem === undefined
+      ? new BrowserStateFilesystem(
+          runtimeSource.LOCAL_BROWSER_STATE_ROOT ??
+            "/var/lib/firecrawl-browser",
+        )
+      : options.browserStateFilesystem;
   const database =
     options.database ??
     new PgLocalRetentionDatabase(localConfig.applicationDatabaseUrl);
@@ -846,6 +1258,7 @@ export async function runLocalRetentionLoop(
         await runLocalRetentionIteration({
           database,
           artifactStore,
+          browserStateFilesystem,
           now: now(),
           signal: options.signal,
           logger,

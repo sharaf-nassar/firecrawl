@@ -1324,11 +1324,60 @@ describeWithDatabase("scrape replay checkpoint store", () => {
 
     const rows = await pool.query(
       `SELECT
+         (SELECT count(*)::int FROM browser_sessions) AS sessions,
+         (SELECT count(*)::int FROM browser_interact_runs) AS runs,
+         (SELECT count(*)::int FROM browser_profiles) AS profiles,
+         (SELECT count(*)::int FROM browser_profile_generations) AS generations,
+         (SELECT count(*)::int FROM browser_session_activities) AS activities,
+         (SELECT count(*)::int FROM browser_capabilities) AS capabilities,
+         (SELECT count(*)::int FROM browser_proxy_grants) AS grants,
          (SELECT count(*)::int FROM browser_replay_envelopes) AS envelopes,
-         (SELECT count(*)::int FROM browser_replay_checkpoints) AS checkpoints`,
+         (SELECT count(*)::int FROM browser_replay_checkpoints) AS checkpoints,
+         (SELECT count(*)::int FROM local_artifacts
+           WHERE kind LIKE 'browser%') AS artifacts`,
     );
-    expect(rows.rows[0]).toEqual({ envelopes: 0, checkpoints: 0 });
+    expect(rows.rows[0]).toEqual({
+      sessions: 0,
+      runs: 0,
+      profiles: 0,
+      generations: 0,
+      activities: 0,
+      capabilities: 0,
+      grants: 0,
+      envelopes: 0,
+      checkpoints: 0,
+      artifacts: 0,
+    });
     await expect(readdir(root)).resolves.toEqual([]);
+  });
+
+  it("fails closed for a redacted scrape even when replay rows exist", async () => {
+    const fixture = await createFixture();
+    await replayStore.persistScrapeReplayState(input(fixture));
+    await pool.query(
+      `UPDATE scrapes
+          SET url = '<redacted due to zero data retention>', options = NULL
+        WHERE id = $1`,
+      [fixture.scrapeId],
+    );
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+    });
+  });
+
+  it("fails closed when a scrape has no replay envelope", async () => {
+    const fixture = await createFixture();
+
+    await expect(
+      replayStore.loadScrapeReplayState(ownerId, fixture.scrapeId),
+    ).resolves.toMatchObject({
+      kind: "error",
+      category: "replay_unavailable",
+    });
   });
 
   it("returns before normalization and filesystem work when disabled", async () => {

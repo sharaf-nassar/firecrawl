@@ -637,6 +637,8 @@ export async function loadScrapeReplayState(
         byteSize: schema.browser_replay_checkpoints.byte_size,
         expiresAt: schema.browser_replay_checkpoints.expires_at,
         fileDeletedAt: schema.browser_replay_checkpoints.file_deleted_at,
+        scrapeUrl: schema.scrapes.url,
+        scrapeOptions: schema.scrapes.options,
       })
       .from(schema.browser_replay_envelopes)
       .innerJoin(
@@ -678,6 +680,11 @@ export async function loadScrapeReplayState(
       !row ||
       !row.statePath ||
       row.fileDeletedAt !== null ||
+      typeof row.scrapeUrl !== "string" ||
+      row.scrapeUrl.trim().toLowerCase().includes("redacted") ||
+      row.scrapeOptions === null ||
+      typeof row.scrapeOptions !== "object" ||
+      Array.isArray(row.scrapeOptions) ||
       Date.parse(row.expiresAt) <= Date.now()
     ) {
       return;

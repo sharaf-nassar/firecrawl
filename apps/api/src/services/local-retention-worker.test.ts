@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { Pool } from "pg";
 import {
@@ -14,9 +17,12 @@ import {
 import { runApplicationMigrations } from "../db/migrate";
 import type { ArtifactStore } from "../lib/artifacts";
 import { MinioArtifactStore } from "../lib/artifacts/minio";
+import { BrowserStateFilesystem } from "../lib/browser-state/filesystem-store";
 import { retentionDeadline } from "../lib/local-retention-deadline";
 import {
   createLocalRetentionService,
+  type BrowserStateFileClaim,
+  type ExpiredBrowserStateFile,
   LocalArtifactRetentionError,
   LocalOperationalRetentionError,
   LocalRetentionShutdownTimeoutError,
@@ -50,6 +56,7 @@ const silentLogger: RetentionLogger = {
 class FakeDatabase implements LocalRetentionDatabase {
   readonly events: string[] = [];
   manifests: ExpiredArtifactManifest[] = [];
+  browserStateFiles: ExpiredBrowserStateFile[] = [];
   operationalResult = {
     requestsDeleted: 0,
     dependentRowsDeleted: 0,
@@ -60,6 +67,7 @@ class FakeDatabase implements LocalRetentionDatabase {
   operationalNow: Date | undefined;
   operationalRuns = 0;
   manifestDeleteError: Error | undefined;
+  browserMarkResult = true;
 
   async listExpiredArtifactManifests(
     _now: Date,
@@ -93,6 +101,37 @@ class FakeDatabase implements LocalRetentionDatabase {
     };
   }
 
+  async listExpiredBrowserStateFiles(
+    _now: Date,
+    limit: number,
+  ): Promise<ExpiredBrowserStateFile[]> {
+    return this.browserStateFiles.slice(0, limit);
+  }
+
+  async tryClaimBrowserStateFile(
+    candidate: ExpiredBrowserStateFile,
+    _now: Date,
+  ): Promise<BrowserStateFileClaim | null> {
+    const file = this.browserStateFiles.find(
+      item => item.kind === candidate.kind && item.id === candidate.id,
+    );
+    if (!file) return null;
+    return {
+      file,
+      markFileDeleted: async () => {
+        if (!this.browserMarkResult) return false;
+        this.events.push(`metadata:${file.statePath}`);
+        this.browserStateFiles = this.browserStateFiles.filter(
+          item => item.kind !== file.kind || item.id !== file.id,
+        );
+        return true;
+      },
+      release: async () => {
+        this.events.push(`file-release:${file.statePath}`);
+      },
+    };
+  }
+
   async deleteExpiredOperationalRows(now: Date, limit: number) {
     this.operationalRuns += 1;
     this.operationalNow = now;
@@ -119,10 +158,21 @@ function fakeStore(
 function manifests(count: number): ExpiredArtifactManifest[] {
   return Array.from({ length: count }, (_, index) => ({
     objectKey: `artifact-${index}`,
+    kind: "retention-test",
     requestId: `request-${index}`,
     jobId: `job-${index}`,
     deleteAfter: new Date("2026-07-17T00:00:00.000Z"),
     deleteAfterToken: "2026-07-17 00:00:00+00",
+  }));
+}
+
+function browserStateFiles(count: number): ExpiredBrowserStateFile[] {
+  return Array.from({ length: count }, (_, index) => ({
+    kind: "replay-checkpoint" as const,
+    id: `checkpoint-${index}`,
+    statePath: `replay/owner/scrape/checkpoint-${index}.json`,
+    checksum: `${index}`.padStart(64, "0"),
+    deleteAfter: new Date("2026-07-17T00:00:00.000Z"),
   }));
 }
 
@@ -145,6 +195,73 @@ describe("retentionDeadline", () => {
 });
 
 describe("runLocalRetentionIteration", () => {
+  it("deletes browser state before metadata and operational rows", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = browserStateFiles(1);
+    const filesystem = {
+      delete: vi.fn(async (statePath: string) => {
+        database.events.push(`file:${statePath}`);
+      }),
+    };
+
+    await runLocalRetentionIteration({
+      database,
+      artifactStore: null,
+      browserStateFilesystem: filesystem,
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    });
+
+    expect(database.events).toEqual([
+      "file:replay/owner/scrape/checkpoint-0.json",
+      "metadata:replay/owner/scrape/checkpoint-0.json",
+      "file-release:replay/owner/scrape/checkpoint-0.json",
+      "operational",
+    ]);
+  });
+
+  it("leaves browser metadata and operational rows retryable on file failure", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = browserStateFiles(1);
+
+    await expect(
+      runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: {
+          delete: vi.fn().mockRejectedValue(new Error("filesystem offline")),
+        },
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      }),
+    ).rejects.toThrow("Browser state retention delete failed");
+
+    expect(database.browserStateFiles).toHaveLength(1);
+    expect(database.operationalRuns).toBe(0);
+    expect(database.events).toEqual([
+      "file-release:replay/owner/scrape/checkpoint-0.json",
+    ]);
+  });
+
+  it("does not delete requests after a browser metadata CAS loses", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = browserStateFiles(1);
+    database.browserMarkResult = false;
+
+    await expect(
+      runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: { delete: vi.fn() },
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      }),
+    ).rejects.toThrow("Browser state retention delete failed");
+
+    expect(database.browserStateFiles).toHaveLength(1);
+    expect(database.operationalRuns).toBe(0);
+  });
+
   it("deletes at most 50 objects before their manifests", async () => {
     const database = new FakeDatabase();
     database.manifests = manifests(51);
@@ -309,6 +426,47 @@ describe("runLocalRetentionIteration", () => {
     });
     expect(retry.artifactsDeleted).toBe(1);
     expect(database.manifests).toHaveLength(0);
+  });
+
+  it("keeps a failed browser artifact ahead of run and request cleanup", async () => {
+    const database = new FakeDatabase();
+    database.manifests = [
+      {
+        ...manifests(1)[0]!,
+        objectKey: "browser-runs/session/run/output.json",
+        kind: "browser-run",
+      } as ExpiredArtifactManifest,
+    ];
+    let unavailable = true;
+    const store = fakeStore(async key => {
+      database.events.push(`object:${key}`);
+      if (unavailable) throw new Error("browser artifact store offline");
+    });
+
+    await expect(
+      runLocalRetentionIteration({
+        database,
+        artifactStore: store,
+        now: new Date("2026-07-18T00:00:00.000Z"),
+        logger: silentLogger,
+      }),
+    ).rejects.toBeInstanceOf(LocalArtifactRetentionError);
+    expect(database.operationalRuns).toBe(0);
+    expect(database.manifests).toHaveLength(1);
+
+    unavailable = false;
+    await runLocalRetentionIteration({
+      database,
+      artifactStore: store,
+      now: new Date("2026-07-18T00:00:01.000Z"),
+      logger: silentLogger,
+    });
+    expect(database.events.slice(-4)).toEqual([
+      "object:browser-runs/session/run/output.json",
+      "manifest:browser-runs/session/run/output.json",
+      "release:browser-runs/session/run/output.json",
+      "operational",
+    ]);
   });
 
   it("preserves an object failure when releasing its claim also fails", async () => {
@@ -1036,6 +1194,7 @@ describeWithDatabase("PostgreSQL local retention", () => {
     integrationDatabaseUrl ?? "postgresql://disabled",
   );
   const fixtureIds = new Set<string>();
+  const profileIds = new Set<string>();
 
   beforeAll(async () => {
     await runApplicationMigrations({
@@ -1070,6 +1229,12 @@ describeWithDatabase("PostgreSQL local retention", () => {
       await pool.query("DELETE FROM requests WHERE id = ANY($1::uuid[])", [
         ids,
       ]);
+    }
+    if (profileIds.size > 0) {
+      await pool.query(
+        "DELETE FROM browser_profiles WHERE id = ANY($1::uuid[])",
+        [[...profileIds]],
+      );
     }
     await pool.query(
       "DELETE FROM local_artifacts WHERE object_key LIKE 'retention-test/%'",
@@ -1172,6 +1337,357 @@ describeWithDatabase("PostgreSQL local retention", () => {
 
     return ids.crawls;
   }
+
+  async function insertReplayCheckpoint(
+    requestId: string,
+    scrapeId: string,
+    statePath: string,
+    expiresAt = new Date("2026-07-19T00:00:00.000Z"),
+  ): Promise<string> {
+    const checkpointId = randomUUID();
+    await pool.query(
+      `INSERT INTO browser_replay_envelopes (
+         scrape_id, request_id, owner_id, version,
+         navigation_policy_version, envelope
+       ) VALUES ($1, $2, $3, 1, 1, '{}')`,
+      [scrapeId, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO browser_replay_checkpoints (
+         id, scrape_id, request_id, owner_id, envelope_version, state_path,
+         final_url, fingerprint, checksum, byte_size, expires_at
+       ) VALUES ($1, $2, $3, $4, 1, $5, 'https://example.com', '{}',
+                 $6, 2, $7)`,
+      [
+        checkpointId,
+        scrapeId,
+        requestId,
+        ownerId,
+        statePath,
+        "a".repeat(64),
+        expiresAt,
+      ],
+    );
+    return checkpointId;
+  }
+
+  async function insertScrape(
+    requestId: string,
+    scrapeId: string,
+  ): Promise<void> {
+    await pool.query(
+      `INSERT INTO scrapes (
+         id, request_id, url, is_successful, time_taken, team_id,
+         credits_cost
+       ) VALUES ($1, $2, 'https://example.com/browser', true, 1, $3, 1)`,
+      [scrapeId, requestId, ownerId],
+    );
+  }
+
+  it("lists only expired unprotected browser state files", async () => {
+    const now = new Date("2026-07-18T00:00:00.000Z");
+    const replayRequestId = randomUUID();
+    const replayScrapeId = randomUUID();
+    await insertRequest(replayRequestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(replayRequestId, replayScrapeId);
+    const replayPath = `replay/${ownerId}/${replayScrapeId}/${randomUUID()}.json`;
+    const replayId = await insertReplayCheckpoint(
+      replayRequestId,
+      replayScrapeId,
+      replayPath,
+    );
+
+    const profileId = randomUUID();
+    profileIds.add(profileId);
+    await pool.query(
+      "INSERT INTO browser_profiles (id, owner_id, name) VALUES ($1, $2, $3)",
+      [profileId, ownerId, `retention-${profileId}`],
+    );
+    const expiredId = randomUUID();
+    const futureId = randomUUID();
+    const latestId = randomUUID();
+    const activeId = randomUUID();
+    const generations = [
+      [expiredId, 1, new Date("2026-07-17T00:00:00.000Z")],
+      [futureId, 2, new Date("2026-07-19T00:00:00.000Z")],
+      [latestId, 3, new Date("2026-07-17T00:00:00.000Z")],
+      [activeId, 4, new Date("2026-07-17T00:00:00.000Z")],
+    ] as const;
+    for (const [id, generation, expiresAt] of generations) {
+      await pool.query(
+        `INSERT INTO browser_profile_generations (
+           id, profile_id, generation, state_path, byte_size, checksum,
+           expires_at
+         ) VALUES ($1, $2, $3, $4, 2, $5, $6)`,
+        [
+          id,
+          profileId,
+          generation,
+          `profiles/${ownerId}/${profileId}/${randomUUID()}.json`,
+          "b".repeat(64),
+          expiresAt,
+        ],
+      );
+    }
+    await pool.query(
+      "UPDATE browser_profiles SET latest_generation_id = $2 WHERE id = $1",
+      [profileId, latestId],
+    );
+
+    const activeRequestId = randomUUID();
+    await insertRequest(activeRequestId, new Date("2026-07-19T00:00:00.000Z"));
+    await pool.query(
+      `INSERT INTO browser_sessions (
+         id, request_id, owner_id, profile_id, profile_generation_id, state,
+         absolute_deadline_at, idle_deadline_at, last_activity_at
+       ) VALUES ($1, $2, $3, $4, $5, 'ready', $6, $6, $7)`,
+      [
+        randomUUID(),
+        activeRequestId,
+        ownerId,
+        profileId,
+        activeId,
+        new Date("2026-07-19T00:00:00.000Z"),
+        now,
+      ],
+    );
+
+    const candidates = await database.listExpiredBrowserStateFiles(now, 50);
+
+    expect(candidates.map(candidate => [candidate.kind, candidate.id])).toEqual(
+      [
+        ["profile-generation", expiredId],
+        ["replay-checkpoint", replayId],
+      ],
+    );
+  });
+
+  it("marks an already-missing checkpoint file deleted with path checksum CAS", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "retention-browser-"));
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const statePath = `replay/${ownerId}/${scrapeId}/${randomUUID()}.json`;
+    const checkpointId = await insertReplayCheckpoint(
+      requestId,
+      scrapeId,
+      statePath,
+    );
+    try {
+      const candidate = (
+        await database.listExpiredBrowserStateFiles(
+          new Date("2026-07-18T00:00:00.000Z"),
+          50,
+        )
+      ).find(item => item.id === checkpointId)!;
+      const claim = await database.tryClaimBrowserStateFile(
+        candidate,
+        new Date("2026-07-18T00:00:00.000Z"),
+      );
+      expect(claim).not.toBeNull();
+      await new BrowserStateFilesystem(root).delete(claim!.file.statePath);
+      await expect(claim!.markFileDeleted()).resolves.toBe(true);
+      await claim!.release();
+
+      const retained = await pool.query(
+        `SELECT state_path, file_deleted_at
+           FROM browser_replay_checkpoints WHERE id = $1`,
+        [checkpointId],
+      );
+      expect(retained.rows[0]).toMatchObject({ state_path: null });
+      expect(retained.rows[0]!.file_deleted_at).toBeInstanceOf(Date);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes browser file claims and rejects a stale path CAS", async () => {
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const statePath = `replay/${ownerId}/${scrapeId}/${randomUUID()}.json`;
+    const checkpointId = await insertReplayCheckpoint(
+      requestId,
+      scrapeId,
+      statePath,
+    );
+    const now = new Date("2026-07-18T00:00:00.000Z");
+    const candidate = (
+      await database.listExpiredBrowserStateFiles(now, 50)
+    ).find(item => item.id === checkpointId)!;
+    const claim = await database.tryClaimBrowserStateFile(candidate, now);
+    expect(claim).not.toBeNull();
+
+    await expect(
+      database.tryClaimBrowserStateFile(candidate, now),
+    ).resolves.toBeNull();
+    const replacementPath = `replay/${ownerId}/${scrapeId}/${randomUUID()}.json`;
+    await pool.query(
+      "UPDATE browser_replay_checkpoints SET state_path = $2 WHERE id = $1",
+      [checkpointId, replacementPath],
+    );
+    await expect(claim!.markFileDeleted()).resolves.toBe(false);
+    await claim!.release();
+    await expect(
+      database.tryClaimBrowserStateFile(candidate, now),
+    ).resolves.toBeNull();
+
+    const retained = await pool.query(
+      `SELECT state_path, file_deleted_at
+         FROM browser_replay_checkpoints WHERE id = $1`,
+      [checkpointId],
+    );
+    expect(retained.rows[0]).toEqual({
+      state_path: replacementPath,
+      file_deleted_at: null,
+    });
+  });
+
+  it("keeps checkpoint metadata and request rows retryable after file failure", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "retention-browser-"));
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const statePath = `replay/${ownerId}/${scrapeId}/${randomUUID()}.json`;
+    const fullPath = path.join(root, statePath);
+    await mkdir(path.dirname(fullPath), { recursive: true, mode: 0o700 });
+    await writeFile(fullPath, "{}", { mode: 0o600 });
+    const checkpointId = await insertReplayCheckpoint(
+      requestId,
+      scrapeId,
+      statePath,
+    );
+    try {
+      await expect(
+        runLocalRetentionIteration({
+          database,
+          artifactStore: null,
+          browserStateFilesystem: {
+            delete: vi.fn().mockRejectedValue(new Error("filesystem offline")),
+          },
+          now: new Date("2026-07-18T00:00:00.000Z"),
+          logger: silentLogger,
+        }),
+      ).rejects.toBeInstanceOf(Error);
+      const retained = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM requests WHERE id = $1) AS requests,
+           (SELECT count(*)::int FROM scrapes WHERE id = $2) AS scrapes,
+           (SELECT count(*)::int FROM browser_replay_checkpoints
+             WHERE id = $3 AND state_path = $4) AS checkpoints`,
+        [requestId, scrapeId, checkpointId, statePath],
+      );
+      expect(retained.rows[0]).toEqual({
+        requests: 1,
+        scrapes: 1,
+        checkpoints: 1,
+      });
+
+      await runLocalRetentionIteration({
+        database,
+        artifactStore: null,
+        browserStateFilesystem: new BrowserStateFilesystem(root),
+        now: new Date("2026-07-18T00:00:01.000Z"),
+        logger: silentLogger,
+      });
+      await expect(access(fullPath)).rejects.toMatchObject({ code: "ENOENT" });
+      const deleted = await pool.query("SELECT 1 FROM requests WHERE id = $1", [
+        requestId,
+      ]);
+      expect(deleted.rows).toHaveLength(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not cascade a request while its checkpoint path is pending", async () => {
+    const requestId = randomUUID();
+    const scrapeId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await insertScrape(requestId, scrapeId);
+    const statePath = `replay/${ownerId}/${scrapeId}/${randomUUID()}.json`;
+    await insertReplayCheckpoint(requestId, scrapeId, statePath);
+
+    const result = await database.deleteExpiredOperationalRows(
+      new Date("2026-07-18T00:00:00.000Z"),
+      50,
+    );
+
+    expect(result.requestIds).not.toContain(requestId);
+    const retained = await pool.query(
+      `SELECT
+         (SELECT count(*)::int FROM requests WHERE id = $1) AS requests,
+         (SELECT count(*)::int FROM browser_replay_checkpoints
+           WHERE request_id = $1 AND state_path = $2) AS checkpoints`,
+      [requestId, statePath],
+    );
+    expect(retained.rows[0]).toEqual({ requests: 1, checkpoints: 1 });
+  });
+
+  it("does not cascade a request while its browser artifact is pending", async () => {
+    const requestId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    const objectKey = `browser-runs/${randomUUID()}.json`;
+    await pool.query(
+      `INSERT INTO local_artifacts (
+         object_key, owner_id, request_id, kind, content_type, byte_size,
+         delete_after
+       ) VALUES ($1, $2, $3, 'browser-run', 'application/json', 2, NULL)`,
+      [objectKey, ownerId, requestId],
+    );
+
+    const result = await database.deleteExpiredOperationalRows(
+      new Date("2026-07-18T00:00:00.000Z"),
+      50,
+    );
+
+    expect(result.requestIds).not.toContain(requestId);
+    const retained = await pool.query(
+      `SELECT
+         (SELECT count(*)::int FROM requests WHERE id = $1) AS requests,
+         (SELECT count(*)::int FROM local_artifacts
+           WHERE object_key = $2) AS artifacts`,
+      [requestId, objectKey],
+    );
+    expect(retained.rows[0]).toEqual({ requests: 1, artifacts: 1 });
+  });
+
+  it("expires browser artifacts on their parent request deadline", async () => {
+    const requestId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    const objectKey = `browser-runs/${randomUUID()}.json`;
+    await pool.query(
+      `INSERT INTO local_artifacts (
+         object_key, owner_id, request_id, kind, content_type, byte_size,
+         delete_after
+       ) VALUES ($1, $2, $3, 'browser-run', 'application/json', 2, NULL)`,
+      [objectKey, ownerId, requestId],
+    );
+    const events: string[] = [];
+
+    await runLocalRetentionIteration({
+      database,
+      artifactStore: fakeStore(async key => {
+        events.push(`object:${key}`);
+      }),
+      browserStateFilesystem: null,
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    });
+
+    expect(events).toContain(`object:${objectKey}`);
+    const retained = await pool.query(
+      `SELECT
+         (SELECT count(*)::int FROM local_artifacts
+           WHERE object_key = $1) AS artifacts,
+         (SELECT count(*)::int FROM requests WHERE id = $2) AS requests`,
+      [objectKey, requestId],
+    );
+    expect(retained.rows[0]).toEqual({ artifacts: 0, requests: 0 });
+  });
 
   it("deletes every expired dependency before requests and preserves future data", async () => {
     const expiredRequest = randomUUID();
