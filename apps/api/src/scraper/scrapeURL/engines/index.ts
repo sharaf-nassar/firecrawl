@@ -30,6 +30,7 @@ import { getPDFMaxPages } from "../../../controllers/v2/types";
 import type { PdfMetadata } from "./pdf/types";
 import { BrandingProfile } from "../../../types/branding";
 import { BrandingNotSupportedError } from "../error";
+import type { ReplayCheckpointCaptureV1 } from "../../../lib/scrape-interact/replay-store";
 
 export type Engine =
   | "fire-engine;chrome-cdp"
@@ -161,6 +162,7 @@ export type EngineScrapeResult = {
 
   proxyUsed: "basic" | "stealth";
   timezone?: string;
+  replayCheckpoint?: ReplayCheckpointCaptureV1;
 };
 
 const engineHandlers: {

@@ -29,6 +29,10 @@ import {
 } from "../../lib/local-owner";
 import { isArtifactStoreConfigured } from "../../lib/artifacts";
 import { retentionDeadline } from "../../lib/local-retention-deadline";
+import {
+  persistScrapeReplayState,
+  type ReplayCheckpointCaptureV1,
+} from "../../lib/scrape-interact/replay-store";
 configDotenv();
 
 const nullByteRegex = /\u0000/g;
@@ -84,7 +88,7 @@ async function robustInsert(
     logger.info(
       "Skipping database insertion because application persistence is disabled",
     );
-    return;
+    return false;
   }
 
   const target = tableMap[table];
@@ -149,13 +153,16 @@ async function robustInsert(
       if (config.LOCAL_PERSISTENCE_ENABLED) {
         throw failure;
       }
+      return false;
     }
+    return true;
   } else {
     const start = Date.now();
     try {
       await db.insert(target).values(data);
       attempts.push({ error: null, timeMs: Date.now() - start, backoffMs: 0 });
       logger.debug("Inserted into database successfully", { attempts });
+      return true;
     } catch (error) {
       attempts.push({ error, timeMs: Date.now() - start, backoffMs: 0 });
       logger.error("Failed to insert into database", { attempts });
@@ -171,6 +178,7 @@ async function robustInsert(
           data: JSON.stringify(data).substring(0, 500), // Limit size
         },
       });
+      return false;
     }
   }
 }
@@ -285,6 +293,8 @@ export type LoggedScrape = {
   credits_cost: number;
   skipNuq: boolean;
   zeroDataRetention: boolean;
+  callerOrigin?: string;
+  replayCheckpoint?: ReplayCheckpointCaptureV1;
   is_parse?: boolean;
   monitor_id?: string | null;
   monitor_check_id?: string | null;
@@ -302,7 +312,7 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
 
   const tableName = scrape.is_parse ? "parses" : "scrapes";
 
-  await robustInsert(
+  const inserted = await robustInsert(
     tableName,
     {
       id: scrape.id,
@@ -333,6 +343,34 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
     force,
     logger,
   );
+
+  if (inserted && !scrape.is_parse && scrape.is_successful) {
+    try {
+      const result = await persistScrapeReplayState({
+        requestId: scrape.request_id,
+        scrapeId: scrape.id,
+        ownerId: resolveScrapePersistenceOwner(scrape.team_id),
+        url: scrape.url,
+        options: scrape.options,
+        callerOrigin: scrape.callerOrigin ?? "unknown",
+        zeroDataRetention: scrape.zeroDataRetention,
+        replayCheckpoint: scrape.replayCheckpoint,
+      });
+      logger.info("Scrape replay persistence completed", {
+        category: result.persisted ? "persisted" : result.reason,
+        scrapeId: scrape.id,
+      });
+    } catch (error) {
+      logger.error("Scrape replay persistence failed", {
+        category:
+          error instanceof Error && "category" in error
+            ? String(error.category)
+            : "persistence_failed",
+        scrapeId: scrape.id,
+      });
+      throw error;
+    }
+  }
 
   if (
     !scrape.is_parse &&

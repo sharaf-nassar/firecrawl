@@ -5,6 +5,7 @@ import UserAgent from 'user-agents';
 import { getError } from './helpers/get_error';
 import { lookup } from 'dns/promises';
 import IPAddr from 'ipaddr.js';
+import { createHash } from 'node:crypto';
 
 dotenv.config();
 
@@ -17,6 +18,7 @@ const BLOCK_MEDIA = (process.env.BLOCK_MEDIA || 'False').toUpperCase() === 'TRUE
 const MAX_CONCURRENT_PAGES = Math.max(1, Number.parseInt(process.env.MAX_CONCURRENT_PAGES ?? '10', 10) || 10);
 const ALLOW_LOCAL_WEBHOOKS = (process.env.ALLOW_LOCAL_WEBHOOKS || 'False').toUpperCase() === 'TRUE';
 const DNS_CACHE_TTL_MS = 30_000;
+const REPLAY_CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
 
 const PROXY_SERVER = process.env.PROXY_SERVER || null;
 const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
@@ -27,6 +29,15 @@ class InsecureConnectionError extends Error {
   constructor(public readonly blockedUrl: string, reason: string) {
     super(`Blocked insecure target URL "${blockedUrl}": ${reason}`);
     this.name = 'InsecureConnectionError';
+  }
+}
+
+class CheckpointTooLargeError extends Error {
+  readonly category = 'checkpoint_too_large';
+
+  constructor() {
+    super('Replay checkpoint exceeds 2 MiB');
+    this.name = 'CheckpointTooLargeError';
   }
 }
 
@@ -178,7 +189,51 @@ interface UrlModel {
   headers?: { [key: string]: string };
   check_selector?: string;
   skip_tls_verification?: boolean;
+  capture_replay_checkpoint?: boolean;
+  mobile?: boolean;
+  location?: { country?: string; languages?: string[] };
+  proxy_kind?: 'basic' | 'stealth' | 'enhanced' | 'auto';
+  block_ads?: boolean;
+  lockdown?: boolean;
 }
+
+type ReplayBrowserSettingsV1 = {
+  headers: Record<string, string>;
+  cookies: [];
+  viewport: {
+    width: number;
+    height: number;
+    deviceScaleFactor: number;
+    isMobile: boolean;
+    hasTouch: boolean;
+  };
+  deviceName?: string;
+  userAgent: string;
+  locale: string;
+  timezoneId?: string;
+  geolocation?: { latitude: number; longitude: number; accuracy: number };
+  location: { country: string; languages: string[] };
+  proxy: {
+    kind: 'basic' | 'stealth' | 'enhanced' | 'auto';
+    country?: string;
+    credentialRef?: string;
+  };
+  skipTlsVerification: boolean;
+  blockAds: boolean;
+  lockdown: boolean;
+};
+
+type ReplayCheckpointCaptureV1 = {
+  version: 1;
+  storageState: Awaited<ReturnType<BrowserContext['storageState']>>;
+  finalUrl: string;
+  fingerprint: {
+    finalUrl: string;
+    titleSha256: string;
+    bodyTextSha256: string;
+  };
+  browserSettings: ReplayBrowserSettingsV1;
+};
 
 let browser: Browser;
 
@@ -197,9 +252,25 @@ const initializeBrowser = async () => {
   });
 };
 
-const createContext = async (skipTlsVerification: boolean = false, userAgentOverride?: string): Promise<{ context: BrowserContext; securityState: ContextSecurityState }> => {
+const createContext = async (model: UrlModel = { url: 'about:blank' }): Promise<{
+  context: BrowserContext;
+  securityState: ContextSecurityState;
+  browserSettings: ReplayBrowserSettingsV1;
+}> => {
+  const userAgentOverride = model.headers
+    ? Object.entries(model.headers).find(([key]) => key.toLowerCase() === 'user-agent')?.[1]
+    : undefined;
   const userAgent = userAgentOverride || new UserAgent().toString();
-  const viewport = { width: 1280, height: 800 };
+  const mobile = model.mobile === true;
+  const viewport = mobile ? { width: 390, height: 844 } : { width: 1280, height: 800 };
+  const deviceScaleFactor = mobile ? 3 : 1;
+  const languages = model.location?.languages?.length
+    ? [...model.location.languages]
+    : ['en-US'];
+  const locale = languages[0] ?? 'en-US';
+  const country = model.location?.country?.toLowerCase() || 'us-generic';
+  const proxyKind = model.proxy_kind ?? 'basic';
+  const blockAds = model.block_ads !== false;
   const securityState: ContextSecurityState = {
     blockedNavigationRequestUrl: null,
   };
@@ -207,7 +278,11 @@ const createContext = async (skipTlsVerification: boolean = false, userAgentOver
   const contextOptions: any = {
     userAgent,
     viewport,
-    ignoreHTTPSErrors: skipTlsVerification,
+    deviceScaleFactor,
+    isMobile: mobile,
+    hasTouch: mobile,
+    locale,
+    ignoreHTTPSErrors: model.skip_tls_verification === true,
     serviceWorkers: 'block',
   };
 
@@ -250,14 +325,83 @@ const createContext = async (skipTlsVerification: boolean = false, userAgentOver
     const requestUrl = new URL(requestUrlString);
     const hostname = normalizeHostname(requestUrl.hostname);
 
-    if (AD_SERVING_DOMAINS.some(domain => hostname.includes(domain))) {
+    if (blockAds && AD_SERVING_DOMAINS.some(domain => hostname.includes(domain))) {
       console.log(hostname);
       return route.abort();
     }
     return route.continue();
   });
   
-  return { context: newContext, securityState };
+  return {
+    context: newContext,
+    securityState,
+    browserSettings: {
+      headers: { ...(model.headers ?? {}) },
+      cookies: [],
+      viewport: {
+        ...viewport,
+        deviceScaleFactor,
+        isMobile: mobile,
+        hasTouch: mobile,
+      },
+      userAgent,
+      locale,
+      location: { country, languages },
+      proxy: {
+        kind: proxyKind,
+        ...(model.location?.country ? { country } : {}),
+        ...(PROXY_USERNAME && PROXY_PASSWORD
+          ? { credentialRef: 'proxy-credential:playwright-service' }
+          : {}),
+      },
+      skipTlsVerification: model.skip_tls_verification === true,
+      blockAds,
+      lockdown: model.lockdown === true,
+    },
+  };
+};
+
+const sha256 = (value: string): string =>
+  createHash('sha256').update(value, 'utf8').digest('hex');
+
+const captureReplayCheckpoint = async (
+  context: BrowserContext,
+  page: Page,
+  browserSettings: ReplayBrowserSettingsV1,
+): Promise<ReplayCheckpointCaptureV1> => {
+  const runtimeViewport = page.viewportSize();
+  if (
+    !runtimeViewport ||
+    runtimeViewport.width !== browserSettings.viewport.width ||
+    runtimeViewport.height !== browserSettings.viewport.height
+  ) {
+    throw new Error('Replay checkpoint viewport does not match runtime context');
+  }
+  const storageState = await context.storageState({ indexedDB: true });
+  const finalUrl = page.url();
+  const title = await page.title();
+  const bodyText = (await page.locator('body').innerText())
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 65_536);
+  const serializedBytes = Buffer.byteLength(
+    JSON.stringify({ storageState, browserSettings }),
+    'utf8',
+  );
+  if (serializedBytes > REPLAY_CHECKPOINT_MAX_BYTES) {
+    throw new CheckpointTooLargeError();
+  }
+  return {
+    version: 1,
+    storageState,
+    finalUrl,
+    fingerprint: {
+      finalUrl,
+      titleSha256: sha256(title),
+      bodyTextSha256: sha256(bodyText),
+    },
+    browserSettings,
+  };
 };
 
 const shutdownBrowser = async () => {
@@ -354,13 +498,14 @@ app.get('/health', async (req: Request, res: Response) => {
 });
 
 app.post('/scrape', async (req: Request, res: Response) => {
-  const { url, wait_after_load = 0, timeout = 15000, headers, check_selector, skip_tls_verification = false }: UrlModel = req.body;
+  const model: UrlModel = req.body;
+  const { url, wait_after_load = 0, timeout = 15000, headers, check_selector, skip_tls_verification = false, capture_replay_checkpoint = false } = model;
 
   console.log(`================= Scrape Request =================`);
   console.log(`URL: ${url}`);
   console.log(`Wait After Load: ${wait_after_load}`);
   console.log(`Timeout: ${timeout}`);
-  console.log(`Headers: ${headers ? JSON.stringify(headers) : 'None'}`);
+  console.log(`Headers: ${headers ? 'Provided' : 'None'}`);
   console.log(`Check Selector: ${check_selector ? check_selector : 'None'}`);
   console.log(`Skip TLS Verification: ${skip_tls_verification}`);
   console.log(`==================================================`);
@@ -404,11 +549,10 @@ app.post('/scrape', async (req: Request, res: Response) => {
     // Extract user-agent from request headers (case-insensitive) so it can
     // be applied at the context level.  Playwright ignores user-agent in
     // setExtraHTTPHeaders when the context already defines one (#2802).
-    const userAgentOverride = headers
-      ? Object.entries(headers).find(([k]) => k.toLowerCase() === 'user-agent')?.[1]
-      : undefined;
-
-    const contextBundle = await createContext(skip_tls_verification, userAgentOverride);
+    const contextBundle = await createContext({
+      ...model,
+      skip_tls_verification,
+    });
     requestContext = contextBundle.context;
     securityState = contextBundle.securityState;
     page = await requestContext.newPage();
@@ -441,11 +585,20 @@ app.post('/scrape', async (req: Request, res: Response) => {
       console.log(`🚨 Scrape failed with status code: ${result.status} ${pageError}`);
     }
 
+    const replayCheckpoint = capture_replay_checkpoint
+      ? await captureReplayCheckpoint(
+          requestContext,
+          page,
+          contextBundle.browserSettings,
+        )
+      : undefined;
+
     res.json({
       content: result.content,
       pageStatusCode: result.status,
       contentType: result.contentType,
-      ...(pageError && { pageError })
+      ...(pageError && { pageError }),
+      ...(replayCheckpoint ? { replayCheckpoint } : {}),
     });
 
   } catch (error) {
@@ -454,6 +607,12 @@ app.post('/scrape', async (req: Request, res: Response) => {
         content: '',
         pageStatusCode: 403,
         pageError: error.message,
+      });
+    }
+    if (error instanceof CheckpointTooLargeError) {
+      return res.status(413).json({
+        errorCategory: error.category,
+        error: error.message,
       });
     }
     console.error('Scrape error:', error);

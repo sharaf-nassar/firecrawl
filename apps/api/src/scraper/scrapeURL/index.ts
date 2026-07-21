@@ -86,12 +86,14 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import type { ReplayCheckpointCaptureV1 } from "../../lib/scrape-interact/replay-store";
 
 export type ScrapeUrlResponse =
   | {
       success: true;
       document: Document;
       unsupportedFeatures?: Set<FeatureFlag>;
+      replayCheckpoint?: ReplayCheckpointCaptureV1;
     }
   | {
       success: false;
@@ -1045,6 +1047,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
       success: true,
       document,
       unsupportedFeatures: result.unsupportedFeatures,
+      replayCheckpoint: engineResult.replayCheckpoint,
     };
   });
 }
