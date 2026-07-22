@@ -530,8 +530,10 @@ durable `aborting_prepublication` with null classification and outcome
 2. Persist/fsync intent phase `manifest_planned` with identityManifest phase
    `planned`, exact locators/hash/size/count, and null inode evidence.
 3. Create/write/fsync exact temp through authenticated
-   `private_manifest_temp_file`, then publish temp to absent stable filename via
-   reconciliation-controlled native no-replace and sync `intents`.
+   `private_manifest_temp_file`, retain its pinned semantic ID and full
+   post-write evidence, then publish that exact temp to the absent stable
+   filename via reconciliation-controlled native no-replace without reopening
+   it, and sync `intents`.
 4. Open/hash/size the stable file, capture dev/ino/mode, and persist/fsync phase
    `manifest_published` with identityManifest phase `published` before any
    cleanup/source mutation.
@@ -650,9 +652,10 @@ Intent durability always precedes corresponding filesystem effects:
 
 1. Write `allocated` to a new closed-grammar temp with
    `O_CREAT | O_EXCL | O_NOFOLLOW`, sync file, authenticate it as
-   `private_intent_temp_file`, publish to absent stable intent through native
-   no-replace, resolve both locations, then sync `intents`. Only then may
-   wrapper creation begin.
+   `private_intent_temp_file`, retain its pinned semantic ID/full evidence, and
+   publish that exact object to absent stable intent through native no-replace
+   without reopening it. Resolve both locations, then sync `intents`. Only then
+   may wrapper creation begin.
 2. Create and pin wrapper plus its kind-specific private publication source,
    sync their parents, then write `building` using a new temp.
 3. Finish/hash/sync that source, then write `ready` using a new temp.
@@ -715,6 +718,8 @@ effect protocol. Its closed data-only interface is:
 ```ts
 type AtomicNativeMoveV1 = "profile_publish" | "canary_publish" |
   "profile_source_to_private" | "canary_source_to_private";
+type AtomicLocationMoveV1 = AtomicNativeMoveV1 | "intent_publish" |
+  "manifest_publish";
 
 declare const flightIdBrand: unique symbol;
 type FlightSemanticId = Readonly<{ [flightIdBrand]: true }>;
@@ -762,6 +767,7 @@ type CanonicalLocationEvidenceV1 = Readonly<{
   dev: string | null;
   ino: string | null;
   mode: number | null;
+  evidence: AtomicObjectEvidenceV1 | null;
   evidenceDigest: Sha256;
 }>;
 
@@ -859,7 +865,7 @@ type AtomicEffectRequestV1 =
       expected: AtomicObjectEvidenceV1;
     }>
   | Readonly<{
-      kind: "persist_intent" | "replace_intent" | "persist_manifest";
+      kind: "persist_intent" | "persist_manifest";
       effectId: FlightEffectId;
       operationId: CanonicalUuid;
       expectedPhase: AtomicPublishIntentV1["phase"] | null;
@@ -867,9 +873,26 @@ type AtomicEffectRequestV1 =
       contentDigest: Sha256;
       tempParentId: FlightSemanticId;
       tempLeaf: string;
+      tempObjectId: FlightSemanticId;
+      expectedTemp: AtomicObjectEvidenceV1;
       stableParentId: FlightSemanticId;
       stableLeaf: string;
-      expectedStable: AtomicObjectEvidenceV1 | Readonly<{ absent: true }>;
+      expectedStable: Readonly<{ absent: true }>;
+    }>
+  | Readonly<{
+      kind: "replace_intent";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      expectedPhase: AtomicPublishIntentV1["phase"];
+      canonicalBytes: Uint8Array;
+      contentDigest: Sha256;
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      tempObjectId: FlightSemanticId;
+      expectedTemp: AtomicObjectEvidenceV1;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      expectedStable: AtomicObjectEvidenceV1;
     }>
   | Readonly<{
       kind: "remove_intent" | "remove_manifest";
@@ -881,7 +904,22 @@ type AtomicEffectRequestV1 =
       expectedStable: AtomicObjectEvidenceV1;
     }>
   | Readonly<{
-      kind: "native_no_replace" | "observe_locations";
+      kind: "native_no_replace";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      move: AtomicNativeMoveV1;
+      sourceParentId: FlightSemanticId;
+      sourceId: FlightSemanticId;
+      sourceLeaf: string;
+      targetParentId: FlightSemanticId;
+      targetLeaf: string;
+      expectedSource: AtomicObjectEvidenceV1;
+      expectedTarget: AtomicObjectEvidenceV1 | Readonly<{ absent: true }>;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "observe_locations";
+      requestKind: "native_no_replace";
       effectId: FlightEffectId;
       operationId: CanonicalUuid;
       move: AtomicNativeMoveV1;
@@ -892,6 +930,38 @@ type AtomicEffectRequestV1 =
       targetLeaf: string;
       expectedSource: AtomicObjectEvidenceV1;
       expectedTarget: AtomicObjectEvidenceV1 | Readonly<{ absent: true }>;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "observe_locations";
+      requestKind: "persist_intent";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      move: "intent_publish";
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      tempObjectId: FlightSemanticId;
+      expectedTemp: AtomicObjectEvidenceV1;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      expectedTargetBefore: Readonly<{ absent: true }>;
+      expectedTargetAfter: AtomicObjectEvidenceV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "observe_locations";
+      requestKind: "persist_manifest";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      move: "manifest_publish";
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      tempObjectId: FlightSemanticId;
+      expectedTemp: AtomicObjectEvidenceV1;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      expectedTargetBefore: Readonly<{ absent: true }>;
+      expectedTargetAfter: AtomicObjectEvidenceV1;
       evidenceDigest: Sha256;
     }>
   | Readonly<{
@@ -937,6 +1007,9 @@ type AtomicEffectObservationV1 =
       requestKind: Exclude<
         AtomicEffectKindV1,
         "native_no_replace" | "observe_locations" |
+          "persist_intent" | "persist_manifest" |
+          "remove_intent" | "remove_manifest" |
+          "remove_file" | "remove_directory" | "remove_root" |
           "create_and_pin_wrapper" | "create_and_pin_directory" |
           "create_and_pin_file" | "create_and_pin_temp_file" |
           "open_pin_handle" |
@@ -998,6 +1071,17 @@ type AtomicEffectObservationV1 =
       evidenceDigest: Sha256;
     }>
   | Readonly<{
+      kind: "removal_observed";
+      effectId: FlightEffectId;
+      requestKind: "remove_intent" | "remove_manifest" |
+        "remove_file" | "remove_directory" | "remove_root";
+      objectId: FlightSemanticId;
+      removedEvidence: AtomicObjectEvidenceV1;
+      state: "absent";
+      parentSynced: true;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
       kind: "directory_observed";
       effectId: FlightEffectId;
       cursor: number;
@@ -1024,6 +1108,35 @@ type AtomicEffectObservationV1 =
   | Readonly<{
       kind: "native_resolved";
       effectId: FlightEffectId;
+      requestKind: "native_no_replace";
+      operationId: CanonicalUuid;
+      move: AtomicNativeMoveV1;
+      sourceObjectId: FlightSemanticId;
+      sourceEvidence: AtomicObjectEvidenceV1;
+      rawCode: AtomicRawNativeCodeV1;
+      nativePrecheckEvidenceDigest: Sha256;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "native_resolved";
+      effectId: FlightEffectId;
+      requestKind: "persist_intent";
+      operationId: CanonicalUuid;
+      move: "intent_publish";
+      sourceObjectId: FlightSemanticId;
+      sourceEvidence: AtomicObjectEvidenceV1;
+      rawCode: AtomicRawNativeCodeV1;
+      nativePrecheckEvidenceDigest: Sha256;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "native_resolved";
+      effectId: FlightEffectId;
+      requestKind: "persist_manifest";
+      operationId: CanonicalUuid;
+      move: "manifest_publish";
+      sourceObjectId: FlightSemanticId;
+      sourceEvidence: AtomicObjectEvidenceV1;
       rawCode: AtomicRawNativeCodeV1;
       nativePrecheckEvidenceDigest: Sha256;
       evidenceDigest: Sha256;
@@ -1031,6 +1144,50 @@ type AtomicEffectObservationV1 =
   | Readonly<{
       kind: "locations_observed";
       effectId: FlightEffectId;
+      requestKind: "native_no_replace";
+      operationId: CanonicalUuid;
+      move: AtomicNativeMoveV1;
+      sourceParentId: FlightSemanticId;
+      sourceLeaf: string;
+      targetParentId: FlightSemanticId;
+      targetLeaf: string;
+      requestedSourceObjectId: FlightSemanticId | null;
+      sourceObjectId: FlightSemanticId | null;
+      targetObjectId: FlightSemanticId | null;
+      source: CanonicalLocationEvidenceV1;
+      target: CanonicalLocationEvidenceV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "locations_observed";
+      effectId: FlightEffectId;
+      requestKind: "persist_intent";
+      operationId: CanonicalUuid;
+      move: "intent_publish";
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      requestedSourceObjectId: FlightSemanticId;
+      sourceObjectId: FlightSemanticId | null;
+      targetObjectId: FlightSemanticId | null;
+      source: CanonicalLocationEvidenceV1;
+      target: CanonicalLocationEvidenceV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "locations_observed";
+      effectId: FlightEffectId;
+      requestKind: "persist_manifest";
+      operationId: CanonicalUuid;
+      move: "manifest_publish";
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      requestedSourceObjectId: FlightSemanticId;
+      sourceObjectId: FlightSemanticId | null;
+      targetObjectId: FlightSemanticId | null;
       source: CanonicalLocationEvidenceV1;
       target: CanonicalLocationEvidenceV1;
       evidenceDigest: Sha256;
@@ -1068,10 +1225,96 @@ record binds role, operation, parent ID, canonical leaf, held handle, startup
 binding, and dev/ino/mode/size/hash evidence. Unknown/foreign/stale IDs reject
 before effect.
 
+### Held-procfd adapter for non-rename effects
+
+Logical create, existing-open, and removal effects have one exact Linux/Node 22
+implementation. Reconciliation resolves the request's held parent record,
+validates a single leaf, and constructs
+`/proc/self/fd/<held-parent-fd>/<strict-leaf>` only in the stack frame executing
+that effect. `<strict-leaf>` must pass its closed role grammar: control leaves
+use the 1-128-byte ASCII native-leaf grammar; payload leaves use one canonical
+NFC UTF-8 manifest segment of 1..255 bytes. Both independently reject NUL,
+`/`, `\\`, empty, `.`, and `..`, and require encode/decode round-trip equality.
+Nested traversal is represented by another held parent ID and another single
+strict leaf; a slash-containing or multi-segment selector is never accepted.
+The numeric fd extracted from the held `FileHandle` is not stored as separate
+record data, and the constructed procfd string is not retained beyond the one
+awaited Node operation. Neither is returned, captured by a controller-owned
+long-lived closure, placed in a request or observation, logged, persisted, or
+exported.
+
+Startup preflight requires Linux procfs before reducer admission. It calls
+Node 22 `statfsSync("/proc/self/fd", { bigint: true })`, requires filesystem
+type `PROC_SUPER_MAGIC` (`0x9fa0n`), opens `/proc/self/fd` with numeric
+`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`, and closes that probe with verified
+closure. It then `statSync`s `/proc/self/fd/<held-root-fd>` and requires its
+dev/ino/type to equal `fstatSync(<held-root-fd>)`. Missing/inaccessible procfs,
+the wrong filesystem type, a non-kernel-controlled fd directory, mismatch, or
+any unsupported Node operation produces `atomic_publish_unsupported`, leaves
+readiness false, and permits no pathname or native-addon fallback.
+
+Before and after every awaited filesystem operation, the controller runs a
+synchronous full-chain gate over the held volume→state→operation parent chain.
+The gate resolves every flight-local record, checks global admission, verifies
+the operation/role/parent linkage, and compares `fstatSync` dev/ino/type/mode
+with its captured startup/record evidence. Any drift or closed/replaced record
+rejects the effect and closes admission before another operation. The second
+gate runs even when the awaited call rejects. This guarantee relies on the
+specified protected-parent invariant: after startup ownership/mode validation,
+neither an untrusted process nor request code can mutate these directories.
+Privileged or same-UID mutation is an out-of-scope compromise tested only to
+prove detection/fail-stop; this design does not claim race-safe removal from an
+attacker-writable parent.
+
+Directory creation calls Node 22
+`fs.promises.mkdir(procfdChild, { mode: 0o700, recursive: false })`, then
+`fs.promises.open(procfdChild, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`, with all
+flags passed as numeric `fs.constants` values, then `FileHandle.stat({ bigint:
+true })`. File/temp creation calls `fs.promises.open` with numeric
+`O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW` and the role's fixed mode, then the
+same bigint handle stat. Existing-directory open uses numeric
+`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`; existing-file open uses numeric
+`O_RDONLY | O_NOFOLLOW`; each is immediately statted and matched to the
+request's complete evidence before its semantic ID is minted or accepted.
+String flags, recursive creation, ordinary configured/root paths, and a second
+unrequested open are forbidden.
+
+Node `SystemError` objects may contain their procfd `path`, `dest`, `syscall`,
+or message. They never leave the effect frame: reconciliation reads only the
+allowlisted errno `code`, maps it to the closed path-free rejection code, and
+discards the original error before observation/logging. An unknown error closes
+admission and surfaces one constant path-free internal failure without attaching
+the original as `cause`. No telemetry or diagnostic serialization receives the
+Node error object.
+
+Every logical removal—including intent/manifest and tree cleanup—resolves its
+existing pinned record, `lstat`s the procfd child, opens it with the applicable
+numeric flags—`O_RDONLY | O_NOFOLLOW` for a file and
+`O_RDONLY | O_DIRECTORY | O_NOFOLLOW` for a directory—then
+`FileHandle.stat({ bigint: true })` pins the observed child. It requires lstat,
+fstat, registry evidence, role, and requested full evidence to match. It repeats
+`lstat` immediately before namespace mutation and requires the same identity.
+It then calls exactly `fs.promises.unlink` for a file or `fs.promises.rmdir` for
+an empty directory on that procfd child; neither recursive removal nor `rm` is
+permitted. After verified closure of the removal pin, it proves the leaf absent,
+calls `sync()` on the already-held parent
+`FileHandle`, and only then emits `removal_observed` with the removed object ID,
+full removed evidence, `state: "absent"`, and `parentSynced: true`. Child
+absence/replacement or failure at lstat/open/fstat/recheck/remove/close/absence
+proof/parent sync fails closed and never advances phase/cursor or reports
+success.
+
+Reads, writes, hashes, enumeration, and fsync effects operate only on their
+already-held `FileHandle` records; they do not reconstruct a pathname. The only
+native operation remains `renameNoReplace`. Effect names such as
+`create_and_pin_*`, `open_pin_handle`, and `remove_*` describe semantic
+results; this design makes no claim that JavaScript calls a `mkdirat`, `openat`,
+or `unlinkat` API.
+
 Create-and-pin effects are composite only inside an already-held protected
-parent. Wrapper/directory creation executes exact `mkdirat(mode)`, then
-`openat(O_DIRECTORY | O_NOFOLLOW)`, then `fstat`. File/temp creation executes
-exact `openat(O_CREAT | O_EXCL | O_NOFOLLOW, mode)`, then `fstat`. Success is one
+parent. Wrapper/directory creation executes the exact procfd mkdir/open/stat
+sequence above. File/temp creation executes the exact procfd exclusive
+open/stat sequence above. Success is one
 `create_and_pin_completed` observation with new `handleId` and complete
 evidence; no
 following `open_pin_handle` is legal. That open effect is only for an existing
@@ -1083,8 +1326,9 @@ creation returns `create_and_pin_partial` before cleanup and mints a one-use
 `cleanup_partial_create`. As one specified composite effect, controller closes
 the partial handle when present and requires verified closure, reopens/stats the
 canonical leaf through the held protected parent, establishes or compares exact
-dev/ino/type/mode against the exclusive-creation record, and uses `unlinkat` or
-`unlinkat(..., AT_REMOVEDIR)` for that identity. It proves leaf absence, fsyncs
+dev/ino/type/mode against the exclusive-creation record, and uses the exact
+procfd `fs.promises.unlink` or `fs.promises.rmdir` removal sequence above for
+that identity. It proves leaf absence, fsyncs
 the held containing parent, and only then returns exactly
 `partial_create_cleanup_observed` with `state: "absent"` and
 `parentSynced: true`.
@@ -1137,6 +1381,54 @@ raw native result/precheck digest only; locations require the reducer's next
 separate effect. No operand is stored in an effect request/observation, promise,
 closure that outlives the callback, log, or exported value.
 
+`persist_intent` and `persist_manifest` requests are complete publication
+authorizations, not instructions to rediscover a temp. Each carries the exact
+existing `tempObjectId`, temp and stable parent IDs/leaves, full
+`expectedTemp`, canonical `Uint8Array` bytes, their SHA-256 digest, and exact
+absent-stable expectation. The controller resolves the already-pinned temp
+record created by the preceding `create_and_pin_temp_file`; requires its
+operation, role, parent, leaf, dev/ino/type/mode/size/content hash, and evidence
+digest to match; hashes `canonicalBytes` and requires that digest, byte length,
+`contentDigest`, and the temp record's post-write/post-fsync content evidence
+all agree. It then invokes `renameNoReplace` using that record's held source
+parent and leaf. It performs no temp pathname/procfd open, lstat, read,
+filesystem hash, or selector reconstruction inside persistence. A
+`native_resolved` observation
+echoes the exact request kind, operation ID, and closed move discriminator and
+binds `sourceObjectId` plus full `sourceEvidence` to the native precheck/result;
+a different association or ID/evidence pair is not a matching observation.
+Location proof remains the next explicit reducer
+effect. For intent its exact tuple is `observe_locations`, `persist_intent`,
+`intent_publish`; for manifest it is `observe_locations`, `persist_manifest`,
+`manifest_publish`. That request repeats the same operation ID, temp object/full
+evidence and temp parent/leaf, stable parent/leaf, original target-absence
+precondition, and expected post-move target evidence. It must associate with the
+immediately preceding matching
+`native_resolved` source ID/evidence; profile/canary/source moves instead use
+`observe_locations/native_no_replace/<AtomicNativeMoveV1>`.
+
+Every `locations_observed` echoes the exact request kind and closed
+`AtomicLocationMoveV1` discriminator, the requested source object ID, and the
+observed source/target object IDs alongside their complete canonical location
+proofs. Each explicit object ID must equal its corresponding
+`CanonicalLocationEvidenceV1.objectId`; absence requires null and match/other
+requires the ID minted by that exact observation. Absence also requires null
+dev/ino/mode/evidence; match/other requires full non-null evidence whose
+dev/ino/mode equal the scalar fields and whose digest participates in the
+location digest. Effect ID, request kind, move, operation, authorized source
+ID/evidence, both parent IDs/leaves, and target expectations must all match the
+outstanding request before the reducer can classify or sync. Wrong persistence/
+native discriminator pairing is not representable in the closed union and
+fails parsing at runtime.
+
+`replace_intent` carries the same exact pinned-temp authorization plus full
+expected stable evidence. After identical byte/evidence checks, reconciliation
+uses Node 22 `fs.promises.rename` between locally constructed held-parent
+procfd child strings to replace only that authenticated stable intent. It does
+not reopen either record. Its following explicit stable-open/hash observation
+and parent sync establish the committed phase. Ordinary replacement never
+enters the native addon; the addon still implements only `renameNoReplace`.
+
 Before the first reducer call only, reconciliation may acquire/validate/lease
 the trusted volume→state→`profiles`/staging authority and construct
 `PreReadyRecoveryAuthority`. That acquisition does not enumerate/read intent,
@@ -1167,10 +1459,15 @@ Ordering is fixed for every loop and expands every earlier protocol step:
    fail-stop.
 3. Initial intent and manifest publication sequence is reserve, composite temp
    creation with `create_and_pin_temp_file`, chunk writes, file fsync,
-   `persist_intent|persist_manifest`, location
-   observation, parent fsync, and close. Later intent transition uses the same
-   sequence with `replace_intent`. Stable record removal is
-   `remove_intent|remove_manifest` followed by parent fsync and budget release.
+   hash/evidence finalization, then `persist_intent|persist_manifest` carrying
+   that existing temp ID/evidence, exact parents/leaves, and canonical bytes/
+   digest. Native resolution binds the same source ID/evidence, followed by
+   the exact `intent_publish` or `manifest_publish` location request/observation
+   carrying the same temp/stable authority, then parent fsync and close;
+   persistence performs no hidden reopen. Later intent transition uses the same pinned-temp sequence
+   with `replace_intent`. Stable record removal is
+   `remove_intent|remove_manifest`, whose successful observation already proves
+   parent fsync, followed by budget release.
    Immutable manifests have no replace effect; a replacement request is outside
    the closed union and fails parsing.
 4. Profile/canary/source movement is exactly `native_no_replace`,
@@ -1179,9 +1476,10 @@ Ordering is fixed for every loop and expands every earlier protocol step:
    particular source-missing carries no locations/admission decision; no native
    result implies observation, normalization, sync, or fail-stop.
 5. Cleanup first persists the next cursor using step 3, then emits exactly one
-   `remove_file|remove_directory|remove_root`, observes it, fsyncs its parent,
-   closes any handle, and releases its reservation. It cannot advance cursor or
-   remove the next identity in the same reducer step.
+   `remove_file|remove_directory|remove_root`; its sole success observation
+   proves exact identity removal, absence, and containing-parent fsync. It then
+   closes the retained handle and releases its reservation. It cannot advance
+   cursor or remove the next identity in the same reducer step.
 6. Reconciliation resolves its own authority only for `resolve_adoption`. The
    reducer first completes durable adopted intent replacement, then emits
    `adopt_generation`; release follows durable discard/cleaned transitions and
@@ -1807,10 +2105,12 @@ hashes the already-built production addon, parses the exact runtime checksum
 attestation, requires hash/interface/N-API match, then validates ELF, ABI, and
 the loaded three-property interface. It never compiles and never trusts input
 audit sidecars for runtime integrity.
-Startup root preflight validates staging/public invariants,
-statfs allowlist, device and mount IDs, then performs a private positive canary
-and no-replace conflict canary on actual persistent filesystem. Any missing
-artifact, symbol, support, or proof leaves readiness false.
+Startup root preflight first proves the exact Linux procfs held-fd adapter,
+then validates staging/public invariants, statfs allowlist, device and mount
+IDs, and performs a private positive canary plus no-replace conflict canary on
+the actual persistent filesystem. Any missing/inaccessible/wrong-type procfs,
+fd-identity mismatch, artifact, symbol, support, or proof leaves readiness
+false with no alternate path implementation.
 
 Current Task 4 proves deterministic host compilation/loading and unprivileged
 filesystem semantics only. It does not claim image, different-UID, privileged
@@ -1900,16 +2200,56 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   mount the named volume at `/var/lib/firecrawl-browser-volume`, API has no
   volume mount, service root is exact child `state`, init gates service start,
   and activation remains false until final acceptance commit;
+- held-procfd preflight tests cover missing `/proc`, inaccessible
+  `/proc/self/fd`, injected non-procfs `statfs` type, fd-probe dev/ino/type
+  mismatch, and unsupported Node operations; every case keeps readiness false
+  and proves no configured-path or addon fallback. Adapter spies assert exact
+  Node 22 `mkdir`/numeric-flag `open`/bigint-stat and
+  lstat→open→fstat→re-lstat→unlink-or-rmdir→absence→parent-sync sequences.
+  Control and payload strict-leaf boundary/invalid-encoding fixtures reject
+  before I/O; string flags, missing `O_DIRECTORY`/`O_NOFOLLOW`, missing
+  `O_CREAT`/`O_EXCL`, recursive mkdir/removal, `rm`, and ordinary-path access
+  fail the test;
+- barriers before and after every adapter await replace a held parent/ancestor,
+  remove or replace the selected child between lstat/open/fstat/recheck/removal,
+  and drift admission/record identity. Host-protected cases and deferred
+  privileged/same-UID Docker cases must detect drift, perform no wrong-object
+  mutation, emit no success, and globally fail-stop. Instrumentation inspects
+  every request, observation, error, log, registry field, returned value, and
+  promise/retained closure and proves no extracted numeric-fd field or
+  constructed procfd string escapes reconciliation's effect frame;
 - exact native export stays three properties; reducer tests cover every closed
   effect kind and require exactly one matching observation before the next
-  effect. Composite create-and-pin tests prove exact directory/file syscall
+  effect. Composite create-and-pin tests prove exact procfd Node-operation
   sequences, success returns one ID/full evidence with no second open, and
   partial failure returns a one-use partial ID before explicit cleanup. Cleanup
   tests require close when applicable, protected-parent identity verification,
-  exact unlink/rmdir, absence proof, and containing-parent fsync before the
-  sole `absent/parentSynced` success observation. Injected failure/crash at each
-  syscall boundary retains partial ID and stable intent, emits no phase/cursor/
-  reservation advance, and fail-stops on close/remove/fsync failure;
+  exact procfd unlink/rmdir, absence proof, and containing-parent fsync before
+  the sole `absent/parentSynced` success observation. Injected failure/crash at
+  each awaited-operation boundary retains partial ID and stable intent, emits
+  no phase/cursor/reservation advance, and fail-stops on close/remove/fsync
+  failure;
+- intent/manifest publication tests require exact `tempObjectId`,
+  `expectedTemp`, temp/stable parent IDs and leaves, canonical `Uint8Array`
+  bytes/digest, and absent-stable evidence. Altering any ID, evidence field,
+  byte, digest, size, role, operation, parent, or leaf rejects before native
+  invocation. Spies prove persistence resolves the existing pinned temp and
+  performs no procfd/path open, lstat, read, or filesystem hash;
+  `native_resolved` must bind the same request kind, operation ID, publication
+  discriminator, source ID, and full source evidence. The next request must use
+  the exact `intent_publish` or `manifest_publish` discriminator and repeat
+  operation, temp object/evidence,
+  both parents/leaves, target-absence precondition, and expected target
+  evidence. Its observation must echo request kind/discriminator/requested
+  source ID, return explicit source/target IDs equal to the IDs inside both
+  canonical location proofs, and reject null/match or full-evidence/scalar
+  inconsistencies. Swapped
+  intent/manifest discriminators, native-move discriminators, stale preceding
+  `native_resolved`, altered target evidence, or mismatched IDs reject before
+  classification/fsync. Restart may remint authority only through the earlier
+  explicit discovery/open effects. Native
+  export inspection remains exactly the three specified properties and exposes
+  no mkdir/open/unlink helper;
 - fresh-process partial-create recovery tests cover crash after mkdir/open/fstat
   and after remove but before parent fsync/observation. Lost flight IDs grant no
   authority: recovery remints from stable intent plus exact locator/evidence,
