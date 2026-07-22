@@ -816,6 +816,134 @@ Profile/session creation remains impossible until handoff and reconciliation
 succeed. Its tests use fixture roots and injected snapshots; no database
 credentials enter Browser Service.
 
+### Task 4 persistent replay boundary
+
+Task 4 owns profile/session/replay files plus the restore-gate changes and tests
+in `egress-proxy.ts` and `egress-proxy.test.ts`. It locks Playwright `1.61.1`
+behavior. Persistent launch options must not
+contain `storageState`; `launchPersistentContext()` intentionally omits that
+option, while `BrowserContext.setStorageState()` is the supported post-launch
+restore API. After validating every request setting and, for replay, checkpoint
+file, metadata, checksum, canonical byte, and closed-schema boundary, Browser
+Service creates a private provisional Registry entry, fresh isolated working
+directory, and loopback proxy with one closed per-session gate. For non-replay,
+it launches the persistent context, immediately proves zero gate violations,
+atomically opens the gate, and only then acquires/creates a page and navigates
+`initialUrl`. That navigation must observe ingress, DNS, policy, and dial in
+order. For replay, it launches the persistent context, immediately calls
+`setStorageState()`, immediately receives
+`storageState({ indexedDB: true })` as `unknown`, parses it through the bounded
+closed `StorageStateV1` schema, compares semantic-normalized state, proves the
+gate recorded zero ingress violations, and atomically opens it. Only then may
+service code acquire `context.pages()[0]`, create a page, or navigate.
+Both paths use the same `provisional.acquireWorkingCopy()`,
+`provisional.acquireEgressProxy()`, and
+`provisional.acquirePersistentContext()` methods; each attaches its owned
+resource before returning and before the caller's next fallible await.
+Persistent-context acquisition owns a `launch_attempt` token before calling
+Playwright; a returned context atomically replaces the token.
+
+Persistent Chromium automatically initializes an `about:blank` page before
+launch returns. Mobile Chromium may cause Playwright to create a replacement
+default-context page and close the original. Playwright's storage APIs may
+inspect existing-page origins, create helper pages, navigate to origins under
+a prepended handler that fulfills every request locally, and evaluate their
+utility-world storage script. Those launch/storage-library operations are
+allowed. Service and caller code may not acquire a page, call `newPage()`,
+navigate, use locators, evaluate script, or register initiating listener work
+until non-replay zero-violation checks, or replay equality plus zero-violation
+checks, succeed and the gate opens. Playwright 1.61.1 suppresses public context
+events for storage helper pages, so those events are incomplete and never an
+egress oracle.
+
+Task 4 extends Task 2's egress proxy. Its categories are exactly
+`http | connect | upgrade`: HTTP handler requests map to `http`, CONNECT maps
+HTTPS and WSS tunnels to `connect`, and WS Upgrade maps to `upgrade`; no `ws`
+or `wss` category exists. Each session gate has exact state
+`restore_closed | open | closed`; its ingress linearization point is before DNS
+resolution, policy `onDecision`, and dial.
+While restore-closed, any attempt increments a bounded violation counter,
+records only the exact mapped category above, rejects and closes, and performs
+zero DNS, decision, or dial. A closed-linearized attempt is never queued or
+replayed and permanently disqualifies that session gate from opening. Monotonic
+ingress/violation/DNS/decision/dial counters are
+per-session. Each checked increment fails closed before downstream work on
+`Number.MAX_SAFE_INTEGER` overflow without changing any counter. Non-replay
+open requires zero violations; replay open additionally requires successful
+export parse and semantic equality. Open from `open` or `closed`, or after a
+violation, is a typed no-state-change invariant failure. Close is
+terminal and idempotent once closed. Post-open non-replay `initialUrl` or replay
+`finalUrl` navigation must traverse the same observer and all Task 2 transport
+defenses as positive control.
+
+Semantic normalization sorts cookies, origins, localStorage entries,
+databases, stores, records, and indexes by a total order derived from the local
+closed schema. Tagged, length-framed identity tuples compare raw UTF-8 bytes,
+then full fixed-key normalized element bytes. Identities are cookie
+`(domain,path,name,partitionKey-or-absent,
+_crHasCrossSiteAncestor-or-absent)`, origin `(origin)`, localStorage `(name)`,
+database `(name)`, store `(name)`, index `(name)`, and record `key:` plus
+canonical key, `keyEncoded:` plus canonical encoded key, or for inline/keyless
+records `value:`/`valueEncoded:` plus canonical value. Duplicate identities,
+including same-primary/different-payload, are rejected. Duplicates remain
+allowed only in ordered value-semantic arrays such as `keyPathArray` and JSON
+payload arrays; their order is preserved. Absent IndexedDB equals `[]`, empty
+origins are dropped, and other absent optionals are omitted. Semantic bytes are
+compared only to each other, never to foundation checkpoint bytes/checksum.
+
+Registry creates a private provisional entry before its first resource and
+incrementally owns working path, context, proxy/gate/listener/live sockets,
+pending acquisition, and cleanup state until navigation/fingerprint success.
+A partially acquiring working/proxy constructor attaches ownership before its
+next fallible await or returns only after self-cleaning. Validation failures
+precede side effects and launch nothing. Detached launch races are forbidden.
+
+Public Playwright rejection/timeout after launch starts does not prove process
+cleanup, and without a returned context there is no public process handle.
+Only explicit trusted `preSpawn` proof that no browser process/resource existed
+permits proxy shutdown, working discard, and provisional removal; rejected
+promise state alone is never proof. Otherwise Registry records
+`cleanup_failed/launch_cleanup_unverified` before returning a typed unavailable
+error, retains launch token and working profile, closes/drains proxy when
+verifiable, performs no discard/prepare/stage/finalize/publication, and globally
+closes new-session admission/readiness or drains this service process. Sweeper
+cannot clear the token from public evidence. No private PID/process API is
+allowed. Unverified proxy closure retains its handles and bounded cleanup codes
+in the same entry. Token and Registry ownership are process-local and never
+persisted; the working directory remains ordinary unreferenced filesystem
+state. Process/container restart guarantees old Chromium termination and
+clears that in-memory uncertainty. Task 3 reconciliation then treats the exact
+recognized unreferenced working generation under existing authority: retain while maximum
+descendant age is <=10 minutes, with readiness allowed, then remove only in a
+later startup/reconciliation generation after age >10 minutes through existing
+manifest/quarantine/fsync/delete/completion rules. There is no new marker or
+immediate-deletion exception.
+
+Every failure after a context was returned calls public `context.close()` once,
+preserves and observes
+that original promise under a bound, and never recalls it. On graceful
+rejection/timeout without verified closure, cleanup calls bounded public
+`context.browser()?.close()` as its only force-quit-like fallback. Verified
+context close or Browser disconnect succeeds; unavailable, failed, or pending
+public close state remains owned. Cleanup independently performs terminal gate
+close, proxy listener close, bounded socket drain, and profile discard only
+after verified context closure. Private Playwright process APIs are forbidden.
+Cleanup aggregates only
+`chromium_close_failed`, `proxy_listener_close_failed`,
+`proxy_socket_drain_failed`, and `profile_discard_failed`. Terminal gate close
+is infallible. Verified cleanup removes provisional ownership. Any unverified
+context/listener/socket/path remains truthfully owned in `cleanup_failed` with
+admission closed, original close promises/states, and no
+prepare/stage/finalize/publication. Sweeper observes those promises, may retry
+only `browser.close()` when public state permits, never recalls an already
+started `context.close()`, and removes ownership only after verified closure/
+discard. Service restart is operator fallback. Normal writer close uses the
+same public fallback and verifies context/browser closure, terminal gate close,
+listener close, and zero sockets before prepare/finalize; any cleanup failure
+prevents publication. Snapshot close discards. Publication errors add
+`profile_prepare_failed` or `profile_finalize_failed`; reconciliation owns
+durable partial filesystem state.
+
 ### Task 6
 
 Task 6 mounts authenticated discovery, control-generation, scoped health,
@@ -961,6 +1089,53 @@ New tests in the implementation plan must prove:
 - Task 3 and Task 4 share exact UTF-8-sorted type/mode/size/content-SHA tree
   encoding and enforce depth 64, checkpoint 2 MiB, profile-file 64 MiB,
   profile-tree 256 MiB, and path/segment bounds during walks;
+- Playwright persistent launch receives no `storageState` option; replay uses
+  immediate `setStorageState()` followed by an `unknown` immediate
+  `storageState({ indexedDB: true })` export and closed-schema parse before any
+  service-owned page acquisition or work;
+- desktop `about:blank` initialization and mobile launch-owned replacement and
+  close, existing-page origin inspection, storage helper pages, fulfilled
+  origin navigation, and utility evaluation remain Playwright-only while
+  service page acquisition, creation, navigation, locator, evaluation, and
+  initiating listener work remain absent through verification;
+- suppressed storage-helper context events are incomplete and unused; exact
+  `http | connect | upgrade` per-session categories cover HTTP handler,
+  HTTPS/WSS CONNECT, and WS Upgrade ingress before DNS, policy, or dial;
+- non-replay launch proves zero closed-gate violations before open/page/
+  `initialUrl`; replay additionally restores, exports, parses, and compares
+  before open/page/`finalUrl`, and both navigations positively observe
+  ingress-to-DNS-to-policy-to-dial order;
+- exact real-Chromium replay roundtrips cookies, localStorage, and IndexedDB;
+  semantic normalization drops empty origins, equates absent and empty
+  IndexedDB, uses tagged length-framed raw UTF-8 identity tuples with full-byte
+  tie-breakers, rejects tag collisions and duplicate or same-primary/different-
+  payload identities, and accepts non-ASCII/reversed foundation arrays without
+  comparing semantic bytes to checkpoint bytes;
+- launch options and exact replay/non-replay call order are inspected; malformed
+  unknown export and acquisition/restore/export/parse/compare/gate/navigation/
+  fingerprint/timeout/crash failures distinguish zero-launch validation from
+  incremental provisional ownership; exact order owns `launch_attempt` before
+  calling Playwright and replaces it only when a context returns;
+- trusted `preSpawn` rejection proves no browser process/resource and may
+  discard; timeout/post-spawn rejection retains
+  `cleanup_failed/launch_cleanup_unverified`, working profile, and globally
+  closed admission for the current process; verified restart drops the
+  process-local token, immediate reconciliation retains the <=10-minute working
+  generation and may become ready, and a later generation removes it
+  crash-safely only after age >10 minutes;
+- gate tests cover invalid open transitions, close from restore-closed/open,
+  repeated close, session isolation, checked counter overflow, violation-open
+  exclusion, no queue/replay, and post-open DNS/policy/dial ordering; isolation
+  compares state plus all five counters, and overflow changes no counter;
+- successful returned-context cleanup verifies context/listener/socket/path closure before
+  removing ownership; failed public cleanup retains truthful `cleanup_failed`
+  ownership and closed admission for sweeper retry, performs no
+  prepare/stage/finalize/publication, and uses no private browser kill API;
+- cleanup tests cover one-shot graceful context close failure followed by
+  successful public `browser.close()`, plus unavailable/both-failed fallback
+  retention with original promise observation and Browser-only sweeper retry;
+- normal writer close verifies context, gate, listener, and socket teardown
+  before profile prepare/finalize; any cleanup failure prevents publication;
 - the global managed-entry counter includes every yielded nested namespace and
   manifest entry; a non-null overflow lookahead fails with zero downstream
   processing, while descendant maximum mtime controls the 10-minute grace;

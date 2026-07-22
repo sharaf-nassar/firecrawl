@@ -2611,6 +2611,8 @@ Resume exact crash phases after filesystem failure or restart."
 - Create: `apps/browser-service/src/session-registry.test.ts`
 - Create: `apps/browser-service/src/replay-restore.ts`
 - Create: `apps/browser-service/src/replay-restore.integration.test.ts`
+- Modify: `apps/browser-service/src/egress-proxy.ts`
+- Modify: `apps/browser-service/src/egress-proxy.test.ts`
 
 - [ ] **Step 1: Write profile crash-boundary and TTL tests**
 
@@ -2644,11 +2646,14 @@ test("cannot create a profile or Chromium session before reconciliation", async 
   expect(profileStore.createWorkingCopy).not.toHaveBeenCalled();
 });
 
-test("real Chromium restores storage before its first network request", async () => {
+test("real Chromium restores through a closed proxy ingress gate", async () => {
   const restored = await restoreRealCheckpoint({
     cookies: true, localStorage: true, indexedDB: true,
   });
-  expect(restored.preRestoreNetworkRequests).toBe(0);
+  expect(restored.preVerificationIngressViolations).toBe(0);
+  expect(restored.preVerificationDnsResolutions).toBe(0);
+  expect(restored.preVerificationPolicyDecisions).toBe(0);
+  expect(restored.preVerificationDials).toBe(0);
   expect(restored.documentValues).toEqual(EXPECTED_STORAGE_VALUES);
   expect(restored.requestFileCanonicalBytes).toEqual(
     restored.checkpointFileCanonicalBytes,
@@ -2659,6 +2664,549 @@ test("real Chromium restores storage before its first network request", async ()
   expect(restored.checkpointFileChecksum).toBe(
     sha256(restored.checkpointFileCanonicalBytes),
   );
+});
+
+test("uses exact restore order without a launch storageState option", async () => {
+  const restored = await restoreRealCheckpoint({ captureCallOrder: true });
+  expect(restored.launchOptions).not.toHaveProperty("storageState");
+  expect(restored.callOrder).toEqual([
+    "validate", "registry-provisional", "working-copy",
+    "proxy-gate-closed", "launch-attempt-owned", "launch",
+    "set-storage-state", "export-unknown", "parse", "compare",
+    "assert-zero-ingress-violations", "open-gate", "acquire-page",
+    "navigate", "fingerprint", "publish-session",
+  ]);
+});
+
+test("opens a non-replay gate before initial page work", async () => {
+  const created = await createRealSessionWithoutReplay({
+    captureCallOrder: true,
+    observeProxyIngress: true,
+  });
+  expect(created.callOrder).toEqual([
+    "validate", "registry-provisional", "working-copy",
+    "proxy-gate-closed", "launch-attempt-owned", "launch",
+    "assert-zero-ingress-violations",
+    "open-gate", "acquire-page", "navigate-initial-url", "fingerprint",
+    "publish-session",
+  ]);
+  expect(created.preOpenIngressViolations).toBe(0);
+  expect(created.preOpenDnsResolutions).toBe(0);
+  expect(created.preOpenPolicyDecisions).toBe(0);
+  expect(created.preOpenDials).toBe(0);
+  expect(created.postOpenInitialUrlOrder).toEqual([
+    "ingress-linearize", "dns", "policy", "dial",
+  ]);
+});
+
+test("permits desktop launch-owned pages but no service page work", async () => {
+  const restored = await restoreRealCheckpoint({ observePageLifecycle: true });
+  expect(restored.launchOwnedPageLifecycle).toEqual([
+    "about:blank-initialized",
+  ]);
+  expect(restored.servicePageOperationsBeforeVerification).toEqual([]);
+});
+
+test("permits mobile launch-owned replacement but no service page work", async () => {
+  const restored = await restoreRealCheckpoint({
+    device: "validated-mobile-device",
+    observePageLifecycle: true,
+  });
+  expect(restored.launchOwnedPageLifecycle).toEqual([
+    "about:blank-initialized",
+    "mobile-default-page-created",
+    "about:blank-closed",
+  ]);
+  expect(restored.servicePageOperationsBeforeVerification).toEqual([]);
+});
+
+test("never uses suppressed context events as the ingress oracle", async () => {
+  const restored = await restoreRealCheckpoint({ captureEgressOracle: true });
+  expect(restored.egressOracle).toBe("proxy-restore-gate");
+  expect(restored.contextEventOracleSubscriptions).toEqual([]);
+});
+
+test("blocks each closed-gate ingress before DNS, policy, or dial", async () => {
+  for (const [entryPoint, category] of [
+    ["http-handler", "http"],
+    ["https-connect", "connect"],
+    ["wss-connect", "connect"],
+    ["ws-upgrade", "upgrade"],
+  ] as const) {
+    const attempt = await attemptClosedRestoreIngress(entryPoint);
+    expect(attempt).toMatchObject({
+      gateState: "restore_closed",
+      recordedCategory: category,
+      ingressAttempts: 1,
+      ingressViolations: 1,
+      dnsResolutions: 0,
+      policyDecisions: 0,
+      dials: 0,
+    });
+    expect(() => attempt.gate.open()).toThrowError(
+      "restore_ingress_violation",
+    );
+  }
+});
+
+test("enforces exact gate transitions and idempotent close", () => {
+  const opened = createRestoreGate();
+  opened.open();
+  expect(opened.state).toBe("open");
+  expect(() => opened.open()).toThrowError("restore_gate_invalid_state");
+  expect(opened.state).toBe("open");
+  opened.close();
+  opened.close();
+  expect(opened.state).toBe("closed");
+
+  const closed = createRestoreGate();
+  closed.close();
+  closed.close();
+  expect(() => closed.open()).toThrowError("restore_gate_invalid_state");
+  expect(closed.state).toBe("closed");
+});
+
+test("isolates gate counters by session", async () => {
+  const first = createRestoreGate();
+  const second = createRestoreGate();
+  await attemptClosedRestoreIngress("http-handler", first);
+  expect(first.snapshot()).toEqual({
+    state: "restore_closed",
+    counters: {
+      ingressAttempts: 1, ingressViolations: 1, dnsResolutions: 0,
+      policyDecisions: 0, dials: 0,
+    },
+  });
+  expect(second.snapshot()).toEqual({
+    state: "restore_closed",
+    counters: {
+      ingressAttempts: 0, ingressViolations: 0, dnsResolutions: 0,
+      policyDecisions: 0, dials: 0,
+    },
+  });
+  second.open();
+  expect(second.state).toBe("open");
+  expect(first.snapshot()).toEqual({
+    state: "restore_closed",
+    counters: {
+      ingressAttempts: 1, ingressViolations: 1, dnsResolutions: 0,
+      policyDecisions: 0, dials: 0,
+    },
+  });
+});
+
+test("fails closed before downstream on any counter overflow", async () => {
+  for (const counter of [
+    "ingressAttempts", "ingressViolations", "dnsResolutions",
+    "policyDecisions", "dials",
+  ] as const) {
+    const gate = gateForCounterIncrement(counter, {
+      [counter]: Number.MAX_SAFE_INTEGER,
+    });
+    const beforeCounters = gate.completeCounterSnapshot();
+    const attempt = await attemptThatWouldIncrement(counter, gate);
+    expect(attempt.result).toBe("counter_overflow");
+    expect(gate.state).toBe("closed");
+    expect(gate.counters[counter]).toBe(Number.MAX_SAFE_INTEGER);
+    expect(gate.completeCounterSnapshot()).toEqual(beforeCounters);
+    expect(attempt.downstreamAfterOverflow).toEqual([]);
+  }
+});
+
+test("never queues or permits open after closed-linearized ingress", async () => {
+  const attempt = await pauseClosedGateIngressAtLinearization();
+  expect(() => attempt.gate.open()).toThrowError(
+    "restore_ingress_violation",
+  );
+  await attempt.release();
+  expect(attempt.result).toBe("rejected_while_restore_closed");
+  expect(attempt.gate.state).toBe("restore_closed");
+  expect(attempt.queuedOrReplayed).toBe(false);
+  expect(attempt.dnsResolutions).toBe(0);
+  expect(attempt.dials).toBe(0);
+});
+
+test("opens the gate once and observes the final URL positive control", async () => {
+  const restored = await restoreRealCheckpoint({ observeProxyIngress: true });
+  expect(restored.gateTransitions).toEqual(["restore_closed", "open"]);
+  expect(restored.preVerificationIngressViolations).toBe(0);
+  expect(restored.postOpenIngressUrls).toContain(restored.finalUrl);
+  expect(restored.postOpenIngressOrder).toEqual([
+    "ingress-linearize", "dns", "policy", "dial",
+  ]);
+});
+
+test("normalizes empty origins and absent IndexedDB as empty", async () => {
+  const restored = await restoreRealCheckpoint({
+    includeEmptyOrigin: true,
+    omitEmptyIndexedDbInRequest: true,
+  });
+  expect(restored.exportedSemanticBytes).toEqual(
+    restored.requestSemanticBytes,
+  );
+});
+
+test("normalizes keyed and inline-key IndexedDB record order", async () => {
+  const restored = await restoreRealCheckpoint({
+    reverseKeyedRecords: true,
+    reverseInlineKeyRecords: true,
+  });
+  expect(restored.exportedSemanticBytes).toEqual(
+    restored.requestSemanticBytes,
+  );
+});
+
+test("uses tagged bytewise total order and rejects duplicate identities", async () => {
+  const tagged = tagCollisionFixture();
+  expect(await semanticNormalize(tagged.forward)).toEqual(
+    await semanticNormalize(tagged.reversed),
+  );
+  for (const fixture of [
+    samePrimaryKeyDifferentPayload(),
+    duplicateCookieIdentity(),
+    duplicateNestedIdentity(),
+  ]) {
+    await expect(semanticNormalize(fixture)).rejects.toMatchObject({
+      category: "replay_unavailable",
+    });
+  }
+  expect(await semanticNormalize(nonAsciiReversalFixture())).toEqual(
+    await semanticNormalize(forwardNonAsciiFixture()),
+  );
+});
+
+test("rejects a malformed unknown export after launch and cleans all resources", async () => {
+  const restored = await createRestoreHarness({
+    exportedStorageState: malformedUnknownExport(),
+  });
+  await expect(restored.run()).rejects.toMatchObject({
+    category: "replay_unavailable",
+  });
+  expect(restored.launchCount).toBe(1);
+  expect(await restored.registryEntries()).toEqual([]);
+  expect(restored.hasLiveContext()).toBe(false);
+  expect(restored.proxyListenerOpen()).toBe(false);
+  expect(restored.liveProxySockets()).toBe(0);
+  expect(restored.profileDiscardAttempts).toBe(1);
+  expect(await restored.profileStore.listWorking()).toEqual([]);
+  expect(restored.profileLifecycleCalls).toEqual([]);
+});
+
+test("owns or self-cleans working and proxy acquisition failures", async () => {
+  for (const phase of [
+    "working-copy", "proxy-bind", "proxy-start",
+  ] as const) {
+    const restored = await createRestoreHarness({ failAt: phase });
+    await expect(restored.run()).rejects.toMatchObject({
+      category: "replay_unavailable",
+    });
+    expect(restored.acquisitionTrace[0]).toBe("registry-provisional");
+    expect(restored.workingOrProxyConstructorSelfCleanVerified).toBe(true);
+    expect(await restored.registryEntries()).toEqual([]);
+    expect(restored.hasLiveContext()).toBe(false);
+    expect(restored.proxyListenerOpen()).toBe(false);
+    expect(restored.liveProxySockets()).toBe(0);
+    expect(restored.profileDiscardAttempts).toBe(
+      phase === "working-copy" ? 0 : 1,
+    );
+    expect(await restored.profileStore.listWorking()).toEqual([]);
+    expect(restored.profileLifecycleCalls).toEqual([]);
+    expect(restored.launchCount).toBe(0);
+  }
+});
+
+test("discards only a trusted pre-spawn launch rejection", async () => {
+  const restored = await createRestoreHarness({
+    failAt: "launch-reject",
+    trustedLaunchFailureProof: "preSpawn",
+  });
+  await expect(restored.run()).rejects.toMatchObject({
+    category: "replay_unavailable",
+  });
+  expect(restored.acquisitionTrace).toContain("launch-attempt-owned");
+  expect(restored.launchCount).toBe(1);
+  expect(restored.trustedPreSpawnProofAccepted).toBe(true);
+  expect(restored.browserProcessOrResourceCreated).toBe(false);
+  expect(restored.hasOwnedContext()).toBe(false);
+  expect(restored.proxyListenerOpen()).toBe(false);
+  expect(restored.liveProxySockets()).toBe(0);
+  expect(restored.profileDiscardAttempts).toBe(1);
+  expect(await restored.profileStore.listWorking()).toEqual([]);
+  expect(await restored.registryEntries()).toEqual([]);
+  expect(restored.globalAdmissionOpen()).toBe(true);
+  expect(restored.profileLifecycleCalls).toEqual([]);
+});
+
+test("retains unverified timeout or post-spawn launch rejection", async () => {
+  for (const phase of [
+    "launch-timeout", "launch-reject-post-spawn",
+  ] as const) {
+    const restored = await createRestoreHarness({ failAt: phase });
+    const error = await captureRejection(restored.run());
+    expect(error).toMatchObject({ category: "replay_unavailable" });
+    expect(restored.launchCount).toBe(1);
+    expect(restored.acquisitionTrace).toContain("launch-attempt-owned");
+    expect(restored.errorReturnedAfterOwnershipRecorded).toBe(true);
+    expect(restored.usedPrivateProcessApi).toBe(false);
+    expect(restored.hasOwnedContext()).toBe(false);
+    expect(restored.proxyListenerOpen()).toBe(false);
+    expect(restored.liveProxySockets()).toBe(0);
+    expect(restored.profileDiscardAttempts).toBe(0);
+    expect((await restored.profileStore.listWorking()).length).toBe(1);
+    expect(await restored.registryEntries()).toMatchObject([{
+      state: "cleanup_failed",
+      admission: "closed",
+      cleanupDetail: "launch_cleanup_unverified",
+      launchAttempt: {
+        state: "cleanup_unverified",
+        publicProcessHandle: null,
+      },
+    }]);
+    expect(restored.globalAdmissionOpen()).toBe(false);
+    expect(restored.readiness()).toBe(false);
+    expect(restored.profileLifecycleCalls).toEqual([]);
+    const workingGeneration = restored.workingGenerationId;
+
+    await restored.registry.sweepCleanupFailed();
+    expect(await restored.registryEntries()).toMatchObject([{
+      cleanupDetail: "launch_cleanup_unverified",
+      launchAttempt: { state: "cleanup_unverified" },
+    }]);
+    expect((await restored.profileStore.listWorking()).length).toBe(1);
+
+    const restarted = await restored.restartServiceAndReconcile();
+    expect(restarted.oldChromiumTerminationGuaranteed).toBe(true);
+    expect(restarted.startupOrder).toEqual([
+      "guarantee-old-process-termination", "reconcile-retain-young-working",
+      "ready",
+    ]);
+    expect(await restarted.registryEntries()).toEqual([]);
+    expect(await restarted.profileStore.listWorking()).toEqual([
+      workingGeneration,
+    ]);
+    expect(await restarted.publishedProfiles()).toEqual([]);
+    expect(restarted.reconciliationCompletedBeforeReady).toBe(true);
+    expect(restarted.createdLaunchCleanupMarker).toBe(false);
+    expect(restarted.globalAdmissionOpen()).toBe(true);
+    expect(restarted.readiness()).toBe(true);
+    expect(restarted.profileLifecycleCalls).toEqual([]);
+
+    restarted.clock.advance(600_001);
+    const later = await restarted.restartServiceAndReconcile();
+    expect(later.reconciliationRemoval).toMatchObject({
+      generationId: workingGeneration,
+      usedExistingTask3ManifestProtocol: true,
+      crashSafeRenameFsyncDelete: true,
+    });
+    expect(await later.profileStore.listWorking()).toEqual([]);
+    expect(await later.publishedProfiles()).toEqual([]);
+    expect(later.profileLifecycleCalls).toEqual([]);
+    expect(later.createdLaunchCleanupMarker).toBe(false);
+    expect(later.readiness()).toBe(true);
+  }
+});
+
+test("cleans every later failure without publication", async () => {
+  for (const phase of [
+    "set-storage-state", "export", "parse", "compare", "gate-open",
+    "navigation", "fingerprint", "operation-timeout", "chromium-crash",
+  ] as const) {
+    const restored = await createRestoreHarness({ failAt: phase });
+    await expect(restored.run()).rejects.toMatchObject({
+      category: "replay_unavailable",
+    });
+    expect(restored.launchCount).toBe(1);
+    expect(await restored.registryEntries()).toEqual([]);
+    expect(restored.hasLiveContext()).toBe(false);
+    expect(restored.proxyListenerOpen()).toBe(false);
+    expect(restored.liveProxySockets()).toBe(0);
+    expect(restored.profileDiscardAttempts).toBe(1);
+    expect(await restored.profileStore.listWorking()).toEqual([]);
+    expect(restored.profileLifecycleCalls).toEqual([]);
+  }
+});
+
+test("uses public browser close after graceful context close fails", async () => {
+  for (const gracefulFailure of ["reject", "timeout"] as const) {
+    const restored = await createRestoreHarness({
+      failAt: "compare",
+      contextCloseFailure: gracefulFailure,
+      browserCloseResult: "verified-disconnected",
+    });
+    await expect(restored.run()).rejects.toMatchObject({
+      category: "replay_unavailable",
+    });
+    expect(restored.contextCloseCalls).toBe(1);
+    expect(restored.originalContextClosePromisePreserved).toBe(true);
+    expect(restored.originalContextCloseSettlementObserved).toBe(true);
+    expect(restored.browserCloseSource).toBe("context.browser()");
+    expect(restored.browserCloseCalls).toBe(1);
+    expect(restored.cleanupAttempts).toEqual([
+      "context-close", "browser-close", "gate-close",
+      "proxy-listener-close", "proxy-socket-drain", "profile-discard",
+    ]);
+    expect(restored.browserDisconnected()).toBe(true);
+    expect(await restored.registryEntries()).toEqual([]);
+    expect(restored.hasLiveContext()).toBe(false);
+    expect(restored.proxyListenerOpen()).toBe(false);
+    expect(restored.liveProxySockets()).toBe(0);
+    expect(restored.profileDiscardAttempts).toBe(1);
+    expect(await restored.profileStore.listWorking()).toEqual([]);
+    expect(restored.profileLifecycleCalls).toEqual([]);
+  }
+});
+
+test("retains both failed public close attempts without recalling context close", async () => {
+  const restored = await createRestoreHarness({
+    failAt: "compare",
+    contextCloseFailure: "timeout",
+    browserCloseResult: "reject",
+  });
+  await expect(restored.run()).rejects.toMatchObject({
+    cleanupCodes: ["chromium_close_failed"],
+  });
+  expect(restored.contextCloseCalls).toBe(1);
+  expect(restored.browserCloseCalls).toBe(1);
+  expect(restored.cleanupAttempts).toEqual([
+    "context-close", "browser-close", "gate-close",
+    "proxy-listener-close", "proxy-socket-drain",
+    "profile-discard-if-context-closed",
+  ]);
+  expect(await restored.registryEntries()).toMatchObject([{
+    state: "cleanup_failed",
+    admission: "closed",
+    contextCloseState: "closing",
+    originalContextClosePromiseRetained: true,
+    browserCloseState: "rejected",
+  }]);
+  expect(restored.hasLiveContext()).toBe(true);
+  expect(restored.proxyListenerOpen()).toBe(false);
+  expect(restored.liveProxySockets()).toBe(0);
+  expect(restored.profileDiscardAttempts).toBe(0);
+  expect((await restored.profileStore.listWorking()).length).toBe(1);
+  expect(restored.profileLifecycleCalls).toEqual([]);
+
+  await restored.registry.sweepCleanupFailed();
+  expect(restored.contextCloseCalls).toBe(1);
+  expect(restored.originalContextClosePromiseObservationActive).toBe(true);
+  expect(restored.browserPublicStateAllowsRetry()).toBe(true);
+  expect(restored.browserCloseCalls).toBe(2);
+  expect(await restored.registryEntries()).toMatchObject([{
+    state: "cleanup_failed",
+    admission: "closed",
+  }]);
+
+  restored.allowBrowserCloseToSucceed();
+  await restored.registry.sweepCleanupFailed();
+  expect(restored.contextCloseCalls).toBe(1);
+  expect(restored.browserCloseCalls).toBe(3);
+  expect(await restored.registryEntries()).toEqual([]);
+  expect(restored.hasLiveContext()).toBe(false);
+  expect(await restored.profileStore.listWorking()).toEqual([]);
+});
+
+test("retains cleanup when persistent context has no public browser handle", async () => {
+  const restored = await createRestoreHarness({
+    failAt: "compare",
+    contextCloseFailure: "reject",
+    contextBrowserResult: null,
+  });
+  await expect(restored.run()).rejects.toMatchObject({
+    cleanupCodes: ["chromium_close_failed"],
+  });
+  expect(restored.contextCloseCalls).toBe(1);
+  expect(restored.browserCloseCalls).toBe(0);
+  expect(await restored.registryEntries()).toMatchObject([{
+    state: "cleanup_failed",
+    admission: "closed",
+    contextCloseState: "rejected",
+    browserCloseState: "unavailable",
+  }]);
+  expect(restored.hasLiveContext()).toBe(true);
+  expect(restored.proxyListenerOpen()).toBe(false);
+  expect(restored.liveProxySockets()).toBe(0);
+  expect(restored.profileDiscardAttempts).toBe(0);
+  expect((await restored.profileStore.listWorking()).length).toBe(1);
+  expect(restored.profileLifecycleCalls).toEqual([]);
+});
+
+test("retains truthful cleanup_failed ownership until sweeper succeeds", async () => {
+  for (const failure of [
+    {
+      step: "proxy-listener-close", code: "proxy_listener_close_failed",
+      liveContext: false, listenerOpen: true, liveSockets: 0,
+      profileDiscardAttempts: 1, workingCopies: 0,
+    },
+    {
+      step: "proxy-socket-drain", code: "proxy_socket_drain_failed",
+      liveContext: false, listenerOpen: false, liveSockets: 1,
+      profileDiscardAttempts: 1, workingCopies: 0,
+    },
+    {
+      step: "profile-discard", code: "profile_discard_failed",
+      liveContext: false, listenerOpen: false, liveSockets: 0,
+      profileDiscardAttempts: 1, workingCopies: 1,
+    },
+  ] as const) {
+    const restored = await createRestoreHarness({
+      failAt: "compare",
+      cleanupFailures: [failure.step],
+    });
+    await expect(restored.run()).rejects.toMatchObject({
+      cleanupCodes: [failure.code],
+    });
+    expect(restored.cleanupAttempts).toEqual([
+      "context-close", "gate-close", "proxy-listener-close",
+      "proxy-socket-drain", "profile-discard-if-context-closed",
+    ]);
+    expect(await restored.registryEntries()).toMatchObject([{
+      state: "cleanup_failed",
+      admission: "closed",
+    }]);
+    expect(restored.hasLiveContext()).toBe(failure.liveContext);
+    expect(restored.proxyListenerOpen()).toBe(failure.listenerOpen);
+    expect(restored.liveProxySockets()).toBe(failure.liveSockets);
+    expect(restored.profileDiscardAttempts)
+      .toBe(failure.profileDiscardAttempts);
+    expect((await restored.profileStore.listWorking()).length)
+      .toBe(failure.workingCopies);
+    expect(restored.profileLifecycleCalls).toEqual([]);
+
+    restored.clearCleanupFailure(failure.step);
+    await restored.registry.sweepCleanupFailed();
+    expect(await restored.registryEntries()).toEqual([]);
+    expect(restored.hasLiveContext()).toBe(false);
+    expect(restored.proxyListenerOpen()).toBe(false);
+    expect(restored.liveProxySockets()).toBe(0);
+    expect(await restored.profileStore.listWorking()).toEqual([]);
+  }
+});
+
+test("publishes a writer only after verified normal resource shutdown", async () => {
+  const restored = await createWriterSessionHarness();
+  await restored.close();
+  expect(restored.closeOrder).toEqual([
+    "context-close-verified", "gate-close", "listener-close-verified",
+    "sockets-drained", "profile-prepare", "profile-finalize",
+    "publish-generation",
+  ]);
+
+  for (const phase of [
+    "context-close", "proxy-listener-close", "proxy-socket-drain",
+  ] as const) {
+    const failed = await createWriterSessionHarness({
+      cleanupFailure: phase,
+      browserCloseResult: phase === "context-close" ? "reject" : undefined,
+    });
+    await expect(failed.close()).rejects.toMatchObject({
+      category: "browser_unavailable",
+    });
+    expect(failed.profileLifecycleCalls).toEqual([]);
+    expect(await failed.registryEntries()).toMatchObject([{
+      state: "cleanup_failed",
+      admission: "closed",
+    }]);
+  }
 });
 
 test("accepts foundation-canonical storage with unsorted semantic arrays", async () => {
@@ -2689,7 +3237,12 @@ test("checkpoint file is canonical storage bytes, not an envelope", async () => 
     await expect(harness.restore()).rejects.toMatchObject({
       category: "replay_unavailable",
     });
+    expect(harness.launchCount).toBe(0);
     expect(harness.launchPersistentContext).not.toHaveBeenCalled();
+    expect(harness.profileStore.createWorkingCopy).not.toHaveBeenCalled();
+    expect(harness.createEgressProxy).not.toHaveBeenCalled();
+    expect(await harness.registryEntries()).toEqual([]);
+    expect(await harness.profileStore.listWorking()).toEqual([]);
     expect(await harness.publishedProfiles()).toEqual([]);
     await harness.dispose();
   }
@@ -2710,7 +3263,7 @@ test("restore crash discards work and never publishes a profile", async () => {
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
 cd apps/browser-service
-corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
+corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts
 ```
 
 Expected: FAIL because profile store and registry do not exist.
@@ -2737,8 +3290,10 @@ or promotes an orphan generation.
 - [ ] **Step 4: Implement persistent Chromium sessions and replay**
 
 Validate all request settings and, for replay, the file/request storage
-boundary below before side effects. Then create a new UUID-derived isolated
-working profile for every session and launch one
+boundary below before side effects. Create the private provisional Registry
+entry before acquiring the first owned resource. Then create a new UUID-derived
+isolated working profile for every session, start its loopback proxy with a
+closed per-session gate, and launch one
 `chromium.launchPersistentContext()` with `headless: true`,
 `acceptDownloads: false`, `serviceWorkers: "block"`, validated replay device,
 locale, timezone, geolocation, headers, TLS settings, and the exact Task 2
@@ -2747,6 +3302,29 @@ policy `{proxy:{server:loopbackProxyUrl,bypass:"<-loopback>"},args:[
 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]}`. Unknown
 device/timezone/proxy references return `replay_unsupported` before creating a
 working copy or launching Chromium.
+
+For a non-replay/profile session, keep that gate closed through persistent
+context launch, immediately assert zero violations, and synchronously open it.
+Only then may service code acquire or create a page and navigate `initialUrl`:
+
+```ts
+const provisional = registry.reserveProvisional(validatedRequest);
+const work = await provisional.acquireWorkingCopy();
+const proxy = await provisional.acquireEgressProxy({ gate: "restore_closed" });
+const context = await provisional.acquirePersistentContext(
+  work.path,
+  launchOptionsWithoutStorageState,
+);
+proxy.restoreGate.assertZeroViolations();
+proxy.restoreGate.open();
+const page = context.pages()[0] ?? await context.newPage();
+await page.goto(validatedRequest.initialUrl);
+```
+
+`initialUrl` must supply a positive proxy control in exact order: ingress gate
+linearization, DNS resolution, policy decision, then dial. Replay uses the
+longer set/export/parse/compare sequence below before the same gate open and
+page boundary.
 
 An existing profile generation and a replay checkpoint are mutually
 exclusive. Reject that combination as `replay_unsupported` before filesystem,
@@ -2770,50 +3348,226 @@ stable-JSON algorithm (sorted object keys, original array order), and require
 those file-canonical bytes equal both raw bytes and the request storage state
 encoded by the same algorithm. This is the only byte/checksum authority.
 Reject any raw/file-canonical/request byte, checksum, shape, or value mismatch
-before profile/proxy/Chromium creation. After launch, perform this exact order
-with no page creation, navigation, locator,
-script evaluation, listener that can initiate work, access to Chromium's
-automatic `about:blank` page, or other network-capable operation between
-steps:
+before profile/proxy/Chromium creation. Playwright 1.61.1 intentionally omits
+`storageState` from `launchPersistentContext()` options and provides
+`BrowserContext.setStorageState()` instead. For replay, use a fresh empty
+isolated working directory and perform this exact order after the proxy's
+closed restore gate is active:
 
 ```ts
-const context = await chromium.launchPersistentContext(
-  isolatedWorkingProfile,
-  launchOptions,
+const provisional = registry.reserveProvisional(validatedRequest);
+const work = await provisional.acquireWorkingCopy();
+const proxy = await provisional.acquireEgressProxy({ gate: "restore_closed" });
+const context = await provisional.acquirePersistentContext(
+  work.path,
+  launchOptionsWithoutStorageState,
 );
 await context.setStorageState(checkpoint.storageState);
-const accepted = await context.storageState({ indexedDB: true });
+const exported: unknown = await context.storageState({ indexedDB: true });
+const accepted = storageStateV1Schema.parse(exported);
 verifySemanticallyEquivalentStorageState(accepted, checkpoint.storageState);
+proxy.restoreGate.assertZeroViolations();
+proxy.restoreGate.open();
+const page = context.pages()[0] ?? await context.newPage();
 ```
 
-`verifySemanticallyEquivalentStorageState()` independently validates the
-bounded closed schema, then normalizes both request and immediate Playwright
-export by sorting cookie/origin/localStorage/database/store/record/index arrays
-by stable identity keys, preserving record order where identity is absent,
-omitting absent optional fields, and emitting fixed-key whitespace-free UTF-8
-JSON. Require those two semantic-normalized byte strings to match. Never
+Each `provisional.acquire*` method attaches its successfully acquired resource
+to the same Registry entry before it returns and before the caller's next
+fallible await. `acquirePersistentContext()` first attaches a `launch_attempt`
+token before invoking Playwright. A returned context atomically replaces that
+token with owned context state.
+
+Persistent Chromium creates and initializes an automatic `about:blank` page
+before `launchPersistentContext()` returns. For mobile Chromium, Playwright may
+also create a replacement default-context page and close the original during
+launch. Its storage APIs may inspect the origin of an existing page, create
+library-internal storage helper pages, perform origin navigations under a
+prepended route that fulfills every request locally, and evaluate the storage
+utility script in its utility world. These are the only page lifecycle,
+inspection, navigation, and evaluation operations allowed before semantic
+verification on replay. Browser Service and every caller must not acquire
+`context.pages()`, call `newPage()`, navigate, use a locator, evaluate script,
+or register listener work that can initiate page work until the non-replay
+zero-violation check, or replay equality plus zero-violation checks, succeeds
+and the gate opens.
+
+Playwright 1.61.1 suppresses public context events for storage helper pages, so
+BrowserContext request events are incomplete and are never an egress oracle.
+Task 4 extends Task 2's proxy with one per-session restore gate at proxy ingress.
+Its recorded categories are exactly `http | connect | upgrade`: the HTTP
+request handler records `http`; CONNECT records `connect` for HTTPS and WSS
+tunnels; the Upgrade handler records `upgrade` for WS. It never records `ws`
+or `wss`. Its state is exactly
+`restore_closed | open | closed`. The ingress linearization point precedes DNS
+resolution, `onDecision`, and every dial. While `restore_closed`, any ingress
+attempt increments the bounded `ingressViolations` counter, records only its
+allowlisted protocol category, rejects/closes the request, and performs zero
+DNS resolution, policy decision, or dial. An attempt linearized while closed
+is never queued or replayed, and its violation permanently disqualifies this
+session gate from opening. Non-replay open requires zero violations. Replay
+open additionally requires successful export parse and semantic equality.
+`open()` is a synchronous one-way compare-and-set from `restore_closed` to
+`open` after its applicable conditions succeed. Calling `open()`
+from `open` or `closed`, or after any violation, fails with a typed invariant
+and changes no state. `close()` reaches terminal `closed` from either prior
+state and is idempotent once closed. Counters for ingress attempts, violations,
+DNS resolutions, policy decisions, and dials are monotonic safe integers owned
+by that session. Every increment is checked before mutation; overflow moves
+the gate to terminal `closed`, fails the session, and performs no downstream
+DNS, decision, or dial. After opening, non-replay `initialUrl` or replay
+`finalUrl` navigation must pass through the same ingress observer and all
+existing Task 2 DNS pinning, policy, half-close, backpressure, cancellation,
+TLS/SNI, and transport defenses as the positive control.
+
+`verifySemanticallyEquivalentStorageState()` receives each operand as
+`unknown` and independently validates the bounded closed schema. It treats
+absent `indexedDB` as `[]`, drops origins whose normalized localStorage and
+IndexedDB arrays are both empty, omits other absent optional fields, and emits
+each element as fixed-key whitespace-free UTF-8 JSON. All tuple components are
+length-framed and field-tagged; ordering compares raw UTF-8 bytes, never locale
+or UTF-16 order. Each semantic set first sorts by the following primary
+identity tuple and then by the full normalized element bytes as a deterministic
+tie-breaker:
+
+- cookies: tagged `(domain,path,name,partitionKey-or-absent,
+  _crHasCrossSiteAncestor-or-absent)`;
+- origins: tagged `(origin)`;
+- localStorage entries within one origin: tagged `(name)`;
+- IndexedDB databases within one origin: tagged `(name)`;
+- stores within one database: tagged `(name)`;
+- records within one store: tagged `key:` plus canonical `key` bytes,
+  `keyEncoded:` plus canonical `keyEncoded` bytes, `value:` plus canonical
+  `value` bytes for inline-key/keyless records, or `valueEncoded:` plus
+  canonical `valueEncoded` bytes for inline-key/keyless records;
+- indexes within one store: tagged `(name)`.
+
+After sorting, duplicate primary identities are rejected even when their
+remaining payload differs. Thus a `key:` payload can never collide with a
+`keyEncoded:` payload, and same-primary/different-payload entries are invalid
+rather than resolved by the tie-breaker. Duplicates are allowed only inside
+ordered value-semantic arrays such as `keyPathArray` and arrays nested inside
+JSON-safe key/value encodings; those arrays preserve order and duplicate
+members. There are no allowed duplicate identities in the seven semantic-set
+arrays above. Require the two semantic-normalized state byte strings to match.
+Never
 compare semantic-normalized export bytes or hash to raw file bytes/checksum;
 foundation-valid files may preserve a different array order. It does not
 manually write cookies,
-`localStorage`, or IndexedDB. Only after equality may the registry select the
-automatic blank page or create one, load `finalUrl`, then compare exact final
-URL and bounded title/body hashes. Do not replay saved actions or side effects.
+`localStorage`, or IndexedDB. Exact real-Chromium roundtrip fixtures cover
+cookies, localStorage, IndexedDB, empty origins, absent versus empty
+`indexedDB`, tagged key/keyEncoded and value/valueEncoded collision attempts,
+same-primary/different-payload rejection, duplicate identities, non-ASCII raw
+byte order, full-array reversal, unsorted keyed records, and unsorted
+inline-key records. Only after equality and the zero-violation assertion may
+the registry atomically open the restore gate, select an existing launch-owned
+page or create one, load `finalUrl` through the positive-control ingress
+observer, then compare exact final URL and bounded title/body hashes. Do not
+replay saved actions or side effects.
 
-Any file/request parse, raw/canonical checksum, byte-size, storage equality,
-`setStorageState`, immediate export,
-canonicalization, equality, navigation, or fingerprint mismatch; timeout; or
-Chromium crash closes context/browser and proxy, recursively discards the
-isolated working profile, leaves no session in registry, and never prepares,
-stages, finalizes, or publishes a profile generation. Cleanup failure is
-surfaced and remains reconciliation-owned; runtime work is never admitted.
+Request/file/settings validation precedes every side effect; its failures have
+launch count zero. Registry reserves one private provisional entry before the
+first working-copy acquisition and incrementally attaches profile work,
+context, proxy/listener/restore gate/live sockets, pending acquisition, and
+cleanup state before the next fallible await. A constructor that can partially
+acquire before returning must either attach that resource to the provisional
+entry or return failure only after its own partial listener, socket, or
+filesystem work is verifiably gone. Before Playwright launch,
+`acquirePersistentContext()` attaches `launch_attempt` while already owning the
+working profile and closed proxy. Never wrap launch in a detached
+`Promise.race`. The provisional entry
+is not returned by public session lookup and becomes a public runtime session
+only after gate opening, navigation, and fingerprint success.
+
+A public Playwright launch rejection or timeout after launch starts does not
+prove internal browser-process cleanup. If no context was returned, no public
+process handle exists. Only an explicit trusted adapter proof with exact value
+`preSpawn` may establish that rejection occurred before any browser process or
+resource creation; that path may close the proxy, discard working state, and
+remove provisional ownership normally. Never infer `preSpawn` from a rejected
+promise.
+
+Without trusted `preSpawn` proof, change the provisional entry to
+`cleanup_failed` with `launch_cleanup_unverified`, retain the `launch_attempt`
+token and working profile, close/drain the proxy when verifiable, and never
+discard, prepare, stage, finalize, or publish the profile. Before returning the
+typed `replay_unavailable` or session-unavailable error, atomically record that
+retained ownership in the process-local Registry and globally close new-session
+admission/readiness for this Browser Service process, or enter its draining
+state. The token is never persisted. Unknown Chromium may still write the
+profile. Do not inspect or terminate private PIDs/processes.
+If proxy closure/drain is not verified, retain those listener/socket handles
+and their existing bounded cleanup codes in the same entry.
+The sweeper has no public evidence that can clear `launch_cleanup_unverified`.
+Browser Service process/container restart is required. Verified restart proves
+old Chromium termination and clears only the process-local uncertainty. It
+does not create a marker or immediately delete the working generation. Task 3
+startup reconciliation sees that generation as an unreferenced recognized
+`profiles/<profileId>/working/<generationId>/` entry under its existing exact
+grammar and authority. It retains the generation while maximum descendant age
+is <=10 minutes and may make readiness true with it retained. Once age is
+>10 minutes, a later startup/reconciliation generation removes it through the
+existing persisted plan, quarantine rename/fsync, delete/fsync, and completion
+rules. No immediate-deletion exception or new marker exists.
+
+After launch returns and replaces the token with an owned context, any
+`setStorageState`, immediate export, unknown-export parse,
+canonicalization, comparison, gate assertion/open, navigation, or fingerprint
+failure; timeout; or Chromium crash runs one idempotent aggregate cleanup. It
+calls public `context.close()` exactly once, preserves that original promise,
+marks it `closing`, and attaches a settlement observer before applying a
+bounded wait. If graceful close rejects or exceeds that observation bound and
+closure is not verified, call public `context.browser()?.close()` as the only
+force-quit-like fallback and observe it with a bound. A verified context close
+or verified browser disconnect is success; preserve observation of the
+original context-close settlement even after fallback success. Persistent
+contexts may return no Browser, and neither public close API guarantees
+success. Never use private Playwright process APIs.
+
+Cleanup also independently performs terminal gate close, proxy listener close,
+bounded await of every accepted socket, and, only after context closure is
+verified, recursive working-profile discard. One failed step never skips an
+independent later cleanup. Terminal gate close is an infallible local state
+transition. The thrown typed aggregate preserves only allowlisted specific
+codes `chromium_close_failed`,
+`proxy_listener_close_failed`, `proxy_socket_drain_failed`, and
+`profile_discard_failed`; raw causes stay internal. `profileLifecycleCalls`
+means only prepare, stage, finalize, and generation publication; discard is
+tracked separately by `profileDiscardAttempts` and `listWorking()`.
+
+After cleanup, remove the provisional entry only when context closure, listener
+closure, zero live sockets, and working-profile discard are verified. If any
+resource cleanup remains unverified after bounded retries/timeouts, retain the
+entry in `cleanup_failed`, keep its admission closed, retain truthful owned
+context/Browser handles, original close promises/states, and remaining working
+path, and perform no profile
+prepare, stage, finalize, or publication. The registry sweeper retries those
+public cleanup operations and removes ownership only after every closure and
+discard succeeds. It first observes stored promise settlement and may retry
+only `browser.close()` when the public Browser state permits; it never calls
+`context.close()` again once the original call is `closing`, rejected, or
+settled. A service-process restart is the operator fallback for a persistent
+public-API cleanup failure; private process handles are forbidden.
+
+Normal writer close uses the same one-shot graceful context close and bounded
+public Browser-close fallback, then moves the gate to terminal `closed`,
+verifies listener close and zero live sockets, and only then permits profile
+preparation. Only complete successful resource shutdown may prepare,
+stage, finalize, return the generation, and let API
+advance its latest pointer. Snapshot close discards instead. Any cleanup or
+publication-step error is aggregated with the cleanup codes above plus
+`profile_prepare_failed` or `profile_finalize_failed`, exposes no published
+generation to API, retains `cleanup_failed` ownership for any unverified live
+resource, and leaves durable partial filesystem state for reconciliation
+without skipping remaining cleanup.
 
 Registry accepts `StartupAdmission` and calls `requireReady(binding)` before any path,
 working-copy, proxy, or Chromium side effect. Registry stores public/runtime
-IDs, state/version, page/context, profile work,
+IDs, state/version, page/context, proxy/gate/listener/sockets, profile work,
 initial/allowed/learned origins, deadlines, DevTools loopback endpoint, stream
 hub, and one writer lease. `withWriter()` rejects concurrent mutation with
 `concurrency_exceeded`; `touch()` moves only idle deadline. Close is
-idempotent and closes Chromium before preparing a writer profile.
+idempotent, retains truthful `cleanup_failed` ownership on incomplete teardown,
+and never prepares a writer profile before verified resource shutdown.
 
 - [ ] **Step 5: Run lifecycle tests**
 
@@ -2821,23 +3575,50 @@ idempotent and closes Chromium before preparing a writer profile.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
 cd apps/browser-service
-corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
+corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts
 ```
 
 Expected: PASS for writer exclusion, snapshot isolation, every publication
 crash point, corrupt-reference readiness, 600-second idle and 3600-second
 absolute maxima, shorter caller limits, and close idempotency. Real bundled
 Chromium proves cookies, localStorage, and IndexedDB exist before first
-navigation; sinks prove no pre-restore request. Unsorted but foundation-
-canonical arrays restore through semantic comparison. File/request canonical
-byte/checksum mismatch, semantic request/export mismatch, full-envelope file,
-timeout, and forced crash leave no Chromium launch or registry/profile
-publication.
+service-owned navigation. Desktop automatic-page initialization, mobile
+default-page replacement/close, existing-page origin inspection, helper
+pages, fulfilled origin navigations, and utility evaluation remain
+Playwright-owned; service/caller page operations remain absent until
+verification. Public context events are neither required nor used as proof.
+The closed proxy ingress gate records zero `http | connect | upgrade`
+violations and therefore zero pre-open DNS resolution, policy decision,
+or dial; after atomic open, non-replay `initialUrl` and replay `finalUrl` supply
+the positive ingress/DNS/policy/dial control.
+
+Unsorted but foundation-canonical arrays, empty origins, absent versus empty
+IndexedDB, tagged key/value representation collisions, duplicate identities,
+same-primary/different-payload entries, non-ASCII order, full reversal, and
+keyed or inline-key record reordering exercise semantic comparison. The
+runtime export enters as `unknown`, and malformed unknown export fails closed.
+Tests inspect launch options and exact replay/non-replay call order. Pre-launch
+validation failures prove launch count zero. Working-copy, proxy bind/start,
+launch rejection/timeout, restore, export, parse, comparison, gate, navigation,
+fingerprint, operation-timeout, and Chromium-crash injections assert every
+owned resource, discard attempt, working path, and publication call. Successful
+cleanup leaves no Registry/resource/working entry. Failed context/listener/
+socket cleanup retains truthful `cleanup_failed` ownership and closed admission
+until the sweeper verifies closure; no failure prepares or publishes a profile.
+Trusted `preSpawn` rejection proves no browser resource and permits discard.
+Launch timeout/post-spawn rejection retains `launch_cleanup_unverified`, working
+state, and process-wide closed admission until restart proves termination.
+Immediate Task 3 reconciliation retains the <=10-minute working generation and
+may reopen readiness; a later generation removes it crash-safely only after
+age >10 minutes. Graceful returned-context close rejection/timeout with
+successful public Browser close removes ownership; unavailable or failed
+Browser fallback retains original close promises and never invokes
+`context.close()` twice.
 
 - [ ] **Step 6: Commit profile lifecycle**
 
 ```bash
-git add apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts apps/browser-service/src/replay-restore.ts apps/browser-service/src/replay-restore.integration.test.ts
+git add apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts apps/browser-service/src/replay-restore.ts apps/browser-service/src/replay-restore.integration.test.ts apps/browser-service/src/egress-proxy.ts apps/browser-service/src/egress-proxy.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: persist browser profile generations" -m "Create isolated Chromium working copies and publish writable profile
 generations through a checksummed two-phase protocol.
@@ -7170,11 +7951,25 @@ zero model-tool events, and checked stale-contract enforcement."
   QUIC/WebRTC UDP packets. Missing proof is failure, never skip.
 - [ ] In both `browser-test` images, run replay restore tests. Require cookies,
   localStorage, and IndexedDB equality immediately after `setStorageState`, no
-  pre-restore network, state-path file containing only canonical
-  `StorageStateV1` bytes, exact foundation-canonical request/file checksum
-  equality, and semantic-normalized request/export equality, including
-  unsorted foundation arrays. Expect zero Chromium/profile publication on
-  envelope-file, mismatch, timeout, or crash.
+  upstream/DNS/policy/dial ingress violations through semantic verification,
+  state-path file containing only canonical `StorageStateV1` bytes, exact
+  foundation-canonical request/file checksum equality, and semantic-normalized
+  request/export equality, including unsorted foundation arrays. Require a
+  post-open `finalUrl` ingress/DNS/policy/dial positive control. Pre-launch
+  validation failures launch nothing. Only trusted `preSpawn` launch rejection
+  may discard normally; timeout/post-spawn rejection retains
+  `launch_cleanup_unverified`, working state, and globally closed admission
+  until process restart guarantees termination. Its process-local token then
+  disappears; existing Task 3 reconciliation retains the unreferenced working
+  generation within the 10-minute grace and may become ready, while a later
+  reconciliation generation removes it crash-safely only after the grace.
+  Every returned-context restore failure
+  performs no prepare/finalize/profile publication; verified cleanup removes
+  ownership, while any unverified context/listener/socket/path remains in
+  closed-admission `cleanup_failed` ownership for public-API sweeper retry.
+  Invoke `context.close()` once and preserve its promise; bounded public
+  `context.browser()?.close()` may recover graceful failure, while unavailable
+  or failed fallback retains handles/promises and never uses private APIs.
 - [ ] Run
   `docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml build browser-service api`;
   expect exit 0.
