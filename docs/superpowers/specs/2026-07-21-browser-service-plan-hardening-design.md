@@ -480,20 +480,25 @@ work and start browser retention.
 ## Filesystem reconciliation
 
 Browser Service requires Linux procfs fd anchoring. It opens the canonical root
-once with `O_DIRECTORY | O_NOFOLLOW`, walks every component through held
-directory handles using `/proc/self/fd/<parentFd>/<segment>`, and rejects
-startup reconciliation as `reconciliation_filesystem_unsafe` when procfs fd
-anchoring is unavailable. It creates and opens quarantine parents one component
-at a time with `O_NOFOLLOW`. Source and destination parent handles stay open
+before any state work by first opening `/`, then every absolute root component
+through its held parent using `/proc/self/fd/<parentFd>/<segment>` with
+`O_DIRECTORY | O_NOFOLLOW`. It retains and validates the whole chain and
+captures initial authority evidence from those exact handles before state work,
+then revalidates/seals it immediately before close. It rejects startup
+reconciliation as `reconciliation_filesystem_unsafe` with zero state work when
+procfs anchoring is unavailable or a component changes during capture. It
+creates and opens quarantine parents one component at a time with `O_NOFOLLOW`.
+Source and destination parent handles stay open
 through rename, both directory fsyncs, identity revalidation, delete, and final
 fsync. Rename and removal use only procfd-anchored parent paths, never the
 original validated string, so an ancestor symlink swap cannot redirect work
 outside the root. A changed leaf type or identity fails closed.
 
 Every non-cleanup filesystem await is bracketed by the reconciliation
-admission checks before and after it. All held handles close unconditionally in
-raw `finally` blocks without admission checks; close is required cleanup after
-abort and cannot be skipped by a closed gate.
+admission checks before and after it. Raw `finally` blocks attempt every held
+handle close without admission checks; close is required cleanup after abort.
+A true close rejection retains fail-stop ownership rather than claiming zero
+handles.
 
 Browser Service validates the complete request before destructive work.
 Checkpoint authority is exactly one regular file matching
@@ -683,15 +688,19 @@ Compose and harness use this order:
    `apiInstanceId` plus one handoff idempotency key, and posts the authenticated
    control-generation request.
 5. Browser Service closes admission synchronously, aborts reconciliation,
-   clears ready/cache, fully drains service runtime, then returns a newly
-   minted `controlGenerationNonce` with the unchanged process nonce.
+   clears ready/cache, fully drains service runtime plus old ProfileStore/root
+   leases, then returns a newly minted, explicitly unready
+   `controlGenerationNonce` with the unchanged process nonce and no installed
+   authority/store.
 6. Only after confirmed handoff, API opens PostgreSQL, applies migrations,
    activates its durable singleton control epoch after older mutations drain,
    and runs startup recovery under its closed/drained gate.
 7. API captures and commits one consistent snapshot and posts it with both
    nonces, service authentication, correlation ID, and bounded deadline.
 8. Browser Service validates generation and authorities, reconciles the
-   filesystem, and returns counts plus matching process/generation/digest.
+   filesystem to an opaque outcome, reacquires root/builds ProfileStore, then
+   atomically installs public result/authority/store/readiness and returns
+   counts plus matching process/generation/digest.
 9. API verifies response and scoped ready health, then opens browser work and
    starts browser retention.
 
@@ -818,9 +827,12 @@ credentials enter Browser Service.
 
 ### Task 4 persistent replay boundary
 
-Task 4 owns profile/session/replay files plus the restore-gate changes and tests
-in `egress-proxy.ts` and `egress-proxy.test.ts`. It locks Playwright `1.61.1`
-behavior. Persistent launch options must not
+Task 4 owns profile/session/replay files, restore-gate changes/tests in
+`egress-proxy.ts` and `egress-proxy.test.ts`, and the minimal held-profile API
+additions/tests in `reconciliation.ts` and `reconciliation.test.ts`. It also
+owns the ready-authority handoff and rollover changes/tests in
+`startup-state.ts` and `startup-state.test.ts`. It locks
+Playwright `1.61.1` behavior. Persistent launch options must not
 contain `storageState`; `launchPersistentContext()` intentionally omits that
 option, while `BrowserContext.setStorageState()` is the supported post-launch
 restore API. After validating every request setting and, for replay, checkpoint
@@ -842,6 +854,108 @@ Both paths use the same `provisional.acquireWorkingCopy()`,
 resource before returning and before the caller's next fallible await.
 Persistent-context acquisition owns a `launch_attempt` token before calling
 Playwright; a returned context atomically replaces the token.
+
+The working value contains no path. Fixed internal
+`launchPersistentChromiumForWorking(boundWorking, binding, options)`
+runtime-authenticates current admission, revalidates the full chain, constructs
+and verifies `/proc/<browser-service-pid>/fd/<generation-fd>`, and directly
+calls Playwright in the same lexical scope. No callback/caller sees an FD/path.
+Its WeakMap-backed session attachment retains the generation/root lease through
+Registry attachment and session lifetime. Internal post-context launch failure
+or Registry attachment failure invokes exactly-once
+`releaseChromiumSessionAttachment()`. Verified context/public Browser closure
+releases; unknown closure retains fail-stop ownership. Forged/double release
+and use after release fail. Path swaps use the original inode or fail prelaunch.
+
+Task 4 does not use Task 3's pathname-reopening
+`canonicalizeProfileTree(canonicalRoot, path)` entry point. Task 3 preserves
+that public API and `ReconciliationResult` behavior. Internally,
+`reconcileBrowserStateWithAuthority()` is exported only between implementation
+modules and returns an opaque `InternalReconciliationOutcome`. A module-private
+WeakMap record, not object fields or TypeScript branding, stores the unchanged
+public result plus `ReconciledRootEvidence`: canonical absolute components,
+every component dev/ino/mode, and exact process/control/snapshot binding.
+Public reconciliation delegates, clones only the result, and disposes its
+uninstalled outcome.
+
+`consumeInternalReconciliationOutcome(outcome, binding, consume)` is its sole
+accessor. Reconciliation owns the WeakMap and single-use
+`fresh → consuming → consumed` transition, reacquires root, and gives one fixed
+internal startup consumer only cloned public result plus opaque authority/root
+capabilities. Forged, stale, concurrent, or repeated consumption fails before
+callback. Consumer failure closes constructed store/root/authority and remains
+consumed; successful return has no later fallible work.
+
+Before any state work, reconciliation opens `/`, then each absolute root
+component through held-parent procfds with `O_DIRECTORY | O_NOFOLLOW`, validates
+parent entries, retains the whole chain, and captures initial evidence before
+state work. It revalidates/seals evidence from the same handles immediately
+before close. Capture-time component swaps fail with zero state work.
+Reacquisition repeats the held walk and exact comparison.
+
+Internal `InternalStartupAdmission.reconcileWithAuthority(request, execute)`
+owns the execution callback/admission boundary while public `reconcile()` stays
+unchanged. Production constructs it with a required internal ProfileStore
+factory; public `createStartupState()` remains unchanged. The route supplies
+only `execute`; the controller invokes it, passes
+its outcome directly to the consume API, builds a generation-scoped
+ProfileStore in the fixed consumer, then atomically installs public result,
+authority, store, and ready state. The route never receives an outcome or calls
+`requireReady()` between pieces. Handoff first clears ready, drains sessions/
+leases, closes old store/root, and mints unready. Later reconciliation/install
+makes it ready. Any failure leaves it unready without partial authority.
+
+`reconciliation.ts` exports opaque
+`AnchoredProfileRoot` and `BoundProfileGeneration` capabilities plus
+`closeAnchoredProfileRoot`, `bindProfileGeneration`,
+`canonicalizeHeldProfileTree`, `syncAndCanonicalizeHeldProfileTree`, and
+`copyHeldProfileTree`. Generation bind holds
+root→profiles→profile→state→generation through procfd children. Module-private
+WeakMaps, not TypeScript brands, authenticate roots, generations, and launch
+capabilities. Serialized records use `live | consuming | consumed | closed`;
+forged/cast/foreign values, use after consume, repeated transition/remove, and
+double close fail before filesystem effect. Root close rejects new operations,
+drains every lease/binding, then closes its chain.
+
+Held canonicalization directly reuses Task 3's private Budget, iterative walk,
+fixed-key encoder, hash, and evidence implementation with the same admission
+hooks and exact 25,000-entry, depth-64, 64-MiB-file, 256-MiB-tree, path/NFC,
+nlink, and file-type bounds. Sync first finishes canonical evidence, then syncs
+files and directories postorder, then revalidates canonical mode/size/content
+SHA, inodes, and all bindings. Copy finishes source evidence before destination
+mutation, streams bounded chunks with exact size/EOF and before/after stat,
+fsyncs destination files/directories, then requires identical revalidated
+source/destination canonical trees. Prefix, truncation, trailing bytes, and
+same-inode drift fail. Limit failure precedes sync/copy.
+
+All ProfileStore create/copy/rename/delete operations retain and revalidate the
+full ancestor chain; the opaque generation capability exposes only high-level
+mutations. A discovered-then-deleted child produces an in-memory evidence
+tombstone and fails unsafe, never an on-disk marker or shortened tree. Opaque
+objects attempt all FD closes. Success, abort, open/stat failure, and
+close-then-throw prove zero retained FDs; a true close rejection retains
+fail-stop `close_unverified` ownership, closes admission, and makes no zero-FD
+claim. Binding close releases unused children; transition/remove consumes the
+old binding. Create-exclusive is working-only: hold
+root→profiles→profile→working-state, perform nonrecursive procfd mkdir that
+fails `EEXIST`, then open with `O_DIRECTORY | O_NOFOLLOW`, fstat, and revalidate
+the now-complete chain. It never claims a pre-mkdir generation handle. Copy
+requires a committed source and new absent empty working destination; working/
+staging sources fail before mutation. Nested directories repeat held-parent
+mkdir/open/fstat/revalidation. Files use `O_CREAT | O_EXCL | O_NOFOLLOW`;
+collision, symlink, and replacement races fail without overwrite. Only
+working→staging and staging→committed are allowed; remove accepts only owned
+working/deletion-tombstone bindings, never committed.
+Writer prepare rejects a root-only empty tree as
+`browser_unavailable` with internal detail `profile_schema_empty`. No duplicate
+tree hash implementation exists. Child create/write/fsync, postorder directory
+fsync, rename, remove, and post-mutation validation are explicit crash points;
+recovery proves canonical state or discards owned partial state before any
+publication.
+
+Canonicalize, sync, copy, create, prepare, finalize, remove, and launch check
+binding/admission immediately before and after every await. Abort starts no
+later effect and still attempts every required close.
 
 Persistent Chromium automatically initializes an `about:blank` page before
 launch returns. Mobile Chromium may cause Playwright to create a replacement
@@ -892,7 +1006,7 @@ origins are dropped, and other absent optionals are omitted. Semantic bytes are
 compared only to each other, never to foundation checkpoint bytes/checksum.
 
 Registry creates a private provisional entry before its first resource and
-incrementally owns working path, context, proxy/gate/listener/live sockets,
+incrementally owns working capability, context, proxy/gate/listener/live sockets,
 pending acquisition, and cleanup state until navigation/fingerprint success.
 A partially acquiring working/proxy constructor attaches ownership before its
 next fallible await or returns only after self-cleaning. Validation failures
@@ -1089,6 +1203,50 @@ New tests in the implementation plan must prove:
 - Task 3 and Task 4 share exact UTF-8-sorted type/mode/size/content-SHA tree
   encoding and enforce depth 64, checkpoint 2 MiB, profile-file 64 MiB,
   profile-tree 256 MiB, and path/segment bounds during walks;
+- public reconciliation API/result remain unchanged; its internal-only function
+  returns a WeakMap-authenticated opaque outcome with no result/authority
+  fields, while the public wrapper clones only its public result; the sole
+  consume API is single-use and invokes one typed internal startup consumer;
+- reconciliation opens and validates `/` through every absolute root component
+  before any state work, captures evidence from those exact retained handles,
+  and reacquisition compares the entire captured chain;
+- handoff clears ready, drains sessions/root leases, closes old store/root, and
+  mints the new generation unready; later internal reconciliation reacquires
+  root/builds store and atomically installs result/authority/store plus ready;
+- Task 4 binds generations through held
+  root→profiles→profile→state→generation FDs and never calls Task 3's
+  pathname-reopening canonicalizer; WeakMap records reject forged, foreign,
+  consumed, or closed capabilities and root close drains serialized leases;
+- held canonicalize/sync/copy reuse Task 3's private Budget/hash/evidence code;
+  bounds complete before sync/copy, streaming enforces exact size/EOF, and full
+  canonical/inode/binding revalidation follows file/directory fsync;
+- tests cover transient swaps restored at root/every ancestor/generation,
+  same-inode mode/size/content drift, prefix/truncation/trailing bytes, child
+  deletion tombstones, open/stat/close-then-throw FD cleanup, true-close
+  rejection fail-stop ownership without a zero-FD claim, 25,001/depth-65/
+  64-MiB+1/256-MiB+1 pre-effect limits, phase-specific held mutations, positive
+  first/completed hook proof, empty writer rejection, state/exclusive-create
+  races, capture-time component swaps with zero state work, rollover during
+  sync/copy, abort before/after every operation await, crash phases, and one
+  hash identity; existing Task 3 public cases remain unchanged while close and
+  root-capture cases are additive;
+- copy source is committed and destination is new absent empty working state;
+  working/staging sources fail before mutation, files use
+  `O_CREAT | O_EXCL | O_NOFOLLOW`, prepare/finalize permit only
+  working→staging→committed, and general removal never accepts committed state;
+- create-working and nested copy directories hold only their existing parent
+  chain before nonrecursive mkdir, then no-follow open/fstat/revalidate the new
+  child; no pre-mkdir generation handle is asserted;
+- real Chromium launch uses fixed internal
+  `launchPersistentChromiumForWorking()` and only the verified
+  `/proc/<browser-service-pid>/fd/<generation-fd>` of a module-private bound
+  working capability, exposes no FD/path or generic callback, retains its
+  FD/root lease through Registry attachment/session, and uses exactly-once
+  `releaseChromiumSessionAttachment()` after verified browser closure;
+- post-context launcher or Registry attachment failure invokes attachment
+  release; double release/use-after-release fails, unknown closure retains
+  fail-stop ownership, and root/state/generation swaps use the original inode
+  or fail before launch;
 - Playwright persistent launch receives no `storageState` option; replay uses
   immediate `setStorageState()` followed by an `unknown` immediate
   `storageState({ indexedDB: true })` export and closed-schema parse before any
@@ -1127,9 +1285,10 @@ New tests in the implementation plan must prove:
   repeated close, session isolation, checked counter overflow, violation-open
   exclusion, no queue/replay, and post-open DNS/policy/dial ordering; isolation
   compares state plus all five counters, and overflow changes no counter;
-- successful returned-context cleanup verifies context/listener/socket/path closure before
-  removing ownership; failed public cleanup retains truthful `cleanup_failed`
-  ownership and closed admission for sweeper retry, performs no
+- successful returned-context cleanup verifies context/listener/socket and
+  working-capability closure before removing ownership; failed public cleanup
+  retains truthful `cleanup_failed` ownership and closed admission for sweeper
+  retry, performs no
   prepare/stage/finalize/publication, and uses no private browser kill API;
 - cleanup tests cover one-shot graceful context close failure followed by
   successful public `browser.close()`, plus unavailable/both-failed fallback
@@ -1146,7 +1305,8 @@ New tests in the implementation plan must prove:
   walks recharge descendants, and EOF/ENOENT probes never charge;
 - procfd-anchored held directory handles survive ancestor symlink swaps; every
   non-cleanup filesystem await has before/after admission checks, while raw
-  finally closes all handles after abort;
+  finally attempts every handle close after abort, retaining fail-stop
+  ownership if any close cannot be verified;
 - canonical immutable plan manifest is durable before candidate mutation;
   corrupt/forged/missing-manifest quarantine and source/destination identity
   mismatches fail unsafe untouched;

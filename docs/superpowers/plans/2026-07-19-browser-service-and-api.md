@@ -2106,8 +2106,9 @@ portably:
   manifests after authority validation, finish pending work with exact counts,
   and never rebuild from quarantine destination paths;
 - draining between every non-cleanup filesystem await starts no later call,
-  but every held descriptor still closes in raw `finally`; assert zero leaked
-  handles after abort and after each injected failure;
+  but every held descriptor gets a close attempt in raw `finally`; assert zero
+  retained handles after abort, open/stat failure, and close-then-throw. A true
+  close rejection retains fail-stop ownership and makes no zero-handle claim;
 - bounded aggregate success/failure logs redact all paths, checksums, manifest
   content, nonces, IDs, keys, URLs, capabilities, and grants.
 
@@ -2160,6 +2161,23 @@ export type StartupAdmission = {
   beginDraining(): void;
 };
 
+// Internal server wiring only; omitted from the public barrel. Task 4 supplies
+// InternalReconciliationOutcome and the generation-scoped ProfileStore factory.
+export type InternalStartupAdmission = StartupAdmission & {
+  reconcileWithAuthority(
+    request: ReconciliationRequestV1,
+    execute: (
+      request: ReconciliationRequestV1,
+      admission: ReconciliationExecutionAdmission,
+    ) => Promise<InternalReconciliationOutcome>,
+  ): Promise<ReconciliationResultV1>;
+};
+
+export type InternalProfileStoreFactory = (
+  root: AnchoredProfileRoot,
+  binding: ReadyProfileRootBinding,
+) => Promise<ProfileStore>;
+
 export type ReconciliationExecutionAdmission = {
   readonly signal: AbortSignal;
   assertAdmitted(): void;
@@ -2185,6 +2203,12 @@ export type ControlGenerationRequestContext = {
 export function createStartupState(deps?: {
   randomBytes?: (size: number) => Buffer;
 }): StartupAdmission;
+
+// Internal server wiring only; Task 4 adds this factory.
+export function createInternalStartupState(deps: {
+  randomBytes?: (size: number) => Buffer;
+  createProfileStore: InternalProfileStoreFactory;
+}): InternalStartupAdmission;
 ```
 
 Generate exactly 32 bytes with `node:crypto.randomBytes` for process identity
@@ -2294,17 +2318,20 @@ generation is `control_generation_mismatch`.
 
 `canonicalRoot` is the configured `LOCAL_BROWSER_STATE_ROOT` itself; no route,
 snapshot, API, harness request, or namespace parameter can replace or extend
-it. Require Linux `/proc/self/fd` anchoring. Open the root with
-`O_DIRECTORY | O_NOFOLLOW`; unavailable procfs fd resolution is
-`reconciliation_filesystem_unsafe` and remains unready. Walk one component at
-a time by opening `/proc/self/fd/<parentFd>/<segment>` with `O_NOFOLLOW` and
-holding each required directory handle. Create/open quarantine parents the same
-way. Hold source and destination parent handles through rename, both parent
-fsyncs, delete, and final fsync. Rename/remove only procfd-anchored parent/leaf
-paths, never original validated strings. Revalidate source identity immediately
-before rename and destination identity immediately after move and before
-delete. Ancestor symlink swaps cannot redirect outside root; any leaf/type/
-identity change fails unsafe.
+it. Require Linux `/proc/self/fd` anchoring. Before any snapshot or filesystem
+state work, open `/`, then each absolute `canonicalRoot` component through
+`/proc/self/fd/<parentFd>/<segment>` with `O_DIRECTORY | O_NOFOLLOW`. Retain
+the full slash→root chain, validate each parent entry and child dev/ino/mode
+around every await, and capture evidence only from those exact handles.
+Unavailable procfs resolution or any capture-time component swap is
+`reconciliation_filesystem_unsafe` and remains unready with zero state work.
+Create/open quarantine parents from the held root the same way. Hold source and
+destination parent handles through rename, both parent fsyncs, delete, and final
+fsync. Rename/remove only procfd-anchored parent/leaf paths, never original
+validated strings. Revalidate source identity immediately before rename and
+destination identity immediately after move and before delete. Ancestor
+symlink swaps cannot redirect outside root; any leaf/type/identity change fails
+unsafe.
 
 Before and after every non-cleanup filesystem await, call both
 `admission.signal.throwIfAborted()` and `admission.assertAdmitted()`. Put every
@@ -2325,8 +2352,10 @@ Reject symlinks, root
 escapes, sockets, FIFOs, devices/special files, and every regular file with
 `nlink !== 1`.
 
-Use one exported canonical profile-tree helper shared unchanged with Task 4.
-Walk to maximum depth 64 and sort root plus descendants by raw UTF-8 relative-
+Keep Task 3's existing pathname-facing canonical profile-tree API, but factor
+its private Budget, held walker, encoder, hash, and evidence engine for Task 4's
+new opaque held-root adapters. Task 4 never calls the pathname-facing helper,
+and no second checksum implementation exists. Walk to maximum depth 64 and sort root plus descendants by raw UTF-8 relative-
 path bytes. Require NFC paths, at most 255 UTF-8 bytes per segment and 1,024 per
 relative path. Encode the root with `path:""`. Serialize exact whitespace-free
 UTF-8 fixed-key JSON shaped as
@@ -2613,6 +2642,10 @@ Resume exact crash phases after filesystem failure or restart."
 - Create: `apps/browser-service/src/replay-restore.integration.test.ts`
 - Modify: `apps/browser-service/src/egress-proxy.ts`
 - Modify: `apps/browser-service/src/egress-proxy.test.ts`
+- Modify: `apps/browser-service/src/reconciliation.ts`
+- Modify: `apps/browser-service/src/reconciliation.test.ts`
+- Modify: `apps/browser-service/src/startup-state.ts`
+- Modify: `apps/browser-service/src/startup-state.test.ts`
 
 - [ ] **Step 1: Write profile crash-boundary and TTL tests**
 
@@ -2621,12 +2654,482 @@ import { describe, expect, test, vi } from "vitest";
 
 test("publishes a writer generation through prepare and finalize", async () => {
   const work = await store.createWorkingCopy(profileId, null, "writer", sessionId);
-  await writeFile(join(work.path, "Cookies"), "state");
+  await heldFixtureWriter.writeFileExclusive(work, "Cookies", "state");
+  expect(work).not.toHaveProperty("path");
   const prepared = await store.prepareWorkingCopy(work);
   expect(await store.hasCommitted(prepared.generationId)).toBe(false);
   const committed = await store.finalizePreparedGeneration(prepared);
   expect(committed.checksum).toMatch(/^[a-f0-9]{64}$/);
   expect(await store.hasCommitted(prepared.generationId)).toBe(true);
+});
+
+test("rejects an empty writer schema before prepare or publication", async () => {
+  const work = await store.createWorkingCopy(profileId, null, "writer", sessionId);
+  await expect(store.prepareWorkingCopy(work)).rejects.toMatchObject({
+    category: "browser_unavailable",
+    detail: "profile_schema_empty",
+  });
+  expect(store.profileLifecycleCalls()).toEqual([]);
+  expect(await store.listWorking()).toEqual([work.generationId]);
+  await store.discardWorkingCopy(work);
+});
+
+test("held profile operations detect restored ancestor swaps", async () => {
+  for (const consumer of ["reconciliation-held-api", "profile-store"] as const) {
+    for (const operation of [
+      "canonicalize", "sync", "copy", "state-transition",
+    ] as const) {
+      for (const component of [
+        "root", "profiles", "profile", "state", "generation",
+      ] as const) {
+        const fixture = await createHeldProfileFixture({ consumer, operation });
+        const attack = fixture.transientSwapAndRestore(component);
+        const outcome = await captureOutcome(fixture.run(attack.hooks));
+        if (operation === "state-transition") {
+          expect(outcome).toMatchObject({
+            status: "rejected",
+            category: "reconciliation_filesystem_unsafe",
+          });
+        } else {
+          expect(outcome).toMatchObject({
+            status: "succeeded",
+            evidence: fixture.originalHeldEvidence,
+          });
+        }
+        expect(attack.proof).toEqual({
+          firstHookReached: true,
+          completed: true,
+        });
+        expect(attack.outsideTreeBytes()).toEqual(attack.originalOutsideBytes);
+        expect(fixture.pathnameReopens()).toBe(0);
+        expect(fixture.openFdCount()).toBe(0);
+      }
+    }
+  }
+});
+
+test("profile mutations retain the phase-specific available chains", async () => {
+  const fixture = await createProfileMutationChainFixture();
+  await fixture.runAllWithHeldEvidence();
+  expect(fixture.phaseChains()).toEqual({
+    "create-working:before-mkdir": [
+      "root", "profiles", "profile", "working-state",
+    ],
+    "create-working:after-open-bind": [
+      "root", "profiles", "profile", "working-state", "generation",
+    ],
+    "copy:source": [
+      "root", "profiles", "profile", "committed-state", "generation",
+    ],
+    "copy:destination-before-mkdir": [
+      "root", "profiles", "profile", "working-state",
+    ],
+    "copy:destination-after-open-bind": [
+      "root", "profiles", "profile", "working-state", "generation",
+    ],
+    "prepare:source-and-destination": "full-held-chains",
+    "finalize:source-and-destination": "full-held-chains",
+    "remove:owned-working-or-tombstone": "full-held-chain",
+  });
+  expect(fixture.revalidatedAtEveryPhaseBoundary()).toBe(true);
+  expect(fixture.pathnameReopens()).toBe(0);
+});
+
+test("rejects same-inode and streaming source drift", async () => {
+  for (const drift of [
+    "same-inode-content", "same-inode-mode", "same-inode-size",
+    "source-prefix", "source-truncation", "source-extra-bytes",
+  ] as const) {
+    const fixture = await createHeldCopyFixture();
+    const attack = fixture.injectDrift(drift);
+    await expect(fixture.copy()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(attack.proof).toEqual({ firstHookReached: true, completed: true });
+    expect(fixture.destinationPublished()).toBe(false);
+    expect(fixture.openFdCount()).toBe(0);
+  }
+});
+
+test("records a deleted enumerated child tombstone and fails closed", async () => {
+  const fixture = await createHeldCopyFixture();
+  fixture.deleteChildAfterEnumeration("Preferences");
+  await expect(fixture.copy()).rejects.toMatchObject({
+    category: "reconciliation_filesystem_unsafe",
+    evidence: {
+      kind: "child_missing_after_enumeration",
+      path: "Preferences",
+    },
+  });
+  expect(fixture.childTombstoneCount()).toBe(1);
+  expect(fixture.copyOrSyncAfterTombstone()).toEqual([]);
+});
+
+test("proves the held copy positive control starts and completes", async () => {
+  const fixture = await createHeldCopyFixture();
+  await fixture.copy();
+  expect(fixture.copyProof()).toEqual({
+    firstChunkRead: true,
+    exactEofObserved: true,
+    completed: true,
+  });
+  expect(fixture.sourceCanonicalTree()).toEqual(
+    fixture.destinationCanonicalTree(),
+  );
+});
+
+test("open/stat and close-then-throw paths close every descriptor", async () => {
+  for (const syscall of ["open", "stat", "close-then-throw"] as const) {
+    const fixture = await createHeldProfileFixture({ failSyscall: syscall });
+    await expect(fixture.exerciseAllHeldApis()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(fixture.closeAttempts()).toEqual(fixture.openedDescriptors());
+    expect(fixture.openFdCount()).toBe(0);
+  }
+});
+
+test("true close rejection retains fail-stop ownership", async () => {
+  const fixture = await createHeldProfileFixture({
+    failSyscall: "close-reject-unverified",
+  });
+  await expect(fixture.exerciseAllHeldApis()).rejects.toMatchObject({
+    category: "reconciliation_filesystem_unsafe",
+  });
+  expect(fixture.closeAttempts()).toEqual(fixture.openedDescriptors());
+  expect(fixture.failStopOwnership()).toMatchObject({
+    state: "close_unverified",
+    admission: "closed",
+    descriptors: expect.any(Array),
+  });
+  expect(fixture.assertedZeroOpenFds()).toBe(false);
+});
+
+test("profile bounds stop before sync or copy", async () => {
+  for (const shape of [
+    "entries-25001", "depth-65", "file-64mib-plus-1",
+    "tree-256mib-plus-1",
+  ] as const) {
+    const fixture = await createHeldProfileLimitFixture(shape);
+    await expect(fixture.syncOrCopy()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(fixture.syncCalls()).toEqual([]);
+    expect(fixture.copyReads()).toEqual([]);
+    expect(fixture.openFdCount()).toBe(0);
+  }
+});
+
+test("Task 3 and Task 4 consume the same held evidence and hash code", async () => {
+  const fixture = await createSharedCanonicalizationFixture();
+  const task3 = await fixture.canonicalizeAsReconciliation();
+  const task4 = await fixture.canonicalizeAsProfileStore();
+  expect(task4.evidence).toEqual(task3.evidence);
+  expect(task4.canonicalBytes).toEqual(task3.canonicalBytes);
+  expect(task4.treeSha256).toBe(task3.treeSha256);
+  expect(fixture.legacyTask3ApiSurfaceUnchanged()).toBe(true);
+  expect(fixture.hashImplementationIds()).toEqual([
+    "reconciliation-private-held-profile-hash",
+  ]);
+});
+
+test("ProfileStore retains one root only for its ready generation", async () => {
+  const fixture = await createProfileStoreGenerationFixture();
+  await fixture.openAndCloseSeveralSessions();
+  expect(fixture.anchoredRootOpenCalls()).toBe(1);
+  expect(fixture.anchoredRootCloseCalls()).toBe(0);
+  await fixture.clearReadyDrainAndMintNextUnready();
+  expect(fixture.anchoredRootCloseCalls()).toBe(1);
+  expect(fixture.currentProfileStore()).toBeUndefined();
+  await fixture.reconcileAndInstallNextReadyGeneration();
+  expect(fixture.profileStoreInstances()).toBe(2);
+  expect(fixture.currentStoreBinding()).toEqual(fixture.nextReadyBinding);
+  expect(fixture.currentRootHeld()).toBe(true);
+  await fixture.shutdown();
+  expect(fixture.openFdCount()).toBe(0);
+});
+
+test("captures the root chain before any reconciliation state work", async () => {
+  for (const component of fixtureAbsoluteComponents()) {
+    const fixture = await createReconciledRootAuthorityFixture();
+    const attack = fixture.swapAndRestoreDuringInitialRootCapture(component);
+    await expect(
+      fixture.reconcileBrowserStateWithAuthority(attack.hooks),
+    ).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(attack.proof).toEqual({ firstHookReached: true, completed: true });
+    expect(fixture.stateWorkCalls()).toEqual([]);
+    expect(fixture.rootCaptureOrder()[0]).toBe("open-slash");
+    expect(fixture.parentEntryValidationStarted()).toBe(true);
+  }
+  const positive = await createReconciledRootAuthorityFixture();
+  await positive.reconcileBrowserStateWithAuthority();
+  expect(positive.rootCaptureOrder()).toEqual([
+    "open-slash", "open-absolute-components-through-held-parents",
+    "validate-parent-entries", "capture-initial-held-evidence", "state-work",
+    "revalidate-and-seal-outcome-evidence",
+  ]);
+});
+
+test("internal reconciliation outcome is opaque and public API strips it", async () => {
+  const fixture = await createReconciledRootAuthorityFixture();
+  const internal = await fixture.reconcileBrowserStateWithAuthority();
+  expect(internal).not.toHaveProperty("result");
+  expect(internal).not.toHaveProperty("authority");
+  expect(fixture.modulePrivateRecordProbe()).toMatchObject({
+    canonicalAbsoluteComponents: fixture.expectedCanonicalComponents,
+    componentIdentities: fixture.expectedDevInoModeChain,
+    binding: fixture.exactProcessControlSnapshotBinding,
+  });
+  const publicResult = await fixture.reconcileBrowserState();
+  expect(publicResult).toEqual(fixture.expectedPublicResult);
+  expect(publicResult).not.toHaveProperty("authority");
+  await expect(
+    fixture.startupAdmission.reconcileWithAuthority(
+      fixture.request,
+      async () => fixture.castPlainObjectAsInternalOutcome(),
+    ),
+  ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+});
+
+test("internal reconciliation outcome consumption is exactly once", async () => {
+  const fixture = await createReconciledRootAuthorityFixture();
+  const outcome = await fixture.reconcileBrowserStateWithAuthority();
+  await fixture.consumeOutcomeAndCloseInstall(outcome);
+  await expect(
+    fixture.consumeOutcomeAndCloseInstall(outcome),
+  ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+  expect(fixture.outcomeConsumerCalls()).toBe(1);
+  expect(fixture.outcomeState(outcome)).toBe("consumed");
+});
+
+test("outcome consumer failure closes partial install and stays consumed", async () => {
+  const fixture = await createUnreadyRootAuthorityFixture({
+    failProfileStoreConstructionAfterAcquire: true,
+  });
+  let capturedOutcome: InternalReconciliationOutcome | undefined;
+  await expect(
+    fixture.startupAdmission.reconcileWithAuthority(
+      fixture.request,
+      async (request, admission) => {
+        capturedOutcome = await fixture.captureCurrentAuthority({
+          request,
+          admission,
+        });
+        return capturedOutcome;
+      },
+    ),
+  ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+  expect(fixture.ready()).toBe(false);
+  expect(fixture.partialStoreCloseCalls()).toBe(1);
+  expect(fixture.rootCloseCalls()).toBe(1);
+  expect(fixture.outcomeState(capturedOutcome!)).toBe("consumed");
+});
+
+test("authority install reacquires the exact reconciled root chain", async () => {
+  for (const component of fixtureAbsoluteComponents()) {
+    const fixture = await createUnreadyRootAuthorityFixture();
+    const attack = fixture.transientSwapAndRestoreDuringReacquisition(component);
+    fixture.armReacquisitionAttack(attack.hooks);
+    const observed = await captureOutcome(
+      fixture.startupAdmission.reconcileWithAuthority(
+        fixture.request,
+        async (request, admission) =>
+          fixture.captureCurrentAuthority({ request, admission }),
+      ),
+    );
+    expect(observed).toMatchObject({
+      status: "rejected",
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(attack.proof).toEqual({ firstHookReached: true, completed: true });
+    expect(fixture.rootLeaseCount()).toBe(0);
+  }
+});
+
+test("startup atomically installs only a genuine current outcome", async () => {
+  const fixture = await createUnreadyRootAuthorityFixture();
+  const oldBinding = fixture.currentBinding;
+  const oldOutcome = await fixture.captureCurrentAuthority();
+  await fixture.clearReadyDrainAndMintNextUnready();
+  expect(fixture.ready()).toBe(false);
+  expect(fixture.currentProfileStore()).toBeUndefined();
+  await expect(
+    fixture.startupAdmission.reconcileWithAuthority(
+      fixture.request,
+      async () => oldOutcome,
+    ),
+  ).rejects.toMatchObject({ category: "reconciliation_required" });
+  expect(fixture.rejectedBinding()).toEqual(oldBinding);
+  await fixture.startupAdmission.reconcileWithAuthority(
+    fixture.request,
+    async (request, admission) =>
+      fixture.captureNextAuthority({ request, admission }),
+  );
+  expect(fixture.retainedAuthorityBindings()).toEqual([
+    fixture.currentBinding,
+  ]);
+  expect(fixture.atomicInstallFields()).toEqual([
+    "public-result", "authority", "profile-store", "ready",
+  ]);
+});
+
+test("capabilities reject forgery, foreign roots, and repeated consumption", async () => {
+  const fixture = await createHeldCapabilityFixture();
+  for (const attempt of [
+    fixture.castPlainObjectAsRoot,
+    fixture.castPlainObjectAsGeneration,
+    fixture.bindGenerationFromForeignRoot,
+    fixture.useAfterTransition,
+    fixture.doubleTransition,
+    fixture.doubleRemove,
+    fixture.doubleClose,
+    fixture.launchWithForeignWorking,
+    fixture.releaseForgedLaunchAttachment,
+    fixture.doubleReleaseLaunchAttachment,
+    fixture.useAfterReleaseLaunchAttachment,
+  ]) {
+    await expect(attempt()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+  }
+  expect(fixture.serializedStateTransitions()).toEqual([
+    "live", "consuming", "consumed",
+  ]);
+  expect(fixture.allLifecycleStatesSeen()).toEqual([
+    "live", "consuming", "consumed", "closed",
+  ]);
+  expect(fixture.rootCloseDrainedOperationsBeforeDescriptors()).toBe(true);
+});
+
+test("create-working holds its parent chain before exclusive child bind", async () => {
+  const fixture = await createWorkingPhaseFixture();
+  await fixture.create();
+  expect(fixture.phaseOrder()).toEqual([
+    "hold-root", "hold-profiles", "hold-profile", "hold-working-state",
+    "mkdir-generation-nonrecursive-eexist", "open-generation-nofollow",
+    "fstat-generation", "revalidate-full-chain", "bind-live",
+  ]);
+  expect(fixture.heldChainBeforeMkdir()).toEqual([
+    "root", "profiles", "profile", "working-state",
+  ]);
+  expect(fixture.mkdir()).toMatchObject({ recursive: false });
+});
+
+test("nested copy creation repeats exclusive held-parent binding", async () => {
+  const fixture = await createNestedHeldCopyFixture();
+  await fixture.copyCommittedToNewWorking();
+  expect(fixture.directoryCreatePhases()).toEqual([
+    "hold-parent", "mkdir-nonrecursive-eexist", "open-dir-nofollow",
+    "fstat-dir", "revalidate-full-chain",
+  ]);
+  expect(fixture.fileCreateFlags()).toEqual([
+    "O_CREAT|O_EXCL|O_NOFOLLOW",
+  ]);
+});
+
+test("enforces generation state and exclusive destination rules", async () => {
+  for (const attack of [
+    "create-in-staging", "create-in-committed", "copy-from-working",
+    "copy-from-staging", "copy-to-existing",
+    "copy-to-staging", "copy-to-committed", "prepare-not-working",
+    "finalize-not-staging", "remove-staging", "remove-committed",
+    "mkdir-collision", "mkdir-symlink-race", "file-collision",
+    "file-symlink-race", "destination-not-empty",
+  ] as const) {
+    const fixture = await createCapabilityRuleFixture(attack);
+    await expect(fixture.run()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(fixture.nonExclusiveCreateFlags()).toEqual([]);
+    expect(fixture.published()).toBe(false);
+  }
+});
+
+test("copy accepts only committed source and new empty working destination", async () => {
+  const fixture = await createCapabilityCopyFixture();
+  await fixture.copyCommittedToNewWorking();
+  expect(fixture.copyBindingStates()).toEqual({
+    source: "committed",
+    destination: "working",
+    destinationWasAbsentAndEmpty: true,
+  });
+});
+
+test("remove accepts only owned working and deletion-tombstone bindings", async () => {
+  const fixture = await createCapabilityRemovalFixture();
+  await fixture.removeOwnedWorking();
+  await fixture.removeOwnedDeletionTombstone();
+  expect(fixture.removedStates()).toEqual(["working", "tombstone"]);
+  expect(fixture.committedRemoveAttempts()).toEqual([]);
+});
+
+test("handoff mints unready before later atomic authority installation", async () => {
+  for (const operation of ["sync", "copy"] as const) {
+    const fixture = await createRootRolloverFixture(operation);
+    const active = fixture.pauseMidOperation();
+    await fixture.operationPaused();
+    const handoff = fixture.beginNewGenerationHandoff();
+    expect(fixture.newProfileRootAcquisitionsClosed()).toBe(true);
+    expect(fixture.oldRootCloseCalls()).toBe(0);
+    fixture.abortOperation();
+    await expect(active).rejects.toMatchObject({
+      category: "reconciliation_required",
+    });
+    await handoff;
+    expect(fixture.handoffOrder()).toEqual([
+      "clear-ready", "close-new-acquisitions", "drain-sessions",
+      "drain-root-leases", "close-old-profile-store", "close-old-root",
+      "mint-new-generation-unready",
+    ]);
+    expect(fixture.ready()).toBe(false);
+    expect(fixture.installedAuthority()).toBeUndefined();
+    await fixture.reconcileWithAuthority(
+      async (request, admission) =>
+        fixture.reconcileAndCaptureAuthority({ request, admission }),
+    );
+    expect(fixture.installOrder()).toEqual([
+      "reconcile-capture", "reacquire-root", "create-profile-store",
+      "atomic-install-result-authority-store-ready",
+    ]);
+    expect(fixture.ready()).toBe(true);
+    expect(fixture.currentRootHeld()).toBe(true);
+    await fixture.shutdown();
+    expect(fixture.openFdCount()).toBe(0);
+  }
+});
+
+test("admission aborts every held operation around each await", async () => {
+  for (const operation of [
+    "canonicalize", "sync", "copy", "create", "prepare", "finalize",
+    "remove", "launch",
+  ] as const) {
+    for (const edge of ["before-await", "after-await"] as const) {
+      const fixture = await createAdmissionAbortFixture(operation, edge);
+      await expect(fixture.run()).rejects.toMatchObject({
+        category: "reconciliation_required",
+      });
+      expect(fixture.firstEffectAfterAbort()).toBeUndefined();
+      expect(fixture.allCloseAttemptsMade()).toBe(true);
+    }
+  }
+});
+
+test("profile mutations survive crash points only through held evidence", async () => {
+  for (const phase of [
+    "child-create", "child-write", "child-fsync", "postorder-dir-fsync",
+    "state-rename", "child-remove", "post-mutation-revalidate",
+  ] as const) {
+    const fixture = await createHeldMutationCrashFixture(phase);
+    await expect(fixture.run()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(fixture.outsideTreeTouched()).toBe(false);
+    expect(fixture.profileLifecycleCalls()).toEqual([]);
+    await fixture.recoverWithHeldEvidence();
+    expect(fixture.recoveredCanonicalOrDiscarded()).toBe(true);
+  }
 });
 
 test("expires at first idle or absolute deadline", async () => {
@@ -2644,6 +3147,58 @@ test("cannot create a profile or Chromium session before reconciliation", async 
   });
   expect(launchPersistentContext).not.toHaveBeenCalled();
   expect(profileStore.createWorkingCopy).not.toHaveBeenCalled();
+});
+
+test("real Chromium launches only through the retained generation fd", async () => {
+  for (const swapAt of ["before-launch", "during-launch"] as const) {
+    const fixture = await createRealProcfdLaunchFixture({ swapAt });
+    const outcome = await captureOutcome(fixture.launchBundledChromium());
+    expect(fixture.publicWorkingCopy).not.toHaveProperty("path");
+    expect(fixture.launchApiCalls()).toEqual([
+      "launchPersistentChromiumForWorking",
+    ]);
+    expect(fixture.launchArgument()).toBe(
+      `/proc/${fixture.browserServicePid}/fd/${fixture.generationFd}`,
+    );
+    expect(fixture.procfdIdentityImmediatelyBeforeLaunch()).toEqual(
+      fixture.boundGenerationIdentity,
+    );
+    expect(fixture.rootLeaseHeldThroughSession()).toBe(true);
+    expect(fixture.publicProcfdValues()).toEqual([]);
+    expect(fixture.fdExposed()).toBe(false);
+    expect(fixture.canonicalSwapProof()).toEqual({
+      root: true, state: true, working: true, restored: true,
+    });
+    expect(fixture.usedOriginalOwnedInodeOrFailedBeforeLaunch(outcome))
+      .toBe(true);
+    expect(fixture.attackerTreeWrites()).toEqual([]);
+    if (outcome.status === "succeeded") {
+      await fixture.releaseChromiumSessionAttachment();
+      expect(fixture.rootLeaseHeldThroughSession()).toBe(false);
+      expect(fixture.launchAttachmentReleased()).toBe(true);
+      await expect(
+        fixture.releaseChromiumSessionAttachment(),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      await expect(
+        fixture.useReleasedChromiumSessionAttachment(),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    }
+  }
+});
+
+test("launch or Registry attachment failure cleans the opaque attachment", async () => {
+  for (const phase of [
+    "internal-launcher-after-context", "registry-attachment",
+  ] as const) {
+    const fixture = await createLaunchAttachmentFailureFixture(phase);
+    await expect(fixture.run()).rejects.toMatchObject({
+      category: "replay_unavailable",
+    });
+    expect(fixture.releaseCalls()).toBe(1);
+    expect(fixture.contextAndBrowserCloseAttemptsMade()).toBe(true);
+    expect(fixture.procfdValuesOutsideLauncher()).toEqual([]);
+    expect(fixture.verifiedCloseReleasedLeaseOrRetainedFailStop()).toBe(true);
+  }
 });
 
 test("real Chromium restores through a closed proxy ingress gate", async () => {
@@ -2671,7 +3226,8 @@ test("uses exact restore order without a launch storageState option", async () =
   expect(restored.launchOptions).not.toHaveProperty("storageState");
   expect(restored.callOrder).toEqual([
     "validate", "registry-provisional", "working-copy",
-    "proxy-gate-closed", "launch-attempt-owned", "launch",
+    "proxy-gate-closed", "launch-attempt-owned",
+    "verify-procfd-generation", "launch",
     "set-storage-state", "export-unknown", "parse", "compare",
     "assert-zero-ingress-violations", "open-gate", "acquire-page",
     "navigate", "fingerprint", "publish-session",
@@ -2685,7 +3241,8 @@ test("opens a non-replay gate before initial page work", async () => {
   });
   expect(created.callOrder).toEqual([
     "validate", "registry-provisional", "working-copy",
-    "proxy-gate-closed", "launch-attempt-owned", "launch",
+    "proxy-gate-closed", "launch-attempt-owned",
+    "verify-procfd-generation", "launch",
     "assert-zero-ingress-violations",
     "open-gate", "acquire-page", "navigate-initial-url", "fingerprint",
     "publish-session",
@@ -2924,6 +3481,7 @@ test("discards only a trusted pre-spawn launch rejection", async () => {
     category: "replay_unavailable",
   });
   expect(restored.acquisitionTrace).toContain("launch-attempt-owned");
+  expect(restored.acquisitionTrace).toContain("verify-procfd-generation");
   expect(restored.launchCount).toBe(1);
   expect(restored.trustedPreSpawnProofAccepted).toBe(true);
   expect(restored.browserProcessOrResourceCreated).toBe(false);
@@ -2946,6 +3504,7 @@ test("retains unverified timeout or post-spawn launch rejection", async () => {
     expect(error).toMatchObject({ category: "replay_unavailable" });
     expect(restored.launchCount).toBe(1);
     expect(restored.acquisitionTrace).toContain("launch-attempt-owned");
+    expect(restored.acquisitionTrace).toContain("verify-procfd-generation");
     expect(restored.errorReturnedAfterOwnershipRecorded).toBe(true);
     expect(restored.usedPrivateProcessApi).toBe(false);
     expect(restored.hasOwnedContext()).toBe(false);
@@ -3257,31 +3816,311 @@ test("restore crash discards work and never publishes a profile", async () => {
 });
 ```
 
+Place primitive Budget/evidence/swap/drift/limit/FD tests in
+`reconciliation.test.ts`; place authority installation, ready-binding,
+generation-rollover, and drain-order tests in `startup-state.test.ts`; place
+ProfileStore generation-lifetime, mutation-chain, empty
+writer, prepare/finalize, and consumer-equivalence tests in
+`profile-store.test.ts`; place the procfd launch and real Chromium swap cases in
+the replay integration test. Existing Task 3 reconciliation cases remain
+unchanged in public behavior; `reconciliation.test.ts` gains additive initial
+root-capture, held-adapter, and close-semantics coverage.
+
 - [ ] **Step 2: Run tests and verify red**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
 cd apps/browser-service
-corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts
+corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts src/reconciliation.test.ts src/startup-state.test.ts
 ```
 
-Expected: FAIL because profile store and registry do not exist.
+Expected: FAIL because held-profile API, profile store, and registry do not
+exist.
 
 - [ ] **Step 3: Implement root-confined two-phase profile publication**
 
+Extend `reconciliation.ts` with a narrow opaque held-profile API while
+preserving every existing Task 3 export and call path:
+
+```ts
+declare const anchoredProfileRootBrand: unique symbol;
+declare const boundProfileGenerationBrand: unique symbol;
+declare const internalReconciliationOutcomeBrand: unique symbol;
+declare const installedReconciledAuthorityBrand: unique symbol;
+declare const chromiumSessionAttachmentBrand: unique symbol;
+
+type ReconciledRootEvidence = Readonly<{
+  canonicalAbsoluteComponents: readonly string[];
+  componentIdentities: readonly Readonly<{
+    dev: string;
+    ino: string;
+    mode: number;
+  }>[];
+  binding: Readonly<{
+    processNonce: string;
+    controlGenerationNonce: string;
+    snapshotDigest: string;
+  }>;
+}>;
+
+export type AnchoredProfileRoot = Readonly<{
+  [anchoredProfileRootBrand]: true;
+}>;
+
+// Internal export for startup-state.ts only; omitted from the public barrel.
+export type InternalReconciliationOutcome = Readonly<{
+  [internalReconciliationOutcomeBrand]: true;
+}>;
+
+export type InstalledReconciledAuthority = Readonly<{
+  [installedReconciledAuthorityBrand]: true;
+}>;
+
+export type ProfileGenerationLocator = Readonly<{
+  profileId: string;
+  state: "working" | "staging" | "committed";
+  generationId: string;
+  openMode: "existing" | "create_exclusive";
+}>;
+
+export type BoundProfileGeneration = Readonly<{
+  [boundProfileGenerationBrand]: true;
+  transitionTo(
+    state: "staging" | "committed",
+  ): Promise<BoundProfileGeneration>;
+  remove(): Promise<void>;
+  close(): Promise<void>;
+}>;
+
+export type ReadyProfileRootBinding = Readonly<{
+  processNonce: string;
+  controlGenerationNonce: string;
+  snapshotDigest: string;
+}>;
+
+export type ChromiumSessionAttachment = Readonly<{
+  [chromiumSessionAttachmentBrand]: true;
+  context: BrowserContext;
+}>;
+
+export type InternalReconciliationInstall = Readonly<{
+  publicResult: ReconciliationResultV1;
+  authority: InstalledReconciledAuthority;
+  root: AnchoredProfileRoot;
+}>;
+
+export async function closeAnchoredProfileRoot(
+  root: AnchoredProfileRoot,
+): Promise<void>;
+export async function bindProfileGeneration(
+  root: AnchoredProfileRoot,
+  locator: ProfileGenerationLocator,
+): Promise<BoundProfileGeneration>;
+export async function canonicalizeHeldProfileTree(
+  generation: BoundProfileGeneration,
+): Promise<CanonicalProfileTreeEvidence>;
+export async function syncAndCanonicalizeHeldProfileTree(
+  generation: BoundProfileGeneration,
+): Promise<CanonicalProfileTreeEvidence>;
+export async function copyHeldProfileTree(
+  source: BoundProfileGeneration,
+  destination: BoundProfileGeneration,
+): Promise<CanonicalProfileTreeEvidence>;
+export async function consumeInternalReconciliationOutcome<T>(
+  outcome: InternalReconciliationOutcome,
+  binding: ReadyProfileRootBinding,
+  consume: (install: InternalReconciliationInstall) => Promise<T>,
+): Promise<T>;
+export async function launchPersistentChromiumForWorking(
+  working: BoundProfileGeneration,
+  binding: ReadyProfileRootBinding,
+  options: ValidatedPersistentChromiumOptions,
+): Promise<ChromiumSessionAttachment>;
+export async function releaseChromiumSessionAttachment(
+  attachment: ChromiumSessionAttachment,
+): Promise<void>;
+
+// Internal export for startup-state.ts only; omitted from the public barrel.
+export async function reconcileBrowserStateWithAuthority(
+  canonicalRoot: string,
+  request: ReconciliationRequestV1,
+  deps: ReconciliationDependencies,
+): Promise<InternalReconciliationOutcome>;
+```
+
+The unique brands are compile-time hints only. Module-private WeakMaps are the
+runtime authority for root, generation, launch attachment, and internal outcome
+objects; casts or foreign objects fail. The internal outcome has no forgeable
+`result` or `authority` fields. Its WeakMap record holds the public result and
+`ReconciledRootEvidence`; neither is exported through the public barrel.
+Preserve the existing public `ReconciliationResultV1` and
+`reconcileBrowserState()` API exactly: it delegates to the internal form,
+returns only a cloned public result, and disposes its uninstalled internal
+outcome.
+
+`consumeInternalReconciliationOutcome()` is the only outcome accessor. It
+runtime-authenticates the fieldless token and exact binding, permits one call,
+and synchronously moves its WeakMap record `fresh → consuming → consumed`
+before invoking the typed consumer. It reacquires the held root and creates an
+opaque `InstalledReconciledAuthority`; the consumer receives only a cloned
+public result plus runtime-authenticated authority/root capabilities, never raw
+evidence or FDs. A forged, foreign, stale, concurrently reused, or already
+consumed outcome fails before callback. There is no fallible work after a
+successful consumer returns. Consumer failure closes any constructed store via
+the controller, then this function closes/revokes root and authority; the
+outcome remains consumed and cannot be retried.
+
+Before any snapshot, namespace enumeration, cleanup-plan read, or other state
+work, internal reconciliation opens `/`, then every canonical absolute root
+component through `/proc/self/fd/<held-parent>/<component>` with
+`O_DIRECTORY | O_NOFOLLOW`. It retains `/` through the final root for the
+entire run, validates each held parent entry and child identity around every
+await, captures initial canonical components/dev/ino/mode from those handles,
+then derives all state work from that chain. Immediately before closing the
+same handles, it revalidates them and seals the initial evidence plus the exact
+process/control/snapshot binding into the outcome's WeakMap record. A
+capture-time component swap fails before any state work; later reacquisition
+must match every captured component.
+
+Task 4 adds internal `InternalStartupAdmission.reconcileWithAuthority()` while
+keeping public `StartupAdmission.reconcile()` unchanged, using the closed
+interface declared in Task 3. The internal method owns the existing execution
+callback/admission boundary. It invokes `execute` itself, then immediately passes the completed outcome and
+current unready process/control/snapshot binding to
+`consumeInternalReconciliationOutcome()`. Its fixed internal consumer builds
+the generation-scoped ProfileStore and atomically caches cloned public result,
+installed authority, held root/store, and ready state. No route receives the
+completed outcome, extracts authority, or calls `requireReady()` between these
+steps. Authentication, execution, reacquisition, or store-construction failure
+closes partial resources, installs no ready state, and leaves the generation
+unready.
+
+Root reacquisition checks the exact binding before and after every await, opens
+`/` and each canonical component through the preceding procfd with
+`O_DIRECTORY | O_NOFOLLOW`, retains the entire ancestor chain, and compares
+every dev/ino/mode with captured evidence. This internal handoff is the sole
+`AnchoredProfileRoot` constructor; there is no public root-open function.
+
+Control-generation handoff first clears ready and closes new acquisitions,
+drains sessions and outstanding root leases, closes the old ProfileStore and
+old root chain, then mints the next generation in an unready state. A later
+reconciliation captures its outcome; `reconcileWithAuthority()` reacquires the
+root, creates the store, and performs the single atomic install/ready flip.
+Authority is never installed during mint. StartupAdmission remains reusable
+across generations. Drain/close/reconciliation/install failure leaves the new
+generation unready and installs no partial authority.
+
+`bindProfileGeneration()` validates canonical lowercase UUID/state tokens and
+opens/holds the exact root→`profiles`→profile→state→generation directory chain
+through procfd children. Its opaque capability also supplies only high-level
+create-exclusive bind, state-transition rename, and generation-remove
+operations needed by ProfileStore; evidence child cleanup remains internal to
+copy/walk code, and no raw pathname or FD escapes. Every
+mutation holds and revalidates the complete root-through-state chain before and
+after mutation, including destination state for transitions. Permit only
+working→staging and staging→committed; any other transition fails before
+mutation. Transition/remove consumes the old binding, and `close()` releases an
+unused binding. Create fsyncs the held parent; transition fsyncs held source and
+destination parents; recursive child removal is postorder and fsyncs each held
+parent.
+
+Runtime authority comes from module-private WeakMap records, not TypeScript
+brands. Root and generation records serialize leases and use only
+`live | consuming | consumed | closed`; casts, foreign-root objects,
+use-after-consume, double transition/remove, and double close fail before
+filesystem effect. Root close first rejects new operations, waits for every
+serialized lease and child binding to drain, then attempts every descriptor
+close. No generation operation may outlive its root lease.
+
+`create_exclusive` is valid only for an absent working generation. It first
+holds only the available parent chain
+root→`profiles`→profile→`working`, calls nonrecursive procfd-relative mkdir, and
+fails on `EEXIST`. Only after mkdir does it open the generation child with
+`O_DIRECTORY | O_NOFOLLOW`, fstat it, and revalidate the full now-existing chain
+before returning a live binding. No test or implementation may claim a
+generation handle exists before that mkdir.
+
+Copy accepts only a committed source and an absent, newly created, empty
+working destination; working or staging source capabilities fail before the
+first destination mutation. Every nested destination directory repeats the
+same held-parent, nonrecursive mkdir/`EEXIST`, no-follow open, fstat, and
+full-chain revalidation sequence. All service-created destination files use
+`O_CREAT | O_EXCL | O_NOFOLLOW`; a non-empty destination, collision, symlink,
+or replacement race fails unsafe without overwrite or publication. Prepare is
+only working→staging, finalize only staging→committed. General removal accepts
+only a module-owned working or deletion-tombstone binding and never a committed
+generation; reconciliation retains its separately authorized cleanup path.
+
+These helpers adapt the existing private reconciliation `Budget`, iterative
+walker, canonical encoder, hash, and evidence implementation. Preserve
+`canonicalizeProfileTree(canonicalRoot, path)` and all Task 3 behavior/API for
+its existing callers, but ProfileStore must never call that pathname-reopening
+entry point. There is one hash/encoder implementation.
+
+`canonicalizeHeldProfileTree()` walks only relative to held generation FDs and
+returns bounded fixed-key canonical bytes/tree SHA plus evidence for every
+directory and file: relative UTF-8 path, type, dev, ino, nlink, mode, size,
+content SHA, parent binding, and open/stat observations. A child found by
+enumeration but absent before bind/open creates one in-memory evidence
+tombstone and fails unsafe; it never silently shrinks the tree or creates an
+on-disk marker.
+
+`syncAndCanonicalizeHeldProfileTree()` first completes that bounded canonical
+walk/evidence with zero sync on failure, syncs exactly evidenced files, then
+directories in postorder, and finally revalidates the full canonical tree,
+including mode/size/content SHA, every inode, and every ancestor/parent binding.
+Same-inode mutation is failure.
+
+`copyHeldProfileTree()` first completes bounded source evidence before any
+destination copy. It reads source files in bounded chunks through held FDs,
+requires exact declared-size bytes followed by EOF, checks stat/binding before
+and after reads, rejects prefix/truncation/trailing bytes or content drift,
+creates destination entries only through the held destination chain, fsyncs
+files then directories postorder, and canonicalizes/revalidates both sides.
+Source and destination canonical bytes/tree SHA must match exactly. The copy
+uses evidence-driven paths only; it never enumerates an unproved pathname.
+
+Canonicalize, sync, copy, create, prepare, finalize, remove, and launch check
+the current binding/admission immediately before and after every filesystem or
+launch await. Abort starts no later effect but still runs raw cleanup. The three
+tree operations keep Task 3 hooks and exact caps: 25,000
+entries, depth 64, 64 MiB per file, 256 MiB per tree, UTF-8/NFC/segment/path,
+regular-file, nlink, and special-file rules. Limit failure occurs after bounded
+evidence discovery and before sync or destination copy. Every opaque object
+attempts every owned descriptor close in raw `finally`. Success, abort,
+open/stat failure, revalidation failure, and a close-then-throw injection prove
+zero retained FDs. A true close rejection cannot prove descriptor closure: it
+retains module-private fail-stop ownership marked `close_unverified`, closes
+admission, and makes no zero-FD claim.
+
+ProfileStore is generation-scoped. Startup creates or rebinds exactly one store
+to the current ready root; generation rollover drains it and its sessions,
+closes the old authority, and mints unready. Later reconciliation reacquires
+the root and creates a fresh store before atomically installing both for the
+new binding. Every working/staging/committed mutation derives from that
+authority.
+
 Derive every path from canonical lowercase UUIDs and permit only exact
 `profiles/<profileId>/{working|staging|committed}/<generationId>/` generation
-directories. Reuse Task 3's exported canonical tree walker/encoder without a
-second checksum implementation: same held-handle confinement, UTF-8 byte sort,
+directories. Reuse the held API above without a second checksum implementation:
+same held-handle confinement, UTF-8 byte sort,
 NFC paths, type/mode/size/content-SHA entries, 64-depth, 64-MiB file, 256-MiB
 tree, path/segment, symlink/special/hard-link rejection, and final tree SHA.
 Unknown direct children at the profile/state namespace levels fail closed;
-bounded content inside a generation is part of the canonical tree. Writer close fsyncs a working
-tree, renames it to staging, hashes it, and returns an opaque prepare token.
+bounded content inside a generation is part of the canonical tree. A writer
+schema must contain at least one bounded regular file after Chromium closes;
+the root-only empty tree fails as `browser_unavailable` with internal detail
+`profile_schema_empty` and cannot prepare or
+publish. Writer close syncs/canonicalizes a held working tree, renames it to
+staging through the held chain, revalidates it, and returns an opaque prepare token.
 Finalize verifies token and checksum, atomically renames staging to committed,
 and is idempotent for the same generation/checksum. Snapshot sessions never
-publish.
+publish. Child creation/write/file-fsync, postorder directory fsync,
+state-rename, removal, and post-mutation revalidation are explicit crash
+boundaries. Restart recovery through held evidence either proves the canonical
+state or discards the owned partial working/tombstone state; no partial tree is
+published, and rename/remove parent directories are fsynced before success.
 
 API advances `latest_generation_id` only after finalize succeeds. Consume the
 Task 3 reconciled root; this store never changes readiness, queries authority,
@@ -3312,7 +4151,7 @@ const provisional = registry.reserveProvisional(validatedRequest);
 const work = await provisional.acquireWorkingCopy();
 const proxy = await provisional.acquireEgressProxy({ gate: "restore_closed" });
 const context = await provisional.acquirePersistentContext(
-  work.path,
+  work,
   launchOptionsWithoutStorageState,
 );
 proxy.restoreGate.assertZeroViolations();
@@ -3359,7 +4198,7 @@ const provisional = registry.reserveProvisional(validatedRequest);
 const work = await provisional.acquireWorkingCopy();
 const proxy = await provisional.acquireEgressProxy({ gate: "restore_closed" });
 const context = await provisional.acquirePersistentContext(
-  work.path,
+  work,
   launchOptionsWithoutStorageState,
 );
 await context.setStorageState(checkpoint.storageState);
@@ -3376,6 +4215,33 @@ to the same Registry entry before it returns and before the caller's next
 fallible await. `acquirePersistentContext()` first attaches a `launch_attempt`
 token before invoking Playwright. A returned context atomically replaces that
 token with owned context state.
+
+The working-generation value exposes no path. Registry invokes fixed internal
+`launchPersistentChromiumForWorking(work, binding, options)` with the genuine
+bound working capability and exact current ready binding. The function checks
+admission and revalidates the held root→profiles→profile→working→generation
+chain before and after every await, constructs and verifies the module-owned
+`/proc/<browser-service-pid>/fd/<generation-fd>` string, and directly invokes
+`chromium.launchPersistentContext(procfdPath, options)` inside the same module.
+The procfd variable's lexical scope ends there; no generic/user callback can
+capture it, and neither an FD nor path is returned or stored in Registry.
+
+The fixed launch returns a runtime-authenticated `ChromiumSessionAttachment`
+containing the public context while its WeakMap record retains the bound
+generation/root lease. `acquirePersistentContext()` attaches both atomically
+before its next fallible await. If internal launcher bookkeeping fails after a
+context exists, or Registry attachment fails, the acquiring layer immediately
+calls `releaseChromiumSessionAttachment()` and aggregates cleanup failure.
+
+`releaseChromiumSessionAttachment()` is the only release path. Its WeakMap
+state transition is exactly once: `live → releasing → released` after verified
+context closure or verified public Browser fallback closure. It then releases
+the generation/root lease. Forged, foreign, double-release, or use-after-release
+attachments fail before effect. Unknown/failed close instead moves to retained
+`close_unverified`, keeps the attachment and lease under fail-stop ownership,
+and closes admission; it never reports release. Swapping/restoring canonical
+root, `working` state, or generation pathname before/during launch therefore
+uses the original owned inode or fails before Playwright starts.
 
 Persistent Chromium creates and initializes an automatic `about:blank` page
 before `launchPersistentContext()` returns. For mobile Chromium, Playwright may
@@ -3560,8 +4426,8 @@ generation to API, retains `cleanup_failed` ownership for any unverified live
 resource, and leaves durable partial filesystem state for reconciliation
 without skipping remaining cleanup.
 
-Registry accepts `StartupAdmission` and calls `requireReady(binding)` before any path,
-working-copy, proxy, or Chromium side effect. Registry stores public/runtime
+Registry accepts `StartupAdmission` and calls `requireReady(binding)` before any
+root acquisition, working-copy, proxy, or Chromium side effect. Registry stores public/runtime
 IDs, state/version, page/context, proxy/gate/listener/sockets, profile work,
 initial/allowed/learned origins, deadlines, DevTools loopback endpoint, stream
 hub, and one writer lease. `withWriter()` rejects concurrent mutation with
@@ -3575,13 +4441,31 @@ and never prepares a writer profile before verified resource shutdown.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
 cd apps/browser-service
-corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts
+corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts src/reconciliation.test.ts src/startup-state.test.ts
 ```
 
 Expected: PASS for writer exclusion, snapshot isolation, every publication
 crash point, corrupt-reference readiness, 600-second idle and 3600-second
-absolute maxima, shorter caller limits, and close idempotency. Real bundled
-Chromium proves cookies, localStorage, and IndexedDB exist before first
+absolute maxima, shorter caller limits, and close idempotency. Held-root tests
+prove transient ancestor swaps, same-inode drift, child tombstones, exact EOF,
+truncation/trailing-byte rejection, phase-specific held mutation chains, first/
+completed positive-control hooks, all close attempts, zero retained FDs where
+closure is verifiable, fail-stop ownership where it is not, bounds before
+sync/copy, empty writer rejection, and one shared Task 3/Task 4 hash/evidence
+implementation. Generation rollover tests prove ready clear, acquisition
+closure, session/root-lease drain, old-store/root close, and unready mint;
+later reconciliation proves capture, reacquisition/store construction, then one
+atomic result/authority/store/ready install. Opaque outcomes consume exactly
+once; forged/stale/repeated consumption never invokes the install callback.
+Real bundled Chromium launches only inside fixed
+`launchPersistentChromiumForWorking()` against the retained generation procfd
+and proves no path/FD escapes the launcher module.
+Canonical root/state/working swaps use the original owned inode or fail before
+launch; the attachment holds its root lease through session lifetime and
+releases exactly once after verified context/Browser closure. Launcher or
+Registry attachment failure cleans it; double release/use after release fails,
+while unknown closure retains fail-stop ownership. It also proves cookies,
+localStorage, and IndexedDB exist before first
 service-owned navigation. Desktop automatic-page initialization, mobile
 default-page replacement/close, existing-page origin inspection, helper
 pages, fulfilled origin navigations, and utility evaluation remain
@@ -3601,8 +4485,8 @@ Tests inspect launch options and exact replay/non-replay call order. Pre-launch
 validation failures prove launch count zero. Working-copy, proxy bind/start,
 launch rejection/timeout, restore, export, parse, comparison, gate, navigation,
 fingerprint, operation-timeout, and Chromium-crash injections assert every
-owned resource, discard attempt, working path, and publication call. Successful
-cleanup leaves no Registry/resource/working entry. Failed context/listener/
+owned resource, discard attempt, working capability, and publication call.
+Successful cleanup leaves no Registry/resource/working entry. Failed context/listener/
 socket cleanup retains truthful `cleanup_failed` ownership and closed admission
 until the sweeper verifies closure; no failure prepares or publishes a profile.
 Trusted `preSpawn` rejection proves no browser resource and permits discard.
@@ -3618,7 +4502,7 @@ Browser fallback retains original close promises and never invokes
 - [ ] **Step 6: Commit profile lifecycle**
 
 ```bash
-git add apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts apps/browser-service/src/replay-restore.ts apps/browser-service/src/replay-restore.integration.test.ts apps/browser-service/src/egress-proxy.ts apps/browser-service/src/egress-proxy.test.ts
+git add apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts apps/browser-service/src/replay-restore.ts apps/browser-service/src/replay-restore.integration.test.ts apps/browser-service/src/egress-proxy.ts apps/browser-service/src/egress-proxy.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts apps/browser-service/src/startup-state.ts apps/browser-service/src/startup-state.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: persist browser profile generations" -m "Create isolated Chromium working copies and publish writable profile
 generations through a checksummed two-phase protocol.
@@ -4076,7 +4960,8 @@ transport without a success or `failed_no_effect` body; it never enters the
 action cache. Artifact streaming verifies declared length and SHA-256 while
 writing and aborts on mismatch.
 
-Create `StartupAdmission` before listener bind. Mount authenticated
+Create `InternalStartupAdmission` with the required ProfileStore factory before
+listener bind. Mount authenticated
 `GET /health/live`, `POST /v1/control-generations`, `GET /health/ready`, and
 `POST /v1/reconciliation` before session routes. Initial live discovery omits
 generation headers and never returns the current generation. Control handoff
@@ -4084,8 +4969,11 @@ validates process nonce and the strict API-instance/idempotency pair, closes
 admission and aborts reconciliation synchronously, clears ready/cache, and
 starts one service-owned registry full-runtime drain before returning 201.
 That shared drain closes sessions, contexts, all stream modes, grants,
-writers, timers, and uncommitted working profiles and is not cancelled by one
-request transport. Feed request close/abort plus its absolute 60-second
+writers, timers, uncommitted working profiles, root leases, the old
+generation-scoped ProfileStore, and its held root. Only after those closes does
+handoff return a newly minted generation that is explicitly unready and has no
+authority/store. The drain is not cancelled by one request transport. Feed
+request close/abort plus its absolute 60-second
 deadline into `ControlGenerationRequestContext`. Under the startup-state
 handoff mutex, a fresh tuple replaces only an orphaned pre-mint owner and
 awaits the same drain; live-owner concurrency remains 409 in-progress.
@@ -4103,10 +4991,15 @@ operation. Apply 16 MiB raw JSON limit only to reconciliation and smaller
 contract bounds elsewhere. Reconciliation validates service key, correlation,
 deadline capped at 60 seconds, process/generation headers, matching body,
 schema, and digest before calling
-`StartupAdmission.reconcile()`. That method checks non-draining admission
-synchronously before invoking its filesystem callback and again before
-caching success/opening readiness. Pass its exact execution admission object
-through the route callback to `reconcileBrowserState()`. A listener-accepted
+internal `InternalStartupAdmission.reconcileWithAuthority()`. Public `reconcile()` and
+`reconcileBrowserState()` retain their existing external/test contracts, but
+the HTTP route supplies only the typed execution callback to the controller.
+The controller checks non-draining admission, invokes that callback to produce
+and consume the opaque outcome internally, reacquires root/builds store, then
+atomically installs result/authority/store/readiness. Pass its exact execution
+admission through the callback to `reconcileBrowserStateWithAuthority()`; the
+route never receives the outcome and cannot extract fields or call
+`requireReady()` between steps. A listener-accepted
 reconciliation that reaches admission after `beginDraining()` fails without
 filesystem access. An in-flight callback observes synchronous abort and may
 finish only its current syscall; it starts no later filesystem call, cannot
