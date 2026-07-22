@@ -147,8 +147,9 @@ subject and every body line are at most 72 characters.
   Chromium TCP/UDP escape proof with positive controls.
 - `apps/browser-service/src/profile-store.ts` — working copies and immutable
   atomic profile generations.
-- `apps/browser-service/src/startup-state.ts` — process nonce, liveness,
-  readiness latch, digest replay rules, and browser-work admission.
+- `apps/browser-service/src/startup-state.ts` — stable process identity,
+  control-generation handoff/drain, readiness latch, generation-scoped digest
+  replay rules, and browser-work admission.
 - `apps/browser-service/src/reconciliation.ts` — closed snapshot
   canonicalization, authority validation, quarantine cleanup, and retry.
 - `apps/browser-service/src/evaluate-policy.ts` — constrained page-expression
@@ -167,7 +168,9 @@ subject and every body line are at most 72 characters.
 
 ### Firecrawl API
 
-- `apps/api/src/db/migrations/0007_browser_adapter_bindings.sql` — durable
+- `apps/api/src/db/migrations/0007_browser_control_generation.sql` — singleton
+  cross-process browser mutation fence and monotonic database epoch.
+- `apps/api/src/db/migrations/0008_browser_adapter_bindings.sql` — durable
   run/capability job, supervisor, process, and activation constraints.
 - `apps/api/src/db/schema/public.ts` and
   `apps/api/src/db/migrate.integration.test.ts` — Drizzle parity and migration
@@ -186,8 +189,9 @@ subject and every body line are at most 72 characters.
   and browser-state mutator/retention gate.
 - `apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts` —
   repeatable-read PostgreSQL authority snapshot and canonical digest.
-- `apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts` — recovery,
-  reconciliation, ready verification, nonce monitoring, and restart coalescing.
+- `apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts` — service
+  discovery, control-generation takeover, recovery, reconciliation, fenced
+  ready verification, and restart coalescing.
 - `apps/api/src/lib/browser-runtime/protocol.ts` — strict shared
   internal `BrowserOperation`/`ModelDecisionV1`, distinct
   `ModelWireBrowserOperationV1`/`ModelWireDecisionV1` envelope, explicit
@@ -222,6 +226,10 @@ subject and every body line are at most 72 characters.
 - `apps/api/src/__tests__/snips/v2/scrape-browser.test.ts` — replay/stop snips.
 - `apps/api/src/__tests__/snips/v2/browser-real-codex.test.ts` — post-host real
   Codex action-ledger and zero-tool smoke.
+- `apps/api/src/cli/browser-stale-contract-scan.ts` — checked production-file
+  manifest plus AST/text invariants for stale browser contracts.
+- `apps/api/src/cli/browser-stale-contract-scan.test.ts` — one positive
+  mutation fixture per stale-contract rule and real-tree coverage.
 - `apps/api/src/harness-browser-service.ts` — disposable service lifecycle.
 - `apps/api/src/harness-browser-service.test.ts` — harness cleanup coverage.
 - `apps/api/src/harness.ts` and `apps/api/package.json` — managed snip command.
@@ -252,6 +260,17 @@ at most 4 KiB.
 Every `:runtimeSessionId`, `:grantId`, and `:generationId` route parameter is
 an `Id`; a body field repeating a route ID must equal it.
 
+Initial `GET /health/live` discovery and
+`POST /v1/control-generations` are the only bootstrap requests that omit
+generation fencing headers. Every request after a successful handoff,
+including scoped live/ready health, reconciliation, session, action, grant,
+artifact, stream, profile, and close requests, also carries exact
+`x-firecrawl-process-nonce` and
+`x-firecrawl-control-generation-nonce` headers. Both are canonical `Token`
+values and must match current service state before request parsing, mutation,
+writer acquisition, or stream upgrade. The control-generation nonce is never
+returned by discovery health.
+
 The single source of contract truth is the checked-in, canonical JSON fixture
 `apps/browser-service/contracts/private-v1.contract.json`. It has exactly the
 top-level members `version:1`, `routes`, and `definitions`; fingerprint input
@@ -262,6 +281,7 @@ byte cap, response byte cap, and streaming metadata. No endpoint may be added
 to either implementation without changing this fixture.
 
 ```text
+POST   /v1/control-generations                          CreateControlGenerationV1 -> 201 ControlGenerationV1
 POST   /v1/sessions                                      CreateSessionV1 -> 201 SessionV1
 GET    /v1/sessions/:runtimeSessionId                    null -> 200 SessionV1
 DELETE /v1/sessions/:runtimeSessionId                    CloseSessionV1 -> 200 ClosedSessionV1
@@ -275,7 +295,7 @@ POST   /v1/reconciliation                                ReconciliationRequestV1
 WS     /v1/sessions/:runtimeSessionId/streams/passive
 WS     /v1/sessions/:runtimeSessionId/streams/interactive
 WS     /v1/sessions/:runtimeSessionId/streams/cdp
-GET    /health/live                                      null -> 200 LiveHealthV1
+GET    /health/live                                      null -> 200 LiveDiscoveryV1 | ScopedLiveHealthV1
 GET    /health/ready                                     null -> 200 ReadyHealthV1 | 503 UnreadyHealthV1
 ```
 
@@ -288,6 +308,19 @@ type Token = string;           // 43-char canonical base64url, 32 decoded bytes
 type HttpUrl = string;         // absolute HTTP(S), 1..8_192 chars
 type Timestamp = string;       // canonical UTC ISO-8601
 type RelativeStatePath = string; // root-relative, 1..1_024 UTF-8 bytes
+
+type CreateControlGenerationV1 = {
+  version: 1;
+  processNonce: Token;
+  apiInstanceId: Id;
+  idempotencyKey: Token;
+};
+type ControlGenerationV1 = {
+  version: 1;
+  processNonce: Token;
+  controlGenerationNonce: Token;
+  apiInstanceId: Id;
+};
 
 type JsonSafe =
   | null | boolean | number | string
@@ -516,17 +549,71 @@ in `x-firecrawl-artifact-version`, `-id`, `-kind`, `-byte-size`, and
 must equal byte size, and streamed bytes must hash to the metadata checksum.
 The service rejects a ninth run artifact or aggregate bytes over 32 MiB.
 
-Health and reconciliation are private too. Before reconciliation,
-`GET /health/live` returns strict
-`{ version: 1, status: "live_unreconciled", processNonce }`; ready returns 503
-with strict `{ version: 1, status: "unready", processNonce, category }`.
-After one successful snapshot, ready returns strict
-`{ version: 1, status: "ready", processNonce, snapshotDigest }`.
-Ordered shutdown closes listener before draining work, so no new live or ready
-health response is served. Already accepted requests fail admission through
-`requireReady()` once shutdown starts.
+Health, control handoff, and reconciliation are private too. Initial
+`GET /health/live` discovery returns strict
+`{ version: 1, status, processNonce }` and never reveals or authorizes a
+control generation. After handoff, scoped live health requires both fencing
+headers and returns strict
+`{ version: 1, status, processNonce, controlGenerationNonce }`.
+Generation-scoped ready returns 503 with strict
+`{ version: 1, status: "unready", processNonce,
+controlGenerationNonce, category }`; after reconciliation it returns strict
+`{ version: 1, status: "ready", processNonce, controlGenerationNonce,
+snapshotDigest }`. Ordered shutdown closes listener before draining work, so
+no new live or ready health response is served. Already accepted requests fail
+admission through `requireReady(binding)` once shutdown starts.
+
 `processNonce` is one unpadded base64url encoding of 32 cryptographically
-random bytes and is never persisted or logged.
+random bytes, remains stable for the entire Browser Service process lifetime,
+and changes only on service process restart. `controlGenerationNonce` is an
+independent 32-byte cryptographically random base64url value minted after one
+successful API takeover drain. Neither is persisted or logged.
+
+`POST /v1/control-generations` accepts and returns these exact closed types:
+
+```ts
+export type CreateControlGenerationV1 = {
+  version: 1;
+  processNonce: Token;
+  apiInstanceId: Id;
+  idempotencyKey: Token;
+};
+
+export type ControlGenerationV1 = {
+  version: 1;
+  processNonce: Token;
+  controlGenerationNonce: Token;
+  apiInstanceId: Id;
+};
+```
+
+Browser Service serializes handoffs. Admission closes synchronously, current
+reconciliation aborts, and readiness plus its reconciliation cache clear
+before draining. It then boundedly closes/revokes every runtime session,
+Chromium context, passive/interactive/CDP stream, relay grant, writer lease,
+timer, and uncommitted profile working copy. It mints and returns a generation
+only after all accepted work and cleanup settle. A server-observed drain
+deadline or partial-drain failure before mint mints nothing, leaves admission
+closed/unready, and exact request retry resumes the same drain. Caller timeout,
+disconnect, or lost response may occur after mint; exact replay recovers that
+already committed result. A concurrent exact request joins the same pending promise.
+Exact completed `(processNonce,apiInstanceId,idempotencyKey)` replay returns
+the one prior result without draining or minting again. Reusing either
+API identity or idempotency key with a different partner is
+`control_generation_conflict`. A different request while handoff is active is
+`control_generation_in_progress` and changes nothing; it may retry after the
+winner completes, at which point a full new drain and generation fences the
+prior API. A running API that receives stale-generation rejection closes its
+gate permanently and never attempts a takeover loop.
+
+Retain accepted pending/completed handoff tuples and completed results as
+process-local tombstones for the entire service process lifetime; never evict
+and reinterpret an old tuple as a new takeover. Cap distinct accepted tuples
+at 1,024. At capacity, exact known replay still works but every unknown tuple
+fails `control_generation_history_exhausted` without closing/draining again;
+operator/service restart supplies a new process namespace. Replaying A after
+completed takeover B returns A's historical response while B remains current,
+so any A-scoped request still fails `control_generation_mismatch`.
 
 `POST /v1/reconciliation` accepts the exact closed request and result types:
 
@@ -544,6 +631,7 @@ export type ReconciliationReferenceV1 = {
 export type ReconciliationRequestV1 = {
   version: 1;
   processNonce: Token;
+  controlGenerationNonce: Token;
   snapshotDigest: Sha256;
   references: ReconciliationReferenceV1[];
 };
@@ -551,6 +639,7 @@ export type ReconciliationRequestV1 = {
 export type ReconciliationResultV1 = {
   version: 1;
   processNonce: Token;
+  controlGenerationNonce: Token;
   snapshotDigest: Sha256;
   retained: number;
   removed: number;
@@ -561,18 +650,31 @@ export type ReconciliationResultV1 = {
 ```
 
 API sorts references by `kind`, `id`, and `path`, serializes fixed-key,
-whitespace-free `{version,references}` JSON, and hashes its UTF-8 bytes.
+whitespace-free `{version,references}` JSON, excluding process nonce, control
+generation nonce, and snapshot digest, and hashes its UTF-8 bytes.
 Browser Service independently repeats canonicalization. Each list is capped
-at 25,000 entries and request JSON at 16 MiB. Same nonce/digest retry returns
-cached success; another digest for that nonce fails
-`reconciliation_conflicting_replay`. Any stale nonce fails
-`reconciliation_nonce_mismatch` before filesystem access.
+at 25,000 entries and request JSON at 16 MiB. Same process/generation/digest
+retry returns cached success; another digest for that process/generation fails
+`reconciliation_conflicting_replay`. A newly completed control handoff permits
+one fresh snapshot digest under the unchanged process nonce because the old
+runtime and cache were fully drained. Any stale process or generation fails
+`reconciliation_nonce_mismatch` or `control_generation_mismatch` before
+filesystem access.
 
 `retained` and `removed` are integers 0..25,000. The request holds at most
 25,000 references and 16 MiB; its response is at most 4 KiB. Health responses
 are at most 4 KiB. Health `category` is exactly
-`reconciliation_required | reconciliation_in_progress`; all process nonces
-and digests use `Token`/`Sha256` above.
+`reconciliation_required | reconciliation_in_progress`; all process/control
+nonces and digests use `Token`/`Sha256` above. Calling ready without a valid
+current generation returns the standard typed error envelope rather than an
+unscoped health body.
+Control handoff returns 201; exact idempotent replay returns the same 201 body.
+`control_generation_in_progress`, `control_generation_conflict`, and
+`control_generation_mismatch` return 409. Missing generation before handoff is
+`control_generation_required` 503. Process mismatch during bootstrap or
+reconciliation is `reconciliation_nonce_mismatch` 409. API sanitizes all of
+these to public `browser_state_unavailable` without exposing either nonce.
+`control_generation_history_exhausted` is a private/public-sanitized 503.
 
 Only API calls these endpoints. `runtimeSessionId` and Browser Service relay
 grants are never public. Browser Service returns `failed_no_effect` only when
@@ -854,10 +956,26 @@ test("private auth requires key, correlation, and future deadline", () => {
   }, "expected")).toThrow(/unauthorized|deadline/i);
 });
 
+test("control handoff and scoped health reject unknown identity fields", () => {
+  expect(createControlGenerationV1Schema.safeParse({
+    version: 1,
+    processNonce: VALID_NONCE,
+    apiInstanceId: VALID_ID,
+    idempotencyKey: VALID_TOKEN,
+    controlGenerationNonce: VALID_NONCE,
+  }).success).toBe(false);
+  expect(scopedLiveHealthV1Schema.safeParse({
+    version: 1,
+    status: "ready",
+    processNonce: VALID_NONCE,
+  }).success).toBe(false);
+});
+
 test("reconciliation rejects malformed filesystem authority", () => {
   expect(reconciliationRequestV1Schema.safeParse({
     version: 1,
     processNonce: "A".repeat(43),
+    controlGenerationNonce: VALID_NONCE,
     snapshotDigest: "a".repeat(64),
     references: [{
       kind: "replay_checkpoint",
@@ -869,25 +987,28 @@ test("reconciliation rejects malformed filesystem authority", () => {
 });
 
 test("health contracts distinguish live, reconciling, and ready", () => {
-  expect(liveHealthV1Schema.parse({
+  expect(liveDiscoveryV1Schema.parse({
     version: 1,
     status: "live_unreconciled",
     processNonce: VALID_NONCE,
   }).status).toBe("live_unreconciled");
-  expect(liveHealthV1Schema.parse({
+  expect(scopedLiveHealthV1Schema.parse({
     version: 1,
     status: "reconciling",
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
   }).status).toBe("reconciling");
-  expect(liveHealthV1Schema.safeParse({
+  expect(scopedLiveHealthV1Schema.safeParse({
     version: 1,
     status: "draining",
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
   }).success).toBe(false);
   expect(readyHealthV1Schema.safeParse({
     version: 1,
     status: "ready",
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
     snapshotDigest: "a".repeat(64),
     extra: true,
   }).success).toBe(false);
@@ -1031,6 +1152,7 @@ const processNonceSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/).refine(
   value => Buffer.from(value, "base64url").length === 32 &&
     Buffer.from(value, "base64url").toString("base64url") === value,
 );
+const controlGenerationNonceSchema = processNonceSchema;
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const relativeStatePathSchema = z.string().superRefine((value, context) => {
   const segments = value.split("/");
@@ -1053,9 +1175,23 @@ export const reconciliationReferenceV1Schema = z.strictObject({
   checksum: sha256Schema,
 });
 
+export const createControlGenerationV1Schema = z.strictObject({
+  version: z.literal(1),
+  processNonce: processNonceSchema,
+  apiInstanceId: canonicalUuidSchema,
+  idempotencyKey: controlGenerationNonceSchema,
+});
+export const controlGenerationV1Schema = z.strictObject({
+  version: z.literal(1),
+  processNonce: processNonceSchema,
+  controlGenerationNonce: controlGenerationNonceSchema,
+  apiInstanceId: canonicalUuidSchema,
+});
+
 export const reconciliationRequestV1Schema = z.strictObject({
   version: z.literal(1),
   processNonce: processNonceSchema,
+  controlGenerationNonce: controlGenerationNonceSchema,
   snapshotDigest: sha256Schema,
   references: z.array(reconciliationReferenceV1Schema).max(25_000),
 }).superRefine((request, context) => {
@@ -1081,6 +1217,7 @@ export const reconciliationRequestV1Schema = z.strictObject({
 export const reconciliationResultV1Schema = z.strictObject({
   version: z.literal(1),
   processNonce: processNonceSchema,
+  controlGenerationNonce: controlGenerationNonceSchema,
   snapshotDigest: sha256Schema,
   retained: z.number().int().nonnegative().max(25_000),
   removed: z.number().int().nonnegative().max(25_000),
@@ -1089,15 +1226,22 @@ export const reconciliationResultV1Schema = z.strictObject({
   ready: z.literal(true),
 });
 
-export const liveHealthV1Schema = z.strictObject({
+export const liveDiscoveryV1Schema = z.strictObject({
   version: z.literal(1),
   status: z.enum(["live_unreconciled", "reconciling", "ready"]),
   processNonce: processNonceSchema,
+});
+export const scopedLiveHealthV1Schema = z.strictObject({
+  version: z.literal(1),
+  status: z.enum(["live_unreconciled", "reconciling", "ready"]),
+  processNonce: processNonceSchema,
+  controlGenerationNonce: controlGenerationNonceSchema,
 });
 export const unreadyHealthV1Schema = z.strictObject({
   version: z.literal(1),
   status: z.literal("unready"),
   processNonce: processNonceSchema,
+  controlGenerationNonce: controlGenerationNonceSchema,
   category: z.enum([
     "reconciliation_required",
     "reconciliation_in_progress",
@@ -1107,6 +1251,7 @@ export const readyHealthV1Schema = z.strictObject({
   version: z.literal(1),
   status: z.literal("ready"),
   processNonce: processNonceSchema,
+  controlGenerationNonce: controlGenerationNonceSchema,
   snapshotDigest: sha256Schema,
 });
 ```
@@ -1130,13 +1275,17 @@ root shared with API. Resolve `replay/`, `profiles/`, and `quarantine/`
 directly beneath it; reconciliation and cleanup never accept a
 request-supplied root or insert another intermediate root layer.
 
-Add `processNonceSchema`, canonical lowercase UUID/path/SHA-256 reference
-schemas, `reconciliationRequestV1Schema`, `reconciliationResultV1Schema`, and
-strict live/unready/ready health schemas. Enforce 25,000 references, 16 MiB
+Add process/control nonce schemas, canonical lowercase UUID/path/SHA-256
+reference schemas, strict control-generation request/result,
+`reconciliationRequestV1Schema`, `reconciliationResultV1Schema`, and strict
+discovery/scoped-live/unready/ready health schemas. Enforce 25,000 references, 16 MiB
 encoded request size, unique `(kind,id)`, and same-checksum path aliases with
 `superRefine`. Add every reconciliation category from the approved addendum to
-`errors.ts`. Task 1 does not mount routes, inspect files, start Chromium, or
-connect PostgreSQL.
+`errors.ts`, plus `control_generation_required`,
+`control_generation_in_progress`, `control_generation_conflict`, and
+`control_generation_mismatch`, and
+`control_generation_history_exhausted`. Task 1 does not mount routes, inspect
+files, start Chromium, or connect PostgreSQL.
 
 - [ ] **Step 8: Run tests and build through the frozen install**
 
@@ -1157,7 +1306,7 @@ Expected: tests PASS; build emits `apps/browser-service/dist`.
 git add apps/browser-service/contracts/private-v1.contract.json apps/browser-service/package.json apps/browser-service/pnpm-lock.yaml apps/browser-service/tsconfig.json apps/browser-service/src/runtime-preflight.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs apps/browser-service/src/contracts.ts apps/browser-service/src/contract-inventory.ts apps/browser-service/src/contracts.test.ts apps/browser-service/src/config.ts apps/browser-service/src/errors.ts apps/browser-service/src/auth.ts apps/browser-service/src/auth.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: define browser service contracts" -m "Add strict private schemas for sessions, typed browser actions,
-profiles, streams, and health requests.
+profiles, control handoff, streams, and health requests.
 
 Validate service identity, correlation IDs, deadlines, and runtime
 configuration."
@@ -1339,7 +1488,7 @@ content."
 ```ts
 import { describe, expect, test, vi } from "vitest";
 
-test("starts live but rejects work until the current nonce is reconciled", () => {
+test("starts discoverable but rejects work before generation handoff", () => {
   const state = createStartupState({
     randomBytes: () => Buffer.alloc(32, 7),
   });
@@ -1348,13 +1497,13 @@ test("starts live but rejects work until the current nonce is reconciled", () =>
     status: "live_unreconciled",
     processNonce: Buffer.alloc(32, 7).toString("base64url"),
   });
-  expect(() => state.requireReady()).toThrow(expect.objectContaining({
-    category: "reconciliation_required",
+  expect(() => state.requireReady(unmintedBinding)).toThrow(expect.objectContaining({
+    category: "control_generation_required",
   }));
 });
 
-test("caches only an exact successful nonce and digest", async () => {
-  const state = createStartupState({ randomBytes: fixedRandomBytes });
+test("caches only an exact successful process, generation, and digest", async () => {
+  const state = await createHandedOffStartupState();
   const first = await state.reconcile(validRequest, reconcileOnce);
   const retry = await state.reconcile(validRequest, reconcileOnce);
   expect(retry).toEqual(first);
@@ -1365,6 +1514,74 @@ test("caches only an exact successful nonce and digest", async () => {
   }, reconcileOnce)).rejects.toMatchObject({
     category: "reconciliation_conflicting_replay",
   });
+});
+
+test("handoff drains old runtime before minting a new generation", async () => {
+  const state = await createReadyStartupStateWithRuntime();
+  const oldProcessNonce = state.processNonce;
+  pauseRuntimeDrain();
+  const handoff = state.createControlGeneration(newApiRequest, drainRuntime);
+  await runtimeDrainStarted();
+  expect(state.liveHealth()).toMatchObject({
+    status: "live_unreconciled",
+    processNonce: oldProcessNonce,
+  });
+  expect(state.currentControlGeneration()).toBeNull();
+  expect(state.reconciliationCacheSize()).toBe(0);
+  expect(state.reconciliationSignal.aborted).toBe(true);
+  releaseRuntimeDrain();
+  const generation = await handoff;
+  expect(generation.processNonce).toBe(oldProcessNonce);
+  expect(generation.controlGenerationNonce).toMatch(CANONICAL_TOKEN);
+  expect(runtimeResources()).toEqual({
+    sessions: 0, contexts: 0, streams: 0, grants: 0,
+    writers: 0, timers: 0, workingProfiles: 0,
+  });
+});
+
+test("exact handoff replay is idempotent and concurrent takeover is fenced", async () => {
+  pauseRuntimeDrain();
+  const winner = state.createControlGeneration(apiARequest, drainRuntime);
+  await runtimeDrainStarted();
+  await expect(state.createControlGeneration(apiBRequest, drainRuntime))
+    .rejects.toMatchObject({ category: "control_generation_in_progress" });
+  releaseRuntimeDrain();
+  const accepted = await winner;
+  await expect(state.createControlGeneration(apiARequest, drainRuntime))
+    .resolves.toEqual(accepted);
+  expect(drainRuntime).toHaveBeenCalledTimes(1);
+});
+
+test("new API generation permits a changed digest after complete drain", async () => {
+  const first = await reconcileReadyGeneration(state, apiARequest, digestA);
+  const second = await state.createControlGeneration(apiBRequest, drainRuntime);
+  expect(second.processNonce).toBe(first.processNonce);
+  await expect(state.reconcile(
+    requestFor(second, digestB), reconcileOnce,
+  )).resolves.toMatchObject({ snapshotDigest: digestB });
+});
+
+test("old handoff replay is tombstoned and cannot replace current generation", async () => {
+  const a = await state.createControlGeneration(apiARequest, drainRuntime);
+  const b = await state.createControlGeneration(apiBRequest, drainRuntime);
+  await expect(state.createControlGeneration(apiARequest, drainRuntime))
+    .resolves.toEqual(a);
+  expect(state.currentControlGeneration()).toEqual(b);
+  expect(drainRuntime).toHaveBeenCalledTimes(2);
+  expect(() => state.requireReady(a)).toThrow(expect.objectContaining({
+    category: "control_generation_mismatch",
+  }));
+});
+
+test("handoff history fails closed at its process-lifetime bound", async () => {
+  await seedAcceptedControlGenerationTombstones(1_024);
+  await expect(state.createControlGeneration(unknownApiRequest, drainRuntime))
+    .rejects.toMatchObject({
+      category: "control_generation_history_exhausted",
+    });
+  await expect(state.createControlGeneration(knownReplayRequest, drainRuntime))
+    .resolves.toEqual(knownHistoricalResult);
+  expect(drainRuntime).not.toHaveBeenCalled();
 });
 
 test("reconcile rejects draining before filesystem execution", async () => {
@@ -1404,10 +1621,15 @@ test("cached same-digest success cannot return after draining", async () => {
 });
 ```
 
-Assert two process instances receive different 43-character nonces; a wrong
-nonce performs no callback; a failed callback returns to
-`live_unreconciled`; `beginDraining()` closes admission permanently; health
-objects contain no path, checksum, key, URL, public browser ID, or capability.
+Assert two process instances receive different 43-character process nonces;
+multiple handoffs in one process retain that process nonce and receive
+different 43-character generation nonces. Wrong/stale process or generation
+performs no callback. Same API identity with a different idempotency key,
+reused key with another API identity, pre-mint drain timeout/partial drain, and shutdown
+during handoff all fail closed. Exact retry resumes one pending drain and
+mints at most once. `beginDraining()` closes admission permanently; health
+objects contain no path, checksum, key, URL, public browser ID, capability, or
+unscoped control-generation nonce.
 
 - [ ] **Step 2: Write failing filesystem reconciliation tests**
 
@@ -1463,7 +1685,8 @@ test("execution failure changes only the exact planned quarantine entry", async 
   await expect(reconcileBrowserState(fixture.root, fixture.request, fixture.deps))
     .rejects.toMatchObject({ category: "reconciliation_cleanup_failed" });
   expect(await fixture.locationOf(fixture.first)).toBe(
-    `quarantine/${fixture.processNonce}/${fixture.first.relativePath}`,
+    `quarantine/${fixture.processNonce}/${fixture.controlGenerationNonce}/` +
+      fixture.first.relativePath,
   );
   expect(await fixture.locationOf(fixture.second)).toBe(
     fixture.second.relativePath,
@@ -1488,7 +1711,7 @@ test("equal basenames preserve complete managed source namespaces", async () => 
   ]);
 });
 
-test("new process resumes an old-nonce quarantine after crash", async () => {
+test("new process resumes an old-process quarantine after crash", async () => {
   const fixture = await crashAfterFirstRenameFixture();
   const restarted = fixture.restartWithNewProcessNonce();
   await expect(reconcileBrowserState(
@@ -1496,6 +1719,20 @@ test("new process resumes an old-nonce quarantine after crash", async () => {
   )).resolves.toMatchObject({ ready: true });
   expect(await restarted.oldNonceQuarantineEntries()).toEqual([]);
   expect(await restarted.unrelatedEntryBytes()).toEqual(fixture.originalBytes);
+});
+
+test("new API generation resumes old-generation quarantine safely", async () => {
+  const fixture = await crashAfterFirstRenameFixture();
+  const next = fixture.handoffSameProcessToNewApi();
+  expect(next.processNonce).toBe(fixture.processNonce);
+  expect(next.controlGenerationNonce)
+    .not.toBe(fixture.controlGenerationNonce);
+  await expect(reconcileBrowserState(
+    next.root, next.changedAuthoritativeRequest, next.deps,
+  )).resolves.toMatchObject({ ready: true });
+  expect(await next.oldGenerationQuarantineEntries()).toEqual([]);
+  expect(await next.authoritativeEntries()).toEqual(next.expectedAuthorities);
+  expect(await next.unrelatedEntryBytes()).toEqual(fixture.originalBytes);
 });
 
 test("draining stops before the next reconciliation filesystem call", async () => {
@@ -1536,7 +1773,7 @@ planning rejection before mutation proves zero eligible entry changed.
 Execution failure after mutation may move/delete only the exact prefix of the
 immutable deletion plan already executed; every authority and unrelated
 planned/unplanned entry remains byte-identical, readiness stays closed, and
-same nonce/digest retry resumes deterministically to convergence.
+same process/generation/digest retry resumes deterministically to convergence.
 
 - [ ] **Step 3: Run focused tests and verify red**
 
@@ -1555,8 +1792,17 @@ Expose this closed interface from `startup-state.ts`:
 ```ts
 export type StartupAdmission = {
   processNonce: string;
-  requireReady(): { processNonce: string; snapshotDigest: string };
-  liveHealth(): LiveHealthV1;
+  createControlGeneration(
+    request: CreateControlGenerationV1,
+    drainRuntime: (admission: ControlGenerationDrainAdmission) => Promise<void>,
+  ): Promise<ControlGenerationV1>;
+  requireReady(binding: ControlGenerationBinding): {
+    processNonce: string;
+    controlGenerationNonce: string;
+    snapshotDigest: string;
+  };
+  liveHealth(): LiveDiscoveryV1;
+  scopedLiveHealth(binding: ControlGenerationBinding): ScopedLiveHealthV1;
   readyHealth(): ReadyHealthV1 | UnreadyHealthV1;
   reconcile(
     request: ReconciliationRequestV1,
@@ -1573,22 +1819,48 @@ export type ReconciliationExecutionAdmission = {
   assertAdmitted(): void;
 };
 
+export type ControlGenerationBinding = {
+  processNonce: string;
+  controlGenerationNonce: string;
+};
+
+export type ControlGenerationDrainAdmission = {
+  readonly signal: AbortSignal;
+  assertCurrent(): void;
+};
+
 export function createStartupState(deps?: {
   randomBytes?: (size: number) => Buffer;
 }): StartupAdmission;
 ```
 
-Generate exactly 32 bytes with `node:crypto.randomBytes`, encode unpadded
-base64url, and never persist or log the nonce. Serialize reconciliation per
-process. Validate nonce before calling filesystem code. Cache only successful
-same-digest result; preserve current readiness on conflicting replay. A failed
-attempt remains retryable and unready. `requireReady()` throws
-`reconciliation_required` outside `ready` and after draining.
+Generate exactly 32 bytes with `node:crypto.randomBytes` for process identity
+and each successful control generation, encode unpadded base64url, and never
+persist or log either nonce. Process nonce never changes within the process.
+Serialize control handoff and reconciliation separately. Starting handoff
+synchronously closes admission, aborts active reconciliation, clears
+readiness/cache, and invokes the idempotent bounded runtime-drain callback.
+Mint a generation only after that callback proves every runtime resource
+closed. Preserve pending tuple and completed drain progress after a pre-mint
+server drain timeout so exact retry converges. Cache a minted result before
+response delivery so caller timeout/loss also converges. Enforce exact replay and collision/concurrency rules
+from Locked private contracts. Retain at most 1,024 accepted tuple/result
+tombstones without eviction for process lifetime; unknown tuple at capacity
+fails closed while known replay remains available.
+
+Validate process and control generation before calling filesystem code. Cache
+only a successful exact `(processNonce,controlGenerationNonce,digest)` result;
+preserve current readiness on a conflicting same-generation replay. A new
+completed handoff clears the prior cache and permits one different digest. A
+failed attempt remains retryable and unready. `requireReady(binding)` throws
+`control_generation_mismatch` for stale generation and
+`reconciliation_required` outside `ready` or after draining.
 `reconcile()` creates one private `AbortController` per accepted execution and
 passes its signal plus `assertAdmitted()` checkpoint to the callback. It
-rejects draining before nonce/digest callback invocation and rechecks after
+rejects draining before process/generation/digest callback invocation and rechecks after
 awaited filesystem work before caching success. It also rechecks draining
-immediately before returning an existing same-nonce/digest cached success.
+immediately before returning an existing same-generation/digest cached
+success.
 `beginDraining()` aborts the controller synchronously before returning. No
 accepted, cached, or in-flight
 reconciliation may start a later filesystem call, publish a cached result, or
@@ -1639,7 +1911,8 @@ absence from snapshot, and age greater than 10 minutes. Build and freeze a
 sorted deletion plan before the first mutation. Each item records full
 root-relative source path, recognized namespace/type, file/tree identity
 SHA-256, byte count, and deterministic destination:
-`quarantine/<processNonce>/<full-root-relative-source-path>`. Preserve every
+`quarantine/<processNonce>/<controlGenerationNonce>/`
+`<full-root-relative-source-path>`. Preserve every
 source path segment (`replay/<owner>/<scrape>/...`,
 `profiles/<id>/committed/...`, `staging/...`, `working/...`) rather than
 basename or a lossy encoding. Validate
@@ -1652,21 +1925,24 @@ identity again, atomically rename, fsync both parents, then delete destination
 and fsync its parent. If source is absent and destination exists, require exact
 recorded type/hash/byte identity before continuing delete. If both are absent,
 treat it as a completed prior delete. If both exist or destination identity
-differs, fail closed without touching either. Thus same nonce/digest retry
+differs, fail closed without touching either. Thus same-generation/digest retry
 resumes after rename/delete/fsync interruption without a separate journal;
 the immutable plan plus collision-free destination is the journal. A changed
 digest cannot reuse the prior cached/partial execution path. Unknown entries
 fail readiness untouched. Reconciliation never changes database paths or
 promotes a generation.
 
-On process restart, recognize only the exact grammar
-`quarantine/<oldCanonicalNonce>/<full-root-relative-source-path>`. Authority
+On process or control-generation replacement, recognize only the exact
+grammar `quarantine/<oldProcessNonce>/<oldControlGenerationNonce>/`
+`<full-root-relative-source-path>`. Authority
 validation still runs first: if snapshot references the original source and
 it is absent, fail missing and do not delete quarantine. Otherwise verify the
 quarantined identity and continue its pending delete directly; never nest it
 under the new nonce or restore it. Tests crash after rename, construct a new
-`StartupAdmission`/nonce, and prove same snapshot digest converges through this
-old-nonce path without touching unrelated entries.
+`StartupAdmission`/process nonce plus a fresh handoff generation, and prove the
+new authoritative snapshot converges through this old-generation path without
+touching unrelated entries. Also cover a same-process API takeover after
+partial cleanup.
 
 Zero-change applies only through complete validation and deletion-plan
 construction. Once execution begins, an error reports bounded counts for the
@@ -1701,7 +1977,7 @@ corepack pnpm --dir apps/browser-service exec vitest run src/startup-state.test.
 corepack pnpm --dir apps/browser-service build
 ```
 
-Expected: tests PASS for fail-before-delete, quarantine retry, nonce/digest
+Expected: tests PASS for fail-before-delete, quarantine retry, generation/digest
 rules, draining admission, zero-change planning failures, prefix-only execution
 failures, deterministic same-digest convergence, equal-basename namespace
 isolation, bounds, and redaction; build PASS.
@@ -1711,7 +1987,7 @@ isolation, bounds, and redaction; build PASS.
 ```bash
 git add apps/browser-service/src/startup-state.ts apps/browser-service/src/startup-state.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts
 apps/api/.husky/_/pre-commit
-git commit -m "feat: reconcile browser state before readiness" -m "Bind readiness to one process nonce and one authoritative snapshot.
+git commit -m "feat: reconcile browser state before readiness" -m "Bind readiness to one control generation and authoritative snapshot.
 
 Validate every retained file before collision-free quarantine and resume
 exact execution prefixes after filesystem failure or restart."
@@ -1913,7 +2189,7 @@ isolated working profile, leaves no session in registry, and never prepares,
 stages, finalizes, or publishes a profile generation. Cleanup failure is
 surfaced and remains reconciliation-owned; runtime work is never admitted.
 
-Registry accepts `StartupAdmission` and calls `requireReady()` before any path,
+Registry accepts `StartupAdmission` and calls `requireReady(binding)` before any path,
 working-copy, proxy, or Chromium side effect. Registry stores public/runtime
 IDs, state/version, page/context, profile work,
 initial/allowed/learned origins, deadlines, DevTools loopback endpoint, stream
@@ -2183,18 +2459,81 @@ test("serialization ambiguity closes transport without a terminal body", async (
   expect(registry.get(runtimeSessionId)).toBeUndefined();
 });
 
-test("live precedes reconciliation while all browser work stays closed", async () => {
-  expect((await getPrivate("/health/live")).status).toBe(200);
-  expect((await getPrivate("/health/ready")).status).toBe(503);
-  expect((await postPrivate("/v1/sessions", validCreate)).body.category)
-    .toBe("reconciliation_required");
-  const reconciled = await postPrivate("/v1/reconciliation", validSnapshot);
+test("handoff precedes reconciliation while all browser work stays closed", async () => {
+  const discovery = await getPrivate("/health/live");
+  expect(discovery.status).toBe(200);
+  expect(discovery.body).not.toHaveProperty("controlGenerationNonce");
+  const generation = await postPrivate(
+    "/v1/control-generations", handoffFor(discovery.body.processNonce),
+  );
+  expect((await getScoped("/health/ready", generation.body)).status).toBe(503);
+  expect((await postScoped(
+    "/v1/sessions", validCreate, generation.body,
+  )).body.category).toBe("reconciliation_required");
+  const snapshot = validSnapshotFor(generation.body);
+  const reconciled = await postScoped(
+    "/v1/reconciliation", snapshot, generation.body,
+  );
   expect(reconciled.status).toBe(200);
-  expect((await getPrivate("/health/ready")).body).toMatchObject({
+  expect((await getScoped("/health/ready", generation.body)).body).toMatchObject({
     status: "ready",
-    processNonce: validSnapshot.processNonce,
-    snapshotDigest: validSnapshot.snapshotDigest,
+    processNonce: snapshot.processNonce,
+    controlGenerationNonce: snapshot.controlGenerationNonce,
+    snapshotDigest: snapshot.snapshotDigest,
   });
+});
+
+test("API takeover closes every old runtime resource before response", async () => {
+  await seedReadyGenerationWithAllRuntimeResources();
+  const handoff = postPrivate("/v1/control-generations", nextApiHandoff);
+  await runtimeDrainStarted();
+  expect(await promiseState(handoff)).toBe("pending");
+  releaseRuntimeDrain();
+  const response = await handoff;
+  expect(response.status).toBe(201);
+  expect(service.processNonce).toBe(ORIGINAL_PROCESS_NONCE);
+  expect(serviceRuntimeInventory()).toEqual({
+    sessions: 0, contexts: 0, streams: 0, grants: 0,
+    writers: 0, timers: 0, workingProfiles: 0,
+  });
+  expect(startupAdmission.readyHealth().status).toBe("unready");
+});
+
+test.each([
+  "GET /health/live",
+  "GET /health/ready",
+  "POST /v1/reconciliation",
+  "POST /v1/sessions",
+  "GET /v1/sessions/:runtimeSessionId",
+  "DELETE /v1/sessions/:runtimeSessionId",
+  "POST /v1/sessions/:runtimeSessionId/actions",
+  "POST /v1/sessions/:runtimeSessionId/grants",
+  "DELETE /v1/sessions/:runtimeSessionId/grants/:grantId",
+  "POST /v1/sessions/:runtimeSessionId/artifacts",
+  "POST /v1/profile-generations/:generationId/finalize",
+  "DELETE /v1/profile-generations/:generationId",
+  "WS /v1/sessions/:runtimeSessionId/streams/passive",
+  "WS /v1/sessions/:runtimeSessionId/streams/interactive",
+  "WS /v1/sessions/:runtimeSessionId/streams/cdp",
+])(
+  "rejects stale generation before touching %s",
+  async route => {
+    const response = await callPrivateRoute(route, OLD_GENERATION_HEADERS);
+    expect(response.status).toBe(409);
+    expect(response.body.category).toBe("control_generation_mismatch");
+    expect(routeEffects(route)).toEqual([]);
+  },
+);
+
+test("service restart during handoff cannot return the old process binding", async () => {
+  const handoff = postControlGenerationPausedBeforeMint(validHandoff);
+  await restartBrowserService();
+  releaseControlGenerationMint();
+  await expect(handoff).rejects.toMatchObject({
+    category: expect.stringMatching(/transport|reconciliation_nonce_mismatch/),
+  });
+  expect(newService.processNonce).not.toBe(validHandoff.processNonce);
+  expect(newService.currentControlGeneration()).toBeNull();
 });
 
 test("shutdown closes health listener before draining admitted work", async () => {
@@ -2290,10 +2629,25 @@ action cache. Artifact streaming verifies declared length and SHA-256 while
 writing and aborts on mismatch.
 
 Create `StartupAdmission` before listener bind. Mount authenticated
-`GET /health/live`, `GET /health/ready`, and `POST /v1/reconciliation` before
-session routes. Apply 16 MiB raw JSON limit only to reconciliation and smaller
+`GET /health/live`, `POST /v1/control-generations`, `GET /health/ready`, and
+`POST /v1/reconciliation` before session routes. Initial live discovery omits
+generation headers and never returns the current generation. Control handoff
+validates process nonce and the strict API-instance/idempotency pair, closes
+admission and aborts reconciliation synchronously, clears ready/cache, and
+awaits the registry's idempotent full-runtime drain before returning 201.
+That drain closes sessions, contexts, all stream modes, grants, writers,
+timers, and uncommitted working profiles under the request's 60-second bound.
+Partial drain returns a typed failure without minting; exact retry resumes.
+Persist the process-local completed result/tombstone before sending 201, so a
+caller timeout or disconnect after mint recovers by exact replay.
+
+Every later private request must authenticate both fencing headers before body
+parsing or route effects. A stale process or control generation returns typed
+409 and performs no registry, filesystem, cache, grant, writer, or handshake
+operation. Apply 16 MiB raw JSON limit only to reconciliation and smaller
 contract bounds elsewhere. Reconciliation validates service key, correlation,
-deadline capped at 60 seconds, nonce, schema, and digest before calling
+deadline capped at 60 seconds, process/generation headers, matching body,
+schema, and digest before calling
 `StartupAdmission.reconcile()`. That method checks non-draining admission
 synchronously before invoking its filesystem callback and again before
 caching success/opening readiness. Pass its exact execution admission object
@@ -2303,17 +2657,17 @@ filesystem access. An in-flight callback observes synchronous abort and may
 finish only its current syscall; it starts no later filesystem call, cannot
 cache success, and cannot resurrect readiness. Every
 create/action/grant/artifact/stream/profile
-route invokes `requireReady()` before touching registry or filesystem.
+route invokes `requireReady(binding)` before touching registry or filesystem.
 
 `beginShutdown()` synchronously closes admission and initiates listener close,
 then returns one idempotent full-shutdown promise. `listenerClosed()` resolves
 only after listener accepts no new connections. Previously accepted requests
-then reach closed `requireReady()` admission and settle; shutdown does not wait
+then reach closed `requireReady(binding)` admission and settle; shutdown does not wait
 for them before they are released. After accepted requests settle, close
 streams, close Chromium with bounded profile save, stop timers, and resolve
 full-shutdown promise. `SIGTERM` invokes `beginShutdown()` once. Live remains
 process liveness only while listener serves it; ready never performs a
-disposable session and never becomes true without current nonce/digest
+disposable session and never becomes true without current generation/digest
 reconciliation.
 
 - [ ] **Step 6: Resolve immutable Playwright base and add container image**
@@ -2382,15 +2736,17 @@ hash and require it equals Dockerfile digest after both builds. Both images
 also pass positive-control-proven egress/UDP and storage-restore tests using
 their bundled Chromium. Both final production images execute the constrained
 evaluate parser smoke successfully, proving `typescript@5.9.3` is present at
-runtime. An unavailable proof fails the build gate.
+runtime. Server tests also prove idempotent control handoff, full runtime
+drain-before-mint, stale-generation zero effect across every private route,
+and service restart during handoff. An unavailable proof fails the build gate.
 
 - [ ] **Step 8: Commit service transport**
 
 ```bash
 git add apps/browser-service/src/streams.ts apps/browser-service/src/streams.test.ts apps/browser-service/src/artifacts.ts apps/browser-service/src/artifacts.test.ts apps/browser-service/src/server.ts apps/browser-service/src/server.test.ts apps/browser-service/src/dockerfile.test.ts apps/browser-service/src/index.ts apps/browser-service/Dockerfile
 apps/api/.husky/_/pre-commit
-git commit -m "feat: serve private browser sessions" -m "Add authenticated session, action, profile, artifact, health, live-view,
-and CDP transports around persistent Chromium.
+git commit -m "feat: serve private browser sessions" -m "Add authenticated control handoff, session, action, profile,
+artifact, health, live-view, and CDP transports around Chromium.
 
 Close admission before listeners and prevent reconciliation from
 restoring readiness during ordered shutdown."
@@ -2452,24 +2808,62 @@ it("posts exact action identity with auth and deadline", async () => {
         authorization: "Bearer secret",
         "x-firecrawl-correlation-id": context.correlationId,
         "x-firecrawl-deadline": context.deadline.toISOString(),
+        "x-firecrawl-process-nonce": context.processNonce,
+        "x-firecrawl-control-generation-nonce":
+          context.controlGenerationNonce,
       }),
     }),
   );
 });
 
-it("binds reconciliation to current live nonce and closed result", async () => {
+it("binds handoff and reconciliation to current process and generation", async () => {
   fetchMock
-    .mockResolvedValueOnce(jsonResponse(200, liveHealth))
+    .mockResolvedValueOnce(jsonResponse(200, liveDiscovery))
+    .mockResolvedValueOnce(jsonResponse(201, controlGeneration))
     .mockResolvedValueOnce(jsonResponse(200, reconciliationResult))
     .mockResolvedValueOnce(jsonResponse(200, readyHealth));
-  expect(await client.getLive(context)).toEqual(liveHealth);
+  expect(await client.discoverLive(bootstrapContext)).toEqual(liveDiscovery);
+  expect(await client.createControlGeneration(
+    handoffRequest, bootstrapContext,
+  )).toEqual(controlGeneration);
   const canonicalBody = canonicalReconciliationRequestJson(snapshot);
-  expect(await client.reconcile(canonicalBody, context)).toEqual(
+  expect(await client.reconcile(canonicalBody, scopedContext)).toEqual(
     reconciliationResult,
   );
-  expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(canonicalBody);
-  expect(await client.getReady(context)).toEqual(readyHealth);
+  expect(fetchMock.mock.calls[2]?.[1]?.body).toBe(canonicalBody);
+  expect(await client.getReady(scopedContext)).toEqual(readyHealth);
 });
+
+it("retries one handoff identity without changing its bytes", async () => {
+  fetchMock
+    .mockRejectedValueOnce(responseLostAfterServiceCommit())
+    .mockResolvedValueOnce(jsonResponse(201, controlGeneration));
+  const body = JSON.stringify(handoffRequest);
+  await expect(client.createControlGeneration(
+    handoffRequest, bootstrapContext,
+  )).rejects.toThrow();
+  await expect(client.createControlGeneration(
+    handoffRequest, bootstrapContext,
+  )).resolves.toEqual(controlGeneration);
+  expect(fetchBodies()).toEqual([body, body]);
+});
+
+it.each([
+  "getLive", "getReady", "reconcile", "createSession", "getSession",
+  "closeSession", "executeAction", "createRelayGrant", "revokeRelayGrant",
+  "fetchArtifact", "finalizeProfile", "discardProfile",
+  "openPassiveStream", "openInteractiveStream", "openCdpStream",
+])(
+  "closes the owning API generation on stale %s response",
+  async method => {
+    transport.respondWithControlGenerationMismatch(method);
+    await expect(callScopedClientMethod(method, CURRENT_BINDING))
+      .rejects.toMatchObject({ category: "control_generation_mismatch" });
+    expect(onControlGenerationMismatch).toHaveBeenCalledWith(CURRENT_BINDING);
+    expect(() => startupGate.assertOpen()).toThrow();
+    expect(callEffects(method)).toEqual([]);
+  },
+);
 
 it("matches the canonical V1 inventory without service imports", () => {
   expect(apiPrivateV1Inventory).toEqual(canonicalPrivateV1Inventory);
@@ -2550,7 +2944,14 @@ Provide create/query, `executeAction`, grant create/revoke, artifact, close,
 profile finalize/discard, and these closed startup methods:
 
 ```ts
-getLive(context: BrowserServiceRequestContext): Promise<LiveHealthV1>;
+discoverLive(
+  context: BrowserServiceBootstrapRequestContext,
+): Promise<LiveDiscoveryV1>;
+createControlGeneration(
+  request: CreateControlGenerationV1,
+  context: BrowserServiceBootstrapRequestContext,
+): Promise<ControlGenerationV1>;
+getLive(context: BrowserServiceRequestContext): Promise<ScopedLiveHealthV1>;
 getReady(context: BrowserServiceRequestContext): Promise<ReadyHealthV1 | UnreadyHealthV1>;
 reconcile(
   canonicalRequestBody: string,
@@ -2564,14 +2965,33 @@ typed errors with Zod. Reject private redirects. Remove any generic
 caller-supplied method/path helper. Never include response bodies or private
 URLs in public errors.
 
-`getLive` parses only `live_unreconciled`, `reconciling`, and `ready`.
+Construct `BrowserServiceClient` with required
+`onControlGenerationMismatch(rejectedBinding)` callback. Every HTTP response,
+artifact stream, and WebSocket upgrade/error decoder recognizes the typed
+generation mismatch before returning control to its caller and invokes the
+callback synchronously. Coordinator compares the rejected binding with its
+current binding; on equality it closes the startup gate permanently, aborts
+work/retention/monitoring, and never retakes control. A late response for an
+older local binding cannot close a newer binding. Client tests enumerate every
+scoped HTTP and WebSocket method; no generic transport bypasses this hook.
+
+Generate one canonical `apiInstanceId` per API process and one 32-byte
+base64url idempotency key per service-process handoff cycle; never regenerate
+either during an exact retry. `BrowserServiceBootstrapRequestContext` carries
+no fencing generation. `BrowserServiceRequestContext` requires process and
+control-generation nonces and automatically sends both exact headers on every
+non-bootstrap method. Callers cannot override or omit them.
+
+`discoverLive` parses only process identity and never accepts a returned
+generation. Scoped `getLive` parses only `live_unreconciled`, `reconciling`,
+and `ready` with the exact current generation.
 `getReady` accepts 200 ready or 503 unready, and `reconcile` caps deadline and
-encoded body at 60 seconds and 16 MiB. All three always send bearer key,
+encoded body at 60 seconds and 16 MiB. Every startup method sends bearer key,
 correlation ID, and absolute deadline.
 
 `reconcile()` accepts only Task 8's already canonical UTF-8 request string,
 sends that exact string as the body, and never reparses or reserializes it.
-This preserves byte identity across same-nonce retries while response parsing
+This preserves byte identity across same-generation retries while response parsing
 remains bounded and strict.
 
 All other client methods lock literal method/path/status and parse the exact
@@ -2605,7 +3025,7 @@ Expected: tests and build PASS.
 git add apps/api/src/config.ts apps/api/src/lib/local-runtime-config.ts apps/api/src/lib/local-runtime-config.test.ts apps/api/src/lib/scrape-interact/browser-service-contracts.ts apps/api/src/lib/scrape-interact/browser-service-contracts.test.ts apps/api/src/lib/scrape-interact/browser-service-client.ts apps/api/src/lib/scrape-interact/browser-service-client.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: gate local browser service" -m "Require explicit private Browser Service configuration and add closed,
-deadline-aware client methods for its runtime contracts.
+fenced client methods for handoff and runtime contracts.
 
 Sanitize transport failures without leaking private endpoints."
 ```
@@ -2613,6 +3033,9 @@ Sanitize transport failures without leaking private endpoints."
 ### Task 8: Gate API startup on authoritative reconciliation
 
 **Files:**
+- Create: `apps/api/src/db/migrations/0007_browser_control_generation.sql`
+- Modify: `apps/api/src/db/schema/public.ts`
+- Modify: `apps/api/src/db/migrate.integration.test.ts`
 - Create: `apps/api/src/lib/browser-runtime/startup-gate.ts`
 - Create: `apps/api/src/lib/browser-runtime/startup-gate.test.ts`
 - Create: `apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts`
@@ -2632,14 +3055,17 @@ Sanitize transport failures without leaking private endpoints."
 
 ```ts
 it("closes admission synchronously and exposes mutation drain", async () => {
-  const gate = createBrowserStartupGate();
+  const gate = createBrowserStartupGate({ pool });
   expect(() => gate.assertOpen()).toThrow(expect.objectContaining({
     category: "browser_state_unavailable",
   }));
   const initialDrain = gate.close("startup");
   await initialDrain.drained;
   gate.open(initialDrain, {
+    apiInstanceId: VALID_API_INSTANCE_ID,
+    databaseControlEpoch: 7,
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
     snapshotDigest: VALID_DIGEST,
   });
   let releaseMutation!: () => void;
@@ -2660,13 +3086,61 @@ it("closes admission synchronously and exposes mutation drain", async () => {
   await mutation;
   await restartDrain.drained;
   gate.open(restartDrain, {
+    apiInstanceId: VALID_API_INSTANCE_ID,
+    databaseControlEpoch: 7,
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
     snapshotDigest: VALID_DIGEST,
   });
   expect(gate.assertOpen()).toEqual({
+    apiInstanceId: VALID_API_INSTANCE_ID,
+    databaseControlEpoch: 7,
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
     snapshotDigest: VALID_DIGEST,
   });
+});
+
+it("durably fences a paused old-API filesystem/database mutation", async () => {
+  const oldMutation = oldApi.gate.withBrowserStateMutationLease(
+    "filesystem_and_database",
+    async lease => persistCheckpointPausedAfterFileWrite(lease),
+  );
+  await oldMutation.databaseFenceLocked();
+  await oldMutation.fileWriteCompleted();
+  const handoff = await newApi.acquireControlGeneration();
+  const initialization = newApi.initializeAfterMigrations(handoff);
+  await newApi.databaseControlActivationStarted();
+  expect(await promiseState(initialization)).toBe("pending");
+  expect(newApi.interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
+  expect(newApi.loadSnapshot).not.toHaveBeenCalled();
+  oldMutation.releaseDatabaseCommit();
+  await oldMutation;
+  await initialization;
+  const newFence = newApi.startupGate.assertOpen();
+  expect(newFence.databaseControlEpoch)
+    .toBe(oldApi.binding.databaseControlEpoch + 1);
+  expect(newApi.snapshotReferences()).toContainEqual(
+    expect.objectContaining({ path: oldMutation.checkpointPath }),
+  );
+  await expect(oldApi.persistAnotherCheckpoint()).rejects.toMatchObject({
+    category: "control_generation_mismatch",
+  });
+  expect(oldApi.secondFilesystemEffects()).toEqual([]);
+});
+
+it("creates one constrained monotonic browser control fence", async () => {
+  await runMigration("0007_browser_control_generation.sql");
+  const first = await activateBrowserControlGeneration(validHandoffA);
+  const replay = await activateBrowserControlGeneration(validHandoffA);
+  const second = await activateBrowserControlGeneration(validHandoffB);
+  expect(replay).toEqual(first);
+  expect(second.databaseControlEpoch).toBe(first.databaseControlEpoch + 1);
+  await expect(insertSecondSingletonControlRow()).rejects.toThrow();
+  for (const invalid of [uppercaseApiId(), malformedProcessNonce(),
+    malformedControlNonce(), zeroEpoch()]) {
+    await expect(writeControlFence(invalid)).rejects.toThrow();
+  }
 });
 
 it("loads every nondeleted authority in one repeatable-read snapshot", async () => {
@@ -2694,7 +3168,7 @@ it("reconciles populated foundation replay paths without moving them", async () 
       "replay/owner-a/scrape-a/77777777-7777-4777-8777-777777777777.json",
     cleanupWriterIdentity: "live",
   });
-  await coordinator.initialize();
+  await startCoordinatorThroughApiLifecycle(coordinator);
   expect(existing.checkpointRow.statePath).toBe(
     "replay/owner-a/scrape-a/66666666-6666-4666-8666-666666666666.json",
   );
@@ -2710,6 +3184,7 @@ it("reconciles populated foundation replay paths without moving them", async () 
   expect(filesystem.write).not.toHaveBeenCalled();
   expect(startupGate.assertOpen()).toMatchObject({
     processNonce: VALID_NONCE,
+    controlGenerationNonce: VALID_CONTROL_GENERATION_NONCE,
   });
 });
 
@@ -2779,15 +3254,25 @@ visible in the transaction's later reads.
 - [ ] **Step 2: Write failing startup, restart, and retention-order tests**
 
 ```ts
-it("opens work and retention only after matching response and ready health", async () => {
-  await coordinator.initialize();
+it("hands off service control before migrations or database recovery", async () => {
+  pauseControlGenerationResponse();
+  const startup = startApiWithBrowserCoordinator();
+  await controlGenerationRequestStarted();
+  expect(runMigrations).not.toHaveBeenCalled();
+  expect(interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
+  expect(loadSnapshot).not.toHaveBeenCalled();
+  releaseControlGenerationResponse();
+  await startup;
   expect(events).toEqual([
     "gate:close",
     "browser-retention:pause",
-    "mutations:drained",
+    "service:live-discovery",
+    "service:control-generation",
+    "migrations",
+    "database-control:activate",
+    "api-mutations:drained",
     "recovery:interrupt",
     "cleanup-intents:recover",
-    "service:live",
     "snapshot:repeatable-read",
     "service:reconcile",
     "service:ready",
@@ -2796,8 +3281,121 @@ it("opens work and retention only after matching response and ready health", asy
   ]);
 });
 
+it("API-only restart drains old service work and accepts changed state", async () => {
+  await firstApi.createCheckpointProfileAndEveryRuntimeResource();
+  const oldBinding = firstApi.startupGate.assertOpen();
+  const restarted = createApiProcessForSameServiceAndDatabase();
+  await restarted.start();
+  expect(restarted.serviceProcessNonce).toBe(oldBinding.processNonce);
+  expect(restarted.controlGenerationNonce)
+    .not.toBe(oldBinding.controlGenerationNonce);
+  expect(restarted.snapshotDigest).not.toBe(oldBinding.snapshotDigest);
+  expect(serviceRuntimeInventory()).toEqual({
+    sessions: 0, contexts: 0, streams: 0, grants: 0,
+    writers: 0, timers: 0, workingProfiles: 0,
+  });
+  await expect(firstApi.client.createSession(validCreate, oldBinding))
+    .rejects.toMatchObject({ category: "control_generation_mismatch" });
+  expect(() => firstApi.startupGate.assertOpen()).toThrow();
+  expect(restarted.startupGate.assertOpen()).toMatchObject({
+    processNonce: oldBinding.processNonce,
+    controlGenerationNonce: restarted.controlGenerationNonce,
+    snapshotDigest: restarted.snapshotDigest,
+  });
+});
+
+it("old API shutdown after takeover cannot affect the new generation", async () => {
+  await oldApi.start();
+  await newApi.startAndTakeControl();
+  const binding = newApi.startupGate.assertOpen();
+  await oldApi.stop();
+  expect(oldApi.scopedCloseAttempts()).toEqual([
+    expect.objectContaining({ category: "control_generation_mismatch" }),
+  ]);
+  expect(newApi.startupGate.assertOpen()).toEqual(binding);
+  await expect(newApi.client.createSession(validCreate, binding))
+    .resolves.toMatchObject({ state: "ready" });
+});
+
+it("old API shutdown racing active handoff cannot close new resources", async () => {
+  await oldApi.start();
+  pauseOldApiShutdownBeforeScopedCloses();
+  const stopping = oldApi.stop();
+  await oldApiShutdownPaused();
+  const takeover = newApi.startAndTakeControl();
+  await newApiControlDrainStarted();
+  releaseOldApiShutdown();
+  await stopping;
+  await takeover;
+  expect(oldApi.scopedCloseAttempts()).toEqual([
+    expect.objectContaining({ category: "control_generation_mismatch" }),
+  ]);
+  expect(service.binding()).toMatchObject({
+    controlGenerationNonce: newApi.controlGenerationNonce,
+  });
+  expect(newApi.startupGate.assertOpen()).toMatchObject({
+    controlGenerationNonce: newApi.controlGenerationNonce,
+  });
+});
+
+it("serializes concurrent API startups and fences the earlier winner", async () => {
+  pauseFirstControlDrain();
+  const first = apiA.start();
+  const second = apiB.start();
+  await expect(apiB.firstControlAttempt()).rejects.toMatchObject({
+    category: "control_generation_in_progress",
+  });
+  releaseFirstControlDrain();
+  await first;
+  await second;
+  expect(apiB.controlGenerationNonce)
+    .not.toBe(apiA.controlGenerationNonce);
+  expect(() => apiA.startupGate.assertOpen()).toThrow();
+  expect(apiB.startupGate.assertOpen()).toMatchObject({
+    controlGenerationNonce: apiB.controlGenerationNonce,
+  });
+  expect(await loadDurableControlFence()).toMatchObject({
+    apiInstanceId: apiB.apiInstanceId,
+    controlGenerationNonce: apiB.controlGenerationNonce,
+  });
+});
+
+it.each(["before_service_commit", "after_service_commit_before_response"])(
+  "retries one in-process handoff identity after transport loss %s",
+  async lossPoint => {
+    const api = createApiProcessWithFixedInstanceIdentity();
+    loseControlTransportAt(lossPoint);
+    await expect(api.start()).rejects.toThrow();
+    await api.retryStartupInSameProcess();
+    expect(api.controlRequestBodies()).toHaveLength(2);
+    expect(api.controlRequestBodies()[1]).toBe(api.controlRequestBodies()[0]);
+    expect(api.controlGenerationMintCount()).toBe(1);
+    expect(api.databaseRecoveryCount()).toBe(1);
+  },
+);
+
+it.each([
+  { crashPoint: "before_control_request_send", expectedTotalMints: 1 },
+  { crashPoint: "after_service_mint_before_response", expectedTotalMints: 2 },
+])("replacement API uses a fresh tuple after process crash $crashPoint",
+  async ({ crashPoint, expectedTotalMints }) => {
+    const crashed = createApiProcess();
+    await crashApiProcessAt(crashed, crashPoint);
+    const replacement = createApiProcessForSameServiceAndDatabase();
+    await replacement.start();
+    expect(replacement.apiInstanceId).not.toBe(crashed.apiInstanceId);
+    expect(replacement.idempotencyKey).not.toBe(crashed.idempotencyKey);
+    expect(service.controlGenerationMintCount()).toBe(expectedTotalMints);
+    expect(crashed.databaseRecoveryCount()).toBe(0);
+    expect(replacement.databaseRecoveryCount()).toBe(1);
+    expect(replacement.startupGate.assertOpen()).toMatchObject({
+      controlGenerationNonce: replacement.controlGenerationNonce,
+    });
+  },
+);
+
 it("coalesces restart detection and never resumes old sessions", async () => {
-  await coordinator.initialize();
+  await startCoordinatorThroughApiLifecycle(coordinator);
   serviceReady.mockResolvedValue(restartedUnreadyHealth);
   await Promise.all([
     coordinator.checkNow(),
@@ -2807,6 +3405,17 @@ it("coalesces restart detection and never resumes old sessions", async () => {
   expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(2);
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(2);
   expect(resumeBrowserSession).not.toHaveBeenCalled();
+});
+
+it("abandons handoff when service process changes before generation", async () => {
+  pauseControlGenerationRequestFor(OLD_NONCE);
+  const startup = coordinator.acquireControlGeneration();
+  restartServiceWithNonce(NEW_NONCE);
+  releaseControlGenerationRequest();
+  await expect(startup).resolves.toMatchObject({ processNonce: NEW_NONCE });
+  expect(controlRequestsFor(OLD_NONCE)).toHaveLength(1);
+  expect(controlRequestsFor(NEW_NONCE)).toHaveLength(1);
+  expect(interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
 });
 
 it("recovers only dead cleanup-intent writers before snapshot", async () => {
@@ -2832,9 +3441,10 @@ it("recovers only dead cleanup-intent writers before snapshot", async () => {
 
 it("bounds retries, backoff, startup budget, and exhaustion", async () => {
   serviceClient.reconcile.mockRejectedValue(new TransportClosedError());
-  await expect(coordinator.initialize()).rejects.toMatchObject({
-    category: "browser_state_unavailable",
-  });
+  await expect(startCoordinatorThroughApiLifecycle(coordinator))
+    .rejects.toMatchObject({
+      category: "browser_state_unavailable",
+    });
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(4);
   expect(fakeClock.sleeps).toEqual([250, 500, 1_000]);
   expect(fakeClock.elapsedMs).toBeLessThanOrEqual(60_000);
@@ -2844,8 +3454,8 @@ it("bounds retries, backoff, startup budget, and exhaustion", async () => {
   }));
 });
 
-it("holds same failed runtime nonce for cooldown", async () => {
-  await exhaustRuntimeCycleForNonce(VALID_NONCE);
+it("holds same failed process/generation binding for cooldown", async () => {
+  await exhaustRuntimeCycleForBinding(VALID_BINDING);
   fakeClock.advanceBy(29_999);
   await fakeClock.runDueTimers();
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(4);
@@ -2857,7 +3467,7 @@ it("retries byte-identical reconciliation after partial execution", async () => 
   serviceClient.reconcile
     .mockRejectedValueOnce(reconciliationCleanupFailed())
     .mockResolvedValueOnce(reconciliationResult);
-  await coordinator.initialize();
+  await startCoordinatorThroughApiLifecycle(coordinator);
   expect(reconcileBodies).toHaveLength(2);
   expect(reconcileBodies[1]).toEqual(reconcileBodies[0]);
   expect(reconcileDigests).toEqual([snapshotDigest, snapshotDigest]);
@@ -2868,19 +3478,20 @@ it("recovers a lost success response through same-digest cache", async () => {
   serviceClient.reconcile
     .mockRejectedValueOnce(responseLostAfterServiceCommit())
     .mockResolvedValueOnce(reconciliationResult);
-  await coordinator.initialize();
+  await startCoordinatorThroughApiLifecycle(coordinator);
   expect(reconcileBodies[1]).toEqual(reconcileBodies[0]);
   expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(1);
   expect(loadSnapshot).toHaveBeenCalledTimes(1);
   expect(startupGate.assertOpen()).toMatchObject({ snapshotDigest });
 });
 
-it("restarts closed recovery and snapshot when nonce changes", async () => {
+it("performs a new handoff before recovery when process nonce changes", async () => {
   serviceClient.reconcile.mockRejectedValueOnce(new TransportClosedError());
-  serviceClient.getLive
-    .mockResolvedValueOnce(liveHealthFor(OLD_NONCE))
-    .mockResolvedValueOnce(liveHealthFor(NEW_NONCE));
-  await coordinator.initialize();
+  serviceClient.discoverLive
+    .mockResolvedValueOnce(liveDiscoveryFor(OLD_NONCE))
+    .mockResolvedValueOnce(liveDiscoveryFor(NEW_NONCE));
+  await startCoordinatorThroughApiLifecycle(coordinator);
+  expect(serviceClient.createControlGeneration).toHaveBeenCalledTimes(2);
   expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(2);
   expect(loadSnapshot).toHaveBeenCalledTimes(2);
   expect(reconcileBodiesFor(OLD_NONCE)).toHaveLength(1);
@@ -2891,7 +3502,7 @@ it("restarts closed recovery and snapshot when nonce changes", async () => {
 
 it("rechecks live nonce after snapshot before the first post", async () => {
   pauseAfterFrozenSnapshotFor(OLD_NONCE);
-  const initialization = coordinator.initialize();
+  const initialization = startCoordinatorThroughApiLifecycle(coordinator);
   await frozenSnapshotReached();
   restartServiceWithNonce(NEW_NONCE);
   releaseFrozenSnapshotPause();
@@ -2902,21 +3513,9 @@ it("rechecks live nonce after snapshot before the first post", async () => {
   expect(reconcileBodiesFor(NEW_NONCE)).toHaveLength(1);
 });
 
-it("new API process recovers cached success for the same service nonce", async () => {
-  await serviceCommitThenCrashBeforeGateOpen(firstCoordinator);
-  const restarted = createCoordinatorForSameDatabaseAndService();
-  await restarted.initialize();
-  expect(restarted.reconcileBodies[0]).toEqual(firstCoordinator.frozenBody);
-  expect(restarted.filesystemExecutionCount).toBe(
-    firstCoordinator.filesystemExecutionCount,
-  );
-  expect(restarted.serviceCacheHitCount).toBe(1);
-  expect(restarted.startupGate.assertOpen()).toMatchObject({ snapshotDigest });
-});
-
 it("stop aborts retry and cannot reopen the gate", async () => {
   pauseReconcileAttempt();
-  const initialization = coordinator.initialize();
+  const initialization = startCoordinatorThroughApiLifecycle(coordinator);
   await reconcileAttemptStarted();
   const stopping = coordinator.stop();
   expect(reconcileAttemptSignal.aborted).toBe(true);
@@ -2940,48 +3539,56 @@ it("runs non-browser retention once when browser feature is disabled", async () 
 });
 ```
 
-Add mismatched result nonce/digest, ready mismatch, timeout, auth, transport,
-database, malformed response, interrupted recovery, and second-reconciliation
-failure cases. Each leaves gate closed and retention paused. Assert public
-mapping is only `browser_state_unavailable` and logs omit paths, IDs, hashes,
-nonce, bearer key, private/database URLs, profile/browser identity,
-capability, and grant.
+Add mismatched process/generation/digest results, ready mismatch, handoff
+timeout/partial drain, auth, transport, database, malformed response,
+interrupted recovery, concurrent API takeover, and second-reconciliation
+failure cases. Each leaves gate closed and retention paused. Assert no database
+recovery/snapshot precedes confirmed handoff, stale API generations cannot
+mutate or open streams, public mapping is only `browser_state_unavailable`,
+and logs omit paths, IDs, hashes, either nonce, bearer key, private/database
+URLs, profile/browser identity, capability, and grant.
 
-Add fake-clock retry tests. Attempts start immediately, then wait exactly 250,
-500, and 1,000 ms before attempts 2, 3, and 4. A 60,000 ms total budget caps
-every request deadline and cancels remaining backoff. Initial startup
-exhaustion throws sanitized `browser_state_unavailable` so API startup fails
-and registered cleanup runs. Runtime exhaustion keeps API alive but gate
-closed; same failed nonce cannot start another cycle for 30,000 ms. A changed
-nonce or explicit `checkNow()` starts one new coalesced bounded cycle.
+Add fake-clock retry tests. Handoff and reconciliation attempts start
+immediately, then wait exactly 250, 500, and 1,000 ms before attempts 2, 3,
+and 4. A 60,000 ms total startup budget spans discovery, handoff, migrations,
+recovery, snapshot, reconciliation, and ready verification; it caps every
+request deadline and cancels remaining backoff. Initial exhaustion throws
+sanitized `browser_state_unavailable` so API startup fails and registered
+cleanup runs. Runtime exhaustion keeps API alive but gate closed; the same
+failed process/generation binding cannot start another cycle for 30,000 ms.
+A changed process nonce or explicit `checkNow()` starts one new coalesced
+bounded cycle. Stale generation never invokes `checkNow()` takeover.
 
-For each observed live service nonce, closed recovery runs exactly once, then
-the coordinator captures one immutable repeatable-read snapshot and canonical
-UTF-8 serialization of the complete reconciliation request. Freeze those
-bytes and its digest before attempt 1. A retry for partial execution,
+For each confirmed service process/control generation, closed database
+recovery runs exactly once, then the coordinator captures one immutable
+repeatable-read snapshot and canonical UTF-8 serialization of the complete
+reconciliation request. Freeze those bytes and its digest before attempt 1. A
+retry for partial execution,
 transport failure, timeout, or a response lost after service success resends
 the byte-identical body; it never reruns cleanup recovery or reloads the
-snapshot while the nonce remains stable. The service's same-nonce,
-same-digest cached result makes lost-response replay safe. Validation or auth
-failure is nonretryable.
+snapshot while the generation remains stable. The service's same-process,
+same-generation, same-digest cached result makes lost-response replay safe.
+Validation or auth failure is nonretryable.
 
-Read authenticated live health immediately before every POST, including
-attempt 1 after snapshot freeze and every retry. If its nonce differs, abort
-the old attempt loop and discard its frozen request. Keep the gate closed,
-pause retention, obtain a new drain epoch, rerun unfinished-work and cleanup-
-intent recovery, capture one new snapshot, and freeze a new request for the
-new nonce. A crash or restart between attempts can never receive the old
-nonce's request. The four-attempt and 250/500/1,000 ms backoff limits apply to
-each coalesced nonce cycle. One 60-second outer startup budget spans all nonce
-changes during `initialize()`; it never resets on service churn. Each runtime
-cycle has its own 60-second budget. Runtime exhaustion holds that nonce for
-the 30-second cooldown. Explicit `checkNow()` may override cooldown but still
-creates only one new coalesced cycle.
+Read authenticated generation-scoped live health immediately before every
+reconciliation POST, including attempt 1 after snapshot freeze and every
+retry. If process nonce differs, abort the old attempt loop, discard its
+frozen request, complete a new handoff, then rerun database recovery and
+snapshot under the new generation. If control generation differs while
+process nonce is stable, another API owns control: permanently close this API
+gate and send no further private mutation. A crash or restart between attempts
+can never receive an old-generation request. Four attempts and
+250/500/1,000 ms backoff apply to each coalesced generation cycle. One
+60-second outer startup budget spans process churn and control retries; it
+never resets on service churn. Each runtime cycle has its own 60-second
+budget. Runtime exhaustion holds that exact binding for 30-second cooldown.
+Explicit `checkNow()` may override cooldown but still creates only one new
+coalesced cycle when this API retains generation authority.
 
 - [ ] **Step 3: Run focused tests and verify red**
 
 ```bash
-pnpm --dir apps/api exec vitest run --no-file-parallelism src/lib/browser-runtime/startup-gate.test.ts src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts src/lib/browser-state/store.integration.test.ts src/lib/scrape-interact/replay-store.integration.test.ts src/services/local-retention-worker.test.ts
+pnpm --dir apps/api exec vitest run --no-file-parallelism src/db/migrate.integration.test.ts src/lib/browser-runtime/startup-gate.test.ts src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts src/lib/browser-state/store.integration.test.ts src/lib/scrape-interact/replay-store.integration.test.ts src/services/local-retention-worker.test.ts
 ```
 
 Expected: FAIL because gate, snapshot loader, and coordinator do not exist and
@@ -2993,7 +3600,10 @@ Expose exact gate methods:
 
 ```ts
 export type BrowserStartupBinding = {
+  apiInstanceId: string;
+  databaseControlEpoch: number;
   processNonce: string;
+  controlGenerationNonce: string;
   snapshotDigest: string;
 };
 
@@ -3002,9 +3612,15 @@ export type BrowserMutationDrain = {
   drained: Promise<void>;
 };
 
+export type BrowserControlFenceTransaction = Pick<PoolClient, "query"> & {
+  readonly databaseControlEpoch: number;
+};
+
 export type BrowserStateMutationLease = {
   readonly epoch: number;
   readonly scope: "filesystem_and_database";
+  readonly binding: BrowserStartupBinding;
+  readonly transaction: BrowserControlFenceTransaction;
 };
 
 export type BrowserStartupGate = {
@@ -3022,24 +3638,45 @@ export type BrowserStartupGate = {
   ): Promise<T>;
 };
 
-export function createBrowserStartupGate(): BrowserStartupGate;
+export function createBrowserStartupGate(deps: {
+  pool: Pick<Pool, "connect">;
+}): BrowserStartupGate;
 ```
 
 Gate starts closed. `close()` synchronously makes later admission and mutation
 leases fail, increments epoch, and returns one drain whose promise settles only
 after every earlier lease releases. One lease covers filesystem side effect
-and matching database compare-and-set as one mutation; lease registration is
-synchronous before operation invocation and releases in `finally`. Never
-acquire separate filesystem and database leases. `open()` accepts only current
-drained epoch and
-coordinator's validated nonce/digest binding; stale drains cannot reopen gate.
+and matching database compare-and-set as one mutation. After process-local
+registration, every normal lease begins a database transaction, locks the
+singleton `browser_control_generation` row `FOR UPDATE`, and requires exact
+API instance/process/control nonce/database epoch equality. It holds that row
+lock and transaction across every filesystem operation plus matching database
+write, then commits before releasing in `finally`. A stale process can perform
+no later filesystem effect even if its local gate remains open. Never acquire
+separate filesystem and database leases or release the durable fence between
+file and row mutation. `open()` accepts only current drained epoch and
+coordinator's validated process/generation/digest binding; stale drains cannot
+reopen gate.
 `withDrainedBrowserStateMutation()` accepts only current fully drained token,
-runs coordinator recovery while admission remains closed, and resolves before
-snapshot may start. It cannot overlap a normal lease or be called by routes.
+runs coordinator recovery while admission remains closed, and uses the same
+durable row-lock/transaction fence for every recovery filesystem/database
+effect before snapshot may start. It cannot overlap a normal lease or be
+called by routes.
 Every later API mutator receives this gate as an explicit constructor or
 function dependency. No browser-state filesystem or database mutator is
 exported to controllers as an unleased callback. Read-only operations may use
 `assertOpen()`; `assertOpen()` alone never authorizes a mutation.
+
+Migration `0007_browser_control_generation.sql` creates one singleton row
+shape with `singleton_id=1`, positive bigint database epoch, canonical process
+and control nonces, canonical API instance UUID, and activation timestamp.
+First activation inserts epoch 1; later activation locks the row and increments
+exactly once. While holding that row lock, activation calls generation-scoped
+live health for the proposed binding, writes it only if still current, commits,
+then rechecks scoped live before any recovery. A concurrent newer handoff makes
+the older activation roll back or fail its post-commit check; it never runs
+recovery or opens a gate. Exact same binding activation is idempotent. Migration
+tests enforce singleton/check/immutability rules and Drizzle parity.
 
 Expose snapshot loader:
 
@@ -3121,7 +3758,8 @@ export type BrowserReconciliationRetryConfig = {
 export type BrowserReconciliationCoordinatorDependencies = {
   gate: BrowserStartupGate;
   serviceClient: Pick<BrowserServiceClient,
-    "getLive" | "getReady" | "reconcile">;
+    "discoverLive" | "createControlGeneration" | "getLive" |
+    "getReady" | "reconcile">;
   loadSnapshot: typeof loadBrowserReconciliationSnapshot;
   interruptUnfinishedBrowserWork: typeof interruptUnfinishedBrowserWork;
   recoverBrowserCleanupIntentsBeforeSnapshot:
@@ -3134,8 +3772,23 @@ export type BrowserReconciliationCoordinatorDependencies = {
   logger: Pick<Logger, "info" | "error">;
 };
 
+export type BrowserControlGenerationHandoff = {
+  apiInstanceId: string;
+  idempotencyKey: string;
+  processNonce: string;
+  controlGenerationNonce: string;
+  canonicalRequestBody: string;
+  drain: BrowserMutationDrain;
+};
+
 export type BrowserReconciliationCoordinator = {
-  initialize(signal?: AbortSignal): Promise<BrowserStartupBinding>;
+  acquireControlGeneration(
+    signal?: AbortSignal,
+  ): Promise<BrowserControlGenerationHandoff>;
+  initializeAfterMigrations(
+    handoff: BrowserControlGenerationHandoff,
+    signal?: AbortSignal,
+  ): Promise<BrowserStartupBinding>;
   checkNow(signal?: AbortSignal): Promise<void>;
   stop(): Promise<void>;
 };
@@ -3151,46 +3804,79 @@ export function createBrowserReconciliationCoordinator(
 `pauseBrowserRetention`, clock/timer hooks, logger, and exact Task 7 retry
 configuration. No harness callback owns recovery or retention.
 
-`initialize()` requires migrations already applied. Under one mutex: call
-`gate.close()`, pause browser-state retention, await returned `drained`, then call
+Generate one canonical UUID `apiInstanceId` at API process start and retain it
+for that process lifetime. For each discovered Browser Service process nonce,
+generate one 32-byte base64url idempotency key and freeze the exact control
+request bytes. `acquireControlGeneration()` calls `gate.close()`, pauses
+browser-state retention, discovers live process identity, then posts that
+exact handoff request. It retries response loss/timeout with the same tuple and
+bytes. If live process identity changes, abandon the old request, generate one
+new handoff key for the new process, and retry within the same outer startup
+budget. It returns only after response process/API identity match and service
+drain has completed, carrying the original still-closed API drain token forward
+to initialization. No migration, database recovery, cleanup-intent access,
+snapshot query, or claim about interrupted Chromium occurs before this return.
+
+On every enabled API startup, including first startup, `index.ts` invokes
+`acquireControlGeneration()` before applying database migrations. It then
+applies migrations and calls `initializeAfterMigrations()` with that exact
+handoff. Under the existing mutex, initialization first activates the durable
+database control fence using the locked-row/scoped-live protocol above. This
+waits for every older cross-process mutation holding the row and rejects a
+superseded handoff. Only after activation and its post-commit service recheck
+does initialization await the API mutation drain and call
 `gate.withDrainedBrowserStateMutation(drain, ...)` once around
 `interruptUnfinishedBrowserWork(now)` and exact-process cleanup-intent
-recovery. After that wrapper resolves, read authenticated live nonce and capture
-the repeatable-read snapshot, post `{version:1, processNonce, snapshotDigest,
-references}`, validate the closed result, fetch ready health, and require both
-responses equal requested nonce/digest. Then `gate.open(drain, binding)` and
+recovery. Only now may API classify durable work interrupted; Browser Service
+runtime closure was already confirmed by handoff. After that wrapper resolves,
+read generation-scoped live health and capture
+the repeatable-read snapshot, post `{version:1,processNonce,
+controlGenerationNonce,snapshotDigest,references}`, validate the closed result, fetch ready
+health, and require both responses equal requested process/generation/digest.
+Then `gate.open(drain, binding)` and
 start browser-state retention. Each request deadline is the smaller of its
 configured timeout and the remaining 60,000 ms startup budget.
 
-For one observed service nonce, run closed recovery once and serialize the
-complete request once with the canonical Task 1 encoder. Freeze the exact
-UTF-8 body, references, and digest for that nonce cycle. Every same-nonce
+For one observed service process/control generation, run closed recovery once
+and serialize the complete request once with the canonical Task 1 encoder.
+Freeze the exact UTF-8 body, references, and digest for that generation cycle.
+Every same-generation
 attempt, including partial-execution error, transport loss, timeout, or lost
 success response, posts those byte-identical bytes. Recheck live health
-immediately before every POST, including attempt 1. If the nonce changed,
-abort and discard the old cycle before any
-post, obtain a new closed/drained epoch, rerun recovery, capture one new
-snapshot, and freeze one new body. Never send an old-nonce body to a new
-process or recapture a different digest under a stable nonce.
+immediately before every POST, including attempt 1. If the binding changed,
+abort and discard the old cycle before any post. A changed process nonce
+requires a new handoff before database recovery repeats. A changed control
+generation with the same process means another API superseded this one: close
+the gate permanently, stop browser retention/monitoring, reject browser work,
+and never attempt to retake control automatically. Never send an old-generation
+body to a new generation or recapture a different digest inside one stable
+generation.
 
-A same-nonce restart of the API repeats closed recovery and snapshot from the
-durable database. If canonical bytes/digest match the service's already cached
-successful request, replay returns that result and the new gate may open. A
-different digest for a service nonce that already reports ready is a
-conflicting replay and fails closed. `stop()` aborts the current request or
+Every API-only restart performs a fresh handoff even if process nonce is
+unchanged. The completed service drain clears old reconciliation cache, so the
+new generation may reconcile a different durable digest. Within one generation,
+exact digest replay remains cached and a different digest remains
+`reconciliation_conflicting_replay`. `stop()` aborts the current request or
 backoff, waits for the mutex, and permanently prevents later gate open or
-retention start.
+retention start. Graceful API shutdown first closes/drains its API gate, then
+uses its still-current generation to close owned sessions/grants and waits for
+writers/streams before stopping monitoring; it never mints another generation.
+Crash cleanup is deferred to the next startup handoff.
 
-`checkNow()` fetches ready health. Any 503, changed nonce, changed digest,
-transport/auth/schema error, or process restart closes gate immediately and
-runs the same recovery sequence. Concurrent detections share one promise. Old
-runtime sessions, model threads, actions, grants, and Chromium processes are
-interrupted, never resumed. One cycle has at most 4 attempts. Attempt 1 starts
+`checkNow()` fetches generation-scoped ready health. Any 503, changed process
+nonce, changed generation, changed digest, transport/auth/schema error, or
+process restart closes gate immediately. Process restart runs a new handoff
+then the same recovery sequence. Stale generation means this API lost control
+and terminates its browser coordinator without takeover. Concurrent detections
+share one promise. Old model threads/actions are interrupted only after a
+confirmed handoff has already closed service runtimes. None resume. One cycle
+has at most 4 attempts. Attempt 1 starts
 immediately; attempts 2..4 wait 250, 500, and 1,000 ms, each capped by remaining
 60,000 ms cycle budget. Startup exhaustion rejects initialization and API
 startup cleanup runs. Runtime exhaustion leaves gate closed, pauses retention,
-records failed nonce, and suppresses same-nonce automatic retry for 30,000 ms;
-nonce change or explicit `checkNow()` may start one new coalesced cycle. No
+records failed binding, and suppresses same-binding automatic retry for
+30,000 ms; process nonce change or explicit `checkNow()` may start one new
+coalesced cycle while generation authority remains current. No
 cloud/stateless fallback.
 
 Split the existing API-owned local retention loop into two explicit phases:
@@ -3249,29 +3935,30 @@ pass-through mutation executor.
 - [ ] **Step 7: Run integration tests serially and build**
 
 ```bash
-pnpm --dir apps/api exec vitest run --no-file-parallelism src/lib/browser-runtime/startup-gate.test.ts src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts src/lib/browser-state/store.integration.test.ts src/lib/scrape-interact/replay-store.integration.test.ts src/services/local-retention-worker.test.ts
+pnpm --dir apps/api exec vitest run --no-file-parallelism src/db/migrate.integration.test.ts src/lib/browser-runtime/startup-gate.test.ts src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts src/lib/browser-state/store.integration.test.ts src/lib/scrape-interact/replay-store.integration.test.ts src/services/local-retention-worker.test.ts
 pnpm --dir apps/api build
 ```
 
 Expected: tests PASS with one shared-schema worker; build PASS. Snapshot,
-recovery, gate, retention, restart, retry, and redaction order are locked.
+durable control migration/fencing, paused-old-mutation drain, recovery, gate,
+retention, restart, retry, and redaction order are locked.
 
 - [ ] **Step 8: Commit API startup reconciliation**
 
 ```bash
-git add apps/api/src/lib/browser-runtime/startup-gate.ts apps/api/src/lib/browser-runtime/startup-gate.test.ts apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts apps/api/src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts apps/api/src/lib/browser-runtime/reconciliation-coordinator.test.ts apps/api/src/lib/browser-state/store.ts apps/api/src/lib/browser-state/store.integration.test.ts apps/api/src/lib/browser-state/filesystem-store.ts apps/api/src/lib/scrape-interact/replay-store.ts apps/api/src/lib/scrape-interact/replay-store.integration.test.ts apps/api/src/services/local-retention-worker.ts apps/api/src/services/local-retention-worker.test.ts apps/api/src/index.ts
+git add apps/api/src/db/migrations/0007_browser_control_generation.sql apps/api/src/db/schema/public.ts apps/api/src/db/migrate.integration.test.ts apps/api/src/lib/browser-runtime/startup-gate.ts apps/api/src/lib/browser-runtime/startup-gate.test.ts apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts apps/api/src/lib/browser-runtime/reconciliation-snapshot.integration.test.ts apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts apps/api/src/lib/browser-runtime/reconciliation-coordinator.test.ts apps/api/src/lib/browser-state/store.ts apps/api/src/lib/browser-state/store.integration.test.ts apps/api/src/lib/browser-state/filesystem-store.ts apps/api/src/lib/scrape-interact/replay-store.ts apps/api/src/lib/scrape-interact/replay-store.integration.test.ts apps/api/src/services/local-retention-worker.ts apps/api/src/services/local-retention-worker.test.ts apps/api/src/index.ts
 apps/api/.husky/_/pre-commit
-git commit -m "feat: gate browser startup on reconciliation" -m "Recover durable work and reconcile one repeatable-read state snapshot
-before opening browser work or browser-state retention.
+git commit -m "feat: gate browser startup on reconciliation" -m "Fence durable mutations with a monotonic database control epoch, then
+recover one repeatable-read snapshot after service handoff.
 
 Store replay files as canonical storage-only bytes and coalesce recovery
-when the service nonce changes."
+when service process or control generation changes."
 ```
 
 ### Task 9: Define one-job execution boundary and session orchestrator
 
 **Files:**
-- Create: `apps/api/src/db/migrations/0007_browser_adapter_bindings.sql`
+- Create: `apps/api/src/db/migrations/0008_browser_adapter_bindings.sql`
 - Modify: `apps/api/src/db/schema/public.ts`
 - Modify: `apps/api/src/db/migrate.integration.test.ts`
 - Create: `apps/api/src/lib/browser-runtime/protocol.ts`
@@ -3465,7 +4152,7 @@ it("restart recovery revokes unactivated and stale adapter capability", async ()
 
 it("migrates a populated valid legacy capability after dropping not null", async () => {
   const legacy = await seedLegacyCapability({ adapterProcessId: 4242 });
-  await runMigration("0007_browser_adapter_bindings.sql");
+  await runMigration("0008_browser_adapter_bindings.sql");
   expect(await loadMigratedCapability(legacy.id)).toMatchObject({
     adapterProcessId: null,
     adapterJobId: null,
@@ -3480,10 +4167,10 @@ it("aborts populated migration before any change for noncanonical job", async ()
     actionAdapterJobId: VALID_JOB_ID.toUpperCase(),
     capabilityAdapterProcessId: 4242,
   });
-  await expect(runMigration("0007_browser_adapter_bindings.sql"))
+  await expect(runMigration("0008_browser_adapter_bindings.sql"))
     .rejects.toThrow("browser_adapter_job_id_preflight_failed");
   expect(await dumpLegacySchemaAndRows()).toEqual(before);
-  expect(await migrationWasRecorded("0007_browser_adapter_bindings.sql"))
+  expect(await migrationWasRecorded("0008_browser_adapter_bindings.sql"))
     .toBe(false);
 });
 
@@ -3582,7 +4269,7 @@ orchestrator do not exist.
 
 - [ ] **Step 3: Migrate durable adapter authorization bindings**
 
-Create migration `0007_browser_adapter_bindings.sql` and matching Drizzle
+Create migration `0008_browser_adapter_bindings.sql` and matching Drizzle
 fields. It performs these operations in this order:
 
 ```sql
@@ -4178,7 +4865,7 @@ host-held lease, profile crash boundaries, and unavailable adapters.
 - [ ] **Step 7: Commit orchestration boundary**
 
 ```bash
-git add apps/api/src/db/migrations/0007_browser_adapter_bindings.sql apps/api/src/db/schema/public.ts apps/api/src/db/migrate.integration.test.ts apps/api/src/lib/browser-runtime/protocol.ts apps/api/src/lib/browser-runtime/protocol.test.ts apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/lib/browser-runtime/orchestrator.test.ts apps/api/src/lib/browser-state/types.ts apps/api/src/lib/browser-state/store.ts apps/api/src/lib/browser-state/store.integration.test.ts apps/api/src/lib/browser-state/capability-store.ts apps/api/src/lib/browser-state/capability-store.test.ts
+git add apps/api/src/db/migrations/0008_browser_adapter_bindings.sql apps/api/src/db/schema/public.ts apps/api/src/db/migrate.integration.test.ts apps/api/src/lib/browser-runtime/protocol.ts apps/api/src/lib/browser-runtime/protocol.test.ts apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/lib/browser-runtime/orchestrator.test.ts apps/api/src/lib/browser-state/types.ts apps/api/src/lib/browser-state/store.ts apps/api/src/lib/browser-state/store.integration.test.ts apps/api/src/lib/browser-state/capability-store.ts apps/api/src/lib/browser-state/capability-store.test.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: bind local browser adapter runs" -m "Persist immutable adapter job, supervisor, process, and capability
 identity before any host callback or model execution.
@@ -4994,6 +5681,8 @@ expect(events).toEqual([
   "browser:start",
   "browser:live",
   "api:start",
+  "api-process:control-handoff",
+  "api-process:migrations",
   "api-process:operational-retention:start",
   "api-process:recovery",
   "api-process:cleanup-intents",
@@ -5006,6 +5695,16 @@ expect(harnessParent.interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
 expect(harnessParent.recoverCleanupIntents).not.toHaveBeenCalled();
 expect(harnessParent.startLocalRetentionService).not.toHaveBeenCalled();
 ```
+
+Add an API-only restart case after creating one replay checkpoint, committing
+one profile generation, and opening session/context/grant/writer/stream
+fixtures. Keep the Browser Service container running and assert its
+`processNonce` is unchanged. The restarted API must complete a fresh control
+handoff before migrations/recovery, receive a different generation, observe a
+changed durable snapshot digest, reconcile successfully, and reach ready.
+Every old service runtime resource is closed before handoff response and one
+request from the retained old API fixture receives
+`control_generation_mismatch` with no effect.
 
 Add a blocked-reconciliation case and assert operational/artifact retention
 started once but no `api-process:browser-retention:start` event. Restart
@@ -5078,10 +5777,14 @@ arbitrary path, append another root component, or clean an unmanaged root.
 Browser Service alone generates its 32-byte process nonce. Harness reads it
 from authenticated live health, requires canonical 43-character base64url,
 requires it differs from every prior process in that invocation, and passes no
-nonce override. API reconciliation must bind that observed nonce.
+nonce override. Harness never creates, passes, reads from discovery, or adopts
+a control-generation nonce. Each API process generates its own API instance
+identity/idempotency key and obtains its generation through the authenticated
+handoff. API reconciliation must bind both returned service nonces.
 
 Return live handle and generated environment to harness, spawn API, then wait
-for authenticated ready whose nonce/digest equal coordinator's binding.
+for authenticated ready whose process/generation/digest equal coordinator's
+binding.
 Remove existing harness-parent imports/calls that run
 `interruptUnfinishedBrowserWork`, cleanup-intent recovery, or
 `createLocalRetentionService`; API `index.ts` is sole operational, artifact,
@@ -5101,7 +5804,9 @@ docker compose --project-name firecrawl --project-directory . -f compose.yaml -f
 docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml build browser-service api
 ```
 
-Expected: lifecycle tests PASS in live/API-reconcile/ready order, Compose
+Expected: lifecycle tests PASS in
+live/API-handoff/migrations/recovery/reconcile/ready order, including API-only
+restart fencing. Compose
 config exits 0, image builds from committed digest, Browser Service has no
 `ports`, feature remains false, only API publishes `127.0.0.1:3002`, override
 environment is rejected, two invocations share no identity/state/database,
@@ -5128,6 +5833,8 @@ and application databases."
 - Create: `apps/api/src/__tests__/snips/v2/browser-local.test.ts`
 - Modify: `apps/api/src/__tests__/snips/v2/scrape-browser.test.ts`
 - Create: `apps/api/src/__tests__/snips/v2/browser-real-codex.test.ts`
+- Create: `apps/api/src/cli/browser-stale-contract-scan.ts`
+- Create: `apps/api/src/cli/browser-stale-contract-scan.test.ts`
 - Modify: `apps/api/package.json`
 
 - [ ] **Step 1: Add public Browser and Interact helpers**
@@ -5241,7 +5948,165 @@ process under rolling capability gate,
 durable contiguous action ledger, no duplicate effects, zero tool/approval
 events, exact final output, and complete cleanup.
 
-- [ ] **Step 4: Run deterministic regression**
+- [ ] **Step 4: Add checked stale-contract scanner and mutation fixtures**
+
+Add `check:browser-stale-contracts` as
+`tsx src/cli/browser-stale-contract-scan.ts`. The scanner owns an exact product
+production-file manifest and fails if any entry is absent. Do not scan test or
+snip files because their rejection fixtures intentionally contain forbidden
+literals. Do not scan generated `pnpm-lock.yaml`; frozen-lock checks own it.
+Do not include the scanner source itself in its product manifest because it
+necessarily contains every forbidden rule literal; its dedicated test imports
+and validates scanner structure and behavior directly.
+
+```ts
+export const browserContractProductionFiles = [
+  "apps/browser-service/contracts/private-v1.contract.json",
+  "apps/browser-service/package.json",
+  "apps/browser-service/tsconfig.json",
+  "apps/browser-service/Dockerfile",
+  "apps/browser-service/src/runtime-preflight.mjs",
+  "apps/browser-service/src/config.ts",
+  "apps/browser-service/src/contracts.ts",
+  "apps/browser-service/src/contract-inventory.ts",
+  "apps/browser-service/src/errors.ts",
+  "apps/browser-service/src/auth.ts",
+  "apps/browser-service/src/network-policy.ts",
+  "apps/browser-service/src/egress-proxy.ts",
+  "apps/browser-service/src/chromium-launch-policy.ts",
+  "apps/browser-service/src/startup-state.ts",
+  "apps/browser-service/src/reconciliation.ts",
+  "apps/browser-service/src/profile-store.ts",
+  "apps/browser-service/src/session-registry.ts",
+  "apps/browser-service/src/replay-restore.ts",
+  "apps/browser-service/src/evaluate-policy.ts",
+  "apps/browser-service/src/operations.ts",
+  "apps/browser-service/src/action-cache.ts",
+  "apps/browser-service/src/streams.ts",
+  "apps/browser-service/src/artifacts.ts",
+  "apps/browser-service/src/server.ts",
+  "apps/browser-service/src/index.ts",
+  "apps/api/package.json",
+  "apps/api/src/config.ts",
+  "apps/api/src/lib/local-runtime-config.ts",
+  "apps/api/src/db/migrations/0007_browser_control_generation.sql",
+  "apps/api/src/db/migrations/0008_browser_adapter_bindings.sql",
+  "apps/api/src/db/schema/public.ts",
+  "apps/api/src/lib/scrape-interact/browser-service-contracts.ts",
+  "apps/api/src/lib/scrape-interact/browser-service-client.ts",
+  "apps/api/src/lib/scrape-interact/replay-store.ts",
+  "apps/api/src/lib/scrape-interact/browser-agent.ts",
+  "apps/api/src/lib/browser-state/filesystem-store.ts",
+  "apps/api/src/lib/browser-state/store.ts",
+  "apps/api/src/lib/browser-state/types.ts",
+  "apps/api/src/lib/browser-state/capability-store.ts",
+  "apps/api/src/lib/browser-state/proxy-grant-store.ts",
+  "apps/api/src/lib/browser-runtime/startup-gate.ts",
+  "apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts",
+  "apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts",
+  "apps/api/src/lib/browser-runtime/protocol.ts",
+  "apps/api/src/lib/browser-runtime/execution-adapter.ts",
+  "apps/api/src/lib/browser-runtime/orchestrator.ts",
+  "apps/api/src/lib/browser-runtime/action-normalization.ts",
+  "apps/api/src/lib/browser-runtime/action-coordinator.ts",
+  "apps/api/src/lib/browser-runtime/proxy-urls.ts",
+  "apps/api/src/lib/browser-runtime/artifacts.ts",
+  "apps/api/src/lib/artifacts/manifest.ts",
+  "apps/api/src/lib/artifacts/local-manifest.ts",
+  "apps/api/src/services/local-retention-worker.ts",
+  "apps/api/src/controllers/internal/browser-runs.ts",
+  "apps/api/src/routes/internal.ts",
+  "apps/api/src/controllers/v2/browser.ts",
+  "apps/api/src/controllers/v2/scrape-browser.ts",
+  "apps/api/src/controllers/v2/browser-proxy.ts",
+  "apps/api/src/routes/v2.ts",
+  "apps/api/src/index.ts",
+  "apps/api/src/harness.ts",
+  "apps/api/src/harness-browser-service.ts",
+  "compose.local.yaml",
+  ".env.example.local",
+] as const;
+
+export const browserSchemaValidationFiles = [
+  "apps/browser-service/src/contracts.ts",
+  "apps/api/src/lib/scrape-interact/browser-service-contracts.ts",
+  "apps/api/src/lib/browser-runtime/protocol.ts",
+  "apps/api/src/lib/browser-runtime/execution-adapter.ts",
+  "apps/api/src/lib/browser-runtime/action-normalization.ts",
+  "apps/api/src/lib/browser-state/store.ts",
+  "apps/api/src/lib/browser-state/types.ts",
+  "apps/api/src/lib/browser-state/capability-store.ts",
+  "apps/api/src/lib/browser-state/proxy-grant-store.ts",
+  "apps/api/src/controllers/internal/browser-runs.ts",
+  "apps/api/src/controllers/v2/browser.ts",
+  "apps/api/src/controllers/v2/scrape-browser.ts",
+  "apps/api/src/controllers/v2/browser-proxy.ts",
+] as const;
+```
+
+Export pure `scanSources([{path,text}])` and a CLI wrapper. Use TypeScript's
+compiler AST for call/property/initializer structure and bounded lexical rules
+for SQL/YAML/env/text. Report stable rule ID, path, line, and sanitized match;
+never rewrite files. Lock these rules:
+
+- `legacy_root_config`: reject namespace/profile-root identifiers and AST root
+  composition that joins/resolves `canonicalRoot`, `stateRoot`, or
+  `localBrowserStateRoot` with a namespace or literal `checkpoints` segment.
+- `legacy_checkpoint_layer`: reject quoted/backtick `checkpoints` path segments,
+  including terminal, slash, and backslash forms.
+- `legacy_zod_strict`: reject direct `\.strict\s*\(` in every product source;
+  closed schemas use `z.strictObject()`.
+- `bare_url_validator`: in `browserSchemaValidationFiles`, reject AST calls to
+  `z.url()` or `z.string().url()`.
+- `bare_uuid_validator`: in `browserSchemaValidationFiles`, reject `z.uuid()`
+  and `z.string().uuid()` except one call inside the declaration named
+  `canonicalUuidSchema` in each of exactly
+  `apps/browser-service/src/contracts.ts` and
+  `apps/api/src/lib/scrape-interact/browser-service-contracts.ts`.
+  Unrelated application config remains in the product manifest for all lexical
+  rules but is explicitly outside browser-schema validator ownership.
+- `typescript_node_test`: reject `node --test` commands targeting `.ts` or
+  `.tsx`; `.mjs` bootstrap tests remain allowed.
+- `database_storage_payload`: in SQL reject
+  `\bstorage_state(?:_[a-z0-9]+)*\b`. In database/persistence TypeScript AST,
+  reject Drizzle/row/select/insert column keys matching
+  `^storageState(?:[A-Z][A-Za-z0-9]*)?$`. Explicitly allow in-memory
+  `StorageStateV1.storageState` transport/reconstruction values outside
+  database column/query structures.
+- `split_adapter_activation`: reject separate run/capability activation names
+  and require one exported `activateAdapterProcess` entry point; transactional
+  rollback/concurrent-winner tests remain behavioral proof.
+- `legacy_acceptance`: reject `observer.onAccepted(`,
+  `onAccepted(processId)`, and `processId: string`.
+- `wrong_reconciliation_category`: reject exact
+  `reconciliation_execution_failed`.
+- `stale_code_result`: inspect `codeRunResultSchema` and require exactly
+  `stdout,result,stderr,exitCode,killed`; reject `fromCache`, missing/extra
+  keys, missing exported `CodeRunResult`, or an alias targeting another schema.
+
+`browser-stale-contract-scan.test.ts` table-drives at least one known-bad
+in-memory source for every rule and asserts exact rule ID/path/line. Include
+plain, payload, JSON, and arbitrary-suffix snake/camel database column forms;
+both UUID call forms; multiline/direct
+`.strict (` syntax, quoted/backtick/backslash checkpoint segments, each split
+activation family, and all legacy acceptance shapes. UUID allowlist fixtures
+prove exact two definitions pass while a third, renamed, moved, or wrong-file
+call fails. Code-result fixtures prove the exact schema/alias passes while
+added `fromCache`, missing `killed`, absent alias, or wrong alias target fails.
+Manifest-missing fixture fails before scanning; real product manifest has zero
+findings. A scanner-self test verifies its manifest/rule exports and a CLI
+fixture returns exit 1 for one bad temporary source and 0 for clean input. No
+negative fixture is added to the production or browser-schema allowlist.
+
+```bash
+pnpm --dir apps/api exec vitest run src/cli/browser-stale-contract-scan.test.ts
+pnpm --dir apps/api check:browser-stale-contracts
+```
+
+Expected: every mutation fixture proves its stale category fails, exact
+allowlists pass, manifest is complete, and real production files exit 0.
+
+- [ ] **Step 5: Run deterministic regression**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
@@ -5249,22 +6114,24 @@ corepack pnpm --dir apps/browser-service install --frozen-lockfile
 corepack pnpm --dir apps/browser-service test
 corepack pnpm --dir apps/browser-service build
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/db/migrate.integration.test.ts src/lib/browser-runtime src/lib/browser-state src/lib/scrape-interact src/controllers/internal/browser-runs.test.ts src/controllers/v2/browser.test.ts src/controllers/v2/browser-proxy.test.ts src/controllers/v2/scrape-browser.test.ts
+pnpm --dir apps/api exec vitest run src/cli/browser-stale-contract-scan.test.ts
+pnpm --dir apps/api check:browser-stale-contracts
 pnpm --dir apps/api build
 ```
 
 Expected: all deterministic tests and builds PASS. Real Codex smoke reports
 SKIP unless explicitly enabled; a skip never counts as host acceptance.
 
-- [ ] **Step 5: Commit acceptance coverage**
+- [ ] **Step 6: Commit acceptance coverage**
 
 ```bash
-git add apps/api/src/__tests__/snips/v2/lib.ts apps/api/src/__tests__/snips/v2/browser-local.test.ts apps/api/src/__tests__/snips/v2/scrape-browser.test.ts apps/api/src/__tests__/snips/v2/browser-real-codex.test.ts apps/api/package.json
+git add apps/api/src/__tests__/snips/v2/lib.ts apps/api/src/__tests__/snips/v2/browser-local.test.ts apps/api/src/__tests__/snips/v2/scrape-browser.test.ts apps/api/src/__tests__/snips/v2/browser-real-codex.test.ts apps/api/src/cli/browser-stale-contract-scan.ts apps/api/src/cli/browser-stale-contract-scan.test.ts apps/api/package.json
 apps/api/.husky/_/pre-commit
 git commit -m "test: cover local browser runtime" -m "Exercise direct Browser, replayed Interact, profiles, origins, grants,
 action coordination, stop, and restart against controlled fixtures.
 
 Define the real Codex smoke for durable actions, callback deduplication,
-and zero model-tool events."
+zero model-tool events, and checked stale-contract enforcement."
 ```
 
 ## Final verification for this plan
@@ -5285,35 +6152,26 @@ and zero model-tool events."
   snippets for permissive UUID/URL validators; expect only the shared local
   primitive definitions to call `.uuid()` and no bare `.url()`. Both sides
   reject uppercase UUIDs and file/mailto/ftp/credential URLs.
-- [ ] Scan this plan and generated contract sources for obsolete
-  `<root>/<namespace>`, `checkpoints/`, `BROWSER_STATE_NAMESPACE`,
-  `BROWSER_PROFILE_ROOT`, `z.object(...).strict()`, invalid TypeScript
-  `node --test` commands, PostgreSQL storage-state payload columns, split
-  activation wording, and missing `CodeRunResult`; expect no positive/stale
-  use outside explicit rejection scans and negative tests. Bare UUID
-  calls appear only inside the two shared `canonicalUuidSchema` definitions;
-  bare URL calls appear nowhere.
+- [ ] Run the Task 15 checked scanner and its mutation-fixture suite over every
+  exact product runtime/config/schema/controller/store/harness/Compose/env path
+  in its manifest. Expect all stale mutations to fail with their exact rule IDs
+  and real product tree to report zero findings. Negative tests and scanner
+  rule source are structurally excluded, never lexical exceptions. Within the
+  explicit browser-schema subset, bare UUID calls are AST-allowlisted only in
+  two named `canonicalUuidSchema` declarations and bare URL calls are absent;
+  direct `.strict(` calls are absent across the full product manifest.
 
   ```bash
-  ! rg -n 'BROWSER_STATE_NAMESPACE|BROWSER_PROFILE_ROOT|checkpoints/' \
-    apps/browser-service/src apps/api/src/lib/browser-runtime \
-    apps/api/src/lib/scrape-interact/browser-service-contracts.ts
-  ! rg -n 'z\.object\([^;]*\)\.strict\(\)|z\.string\(\)\.url\(\)|z\.url\(' \
-    apps/browser-service/src apps/api/src/lib/browser-runtime \
-    apps/api/src/lib/scrape-interact/browser-service-contracts.ts
-  test "$(rg -n 'z\.string\(\)\.uuid\(\)|z\.uuid\(' \
-    apps/browser-service/src apps/api/src/lib/browser-runtime \
-    apps/api/src/lib/scrape-interact/browser-service-contracts.ts | wc -l)" \
-    -eq 2
-  ! rg -n 'node --test[^" ]*.*\.test\.ts' \
-    apps/browser-service/package.json apps/api/package.json
-  ! rg -n 'storage_state_payload|storageStatePayload' \
-    apps/api/src/db/migrations/0007_browser_adapter_bindings.sql \
-    apps/api/src/db/schema/public.ts
-  rg -n 'export type CodeRunResult = z\.infer<typeof codeRunResultSchema>;' \
-    apps/api/src/lib/browser-runtime/protocol.ts
+  pnpm --dir apps/api exec vitest run \
+    src/cli/browser-stale-contract-scan.test.ts
+  pnpm --dir apps/api check:browser-stale-contracts
   ```
-- [ ] Run `0007_browser_adapter_bindings.sql` migration tests transactionally.
+- [ ] Run `0007_browser_control_generation.sql` migration and cross-process
+  race tests. Expect singleton/epoch/nonce/API identity constraints, exact
+  activation idempotency, newer takeover ordering, and a paused old mutation
+  to finish before epoch activation/snapshot; every later old mutation fails
+  before filesystem effect.
+- [ ] Run `0008_browser_adapter_bindings.sql` migration tests transactionally.
   Invalid/noncanonical legacy action job IDs fail preflight with zero data/DDL
   change. A populated valid legacy capability succeeds because `NOT NULL`
   drops before nulling; migration interrupts unfinished legacy runs, revokes
@@ -5369,14 +6227,29 @@ and zero model-tool events."
   harness/service retention owner.
 - [ ] With flag true and dependencies healthy, expect Browser lifecycle snips
   PASS; prompt/code remain typed unavailable until host adapter exists.
-- [ ] Restart Browser Service; expect nonce change closes API gate, old work is
-  interrupted, one reconciliation occurs, and gate reopens only after matching
-  ready nonce/digest.
+- [ ] On every first/API-only startup, require live discovery then one
+  idempotent control handoff before migrations or database recovery. Restart
+  only API after checkpoint/profile mutations; expect stable process nonce,
+  fresh generation, full old session/context/stream/grant/writer/working-copy
+  closure, changed digest reconciliation, old-API stale rejection, and ready
+  only for matching process/generation/digest. Every HTTP/WS stale response
+  synchronously closes only its matching API binding.
+- [ ] Lose handoff transport before/after service commit, crash the API process
+  before request send/after service mint, race two API instances, and restart
+  Browser Service during handoff. Same-process exact replay mints once; true
+  replacement uses a fresh tuple/full drain and may mint again; concurrent
+  takeover serializes; process change abandons old handoff; no database
+  recovery runs before confirmed service and durable mutation drains.
+- [ ] Restart Browser Service; expect process nonce change closes API gate,
+  completes a new handoff, then interrupts durable work and reconciles once.
+  A same-process generation change means this API was superseded: it closes
+  permanently and never retakes control automatically.
 - [ ] Inject partial reconciliation, lost response, API crash before gate open,
-  and service nonce change between attempts. Same-nonce attempts send
-  byte-identical body/digest and use cached success; nonce change reruns closed
-  recovery and captures one new immutable snapshot. Retry/backoff/budget/
-  cooldown stay bounded, and stop cannot reopen the gate.
+  and process change between attempts. Same-generation attempts send
+  byte-identical body/digest and use cached success; API replacement and
+  process change each perform a fresh handoff before closed recovery and one
+  new immutable snapshot. Retry/backoff/budget/cooldown stay bounded, and stop
+  cannot reopen the gate.
 - [ ] Inject reconciliation validation/planning errors; expect zero mutation.
   Inject rename/delete/fsync failures after execution starts; expect only the
   exact sorted plan prefix moved/deleted, all unrelated entries unchanged,
@@ -5446,14 +6319,19 @@ and zero model-tool events."
   must run it against active installed Codex under rolling capability gate
   before feature enablement.
 - Startup authority: Browser Service is live before API, but no Browser route
-  admits work until API recovery, one repeatable-read snapshot, reconciliation,
-  and matching ready health succeed for current process nonce. Retention starts
-  afterward and restart repeats same sequence. API and service share one direct
-  canonical root; existing `replay/...` paths remain unchanged.
+  admits work until API obtains a service-drained control generation before
+  migrations/recovery, captures one repeatable-read snapshot, reconciles, and
+  validates matching process/generation/digest ready health. `processNonce`
+  remains stable for service-process lifetime; API-only restart always mints a
+  new fenced generation. API and service share one direct canonical root;
+  existing `replay/...` paths remain unchanged.
 - Mutation drain: gate close rejects admission synchronously, then coordinator
-  awaits all unified filesystem/database mutation leases before recovery. Dead
-  cleanup-intent writers converge under exact process identity and CAS before
-  snapshot; live/unknown writers remain authoritative.
+  awaits local leases. Every durable lease additionally locks the singleton
+  database control epoch across filesystem effect and database CAS. New API
+  activation waits for old admitted mutations, then increments epoch so old
+  future mutations fail before filesystem effect. Dead cleanup-intent writers
+  converge under exact process identity and CAS before snapshot; live/unknown
+  writers remain authoritative.
 - Mutation coverage: session/profile/run transitions, actions, capabilities,
   grants, artifact attachment, stop, and controller-facing writes all use
   short gate leases. Public and internal code relay setup each hold one only
@@ -5463,11 +6341,12 @@ and zero model-tool events."
   races either drain known completion or recover conservatively.
 - Ownership and retries: API process alone owns operational, artifact, and
   browser-state retention plus recovery; harness owns only fresh disposable
-  process/container/root/database lifecycle. Each nonce cycle has 4 attempts
-  and 250/500/1,000 ms backoff; one startup budget spans nonce churn and each
-  runtime cycle has a 60-second budget plus 30-second cooldown.
-  One nonce cycle freezes one request body; same-nonce retries are byte-exact,
-  while nonce change reruns closed recovery and snapshot capture.
+  process/container/root/database lifecycle. Each handoff/reconciliation cycle
+  has 4 attempts and 250/500/1,000 ms backoff; one startup budget spans process
+  churn and each runtime cycle has a 60-second budget plus 30-second cooldown.
+  One control generation freezes one reconciliation body;
+  same-generation retries are byte-exact. Process change gets a new handoff;
+  stale generation permanently fences the superseded API.
 - Toolchain: every Browser Service install/test/build/start uses installed Node
   `22.22.1`, Corepack pnpm `10.33.0`, frozen lock, Playwright package/image
   `1.61.1`, production TypeScript parser `5.9.3`, exact direct dependencies,
@@ -5482,7 +6361,8 @@ and zero model-tool events."
   publication.
 - Contract drift: one canonical V1 inventory locks every route, field, type,
   bound, status, header, and response cap; Browser Service and API consume and
-  fingerprint it independently.
+  fingerprint it independently. Checked production-manifest scanning plus
+  positive mutation fixtures reject every named stale contract.
 - Reconciliation safety: complete authority validates before deletion; only
   recognized old orphans enter collision-free same-root quarantine preserving
   full source paths. Planning rejection changes nothing; execution failure may

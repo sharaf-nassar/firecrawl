@@ -8,8 +8,8 @@
 ## Context
 
 The Browser Service/API plan is the next stage after the durable browser-state
-foundation. Preflight found two execution hazards and one startup deadlock in
-the existing plan:
+foundation. Preflight found two execution hazards, one startup deadlock, and
+one restart-fencing gap in the existing plan:
 
 1. The active shell runs Node `25.8.2`, while the installed compatible runtime
    selected for this service is Node `22.22.1`. The active Node does not expose
@@ -22,6 +22,10 @@ the existing plan:
    service must not receive database credentials. Waiting for ready before the
    API starts, while also requiring the API to perform reconciliation, creates
    a readiness circle.
+4. A Browser Service process can outlive an API process. Reusing only its
+   stable process nonce prevents a restarted API from reconciling changed
+   durable state and leaves the old API able to mutate surviving Chromium
+   sessions, grants, streams, writers, and profile working copies.
 
 This addendum hardens those boundaries without changing the approved public
 Browser/Interact API, execute-once action model, private-network topology, or
@@ -37,6 +41,8 @@ disabled rollout default.
 - Make PostgreSQL remain the only authority for retained browser-state files.
 - Start Browser Service without database credentials, then reconcile it before
   any browser work can begin.
+- Fence every API process with a service-minted control generation obtained
+  only after complete Browser Service runtime drain.
 - Make restart, retry, filesystem cleanup, and failure behavior deterministic
   and fail closed.
 
@@ -133,9 +139,10 @@ specific version: [Playwright Docker](https://playwright.dev/docs/docker).
 Browser Service has these process-local startup states:
 
 ```text
-starting -> live_unreconciled -> reconciling -> ready
-                 ^                 |
-                 +------failed-----+
+starting -> live_unreconciled -> handing_off -> reconciling -> ready
+                 ^                  |             |
+                 +------failed------+----failed---+
+ready -> handing_off -> live_unreconciled
 ready -> draining -> stopped
 ```
 
@@ -143,37 +150,103 @@ ready -> draining -> stopped
 browser-state root checks passed. It does not permit session creation, profile
 publication, actions, artifacts, grants, streams, or Chromium launch.
 
-`ready` is process-local. It is valid only for the current service process
-nonce and one successfully reconciled snapshot digest. A service restart
-always returns to `live_unreconciled`; readiness is never loaded from disk.
+`ready` is process-local and generation-scoped. It is valid only for the
+current service process nonce, current control-generation nonce, and one
+successfully reconciled snapshot digest. An API takeover keeps the process
+nonce stable but closes admission, drains service runtime state, clears
+readiness/cache, and mints a new generation. A service restart changes process
+nonce, invalidates every generation, and returns to `live_unreconciled`;
+readiness is never loaded from disk.
 
-### Process nonce and health
+### Process nonce, control generation, and health
 
 At process start, Browser Service generates 32 random bytes using the operating
 system cryptographic RNG and encodes them as an unpadded, 43-character base64url
 `processNonce`. The nonce is never persisted or logged and changes on every
-process start.
+process start. It remains stable for that complete service-process lifetime;
+API-only restart never changes it.
+
+Each API process generates one canonical UUID `apiInstanceId`. For each
+observed Browser Service process, it also generates one 32-byte base64url
+idempotency key. Authenticated `POST /v1/control-generations` carries the
+observed process nonce and that exact pair. Browser Service closes admission
+synchronously, aborts in-flight reconciliation, clears readiness/cache, drains
+accepted work, closes/revokes every session, Chromium context, stream, relay
+grant, writer, timer, and uncommitted profile working copy, then generates a
+new random 32-byte base64url `controlGenerationNonce`. It returns only after
+the drain completes. Neither nonce is persisted or logged.
+
+Concurrent exact handoff joins one pending drain. Exact completed
+`(processNonce,apiInstanceId,idempotencyKey)` replay returns the prior result
+without another drain or mint. Reusing one identity/key with a different
+partner is `control_generation_conflict`. A different request during active
+handoff gets `control_generation_in_progress` with no extra effect and may
+retry after completion. A later different request performs a new full drain
+and generation handoff, fencing the prior API. A partial service drain or
+deadline observed before mint mints nothing; this leaves admission closed and
+exact retry resumes pending drain. Caller
+timeout/disconnect may happen after service cached a minted result, so exact
+replay returns that result without another mint.
+
+Accepted tuple/result tombstones remain process-local and non-evicting for
+service-process lifetime, capped at 1,024 distinct tuples. Exact known replay
+continues at capacity; an unknown tuple fails
+`control_generation_history_exhausted` without drain/mint and requires service
+restart for a fresh process namespace. After A then B handoff, replay A returns
+A's historical response but cannot replace current B generation.
 
 Both health routes use the same bearer key, correlation ID, and bounded
 deadline authentication as every private route. They are never public.
 
-- `GET /health/live` returns 200 in `live_unreconciled`, `reconciling`, or
-  `ready`, with strict `{ version: 1, status, processNonce }` JSON.
-- `GET /health/ready` returns 503 until reconciliation succeeds. Its strict
-  body includes `{ version: 1, status: "unready", processNonce, category }`.
+- Initial `GET /health/live` discovery returns 200 with strict
+  `{ version: 1, status, processNonce }` JSON and never reveals a generation.
+- After handoff, scoped live health requires both fencing headers and adds the
+  exact `controlGenerationNonce` to its strict response.
+- Generation-scoped `GET /health/ready` returns 503 until reconciliation
+  succeeds. Its strict body includes `{ version: 1, status: "unready",
+  processNonce, controlGenerationNonce, category }`. Missing/stale fencing
+  headers return the standard typed error envelope, never an unscoped health
+  body.
 - Once ready, `GET /health/ready` returns 200 with strict
-  `{ version: 1, status: "ready", processNonce, snapshotDigest }` JSON.
+  `{ version: 1, status: "ready", processNonce, controlGenerationNonce,
+  snapshotDigest }` JSON.
+
+Every private request after handoff, including scoped health, reconciliation,
+session, action, grant, artifact, stream, profile, and close, carries exact
+`x-firecrawl-process-nonce` and
+`x-firecrawl-control-generation-nonce` headers. Service validates both before
+body parsing, mutation, writer acquisition, or stream upgrade. Stale
+generation returns typed rejection with zero effect; an old API never learns
+the replacement generation from discovery health.
 
 No public browser ID, runtime session ID, relay grant, capability, path,
 checksum, service key, or database identifier appears in health responses.
 
-### Reconciliation endpoint
+### Control-generation and reconciliation endpoints
 
-Add authenticated `POST /v1/reconciliation`. Task 1 defines its strict Zod 4
-schemas and typed errors but does not mount the route or touch Chromium,
-PostgreSQL, or the filesystem. All objects use `z.strictObject()`; unknown
-fields fail. Zod 4 documents that strict objects reject unknown keys:
+Add authenticated `POST /v1/control-generations` and
+`POST /v1/reconciliation`. Task 1 defines their strict Zod 4 schemas and typed
+errors but does not mount routes or touch Chromium, PostgreSQL, or the
+filesystem. All objects use `z.strictObject()`; unknown fields fail. Zod 4
+documents that strict objects reject unknown keys:
 [Zod strict objects](https://zod.dev/api#strictobject).
+
+The control-generation request/result are:
+
+```ts
+type CreateControlGenerationV1 = {
+  version: 1;
+  processNonce: string;
+  apiInstanceId: string;
+  idempotencyKey: string;
+};
+type ControlGenerationV1 = {
+  version: 1;
+  processNonce: string;
+  controlGenerationNonce: string;
+  apiInstanceId: string;
+};
+```
 
 The request is:
 
@@ -181,6 +254,7 @@ The request is:
 type ReconciliationRequestV1 = {
   version: 1;
   processNonce: string;
+  controlGenerationNonce: string;
   snapshotDigest: string;
   references: Array<{
     kind:
@@ -196,7 +270,8 @@ type ReconciliationRequestV1 = {
 
 Bounds and canonical form are exact:
 
-- `processNonce` is unpadded base64url for exactly 32 bytes.
+- Both nonce fields and `idempotencyKey` are unpadded base64url for exactly
+  32 bytes; `apiInstanceId` is a canonical lowercase UUID.
 - `snapshotDigest` and every checksum are lowercase SHA-256 hex.
 - `id` is a canonical lowercase UUID.
 - `path` is root-relative, slash-separated UTF-8, at most 1,024 bytes, with no
@@ -206,9 +281,9 @@ Bounds and canonical form are exact:
   conflicting aliases reject the entire request.
 - The API sorts references by `kind`, then `id`, then `path`. It serializes a
   fixed-key, whitespace-free JSON object containing `version` and
-  `references`, excluding `processNonce` and `snapshotDigest`, and hashes those
-  UTF-8 bytes. Browser Service independently repeats this canonicalization and
-  rejects a digest mismatch.
+  `references`, excluding `processNonce`, `controlGenerationNonce`, and
+  `snapshotDigest`, and hashes those UTF-8 bytes. Browser Service independently
+  repeats this canonicalization and rejects a digest mismatch.
 
 The successful strict response is:
 
@@ -216,6 +291,7 @@ The successful strict response is:
 type ReconciliationResultV1 = {
   version: 1;
   processNonce: string;
+  controlGenerationNonce: string;
   snapshotDigest: string;
   retained: number;
   removed: number;
@@ -228,37 +304,64 @@ type ReconciliationResultV1 = {
 Reconciliation inspects at most 25,000 managed filesystem entries in addition
 to the 25,000 request references; exceeding either cap fails before deletion.
 Response counts are nonnegative safe integers no greater than 25,000 each. API
-accepts the result only when nonce and digest equal its request and all result
-fields pass the closed schema.
+accepts the result only when process nonce, generation nonce, and digest equal
+its request and all result fields pass the closed schema.
 
-The authenticated service key proves the caller is the API. The nonce binds a
-request to one live Browser Service process; it is not a caller capability.
-Wrong, stale, or malformed nonces return `reconciliation_nonce_mismatch` and
-cannot alter the filesystem or readiness.
+The authenticated service key proves the caller is an API. Process nonce binds
+to one live Browser Service process; control generation fences API ownership.
+Wrong, stale, or malformed process/generation values return
+`reconciliation_nonce_mismatch` or `control_generation_mismatch` and cannot
+alter filesystem or readiness.
 
-For one process nonce:
+For one process/control generation:
 
 - First successful digest becomes the ready digest.
-- Exact same nonce and digest retry returns the cached successful result and
+- Exact same process/generation/digest retry returns cached successful result and
   performs no second deletion.
-- Same nonce with a different digest returns
+- Same process/generation with a different digest returns
   `reconciliation_conflicting_replay`, leaves current readiness unchanged, and
   performs no filesystem work.
+- A completed new generation under the same process permits a new digest only
+  because handoff proved all prior service runtime closed and cleared cache.
 - A failed attempt is not cached as success. Exact retry may finish recovery
   from its safe quarantine state.
 
 ### API snapshot authority
 
 API owns the reconciliation coordinator. Browser Service receives no database
-client. Before snapshot capture, API runs migrations and existing browser
-startup recovery so unfinished runs/sessions become interrupted, capabilities
-and grants are revoked, and dead writer leases are cleared.
+client. On every enabled API startup, including first startup, API first keeps
+its gate closed, discovers process-only live health, and completes one control
+handoff. Only after Browser Service confirms its complete runtime drain may API
+run migrations and existing browser startup recovery so unfinished durable
+runs/sessions become interrupted, capabilities and grants are revoked, and
+dead writer leases are cleared. API never claims Chromium interruption from
+database recovery; handoff proves service runtime closure first.
 
-The API keeps a closed `BrowserStartupGate` during recovery, snapshot capture,
-and reconciliation. While closed, all Browser/Interact creation or execution
+The API keeps a closed `BrowserStartupGate` during handoff, migrations,
+recovery, snapshot capture, and reconciliation. While closed, all
+Browser/Interact creation or execution
 returns typed `browser_state_unavailable`; browser-state retention and every
 browser filesystem/database mutator wait. No cloud, Gemini, or stateless
 fallback is allowed.
+
+Service fencing alone cannot stop a paused old API from resuming a local
+filesystem/database mutation. Migration
+`0007_browser_control_generation.sql` therefore creates one singleton durable
+fence with positive monotonic database epoch, process nonce, control-generation
+nonce, API instance UUID, and activation timestamp. After handoff and
+migrations but before recovery, new API locks this row, verifies proposed
+generation through scoped service health while lock is held, increments epoch,
+commits, and verifies scoped health again. A superseded handoff cannot recover
+or open its gate.
+
+Every browser-state durable mutator begins a database transaction, locks that
+singleton row `FOR UPDATE`, requires exact API/process/generation/epoch, and
+holds lock/transaction across all filesystem effects plus matching database
+CAS. New generation activation therefore waits for a previously admitted old
+mutation to finish; its result is included in later snapshot. After epoch
+increment, every old mutation fails before filesystem effect even if old API's
+process-local gate has not yet observed service rejection. Process-local gate
+remains immediate admission optimization, never sole cross-process fence.
 
 API then opens a read-only `REPEATABLE READ` PostgreSQL transaction and reads
 all nondeleted file authorities:
@@ -277,8 +380,8 @@ truncated.
 
 The closed gate makes the committed snapshot stable until reconciliation
 finishes. Only after API validates a successful response and authenticated
-`/health/ready` reports the same nonce/digest may it open browser work and
-start browser retention.
+`/health/ready` reports the same process/generation/digest may it open browser
+work and start browser retention.
 
 ## Filesystem reconciliation
 
@@ -300,11 +403,14 @@ working, or checkpoint entry older than the existing 10-minute grace period.
 Unknown names fail readiness and are never guessed or deleted.
 
 Removal first atomically renames each candidate within the same canonical root
-to a nonce-scoped quarantine name, fsyncs the parent, then deletes the
-quarantine entry and fsyncs again. A partial failure leaves readiness false;
-retry with the same nonce/digest can continue idempotently. Readiness flips to
-true exactly once, only after the whole validated plan completes. No cleanup is
-started from a partial, stale, wrong-nonce, or conflicting snapshot.
+to `quarantine/<processNonce>/<controlGenerationNonce>/<full-source-path>`,
+fsyncs the parent, then deletes the quarantine entry and fsyncs again. A
+partial failure leaves readiness false; retry with the same
+process/generation/digest can continue idempotently. A later generation may
+validate and finish an old-generation quarantine only after its complete new
+authority snapshot proves the original path is unreferenced. Readiness flips
+to true exactly once, only after the whole validated plan completes. No cleanup
+starts from a partial, stale, wrong-generation, or conflicting snapshot.
 
 Once the API opens its gate, normal retention again owns cleanup-intent files
 and database compare-and-set updates. Browser Service startup reconciliation
@@ -317,36 +423,75 @@ Compose and harness use this order:
 
 1. Start Browser Service privately and wait only for authenticated live health.
 2. Start API with browser work and browser retention gated.
-3. API opens PostgreSQL, applies migrations, and runs startup recovery.
-4. API reads `processNonce`, captures and commits one consistent snapshot, and
-   posts it with service authentication, correlation ID, and bounded deadline.
-5. Browser Service validates all authorities, reconciles the filesystem, and
-   returns counts plus the canonical digest.
-6. API verifies the response and authenticated ready health, then opens browser
-   work and starts browser retention.
+3. API discovers `processNonce`, generates one process-lifetime
+   `apiInstanceId` plus one handoff idempotency key, and posts the authenticated
+   control-generation request.
+4. Browser Service closes admission synchronously, aborts reconciliation,
+   clears ready/cache, fully drains service runtime, then returns a newly
+   minted `controlGenerationNonce` with the unchanged process nonce.
+5. Only after confirmed handoff, API opens PostgreSQL, applies migrations,
+   activates its durable singleton control epoch after older mutations drain,
+   and runs startup recovery under its closed/drained gate.
+6. API captures and commits one consistent snapshot and posts it with both
+   nonces, service authentication, correlation ID, and bounded deadline.
+7. Browser Service validates generation and authorities, reconciles the
+   filesystem, and returns counts plus matching process/generation/digest.
+8. API verifies response and scoped ready health, then opens browser work and
+   starts browser retention.
 
-The reconciliation request uses the private request deadline capped at 60
-seconds. Timeout, transport loss, authentication failure, database error,
+Handoff and reconciliation use private request deadlines capped at 60 seconds
+inside one startup budget. Pre-mint drain timeout/partial failure keeps gate
+closed and retries exact API identity/idempotency tuple; response loss after
+mint recovers cached result through the same replay. Database recovery
+cannot start before confirmed drain. Process change abandons the old handoff
+and restarts discovery. Transport loss, authentication failure, database error,
 invalid response, or unready result keeps the gate closed. Compose/harness
-startup fails after its bounded retry budget and performs registered cleanup.
+startup fails after bounded retries and performs registered cleanup.
 
-API continuously checks the authenticated ready nonce. If Browser Service
-restarts, the changed nonce closes the gate immediately. API repeats startup
-recovery and reconciliation under a single-process mutex before reopening it.
-No existing session is resumed. Simultaneous detection coalesces into that one
-attempt.
+API continuously checks authenticated scoped ready identity. If Browser
+Service restarts, changed process nonce closes the gate immediately; API
+performs a new handoff before recovery and reconciliation under one mutex. If
+process stays stable but generation changes, another API took control: old API
+closes permanently, stops browser retention/monitoring, and never retakes
+control automatically. Every later private request from it receives typed
+stale-generation rejection. Required client-wide mismatch handling invokes
+that close synchronously for every HTTP response, artifact stream, and
+WebSocket upgrade, but compares rejected binding so a late old response cannot
+close a newer local binding. No existing session resumes. Simultaneous
+detection coalesces.
+
+Every API-only restart performs a fresh handoff before migrations/recovery,
+even when Browser Service process nonce is unchanged. This closes lingering
+Chromium/session/grant/writer/stream state and permits a changed snapshot digest
+under the new generation without weakening same-generation conflicting replay.
+Same-process transport/response loss is safe because exact tuple replay is
+idempotent. A true API-process crash loses its process-local tuple; replacement
+API deliberately uses a fresh tuple and full handoff. If prior process already
+caused a mint, replacement causes a second safe drain/mint, not replay of lost
+identity. Concurrent takeovers serialize; later completed takeover fences the
+earlier API.
 
 On graceful Browser Service shutdown, it enters `draining`, rejects new work,
 finishes or classifies in-flight work through the existing ordered shutdown,
 closes Chromium, and never changes the reconciliation snapshot. Forced
 shutdown cannot promote or delete a generation. A replacement process has a
-new nonce and must reconcile again.
+new process nonce, no control generation, and must hand off then reconcile.
+Graceful API shutdown first closes/drains its API gate, uses its current
+generation to close owned service resources, and stops monitoring without
+minting another generation. If already superseded, those scoped close requests
+receive stale-generation rejection and cannot affect the new owner. API crash
+leaves cleanup to next startup handoff.
 
 ## Failure categories and logging
 
 Private typed categories include:
 
 - `browser_service_runtime_mismatch`
+- `control_generation_required`
+- `control_generation_in_progress`
+- `control_generation_conflict`
+- `control_generation_mismatch`
+- `control_generation_history_exhausted`
 - `reconciliation_required`
 - `reconciliation_nonce_mismatch`
 - `reconciliation_conflicting_replay`
@@ -361,7 +506,7 @@ Private typed categories include:
 Public API maps all reconciliation/startup failures to the existing sanitized
 `browser_state_unavailable` response. Logs are bounded structured records with
 category, correlation ID, state, aggregate counts, duration, and success/fail
-status. They never include paths, reference IDs, checksums, nonce, bearer key,
+status. They never include paths, reference IDs, checksums, either nonce, bearer key,
 database URL, private service URL, profile name, public browser ID, capability,
 or relay grant. Error causes are reduced to allowlisted categories before
 logging.
@@ -371,9 +516,9 @@ logging.
 ### Task 1
 
 Task 1 adds exact package metadata, Node/pnpm preflight, frozen lock workflow,
-strict reconciliation request/result and health schemas, typed errors, private
-authentication, and tests. It does not start Express, Chromium, PostgreSQL,
-Compose, or filesystem reconciliation.
+strict handoff/reconciliation request/result and discovery/scoped-health
+schemas, typed errors, private authentication, and tests. It does not start
+Express, Chromium, PostgreSQL, Compose, or filesystem reconciliation.
 
 Use Zod 4 `z.strictObject()` instead of legacy `.strict()` for new closed
 objects. Express remains major version 5; its official API supports Node 18 and
@@ -382,40 +527,59 @@ newer, so selected Node 22 is supported:
 
 ### Task 3 before profile readiness
 
-Task 3 implements the process nonce, reconciliation engine, quarantine-safe
-filesystem plan, and readiness latch before session/profile registry can
-become ready. Profile/session creation remains impossible until reconciliation
-succeeds. Its tests use fixture roots and injected snapshots; no database
+Task 3 implements stable process nonce, control-generation state/idempotency,
+generation-scoped reconciliation cache, quarantine-safe filesystem plan, and
+readiness latch before session/profile registry can become ready.
+Profile/session creation remains impossible until handoff and reconciliation
+succeed. Its tests use fixture roots and injected snapshots; no database
 credentials enter Browser Service.
 
-### Task 5
+### Task 6
 
-Task 5 mounts authenticated live, ready, and reconciliation routes, applies
-body/deadline bounds, connects ready state to server admission, and implements
-ordered shutdown. Its Dockerfile resolves and pins the Playwright digest,
-preserves exact Node `22.22.1`, installs from the frozen lock, and adds image
-reproducibility/version tests.
+Task 6 mounts authenticated discovery, control-generation, scoped health,
+reconciliation, and browser routes; applies fencing/body/deadline bounds;
+connects ready state to server admission; wires full runtime takeover drain;
+and implements ordered shutdown. Its Dockerfile resolves and pins Playwright
+digest, preserves exact Node `22.22.1`, installs from frozen lock, and adds
+image reproducibility/version tests.
 
-### API client task
+### Tasks 7 and 8
 
-The typed Browser Service client adds closed live/ready/reconcile methods. API
-adds the startup gate, repeatable-read snapshot loader, recovery ordering, and
-nonce-change re-reconciliation. This work lands before controllers can accept
-browser work.
+Task 7 typed Browser Service client adds closed discovery, handoff,
+generation-scoped health, and reconciliation methods plus automatic fencing
+headers for every later private request. Task 8 adds startup gate,
+pre-migration handoff, `0007_browser_control_generation.sql`, durable
+cross-process mutation leases, repeatable-read snapshot loader, recovery
+ordering, API-only restart fencing, and process-change re-handoff/
+reconciliation. This work lands before controllers can accept browser work.
 
-### Task 12
+### Task 14
 
-Task 12 no longer waits for ready before API spawn. Harness and Compose first
-wait for authenticated live health, then API performs reconciliation, then the
-orchestrator waits for API-confirmed Browser Service readiness. Cleanup remains
-registered before the first health wait. Only API publishes a host port.
+Task 14 no longer waits for ready before API spawn. Harness and Compose first
+wait for authenticated process-only live health, then API performs handoff,
+migrations/recovery, and reconciliation before the orchestrator waits for
+API-confirmed scoped readiness. Harness also covers API-only restart while
+Browser Service stays alive. Cleanup remains registered before first health
+wait. Only API publishes a host port.
+
+### Task 15
+
+Task 15 owns the checked stale-contract scanner and its positive mutation
+fixtures. Its explicit product manifest covers every planned Browser
+Service/API runtime, config, schema, controller, store, harness, Compose, and
+environment file while structurally excluding negative test fixtures and the
+scanner's own rule-literal source. AST-aware browser-schema/alias checks plus
+bounded SQL/text rules prevent permissive validators, legacy root layers,
+duplicate database storage payloads, split activation, and stale code-result
+contracts from passing acceptance silently.
 
 ### Host plan follow-up
 
-Before executing host plan Task 5, revise stale Codex `0.144.5` pins to consume
-the approved rolling installed-Codex contract. Keep model, reasoning effort,
-schema, safety, lifecycle, and capability gates pinned; do not restore an exact
-Codex CLI version requirement.
+Before executing Task 5 of
+`2026-07-19-browser-host-execution-and-operations.md`, revise stale Codex
+`0.144.5` pins to consume the approved rolling installed-Codex contract. Keep
+model, reasoning effort, schema, safety, lifecycle, and capability gates
+pinned; do not restore an exact Codex CLI version requirement.
 
 ## Tests and acceptance
 
@@ -427,13 +591,26 @@ New tests in the implementation plan must prove:
   or missing lock fails;
 - Playwright package, lock, image tag, immutable digest, and built runtime all
   match `1.61.1`, including a no-cache rebuild;
-- live health succeeds before reconciliation while ready health and every
-  browser route fail closed;
-- health and reconciliation reject missing auth, expired deadlines, unknown
-  fields, malformed nonce/hash/path, excess references, and excess bytes;
-- stale/wrong nonce and conflicting same-nonce replay perform zero filesystem
-  changes;
-- exact same nonce/digest retry is idempotent and returns the same result;
+- process-only live discovery succeeds before handoff while scoped health,
+  ready health, and every browser route fail closed;
+- handoff, health, and reconciliation reject missing auth, expired deadlines,
+  unknown fields, malformed process/generation/idempotency/hash/path values,
+  excess references, and excess bytes;
+- handoff mints a generation only after closing every old service runtime
+  resource and clearing readiness/cache while process nonce remains stable;
+- exact API identity/idempotency replay mints once; conflicting/concurrent
+  takeover fails closed and later completed takeover fences prior API;
+- A→B→replay-A returns historical A without changing current B; tuple history
+  capacity accepts known replay and rejects unknown takeover without eviction;
+- every later private route rejects stale process/generation before effects;
+- every client HTTP/WS mismatch synchronously closes only matching API binding;
+- new durable epoch activation waits for a paused old filesystem/database
+  mutation, snapshots its completed result, then rejects old future mutations
+  before filesystem effect;
+- stale/wrong generation and conflicting same-generation replay perform zero
+  filesystem changes;
+- exact same process/generation/digest retry is idempotent and returns same
+  result;
 - one repeatable-read snapshot includes checkpoints, profile generations,
   active/latest generations, and unresolved cleanup intents;
 - missing or corrupt authoritative files cause zero deletion and remain
@@ -442,20 +619,28 @@ New tests in the implementation plan must prove:
   checksum aliases fail closed;
 - only recognized, unreferenced entries older than 10 minutes enter quarantine;
 - partial quarantine/delete failure remains unready and exact retry completes;
-- API opens browser work and retention only after matching response and ready
-  health nonce/digest;
-- service restart changes nonce, closes the API gate, interrupts old runtime
-  work, and requires reconciliation again;
+- no database migration/recovery/snapshot begins before confirmed service
+  handoff drain; API opens browser work/retention only after matching
+  process/generation/digest response and ready health;
+- API-only restart after checkpoint/profile mutation keeps process nonce,
+  drains lingering Chromium/session/grant/writer/stream state, mints a new
+  generation, accepts changed digest, and rejects old API requests;
+- same-process lost response replays one tuple without duplicate mint; true API
+  crash replacement uses a fresh tuple/full handoff and may safely mint again;
+  service restart during handoff causes no premature recovery;
+- service restart changes process nonce, closes API gate, performs new handoff,
+  interrupts durable work, and requires reconciliation again;
 - graceful and forced shutdown never promote an orphan or delete a referenced
   generation;
-- logs contain aggregate metadata but no path, nonce, checksum, key, URL,
+- logs contain aggregate metadata but no path, either nonce, checksum, key, URL,
   capability, grant, or browser identity.
 
-Acceptance also runs Task 1 focused tests/build, Task 3 reconciliation/profile
-tests, Task 5 server/image tests, API client/startup tests, Task 12 harness and
-Compose checks, the actual repository hook, and a clean-tree check. Tests use
-Node `22.22.1` and the frozen install. Browser Service remains private and
-disabled by default.
+Acceptance also runs Task 1 focused tests/build, Task 3
+generation/reconciliation/profile tests, Task 6 server/image tests, Tasks 7
+and 8 client/startup tests, Task 14 harness/Compose checks, Task 15 checked
+stale-contract scanner/mutation fixtures, actual repository hook, and a
+clean-tree check. Tests use Node `22.22.1` and frozen install. Browser Service
+remains private and disabled by default.
 
 ## Rejected alternatives
 
@@ -467,12 +652,14 @@ and lets a browser-owning process make retention decisions directly.
 ### Let Browser Service become ready before reconciliation
 
 Rejected. Sessions could observe or delete state before PostgreSQL authority is
-known, making restart safety timing-dependent.
+known, and an old API would remain unfenced. Control handoff must first drain
+runtime; reconciliation then establishes generation-scoped readiness.
 
 ### Have Compose wait for ready before starting API
 
 Rejected. API is the only component allowed to read the authoritative database
-snapshot, so this recreates the readiness circle.
+snapshot, so this recreates the readiness circle and skips required API
+control handoff.
 
 ### Send public browser IDs or capabilities in the snapshot
 
@@ -494,4 +681,6 @@ the grace period are eligible.
 ### Cache failed reconciliation as terminal
 
 Rejected. Quarantine cleanup is intentionally retryable. Only a successful
-nonce/digest result is cached; conflicting replay remains a hard failure.
+process/generation/digest result is cached; conflicting replay inside that
+generation remains a hard failure. New generation is allowed only after full
+service drain clears prior cache/readiness.
