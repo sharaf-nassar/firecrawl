@@ -365,20 +365,29 @@ type ReconciliationResultV1 = {
 ```
 
 Reconciliation inspects at most 25,000 managed filesystem entries in addition
-to the 25,000 request references. One global counter includes each managed
-namespace root and increments as each descendant file or directory is yielded
-from `replay/`, `profiles/`, or `quarantine/`, including nested profile content,
-plan manifests, temporary files, and completion markers. On entry 25,001 it
-aborts before stat, open, read, or hash of that entry. Walk depth is at most 64;
-every relative path is at
+to the 25,000 request references. Enumerate directories iteratively with
+`fs.opendir` and an explicit `bufferSize` no greater than 32; never use a
+whole-directory `readdir`. Below the cap, charge each non-null `Dirent`
+immediately after `Dir.read()` returns and before yielding or processing it. At
+the cap, permit a `Dir.read()` lookahead only to distinguish uncharged EOF from
+overflow. A non-null overflow result fails immediately and is never
+yielded, inspected for name/type by application code, retained, sorted, statted,
+opened, content-read, hashed, planned, or mutated. Fixed-buffer Node/libuv
+prefetch remains bounded and is outside the processed-entry count. Here and
+below, "read" in a prohibited downstream operation means file-content read,
+not the single enumeration lookahead. Walk depth is at most 64; every relative
+path is at
 most 1,024 UTF-8 bytes and every segment at most 255 UTF-8 bytes. Checkpoint
 files must be at most 2 MiB before read. Each profile file is at most 64 MiB and
 one generation tree at most 256 MiB, enforced while streaming the walk.
-The counter is created once per reconciliation and never reset. Charge each
-managed namespace root exactly once and each descendant when yielded; EOF and
-absent-entry probes do not charge. Descendant entries are never deduplicated
-across authority, enumeration, identity, revalidation, recovery, or retry walks,
-which all consume the same total.
+The counter is created once per reconciliation and never reset. A set keyed by
+`replay`, `profiles`, and `quarantine` charges each successfully entered managed
+namespace root exactly once globally; ENOENT roots, absent-entry probes, and EOF
+lookaheads do not charge. Repeated descendant walks recharge every non-null
+yielded descendant across authority, enumeration, identity, revalidation,
+recovery, and retry walks, which all consume the same total. This filesystem
+traversal budget is independent of the separate 25,000-entry captured-workset
+cardinality bound.
 Exceeding any bound fails before deletion.
 Response counts are nonnegative safe integers no greater than 25,000 each. API
 accepts the result only when process nonce, generation nonce, and digest equal
@@ -952,12 +961,14 @@ New tests in the implementation plan must prove:
 - Task 3 and Task 4 share exact UTF-8-sorted type/mode/size/content-SHA tree
   encoding and enforce depth 64, checkpoint 2 MiB, profile-file 64 MiB,
   profile-tree 256 MiB, and path/segment bounds during walks;
-- the global managed-entry counter includes every nested namespace and manifest
-  entry and stops at 25,001 before stat/read/hash; descendant maximum mtime,
-  not generation-root mtime, controls the 10-minute grace period;
-- a positive traversal fixture with exactly 25,000 charged entries succeeds,
-  entry 25,001 fails before probing it, each managed namespace root charges
-  once, and EOF or absent-entry probes never charge;
+- the global managed-entry counter includes every yielded nested namespace and
+  manifest entry; a non-null overflow lookahead fails with zero downstream
+  processing, while descendant maximum mtime controls the 10-minute grace;
+- a positive traversal fixture with exactly 25,000 charged entries plus an EOF
+  lookahead succeeds. Overflow performs one non-null lookahead but never yields,
+  inspects, retains, sorts, stats, opens, content-reads, hashes, plans, or
+  mutates it; `bufferSize <= 32`, each root charges once, repeated descendant
+  walks recharge descendants, and EOF/ENOENT probes never charge;
 - procfd-anchored held directory handles survive ancestor symlink swaps; every
   non-cleanup filesystem await has before/after admission checks, while raw
   finally closes all handles after abort;

@@ -2054,12 +2054,16 @@ portably:
 - canonical profile-tree fixtures assert raw UTF-8 path order and exact fixed-
   key entry JSON, mode, size, content SHA, final tree SHA, NFC/path/segment
   bounds, and Task 4 checksum reuse;
-- one positive traversal fixture with exactly 25,000 charged entries succeeds;
-  would-be entry 25,001 stops before its stat/open/read/hash, each managed
-  namespace root charges exactly once, and EOF or absent-entry probes do not
-  charge; depth 65 stops before descending; a checkpoint declared above 2 MiB
-  stops before read; one profile file above 64 MiB or cumulative profile bytes
-  above 256 MiB stops while walking, before later entries are read;
+- one positive traversal fixture with exactly 25,000 charged entries plus one
+  EOF lookahead succeeds. Overflow performs one non-null `Dir.read()` lookahead
+  but application code performs zero name/type inspection, yield, retain, sort,
+  stat, open, content read, hash, plan, or mutation on it. Assert iterative
+  `fs.opendir`, explicit `bufferSize <= 32`, no whole-directory `readdir`, each
+  managed root charged once through the global root set, repeated descendant
+  walks recharged per yielded descendant, and EOF/ENOENT probes uncharged. Depth
+  65 stops before descending; a checkpoint declared above 2 MiB stops before
+  content read; one profile file above 64 MiB or cumulative profile bytes above
+  256 MiB stops while walking, before later entries are content-read;
 - deletion eligibility uses maximum descendant mtime; a young nested file keeps
   an otherwise old generation, while all descendants older than 10 minutes
   permit planning;
@@ -2338,12 +2342,23 @@ a checkpoint envelope on disk.
 Create one global managed-entry counter per reconciliation and never reset it.
 Authority walks, namespace enumeration, candidate identity walks, planning
 revalidation, manifest recovery, and retry-phase validation all consume from
-the same 25,000 total. Charge each managed namespace root exactly once and each
-descendant file/directory when yielded, including plan manifests, temp files,
-completion markers, and profile descendants. EOF and absent-entry probes do not
-charge; yielded descendants are not deduplicated across walks. On entry 25,001
-abort before its stat/open/read/hash. Test-only lower limits may exercise
-boundaries; production callers cannot raise exact caps. Only after all
+the same 25,000 total. Enumerate iteratively with `fs.opendir` and an explicit
+`bufferSize` no greater than 32; never use whole-directory `readdir`. Below the
+cap, charge each non-null `Dirent` immediately after `Dir.read()` and before any
+yield or processing. At the cap, permit a `Dir.read()` lookahead only to
+distinguish uncharged EOF from overflow. A non-null overflow fails immediately
+and is never yielded, name/type-inspected by application code, retained, sorted,
+statted, opened, content-read, hashed, planned, or mutated. Node/libuv prefetch
+is bounded by the fixed buffer and remains outside the processed-entry count.
+
+A set keyed by `replay`, `profiles`, and `quarantine` charges each successfully
+entered managed root exactly once globally. ENOENT roots, absent-entry probes,
+and EOF lookaheads do not charge. Repeated descendant walks recharge every
+non-null yielded descendant, including plan manifests, temp files, completion
+markers, and profile descendants. In this budget, "read" means file-content
+read, not enumeration lookahead. Test-only lower limits may exercise boundaries;
+production callers cannot raise exact caps. This filesystem traversal budget is
+independent of the separate captured-workset cardinality cap. Only after all
 authorities pass may enumeration proceed into deletion planning.
 Retain every reference, including cleanup intents and active/latest profile
 generations supplied by API. Eligible deletion requires recognized ownership,
@@ -2570,10 +2585,11 @@ and exact completion equality, completed-cleanup absent-suffix restart and
 ancestor-replacement rejection, current-only plan entries, pending-only
 aggregate count persistence at exact 25,000/25,001 bounds, historical-count
 exclusion, limited completion-only cleanup without extra records, positive
-exact-cap filesystem traversal, every rename/delete/fsync/completion crash
-phase, old-manifest recovery, deterministic counts, abort-time handle closure,
-namespace isolation, and redaction; build PASS. Only the four Task 3 files above
-are implementation scope.
+exact-cap filesystem traversal with bounded iterative `fs.opendir`, EOF/overflow
+lookahead, zero overflow processing, and root/descendant charging, every rename/
+delete/fsync/completion crash phase, old-manifest recovery, deterministic
+counts, abort-time handle closure, namespace isolation, and redaction; build
+PASS. Only the four Task 3 files above are implementation scope.
 
 - [ ] **Step 7: Commit startup reconciliation**
 
