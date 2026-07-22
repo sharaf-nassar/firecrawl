@@ -666,12 +666,17 @@ rule scanning. Checked `browser_schema`, `reviewed_non_browser_schema`, and
 `non_schema` source roles derive from browser-owned roots, followed edges, and
 exact reviewed boundaries. Every newly discovered browser schema receives URL/
 UUID checks; unclassified schema-bearing or changed reviewed boundaries fail
-before rule scanning. Temporary schema fixtures inject their role explicitly,
-so schema-only validators are not incorrectly required to fail arbitrary
-non-schema helpers. AST-aware browser-schema/alias checks plus bounded SQL/text
-rules prevent permissive validators, legacy root layers, duplicate database
-storage payloads, split activation, and stale code-result contracts from
-passing acceptance silently.
+before rule scanning. Temporary workspaces run the real CLI pipeline with no
+source-role injection: one newly discovered browser-root schema and one schema
+outside roots reached through checked `browser_follow` metadata must both
+derive `browser_schema` before producing exact URL/UUID findings. Ordinary
+discovered and followed controls must derive `non_schema` and produce no
+schema-only findings. Tests assert normalized inventory and derived roles
+before findings, so broken discovery-to-role propagation fails acceptance.
+AST-aware browser-schema/alias checks plus bounded SQL/text rules prevent
+permissive validators, legacy root layers, duplicate database storage payloads,
+split activation, and stale code-result contracts from passing acceptance
+silently.
 
 ### Host plan follow-up
 
@@ -757,9 +762,13 @@ New tests in the implementation plan must prove:
 - scanner CommonJS/import-equals fixtures close local two-hop helpers and
   `.cjs`/`.mjs` mappings, allow literal external packages without recursion,
   and fail unresolved local or nonliteral unprovable module references;
-- scanner schema-role fixtures apply bare URL/UUID checks to injected and newly
-  discovered `browser_schema` files, do not apply them to proven `non_schema`
-  helpers, and fail unclassified schema-bearing sources before rule scanning;
+- scanner schema-role fixtures use the real CLI with no role override; assert a
+  discovered browser-root schema and an outside-root schema reached through a
+  checked `browser_follow` edge enter inventory and derive `browser_schema`
+  before exact bare URL/UUID findings;
+- scanner role controls enter the same production-derived inventory as
+  `non_schema` and produce no schema-only findings; unclassified schema-bearing
+  sources and broken discovery-to-role propagation fail before rule scanning;
 - logs contain aggregate metadata but no path, either nonce, checksum, key, URL,
   capability, grant, or browser identity.
 

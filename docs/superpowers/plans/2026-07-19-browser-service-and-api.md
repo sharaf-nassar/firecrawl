@@ -6556,9 +6556,15 @@ boundaries; files with no schema-bearing AST become `non_schema`. A schema-
 bearing source with no deterministic role, a reviewed file that disappears or
 stops matching its declared boundary, or a browser-owned schema forced into a
 non-browser role fails `inventory_schema_role_unclassified` before rule
-scanning. The pure scanner accepts an injected normalized source-role map for
-temporary fixtures; production CLI always derives and validates the checked
-policy above.
+scanning. Production and fixture runs use the same role derivation; no caller
+may inject, replace, or override normalized source roles.
+
+Expose the real CLI's normalized inventory and derived source roles in its
+structured result before findings are evaluated. Temporary-workspace tests run
+that CLI pipeline against checked fixture discovery roots, bridge
+classifications, and exact boundaries. They assert inventory membership and
+derived role first, then exact findings, so a discovery/closure success paired
+with broken role propagation cannot accidentally pass rule assertions.
 
 Reviewed exclusions may identify only tests/negative fixtures, snips, the
 scanner's own rule-literal source, generated files, or vendor trees. Each exact
@@ -6620,9 +6626,28 @@ directory discovery nor import closure silently omits it. Include plain,
 payload, JSON, arbitrary-suffix snake/camel database columns, multiline
 `.strict\n  (`, direct `.strict (`, and quoted/backtick/backslash checkpoint
 segments. Test schema-only URL/UUID rules with temporary sources explicitly
-classified `browser_schema` through the injected role map. The identical
-source classified `non_schema` produces no schema-only finding; omitting a
-role for schema-bearing source fails before rule scanning.
+discovered through the real production CLI pipeline, never a role override.
+Create a new file under
+`apps/browser-service/src/discovered/schema-contract.ts` that imports Zod,
+exports one strict schema, and contains both bare `.url()` and `.uuid()` calls.
+Assert normalized inventory contains it, production derivation labels it
+`browser_schema`, then assert exact `bare_url_validator` and
+`bare_uuid_validator` findings for that path and line.
+
+Create a second Zod schema helper outside configured roots and reach it only
+through an exact checked `browser_follow` bridge import/re-export. Supply the
+same production bridge-classification metadata and exported schema shape the
+real scanner consumes, not test-only source-role data. Assert closure includes
+the helper once, its derived role is `browser_schema`, and both exact validator
+findings occur. Removing or changing the follow classification must fail the
+inventory boundary before role/rule scanning.
+
+Add discovered-root and browser-follow controls that export ordinary
+non-schema helpers and use unrelated `.url()`/`.uuid()` method names without a
+Zod schema-bearing AST. Through the same CLI result, assert both controls are
+present, derive as `non_schema`, and produce neither schema-only rule. A
+schema-bearing source whose role cannot be derived still fails
+`inventory_schema_role_unclassified` before rule scanning.
 
 Separate closure fixtures cover two-hop imports, re-exports, string-literal
 dynamic imports, local literal `require`, TypeScript import-equals, tsconfig
@@ -6667,7 +6692,9 @@ pnpm --dir apps/api check:browser-stale-contracts
 Expected: every directory/import mutation proves its stale category fails,
 all closure forms resolve, exclusions stay exact, required/task-touched paths
 are covered, and the real discovered/import-closed production inventory exits
-0.
+0. Full-CLI fixture output proves discovered and browser-followed schemas enter
+inventory, derive `browser_schema`, and produce exact URL/UUID findings;
+ordinary controls derive `non_schema` with no schema-only finding.
 
 - [ ] **Step 5: Run deterministic regression**
 
@@ -6735,9 +6762,12 @@ zero model-tool events, and checked stale-contract enforcement."
   structural exclusions. Checked source roles classify every schema-bearing
   file; bare UUID calls in `browser_schema` sources are AST-allowlisted only in
   two named `canonicalUuidSchema` declarations and bare URL calls are absent.
-  Injected fixtures prove schema-only rules do not fire in `non_schema`
-  helpers, while missing/changed roles fail closed. Direct `.strict(` calls are
-  absent across the discovered closed inventory.
+  Full-CLI fixtures prove newly discovered and browser-followed schemas derive
+  as `browser_schema` before exact URL/UUID findings, while ordinary controls
+  derive as `non_schema` and produce no schema-only finding. Missing/changed
+  production classification fails closed; fixtures never override source
+  roles. Direct `.strict(` calls are absent across the discovered closed
+  inventory.
 
   ```bash
   pnpm --dir apps/api exec vitest run \
