@@ -1489,7 +1489,8 @@ for isolated code jobs and preserve terminal cleanup ownership."
 
 Use fake `docker`, `systemctl`, `journalctl`, and sockets. Cover missing host
 install, manifest/protocol drift, stale socket, Codex auth, broker down,
-migration failure, start/drain/forced stop/restart order, status counts, deep
+API-owned post-handoff migration failure, start/drain/forced stop/restart
+order, status counts, deep
 health, bounded/redacted logs, lock contention, env creation/upgrade, and
 API-only published port.
 
@@ -1546,8 +1547,12 @@ scripts/local-firecrawl logs [all|api|browser-service|adapter|broker] [correlati
 
 `start`: verify installed manifests and protocol checksums; verify broker;
 create runtime/token; start adapter; verify shallow app-server/auth health;
-start dependencies and private Browser Service; run migrations/MinIO; start
-API recovery; run deep health.
+start long-running dependencies and private Browser Service; run and verify
+the required MinIO bucket initialization after its long-running service is
+healthy; then start API. API alone performs control handoff first, then
+migrations, durable-fence activation, recovery, snapshot, reconciliation, and
+readiness. After API readiness, run deep health. Normal start/restart never
+invokes migration sidecar.
 
 Deep health verifies migration ledger, database, MinIO, disposable Browser
 Service session, adapter socket, exact Codex 0.144.5/model/effort, pinned V2
@@ -1574,20 +1579,26 @@ values. Unknown flags exit 64.
 ```bash
 bash -n scripts/local-firecrawl scripts/init-local-env.sh scripts/upgrade-local-env-browser-runtime
 docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml config --quiet
+node --test scripts/local-firecrawl.test.mjs
 pnpm --dir apps/api exec vitest run src/cli/browser-runtime-cli.test.ts
 pnpm --dir apps/api build
 ```
 
 Expected: shell/Compose validation exits 0; lifecycle tests PASS; API builds.
+Rendered default Compose keeps migration sidecar behind an explicit profile,
+API does not depend on it, and fake-wrapper trace proves Browser Service and
+MinIO initialization precede API-owned handoff/migrations/readiness.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add compose.local.yaml .env.example.local scripts/init-local-env.sh scripts/upgrade-local-env-browser-runtime scripts/local-firecrawl apps/api/src/cli/browser-runtime-drain.ts apps/api/src/cli/browser-runtime-status.ts apps/api/src/cli/browser-runtime-cli.test.ts
 apps/api/.husky/_/pre-commit
-git commit -m "feat: orchestrate local browser runtime" -m "Manage Compose, migrations, Browser Service, app-server adapter, and
-sandbox broker as one locked lifecycle. Add ordered drain, recovery,
-schema-aware health, status, and redacted logs."
+git commit -m "feat: orchestrate local browser runtime" -m "Manage Compose, Browser Service, API-owned migrations, app-server
+adapter, and sandbox broker as one locked lifecycle.
+
+Add ordered drain, recovery, schema-aware health, status, and redacted
+logs."
 ```
 
 ## Task 9: Add coordinated backup and recovery
@@ -1637,7 +1648,8 @@ profiles=<generation>.browser-profiles.tar.gz
 
 Restore preflights all files, rejects absolute/parent/symlink entries, creates
 rollback triplet, restores all stores, verifies checksums and DB profile
-pointers, runs migrations/health, then restarts. Any failure keeps writers
+pointers, then restarts API. API hands off to Browser Service before it runs
+migrations/recovery; wrapper verifies health afterward. Any failure keeps writers
 stopped and preserves rollback. Never back up Codex auth, adapter token,
 runtime sockets, broker state, app-server thread data, or staging generations.
 

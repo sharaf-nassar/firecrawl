@@ -227,7 +227,7 @@ subject and every body line are at most 72 characters.
 - `apps/api/src/__tests__/snips/v2/browser-real-codex.test.ts` — post-host real
   Codex action-ledger and zero-tool smoke.
 - `apps/api/src/cli/browser-stale-contract-scan.ts` — checked production-file
-  manifest plus AST/text invariants for stale browser contracts.
+  discovery/import closure plus AST/text invariants for stale contracts.
 - `apps/api/src/cli/browser-stale-contract-scan.test.ts` — one positive
   mutation fixture per stale-contract rule and real-tree coverage.
 - `apps/api/src/harness-browser-service.ts` — disposable service lifecycle.
@@ -238,6 +238,8 @@ subject and every body line are at most 72 characters.
 
 - `compose.local.yaml` — private service and shared browser-state volume.
 - `.env.example.local` — non-secret disabled rollout configuration.
+- `scripts/local-firecrawl` — Browser-first, API-owned migration lifecycle.
+- `scripts/local-firecrawl.test.mjs` — fake-Compose startup-order coverage.
 
 ## Locked private contracts
 
@@ -591,7 +593,7 @@ Browser Service serializes handoffs under one process-local mutex and permits
 only one physical runtime drain/close operation at a time. The mutex protects
 one service-owned handoff wave containing the current tuple owner, that
 owner's request transport liveness and absolute deadline, one shared drain
-promise, phase `pre_mint | minted`, and bounded tuple tombstones. The first
+promise, phase `pre_mint | minted | failed`, and bounded tuple tombstones. The first
 accepted tuple closes admission synchronously, aborts reconciliation, clears
 readiness/cache, records itself as owner, and starts the shared drain exactly
 once. That promise boundedly closes/revokes every runtime session, Chromium
@@ -611,7 +613,16 @@ crashes repeat this transfer one owner at a time. A different tuple cannot
 steal a live owner and receives `control_generation_in_progress`. When the
 shared drain completes, only the current live, unexpired owner may atomically
 change phase to `minted`, cache its response, and publish the new generation.
-A drain failure mints nothing and leaves admission closed/unready.
+If the physical drain promise rejects before mint, mutex owner atomically
+changes phase to `failed`, clears active-wave ownership, and stores one
+immutable terminal failure containing exact category
+`control_generation_drain_failed` plus one internal allowlisted detail code
+`close_failed | close_deadline_exceeded | drain_invariant_failed`. It mints no
+generation and leaves admission closed/unready. Its private transport uses the
+standard closed `version/category/message` error envelope; raw causes and the
+internal detail code never enter it. Exact tuple replay returns the
+byte-identical cached failure; a superseded tuple remains superseded even if
+later owner drain fails.
 
 An exact concurrent request while its tuple owner remains live may await the
 shared result but never becomes a second owner. If that owner is orphaned but
@@ -629,13 +640,21 @@ API identity or idempotency key with a different partner is
 `control_generation_conflict`. A running API that receives stale-generation
 rejection closes its gate permanently and never attempts a takeover loop.
 
-Retain accepted pending, superseded, and completed handoff tuples plus
-completed results as process-local tombstones for the entire service process
+After a failed wave settles, a fresh tuple with new API identity/key may start
+a brand-new physical drain. It must re-enumerate the full runtime inventory and
+run every idempotent close/revoke/discard step from the cleanup baseline;
+already closed/absent resources count as converged, but no partial success,
+cursor, rejected promise, or prior admission object is reused. Only this full
+redrain may mint.
+
+Retain accepted pending, superseded, failed, and completed handoff tuples plus
+terminal failures/results as process-local tombstones for the entire service process
 lifetime; never evict and reinterpret an old tuple as a new takeover. Cap
 distinct accepted tuples at 1,024. Reserving a first owner or replacement
 owner consumes one slot before any state change. At capacity, exact known
 completed replay still works, exact superseded replay returns
-`control_generation_superseded`, and every unknown tuple fails
+`control_generation_superseded`, exact failed replay returns its cached drain
+failure, and every unknown tuple fails
 `control_generation_history_exhausted` without ownership change, close, drain,
 or mint. An orphaned owner therefore remains orphaned at capacity until
 service restart supplies a fresh process namespace. Replaying completed A
@@ -704,6 +723,10 @@ Missing generation before handoff is
 reconciliation is `reconciliation_nonce_mismatch` 409. API sanitizes all of
 these to public `browser_state_unavailable` without exposing either nonce.
 `control_generation_history_exhausted` is a private/public-sanitized 503.
+`control_generation_drain_failed` is a private/public-sanitized 503. Its
+allowlisted internal detail is logged only as a bounded code, never serialized
+in the strict private error envelope, forwarded publicly, or expanded from raw
+errors.
 
 Only API calls these endpoints. `runtimeSessionId` and Browser Service relay
 grants are never public. Browser Service returns `failed_no_effect` only when
@@ -1314,6 +1337,7 @@ encoded request size, unique `(kind,id)`, and same-checksum path aliases with
 `errors.ts`, plus `control_generation_required`,
 `control_generation_in_progress`, `control_generation_conflict`, and
 `control_generation_superseded`, `control_generation_mismatch`, and
+`control_generation_drain_failed`, and
 `control_generation_history_exhausted`. Task 1 does not mount routes, inspect
 files, start Chromium, or connect PostgreSQL.
 
@@ -1644,6 +1668,77 @@ test("multiple orphan replacements share one drain and only latest mints", async
   expect(drainRuntime).toHaveBeenCalledTimes(1);
 });
 
+test("terminal drain failure replays exactly and fresh tuple fully redrains", async () => {
+  const firstFailure = await captureRejection(state.createControlGeneration(
+    apiARequest, liveRequestContextA, failDrainAfterPartialClose,
+  ));
+  expect(firstFailure).toEqual({
+    category: "control_generation_drain_failed",
+    detail: "close_failed",
+  });
+  expect(state.currentControlGeneration()).toBeNull();
+  expect(state.readyHealth().status).toBe("unready");
+  const replayFailure = await captureRejection(state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  ));
+  expect(replayFailure).toEqual(firstFailure);
+  expect(failDrainAfterPartialClose).toHaveBeenCalledTimes(1);
+  expect(drainRuntime).not.toHaveBeenCalled();
+
+  const replacement = await state.createControlGeneration(
+    apiBRequest, liveRequestContextB, fullInventoryDrain,
+  );
+  expect(fullInventoryDrain.inventory()).toEqual(allRuntimeRegistryKinds);
+  expect(fullInventoryDrain.reusedPriorProgress()).toBe(false);
+  expect(fullInventoryDrain.alreadyClosedResourcesConverged()).toBe(true);
+  expect(replacement.apiInstanceId).toBe(apiBRequest.apiInstanceId);
+  expect(state.controlGenerationMintCount()).toBe(1);
+  await expect(state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  )).rejects.toEqual(firstFailure);
+});
+
+test("failed replacement cannot resurrect its superseded predecessor", async () => {
+  pauseRuntimeDrain();
+  const old = state.createControlGeneration(
+    apiARequest, requestContextA, sharedDrainThatWillFail,
+  );
+  await runtimeDrainStarted();
+  requestContextA.abortTransport();
+  const replacement = state.createControlGeneration(
+    apiBRequest, liveRequestContextB, sharedDrainThatWillFail,
+  );
+  rejectRuntimeDrain();
+  await expect(old).rejects.toMatchObject({
+    category: "control_generation_superseded",
+  });
+  await expect(replacement).rejects.toMatchObject({
+    category: "control_generation_drain_failed",
+  });
+  await expect(state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  )).rejects.toMatchObject({ category: "control_generation_superseded" });
+  expect(state.currentControlGeneration()).toBeNull();
+  expect(sharedDrainThatWillFail).toHaveBeenCalledTimes(1);
+});
+
+test("failed tombstone consumes final history slot", async () => {
+  await seedAcceptedControlGenerationTombstones(1_023);
+  const failure = await captureRejection(state.createControlGeneration(
+    apiARequest, liveRequestContextA, failDrainInvariant,
+  ));
+  expect(failure.category).toBe("control_generation_drain_failed");
+  await expect(state.createControlGeneration(
+    apiBRequest, liveRequestContextB, drainRuntime,
+  )).rejects.toMatchObject({
+    category: "control_generation_history_exhausted",
+  });
+  await expect(state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  )).rejects.toEqual(failure);
+  expect(drainRuntime).not.toHaveBeenCalled();
+});
+
 test("history capacity cannot replace an orphan or start another drain", async () => {
   await seedAcceptedControlGenerationTombstones(1_023);
   pauseRuntimeDrain();
@@ -1761,7 +1856,11 @@ reused key with another API identity, pre-mint drain failure, and shutdown
 during handoff all fail closed. Test transport abort and request deadline
 expiry separately. A live owner cannot be stolen; an orphan replacement adopts
 one shared drain; superseded handlers/retries never mint; multiple sequential
-owner crashes still invoke the physical drain once. Service-process crash
+owner crashes still invoke the physical drain once. A physical drain failure
+caches one immutable typed terminal tombstone; exact replay is identical and a
+fresh tuple succeeds only after a new full-inventory idempotent redrain. Failed
+tombstones consume history capacity and never revive superseded tuples.
+Service-process crash
 starts a fresh identity with no pending wave. `beginDraining()` closes
 admission permanently; health
 objects contain no path, checksum, key, URL, public browser ID, capability, or
@@ -1985,7 +2084,7 @@ persist or log either nonce. Process nonce never changes within the process.
 Serialize control handoff and reconciliation separately. Under the handoff
 mutex, keep exactly one service-owned wave with current tuple owner, request
 transport signal, absolute deadline, shared drain promise, and phase
-`pre_mint | minted`. Starting a wave synchronously closes admission, aborts
+`pre_mint | minted | failed`. Starting a wave synchronously closes admission, aborts
 active reconciliation, clears readiness/cache, and invokes the bounded
 runtime-drain callback once. The shared promise continues if its owner request
 dies; its `ControlGenerationDrainAdmission` is wave-scoped and aborts only for
@@ -1997,14 +2096,20 @@ Every handler rechecks ownership under the mutex after awaits and immediately
 before mint, so an old handler/retry cannot mint or regain ownership. A live
 owner returns `control_generation_in_progress` to other tuples. Only the
 current live owner mints after the shared drain proves every resource closed.
+If drain rejects, atomically store immutable
+`control_generation_drain_failed` with one internal allowlisted detail, clear active
+ownership, and never mint. Exact replay returns that same cached failure.
+Only a fresh tuple may begin a new full-inventory idempotent redrain; do not
+reuse partial progress or the rejected promise.
 After mint, forbid supersession and cache the result before response delivery,
 so caller timeout/loss converges by exact replay; the next different tuple
 starts a normal new full-drain wave. Enforce exact collision rules from Locked
-private contracts. Retain at most 1,024 pending/superseded/completed tuple
-tombstones without eviction for process lifetime. Reserve history capacity
+private contracts. Retain at most 1,024
+pending/superseded/failed/completed tuple tombstones without eviction for
+process lifetime. Reserve history capacity
 before accepting an owner or replacement; at capacity, an unknown tuple
-cannot adopt an orphan drain and fails closed while known completed or
-superseded replay remains deterministic.
+cannot adopt an orphan drain or start after failure and fails closed while
+known completed, superseded, or failed replay remains deterministic.
 
 Validate process and control generation before calling filesystem code. Cache
 only a successful exact `(processNonce,controlGenerationNonce,digest)` result;
@@ -2684,6 +2789,29 @@ test("replacement request adopts an orphaned pre-mint server drain", async () =>
   expect(runtimeDrainInvocationCount()).toBe(1);
 });
 
+test("server caches terminal drain failure before responding", async () => {
+  failPhysicalDrainWith("close_deadline_exceeded");
+  const first = await postPrivate(
+    "/v1/control-generations", apiAHandoff,
+  );
+  const replay = await postPrivate(
+    "/v1/control-generations", apiAHandoff,
+  );
+  expect(first).toEqual(replay);
+  expect(first).toMatchObject({
+    status: 503,
+    body: {
+      category: "control_generation_drain_failed",
+      message: "Browser runtime drain failed",
+    },
+  });
+  expect(service.failedHandoffTombstone(apiAHandoff)).toMatchObject({
+    detailCode: "close_deadline_exceeded",
+  });
+  expect(runtimeDrainInvocationCount()).toBe(1);
+  expect(service.currentControlGeneration()).toBeNull();
+});
+
 test.each([
   "GET /health/live",
   "GET /health/ready",
@@ -2827,9 +2955,12 @@ request transport. Feed request close/abort plus its absolute 60-second
 deadline into `ControlGenerationRequestContext`. Under the startup-state
 handoff mutex, a fresh tuple replaces only an orphaned pre-mint owner and
 awaits the same drain; live-owner concurrency remains 409 in-progress.
-Partial drain returns a typed failure without minting. Persist superseded
-tombstones and the minted result before any response, so old handlers/retries
-cannot mint and post-mint caller timeout/disconnect recovers by exact replay.
+Physical drain rejection atomically persists an immutable failed tombstone
+with typed category/allowlisted detail and no mint. Exact replay returns that
+same failure. A fresh tuple starts a new full-inventory idempotent drain, never
+the rejected promise or partial cursor. Persist superseded, failed, and minted
+results before any response, so old handlers/retries cannot mint and post-mint
+caller timeout/disconnect recovers by exact replay.
 
 Every later private request must authenticate both fencing headers before body
 parsing or route effects. A stale process or control generation returns typed
@@ -3047,6 +3178,7 @@ it.each([
   "control_generation_in_progress",
   "control_generation_conflict",
   "control_generation_superseded",
+  "control_generation_drain_failed",
   "control_generation_history_exhausted",
 ])("preserves typed bootstrap policy category %s", async category => {
   fetchMock.mockResolvedValueOnce(typedPrivateError(category));
@@ -3192,6 +3324,7 @@ non-bootstrap method. Callers cannot override or omit them.
 `createControlGeneration` preserves typed
 `control_generation_in_progress`, `control_generation_conflict`,
 `control_generation_superseded`, and
+`control_generation_drain_failed`, and
 `control_generation_history_exhausted` responses for coordinator startup
 policy; only scoped mismatch invokes the permanent current-binding close hook.
 
@@ -5861,6 +5994,8 @@ Add restrictive viewer headers, origin checks, bounds, and revocation."
 **Files:**
 - Modify: `compose.local.yaml`
 - Modify: `.env.example.local`
+- Modify: `scripts/local-firecrawl`
+- Create: `scripts/local-firecrawl.test.mjs`
 - Modify: `apps/api/package.json`
 - Modify: `apps/api/src/harness.ts`
 - Create: `apps/api/src/harness-browser-service.ts`
@@ -5937,6 +6072,25 @@ test.each([
 });
 ```
 
+`scripts/local-firecrawl.test.mjs` runs the wrapper with a fake `docker`
+executable and records argument arrays. Assert normal `start` order is exactly:
+
+```text
+compose up dependencies including browser-service
+compose up --no-deps minio-init and verify exited 0
+compose up --no-deps api and wait for API readiness
+final health/port verification
+```
+
+The trace contains no `app-db-migrate` invocation. Pause API readiness and
+prove the wrapper remains blocked there until readiness. Make API exit with
+the typed post-handoff migration failure and prove wrapper returns nonzero.
+Parse default rendered Compose JSON and assert API has no dependency on
+`app-db-migrate`, that sidecar has an explicit nondefault maintenance profile,
+and default service selection cannot auto-start it. `minio-init` remains the
+required bucket bootstrap and completes before API starts. Explicitly targeting
+the profiled migration sidecar remains available for operator maintenance.
+
 Add successful order assertion:
 
 ```ts
@@ -5982,6 +6136,7 @@ functions.
 
 ```bash
 pnpm --dir apps/api exec vitest run src/harness-browser-service.test.ts
+node --test scripts/local-firecrawl.test.mjs
 ```
 
 Expected: FAIL because lifecycle helper does not exist.
@@ -6003,7 +6158,12 @@ Remove the API service's pre-start dependency on `app-db-migrate` in the
 rendered local Compose topology. PostgreSQL health may gate process launch,
 but only API process may invoke application migrations, after its successful
 Browser Service control handoff. Keep migration sidecars available for other
-explicit workflows without making local API startup depend on one.
+explicit workflows without making local API startup depend on one. Put
+`app-db-migrate` behind an explicit nondefault maintenance profile so plain
+`docker compose up` cannot auto-start it. Preserve `minio-init` as the required
+bucket bootstrap before API process launch. API may depend on long-running
+PostgreSQL, MinIO, queues, and Browser Service health only; wrapper owns the
+one-shot ordering rather than an API `depends_on` edge.
 
 - [ ] **Step 4: Implement exact harness lifecycle**
 
@@ -6069,11 +6229,22 @@ service with the same generated direct-root mapping. Missing Docker or Podman
 uses existing missing-runtime error; do not install or start an unmanaged
 process.
 
+Modify `scripts/local-firecrawl` normal startup to start long-running
+dependencies plus private Browser Service first, run and verify the required
+`minio-init` bucket bootstrap, then start API with `--no-deps --wait`. API itself
+performs control handoff, migrations, durable fence activation, recovery,
+snapshot, reconciliation, and readiness in that order. After API health reports
+ready, perform final deep/port health. Never invoke `app-db-migrate` from normal
+start/restart. Retain it only as an explicit profiled maintenance service; API
+is sole normal migration owner.
+
 - [ ] **Step 5: Run harness and Compose checks**
 
 ```bash
+node --test scripts/local-firecrawl.test.mjs
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/harness-browser-service.test.ts src/lib/browser-runtime/reconciliation-coordinator.test.ts
 docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml config --quiet
+docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml config --format json
 docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml build browser-service api
 ```
 
@@ -6083,8 +6254,11 @@ restart fencing. Compose
 config exits 0, image builds from committed digest, Browser Service has no
 `ports`, feature remains false, only API publishes `127.0.0.1:3002`, override
 environment is rejected, rendered API has no `app-db-migrate` dependency,
-the harness parent migration spy remains zero while child API owns one
-migration event after handoff,
+default Compose cannot start the profiled migration sidecar, wrapper trace
+starts Browser Service, completes MinIO bucket bootstrap, then starts API for
+handoff/migrations/readiness and never invokes migration sidecar, and harness
+parent migration spy remains zero
+while child API owns one migration event after handoff,
 two invocations share no identity/state/database,
 cleanup is registered before creation, injected failure/signal at every
 creation boundary cleans in reverse order exactly once, partial container run
@@ -6093,13 +6267,13 @@ is removed, and cleanup removes only owned resources.
 - [ ] **Step 6: Commit runtime wiring**
 
 ```bash
-git add compose.local.yaml .env.example.local apps/api/package.json apps/api/src/harness.ts apps/api/src/harness-browser-service.ts apps/api/src/harness-browser-service.test.ts
+git add compose.local.yaml .env.example.local scripts/local-firecrawl scripts/local-firecrawl.test.mjs apps/api/package.json apps/api/src/harness.ts apps/api/src/harness-browser-service.ts apps/api/src/harness-browser-service.test.ts
 apps/api/.husky/_/pre-commit
-git commit -m "feat: add private browser service runtime" -m "Run Browser Service on the private network with bounded resources and
-a shared durable state volume.
+git commit -m "feat: add private browser service runtime" -m "Start Browser Service before API-owned migrations and keep migration
+sidecar outside the default Compose lifecycle.
 
 Pre-register reverse cleanup for fresh harness containers, state roots,
-and application databases."
+application databases, and initialize MinIO before API process startup."
 ```
 
 ### Task 15: Add Browser, Interact, and real-Codex smoke contracts
@@ -6269,6 +6443,7 @@ export const browserContractDiscovery = {
     "apps/browser-service/tsconfig.json",
     "apps/browser-service/Dockerfile",
     "apps/browser-service/src/runtime-preflight.mjs",
+    "scripts/local-firecrawl",
     "apps/api/package.json",
     "compose.local.yaml",
     ".env.example.local",
@@ -6311,21 +6486,24 @@ export const browserContractDiscovery = {
   ],
 } as const;
 
-export const browserSchemaValidationFiles = [
-  "apps/browser-service/src/contracts.ts",
-  "apps/api/src/lib/scrape-interact/browser-service-contracts.ts",
-  "apps/api/src/lib/browser-runtime/protocol.ts",
-  "apps/api/src/lib/browser-runtime/execution-adapter.ts",
-  "apps/api/src/lib/browser-runtime/action-normalization.ts",
-  "apps/api/src/lib/browser-state/store.ts",
-  "apps/api/src/lib/browser-state/types.ts",
-  "apps/api/src/lib/browser-state/capability-store.ts",
-  "apps/api/src/lib/browser-state/proxy-grant-store.ts",
-  "apps/api/src/controllers/internal/browser-runs.ts",
-  "apps/api/src/controllers/v2/browser.ts",
-  "apps/api/src/controllers/v2/scrape-browser.ts",
-  "apps/api/src/controllers/v2/browser-proxy.ts",
-] as const;
+export const browserSchemaRolePolicy = {
+  browserOwnedRoots: [
+    "apps/browser-service/src/",
+    "apps/api/src/lib/browser-state/",
+    "apps/api/src/lib/browser-runtime/",
+    "apps/api/src/lib/scrape-interact/",
+  ],
+  browserSchemaExactFiles: [
+    "apps/api/src/controllers/internal/browser-runs.ts",
+    "apps/api/src/controllers/v2/browser.ts",
+    "apps/api/src/controllers/v2/scrape-browser.ts",
+    "apps/api/src/controllers/v2/browser-proxy.ts",
+  ],
+  reviewedNonBrowserSchemaExactFiles: [
+    "apps/api/src/config.ts",
+    "apps/api/src/controllers/v2/types.ts",
+  ],
+} as const;
 ```
 
 Recursively include every production `apps/browser-service/src/**/*.ts` and
@@ -6339,19 +6517,26 @@ task-touched production path to be discovered, import-closed, or covered by
 one exact reviewed exclusion.
 
 Starting from every discovered/explicit TypeScript root, resolve local static
-imports, re-exports, and string-literal dynamic imports to a fixed point.
-Support extensionless files, `.js` specifiers mapping to source `.ts`/`.tsx`,
-directory `index.ts`, and repository tsconfig path aliases. Reject unresolved
-local imports. The recursive directory roots and `closureEntryPoints` seed
-that closure. Generic API config/index/harness/route aggregators are
+imports, re-exports, string-literal dynamic imports, CommonJS
+`require("./local")` calls, and TypeScript
+`import x = require("./local")` declarations to a fixed point. Use compiler AST
+nodes rather than text matching. Support extensionless files, `.js`, `.cjs`,
+and `.mjs` specifiers mapping to source `.ts`/`.tsx`/`.cts`/`.mts`, directory
+`index` resolution, and repository tsconfig path aliases. Literal external
+package imports/requires remain allowed without recursion. Reject unresolved
+local edges and every nonliteral dynamic import, CommonJS require, or import-
+equals reference whose local/external ownership cannot be proved, using
+`inventory_module_reference_unresolved`. The recursive directory roots and
+`closureEntryPoints` seed that closure. Generic API config/index/harness/route aggregators are
 `scanOnlyBridgeFiles`: scan their own complete text, but do not let unrelated
 v0/v1/application imports redefine browser-contract ownership. Shared
 `controllers/v2/types.ts` is also a scanned bridge: Task 12 removes its own
 legacy `.strict()` call, while its `../v1/types` dependency is an exact
 `reviewed_non_browser_boundary` and does not import all legacy v1 contracts.
 
-For every bridge file, maintain a checked exact import classification keyed by
-normalized resolved target: `browser_follow` or
+For every bridge file, maintain a checked exact import classification for every
+ESM, dynamic-import, CommonJS, and import-equals edge, keyed by normalized
+resolved target: `browser_follow` or
 `reviewed_non_browser_boundary`. Recursively close every `browser_follow`
 target. A browser target classified non-browser, an import absent from the
 classification, a removed/renamed target, or a new import fails
@@ -6360,8 +6545,20 @@ forbidden-file exclusion, and cannot hide any import reachable from a browser
 closure entrypoint. Prefer dedicated browser lifecycle/route modules as
 closure roots and keep generic bridges limited to registration calls. The
 resulting normalized set plus bridge texts is checked production inventory and
-lexical-rule input. Browser-schema AST rules still use the narrower explicit
-schema subset above.
+lexical-rule input.
+
+After inventory closes, parse every source for schema-bearing AST. Assign each
+source one checked role: `browser_schema`, `reviewed_non_browser_schema`, or
+`non_schema`. Schema-bearing files inside `browserOwnedRoots`, files reached by
+a `browser_follow` edge, and `browserSchemaExactFiles` become
+`browser_schema`; `reviewedNonBrowserSchemaExactFiles` are exact reviewed
+boundaries; files with no schema-bearing AST become `non_schema`. A schema-
+bearing source with no deterministic role, a reviewed file that disappears or
+stops matching its declared boundary, or a browser-owned schema forced into a
+non-browser role fails `inventory_schema_role_unclassified` before rule
+scanning. The pure scanner accepts an injected normalized source-role map for
+temporary fixtures; production CLI always derives and validates the checked
+policy above.
 
 Reviewed exclusions may identify only tests/negative fixtures, snips, the
 scanner's own rule-literal source, generated files, or vendor trees. Each exact
@@ -6385,9 +6582,9 @@ and sanitized match; never rewrite files. Lock these rules:
 - `legacy_zod_strict`: reject direct `\.strict\s*\(` in every discovered or
   import-closed production source;
   closed schemas use `z.strictObject()`.
-- `bare_url_validator`: in `browserSchemaValidationFiles`, reject AST calls to
+- `bare_url_validator`: in every `browser_schema` source, reject AST calls to
   `z.url()` or `z.string().url()`.
-- `bare_uuid_validator`: in `browserSchemaValidationFiles`, reject `z.uuid()`
+- `bare_uuid_validator`: in every `browser_schema` source, reject `z.uuid()`
   and `z.string().uuid()` except one call inside the declaration named
   `canonicalUuidSchema` in each of exactly
   `apps/browser-service/src/contracts.ts` and
@@ -6414,21 +6611,29 @@ and sanitized match; never rewrite files. Lock these rules:
   keys, missing exported `CodeRunResult`, or an alias targeting another schema.
 
 `browser-stale-contract-scan.test.ts` creates an isolated temporary workspace
-and always deletes it in `finally`. Table-drive every lexical/AST rule twice:
-once by writing a new production file under
+and always deletes it in `finally`. Table-drive every inventory-wide lexical
+rule twice: once by writing a new production file under
 `apps/browser-service/src/discovered/`, and once by importing a helper outside
 the configured roots from a discovered API source. Put the forbidden pattern
 in the new file and require the corresponding rule finding, proving neither
 directory discovery nor import closure silently omits it. Include plain,
 payload, JSON, arbitrary-suffix snake/camel database columns, multiline
 `.strict\n  (`, direct `.strict (`, and quoted/backtick/backslash checkpoint
-segments.
+segments. Test schema-only URL/UUID rules with temporary sources explicitly
+classified `browser_schema` through the injected role map. The identical
+source classified `non_schema` produces no schema-only finding; omitting a
+role for schema-bearing source fails before rule scanning.
 
 Separate closure fixtures cover two-hop imports, re-exports, string-literal
-dynamic imports, tsconfig aliases, `.js`→`.ts`, extensionless resolution, and
-directory `index.ts`; every transitive file appears once in normalized sorted
-inventory. A bridge fixture classifies one browser registration import and
-proves its two-hop forbidden helper is scanned. Another classifies an
+dynamic imports, local literal `require`, TypeScript import-equals, tsconfig
+aliases, `.js`→`.ts`, `.cjs`→`.cts`, `.mjs`→`.mts`, extensionless resolution,
+and directory `index.ts`; every transitive file appears once in normalized
+sorted inventory. A local CommonJS two-hop helper containing a forbidden global
+pattern must be scanned. Literal external-package require is accepted without
+recursion; nonliteral require/dynamic import and unresolved local CommonJS
+edges fail `inventory_module_reference_unresolved`. A bridge fixture classifies
+one browser registration edge of each supported syntax and proves its two-hop
+forbidden helper is scanned. Another classifies an
 unrelated v1/v2 schema import as a reviewed non-browser boundary and proves it
 does not enter browser-contract inventory; changing either classification or
 adding an unclassified bridge import fails before rule scanning. Real-tree
@@ -6518,17 +6723,21 @@ zero model-tool events, and checked stale-contract enforcement."
   reject uppercase UUIDs and file/mailto/ftp/credential URLs.
 - [ ] Run Task 15 checked discovery/import-closure scanner and its temporary
   mutation suite. Require recursive production roots, transitive local import
-  closure, five named omitted helpers, and every task-touched production path
-  in normalized inventory. Require every scan-only bridge import to retain an
-  exact browser-follow/non-browser-boundary classification; unclassified
-  changes fail, browser imports close recursively, and unrelated aggregator
-  imports do not expand scope. Directory-discovered and imported forbidden files
-  must fail with exact rule IDs; missing closure, stale exclusions, or escaped
-  task paths fail before scanning. Real tree reports zero findings. Negative
-  tests and scanner rule source are exact structural exclusions. Within the
-  explicit browser-schema subset, bare UUID calls are AST-allowlisted only in
-  two named `canonicalUuidSchema` declarations and bare URL calls are absent;
-  direct `.strict(` calls are absent across the discovered closed inventory.
+  closure across ESM, dynamic imports, CommonJS require, and TypeScript import-
+  equals, five named omitted helpers, and every task-touched production path in
+  normalized inventory. Require every scan-only bridge edge to retain an exact
+  browser-follow/non-browser-boundary classification; unclassified changes
+  fail, browser edges close recursively, and unrelated aggregator imports do
+  not expand scope. Directory-discovered and imported forbidden files must fail
+  with exact rule IDs; missing closure, nonliteral/unresolved module edges,
+  stale exclusions, or escaped task paths fail before scanning. Real tree
+  reports zero findings. Negative tests and scanner rule source are exact
+  structural exclusions. Checked source roles classify every schema-bearing
+  file; bare UUID calls in `browser_schema` sources are AST-allowlisted only in
+  two named `canonicalUuidSchema` declarations and bare URL calls are absent.
+  Injected fixtures prove schema-only rules do not fire in `non_schema`
+  helpers, while missing/changed roles fail closed. Direct `.strict(` calls are
+  absent across the discovered closed inventory.
 
   ```bash
   pnpm --dir apps/api exec vitest run \
