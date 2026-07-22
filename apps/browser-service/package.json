@@ -1,0 +1,35 @@
+{
+  "name": "@firecrawl/browser-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "preinstall": "node src/runtime-preflight.mjs",
+    "prebuild": "node src/runtime-preflight.mjs",
+    "build": "tsc -p tsconfig.json",
+    "prestart": "node src/runtime-preflight.mjs",
+    "start": "node dist/index.js",
+    "pretest": "node src/runtime-preflight.mjs",
+    "test:bootstrap": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs",
+    "test": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs && vitest run --exclude 'src/**/*.test.mjs'"
+  },
+  "dependencies": {
+    "express": "5.2.1",
+    "ipaddr.js": "2.4.0",
+    "playwright": "1.61.1",
+    "typescript": "5.9.3",
+    "ws": "8.21.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.1",
+    "@types/ws": "8.18.1",
+    "tsx": "4.23.1",
+    "vitest": "4.1.9"
+  },
+  "engines": {
+    "node": "22.22.1"
+  },
+  "packageManager": "pnpm@10.33.0"
+}
