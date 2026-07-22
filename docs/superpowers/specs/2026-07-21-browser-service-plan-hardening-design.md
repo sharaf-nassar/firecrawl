@@ -139,10 +139,15 @@ specific version: [Playwright Docker](https://playwright.dev/docs/docker).
 Browser Service has these process-local startup states:
 
 ```text
-starting -> live_unreconciled -> handing_off -> reconciling -> ready
-                 ^                  |             |
-                 +------failed------+----failed---+
-ready -> handing_off -> live_unreconciled
+starting -> live_unreconciled -> handoff_pre_mint -> handoff_minted
+                 ^                    |                    |
+                 |       drain failed|                    v
+                 +--------------------+----------> live_unreconciled
+handoff_pre_mint(orphan) --fresh tuple/same drain--> handoff_pre_mint
+live_unreconciled -> reconciling -> ready
+                         |           |
+                         +--failed---+
+ready -> handoff_pre_mint
 ready -> draining -> stopped
 ```
 
@@ -158,6 +163,12 @@ readiness/cache, and mints a new generation. A service restart changes process
 nonce, invalidates every generation, and returns to `live_unreconciled`;
 readiness is never loaded from disk.
 
+`handoff_pre_mint` is one mutex-owned wave, not one HTTP request. An orphaned
+owner leaves that wave and shared drain intact until a fresh tuple adopts it,
+the drain fails, or service shutdown destroys the process. `handoff_minted` is
+the atomic commit point: after it, ownership cannot be superseded and exact
+tuple replay returns the cached generation.
+
 ### Process nonce, control generation, and health
 
 At process start, Browser Service generates 32 random bytes using the operating
@@ -169,31 +180,53 @@ API-only restart never changes it.
 Each API process generates one canonical UUID `apiInstanceId`. For each
 observed Browser Service process, it also generates one 32-byte base64url
 idempotency key. Authenticated `POST /v1/control-generations` carries the
-observed process nonce and that exact pair. Browser Service closes admission
-synchronously, aborts in-flight reconciliation, clears readiness/cache, drains
-accepted work, closes/revokes every session, Chromium context, stream, relay
-grant, writer, timer, and uncommitted profile working copy, then generates a
-new random 32-byte base64url `controlGenerationNonce`. It returns only after
-the drain completes. Neither nonce is persisted or logged.
+observed process nonce and that exact pair. Under one process-local handoff
+mutex, Browser Service owns one handoff wave: current tuple owner, owner
+transport liveness and absolute deadline, one shared drain promise, phase
+`pre_mint | minted`, and bounded tuple tombstones. First owner closes admission
+synchronously, aborts in-flight reconciliation, clears readiness/cache, and
+starts exactly one physical drain/close operation. That service-owned promise
+closes/revokes every session, Chromium context, stream, relay grant, writer,
+timer, and uncommitted profile working copy and continues independently if its
+owner HTTP transport dies.
 
-Concurrent exact handoff joins one pending drain. Exact completed
-`(processNonce,apiInstanceId,idempotencyKey)` replay returns the prior result
-without another drain or mint. Reusing one identity/key with a different
-partner is `control_generation_conflict`. A different request during active
-handoff gets `control_generation_in_progress` with no extra effect and may
-retry after completion. A later different request performs a new full drain
-and generation handoff, fencing the prior API. A partial service drain or
-deadline observed before mint mints nothing; this leaves admission closed and
-exact retry resumes pending drain. Caller
-timeout/disconnect may happen after service cached a minted result, so exact
-replay returns that result without another mint.
+Before mint, an owner whose transport aborts/closes or deadline expires is
+orphaned. A fresh authenticated tuple with a new canonical API instance ID and
+idempotency key may atomically supersede only that orphaned current owner,
+adopt/await the same drain promise, and
+tombstone the old tuple as `control_generation_superseded`; it never starts a
+second drain. Every handler checks ownership under the mutex after each await
+and immediately before mint. The old handler and exact old-tuple retries
+therefore return superseded and can never mint, regain ownership, or resurrect
+readiness. Further replacements may supersede only the newly current owner
+after it too becomes orphaned. A different tuple presented while owner remains
+live gets `control_generation_in_progress` and cannot steal the wave.
 
-Accepted tuple/result tombstones remain process-local and non-evicting for
-service-process lifetime, capped at 1,024 distinct tuples. Exact known replay
-continues at capacity; an unknown tuple fails
-`control_generation_history_exhausted` without drain/mint and requires service
-restart for a fresh process namespace. After A then B handoff, replay A returns
-A's historical response but cannot replace current B generation.
+An exact concurrent request may await the result while its tuple owner remains
+live but does not become another owner. Once owner is orphaned and before a
+fresh tuple supersedes it, exact retry returns
+`control_generation_in_progress` without reviving ownership. After
+supersession, exact old-tuple retry deterministically returns
+`control_generation_superseded`.
+
+When the shared drain completes, current live owner alone atomically changes
+phase to `minted`, caches the response, and publishes a new random 32-byte
+base64url `controlGenerationNonce`. After mint, no supersession is permitted.
+Exact completed `(processNonce,apiInstanceId,idempotencyKey)` replay returns
+the cached result after response loss without another drain or mint. A later
+different tuple starts the next normal full handoff. A failed physical drain
+mints nothing and leaves admission closed/unready. Reusing one identity/key
+with a different partner remains `control_generation_conflict`.
+
+Accepted pending, superseded, and completed tuple/result tombstones remain
+process-local and non-evicting for service-process lifetime, capped at 1,024
+distinct tuples. Reserve capacity before accepting a first or replacement
+owner. At capacity, exact completed replay succeeds, exact superseded replay
+returns superseded, and an unknown tuple fails
+`control_generation_history_exhausted` without ownership change, drain, or
+mint. An orphan then requires service restart for a fresh process namespace.
+After completed A then B, replay A returns A's historical response but cannot
+replace current B generation. Neither nonce is persisted or logged.
 
 Both health routes use the same bearer key, correlation ID, and bounded
 deadline authentication as every private route. They are never public.
@@ -439,14 +472,26 @@ Compose and harness use this order:
 8. API verifies response and scoped ready health, then opens browser work and
    starts browser retention.
 
+API process owns application migration ordering. Harness may create and
+health-check disposable PostgreSQL but never calls application migrations.
+Rendered local Compose API has no dependency on a pre-API migration sidecar.
+Before control handoff succeeds, bootstrap performs no database connect/query,
+DB-backed browser-store construction, listener bind, worker start, or
+retention start. A lazily constructed pool/gate is allowed only when its
+construction causes no database I/O. Browser-disabled startup remains API-owned
+and runs migrations before normal listener/workers without constructing the
+browser coordinator.
+
 Handoff and reconciliation use private request deadlines capped at 60 seconds
-inside one startup budget. Pre-mint drain timeout/partial failure keeps gate
-closed and retries exact API identity/idempotency tuple; response loss after
-mint recovers cached result through the same replay. Database recovery
-cannot start before confirmed drain. Process change abandons the old handoff
-and restarts discovery. Transport loss, authentication failure, database error,
-invalid response, or unready result keeps the gate closed. Compose/harness
-startup fails after bounded retries and performs registered cleanup.
+inside one startup budget. Pre-mint owner transport loss/deadline orphans that
+tuple; a fresh API-process tuple adopts the service-owned drain and the old
+tuple remains superseded. A physical drain failure keeps the gate closed and
+mints nothing. Response loss after mint recovers cached result through exact
+replay. Database recovery cannot start before confirmed drain. Process change
+abandons old service identity and restarts discovery. Authentication failure,
+database error, invalid response, or unready result keeps the gate closed.
+Compose/harness startup fails after bounded retries and performs registered
+cleanup.
 
 API continuously checks authenticated scoped ready identity. If Browser
 Service restarts, changed process nonce closes the gate immediately; API
@@ -465,11 +510,14 @@ even when Browser Service process nonce is unchanged. This closes lingering
 Chromium/session/grant/writer/stream state and permits a changed snapshot digest
 under the new generation without weakening same-generation conflicting replay.
 Same-process transport/response loss is safe because exact tuple replay is
-idempotent. A true API-process crash loses its process-local tuple; replacement
-API deliberately uses a fresh tuple and full handoff. If prior process already
-caused a mint, replacement causes a second safe drain/mint, not replay of lost
-identity. Concurrent takeovers serialize; later completed takeover fences the
-earlier API.
+idempotent only when it recovers a cached minted result or joins an owner that
+service still considers live. It cannot revive a pre-mint orphan or a
+superseded tuple. A true API-process crash loses its process-local tuple;
+replacement API deliberately uses a fresh API identity/key pair. During an
+unfinished pre-mint wave it adopts the same service drain and mints once. If
+prior process already caused a mint, replacement starts a new full handoff and
+causes a second safe drain/mint. Concurrent live takeovers serialize; later
+completed takeover fences the earlier API.
 
 On graceful Browser Service shutdown, it enters `draining`, rejects new work,
 finishes or classifies in-flight work through the existing ordered shutdown,
@@ -490,6 +538,7 @@ Private typed categories include:
 - `control_generation_required`
 - `control_generation_in_progress`
 - `control_generation_conflict`
+- `control_generation_superseded`
 - `control_generation_mismatch`
 - `control_generation_history_exhausted`
 - `reconciliation_required`
@@ -565,13 +614,27 @@ wait. Only API publishes a host port.
 ### Task 15
 
 Task 15 owns the checked stale-contract scanner and its positive mutation
-fixtures. Its explicit product manifest covers every planned Browser
-Service/API runtime, config, schema, controller, store, harness, Compose, and
-environment file while structurally excluding negative test fixtures and the
-scanner's own rule-literal source. AST-aware browser-schema/alias checks plus
-bounded SQL/text rules prevent permissive validators, legacy root layers,
-duplicate database storage payloads, split activation, and stale code-result
-contracts from passing acceptance silently.
+fixtures. Recursive production-root discovery plus fixed-point local
+TypeScript import/re-export/dynamic-import closure defines its inventory; a
+static list is not the discovery source. It covers all Browser Service source,
+API browser-state/browser-runtime/scrape-interact source, relevant
+controllers/services/config/entrypoints/harness, database schema/migrations,
+Compose, environment, and every transitive local import from browser-owned
+closure entrypoints. Generic config/index/harness/route bridges are scanned
+directly and carry exact checked browser-follow versus reviewed non-browser
+import classifications; unclassified or changed bridge imports fail closed
+without pulling unrelated v0/v1 schemas into browser ownership.
+`controllers/v2/types.ts` is scanned as a bridge after Task 12 removes its own
+legacy strict-object call, while its exact `../v1/types` import remains a
+reviewed non-browser boundary. Required helpers
+include `filesystem-store-internal.ts`, `transitions.ts`,
+`process-identity.ts`, `legacy-compatibility.ts`, and `replay-envelope.ts`.
+Only exact reviewed test/negative/generated/vendor exclusions are allowed;
+stale exclusions, unresolved closure, or uncovered task paths fail before
+rule scanning. AST-aware browser-schema/alias checks plus bounded SQL/text
+rules prevent permissive validators, legacy root layers, duplicate database
+storage payloads, split activation, and stale code-result contracts from
+passing acceptance silently.
 
 ### Host plan follow-up
 
@@ -600,8 +663,15 @@ New tests in the implementation plan must prove:
   resource and clearing readiness/cache while process nonce remains stable;
 - exact API identity/idempotency replay mints once; conflicting/concurrent
   takeover fails closed and later completed takeover fences prior API;
+- API crash or request deadline during pre-mint drain lets one fresh tuple
+  supersede the orphan and adopt the same service-owned drain; old handler and
+  retries return `control_generation_superseded` and cannot mint;
+- multiple sequential pre-mint owner crashes still perform one physical drain;
+  a concurrent live owner cannot be stolen, and current live owner alone
+  mints after the shared drain settles;
 - A→B→replay-A returns historical A without changing current B; tuple history
-  capacity accepts known replay and rejects unknown takeover without eviction;
+  capacity accepts known replay, preserves superseded tombstones, and rejects
+  unknown orphan replacement without eviction or a second drain;
 - every later private route rejects stale process/generation before effects;
 - every client HTTP/WS mismatch synchronously closes only matching API binding;
 - new durable epoch activation waits for a paused old filesystem/database
@@ -622,23 +692,32 @@ New tests in the implementation plan must prove:
 - no database migration/recovery/snapshot begins before confirmed service
   handoff drain; API opens browser work/retention only after matching
   process/generation/digest response and ready health;
+- paused/failed handoff produces zero database connects/queries, DB-backed
+  stores, listeners, workers, or retention; harness migration spy stays zero,
+  child API owns migration, and rendered Compose has no migration-sidecar API
+  dependency;
 - API-only restart after checkpoint/profile mutation keeps process nonce,
   drains lingering Chromium/session/grant/writer/stream state, mints a new
   generation, accepts changed digest, and rejects old API requests;
-- same-process lost response replays one tuple without duplicate mint; true API
-  crash replacement uses a fresh tuple/full handoff and may safely mint again;
-  service restart during handoff causes no premature recovery;
+- same-process post-mint lost response replays one tuple without duplicate
+  mint; true API crash replacement uses a fresh tuple, adopts the existing
+  drain when crash was pre-mint, or performs a new full handoff after prior
+  mint; service restart during handoff causes no premature recovery;
 - service restart changes process nonce, closes API gate, performs new handoff,
   interrupts durable work, and requires reconciliation again;
 - graceful and forced shutdown never promote an orphan or delete a referenced
   generation;
+- scanner bridge fixtures follow a browser registration to a two-hop forbidden
+  helper, keep a reviewed unrelated v1/v2 import outside browser inventory,
+  and fail on every unclassified or changed bridge import;
 - logs contain aggregate metadata but no path, either nonce, checksum, key, URL,
   capability, grant, or browser identity.
 
 Acceptance also runs Task 1 focused tests/build, Task 3
 generation/reconciliation/profile tests, Task 6 server/image tests, Tasks 7
 and 8 client/startup tests, Task 14 harness/Compose checks, Task 15 checked
-stale-contract scanner/mutation fixtures, actual repository hook, and a
+discovery/import-closure scanner with temporary directory/import mutation
+fixtures, actual repository hook, and a
 clean-tree check. Tests use Node `22.22.1` and frozen install. Browser Service
 remains private and disabled by default.
 

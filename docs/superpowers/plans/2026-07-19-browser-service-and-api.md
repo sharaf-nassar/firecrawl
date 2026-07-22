@@ -102,7 +102,7 @@ node --version
 
 Expected: `v22.22.1`. Do not invoke Corepack or pnpm until Task 1 has created
 `apps/browser-service/package.json`; only then run Corepack from that package
-or with `--dir apps/browser-service` so it reads the committed
+with process cwd exactly `apps/browser-service` so it reads the committed
 `packageManager: "pnpm@10.33.0"`. Do not scan for or install another Node,
 change the user's default Node, or run Browser Service commands under active
 Node `25.8.2`. Corepack may acquire project-scoped pnpm `10.33.0` during Task
@@ -587,33 +587,61 @@ export type ControlGenerationV1 = {
 };
 ```
 
-Browser Service serializes handoffs. Admission closes synchronously, current
-reconciliation aborts, and readiness plus its reconciliation cache clear
-before draining. It then boundedly closes/revokes every runtime session,
-Chromium context, passive/interactive/CDP stream, relay grant, writer lease,
-timer, and uncommitted profile working copy. It mints and returns a generation
-only after all accepted work and cleanup settle. A server-observed drain
-deadline or partial-drain failure before mint mints nothing, leaves admission
-closed/unready, and exact request retry resumes the same drain. Caller timeout,
-disconnect, or lost response may occur after mint; exact replay recovers that
-already committed result. A concurrent exact request joins the same pending promise.
-Exact completed `(processNonce,apiInstanceId,idempotencyKey)` replay returns
-the one prior result without draining or minting again. Reusing either
-API identity or idempotency key with a different partner is
-`control_generation_conflict`. A different request while handoff is active is
-`control_generation_in_progress` and changes nothing; it may retry after the
-winner completes, at which point a full new drain and generation fences the
-prior API. A running API that receives stale-generation rejection closes its
-gate permanently and never attempts a takeover loop.
+Browser Service serializes handoffs under one process-local mutex and permits
+only one physical runtime drain/close operation at a time. The mutex protects
+one service-owned handoff wave containing the current tuple owner, that
+owner's request transport liveness and absolute deadline, one shared drain
+promise, phase `pre_mint | minted`, and bounded tuple tombstones. The first
+accepted tuple closes admission synchronously, aborts reconciliation, clears
+readiness/cache, records itself as owner, and starts the shared drain exactly
+once. That promise boundedly closes/revokes every runtime session, Chromium
+context, passive/interactive/CDP stream, relay grant, writer lease, timer, and
+uncommitted profile working copy independently of any one HTTP handler.
 
-Retain accepted pending/completed handoff tuples and completed results as
-process-local tombstones for the entire service process lifetime; never evict
-and reinterpret an old tuple as a new takeover. Cap distinct accepted tuples
-at 1,024. At capacity, exact known replay still works but every unknown tuple
-fails `control_generation_history_exhausted` without closing/draining again;
-operator/service restart supplies a new process namespace. Replaying A after
-completed takeover B returns A's historical response while B remains current,
-so any A-scoped request still fails `control_generation_mismatch`.
+Before mint, each handler checks mutex-protected tuple ownership after every
+await and immediately before mint. If the owner transport aborts/closes or its
+deadline expires, mark it orphaned. A fresh authenticated tuple with a new
+canonical API instance ID and idempotency key may atomically supersede only
+that orphaned current owner, adopt and
+await the exact same drain promise, and tombstone the old tuple as
+`control_generation_superseded`; it never closes or drains again. The old
+handler and every exact old-tuple retry return that category and can never
+mint, become owner again, or resurrect readiness. Multiple sequential owner
+crashes repeat this transfer one owner at a time. A different tuple cannot
+steal a live owner and receives `control_generation_in_progress`. When the
+shared drain completes, only the current live, unexpired owner may atomically
+change phase to `minted`, cache its response, and publish the new generation.
+A drain failure mints nothing and leaves admission closed/unready.
+
+An exact concurrent request while its tuple owner remains live may await the
+shared result but never becomes a second owner. If that owner is orphaned but
+not yet superseded, exact retry returns `control_generation_in_progress` with
+no state change; it cannot revive its transport ownership. After a fresh tuple
+supersedes it, every exact replay returns
+`control_generation_superseded`.
+
+After phase `minted`, ownership cannot be superseded. Caller timeout,
+disconnect, or lost response after mint is recovered by exact cached replay.
+A different tuple then starts the next normal handoff with a new full drain.
+Exact completed `(processNonce,apiInstanceId,idempotencyKey)` replay returns
+its one historical result without draining or minting again. Reusing either
+API identity or idempotency key with a different partner is
+`control_generation_conflict`. A running API that receives stale-generation
+rejection closes its gate permanently and never attempts a takeover loop.
+
+Retain accepted pending, superseded, and completed handoff tuples plus
+completed results as process-local tombstones for the entire service process
+lifetime; never evict and reinterpret an old tuple as a new takeover. Cap
+distinct accepted tuples at 1,024. Reserving a first owner or replacement
+owner consumes one slot before any state change. At capacity, exact known
+completed replay still works, exact superseded replay returns
+`control_generation_superseded`, and every unknown tuple fails
+`control_generation_history_exhausted` without ownership change, close, drain,
+or mint. An orphaned owner therefore remains orphaned at capacity until
+service restart supplies a fresh process namespace. Replaying completed A
+after completed takeover B returns A's historical response while B remains
+current, so any A-scoped request still fails
+`control_generation_mismatch`.
 
 `POST /v1/reconciliation` accepts the exact closed request and result types:
 
@@ -669,8 +697,9 @@ nonces and digests use `Token`/`Sha256` above. Calling ready without a valid
 current generation returns the standard typed error envelope rather than an
 unscoped health body.
 Control handoff returns 201; exact idempotent replay returns the same 201 body.
-`control_generation_in_progress`, `control_generation_conflict`, and
-`control_generation_mismatch` return 409. Missing generation before handoff is
+`control_generation_in_progress`, `control_generation_conflict`,
+`control_generation_superseded`, and `control_generation_mismatch` return 409.
+Missing generation before handoff is
 `control_generation_required` 503. Process mismatch during bootstrap or
 reconciliation is `reconciliation_nonce_mismatch` 409. API sanitizes all of
 these to public `browser_state_unavailable` without exposing either nonce.
@@ -881,7 +910,8 @@ failure. Configure `NodeNext`, `strict`, `noUncheckedIndexedAccess`, and
 temporary directory. One case adds dependency `lockfile-mismatch-probe:
 "0.0.0"`; another removes the copied lock. Each invokes
 `corepack pnpm install --frozen-lockfile --ignore-scripts` with argument arrays
-and asserts nonzero exit before deleting its temporary root.
+and child-process `cwd` set to the copied fixture root, then asserts nonzero
+exit before deleting its temporary root.
 
 - [ ] **Step 4: Generate and prove the frozen dependency graph**
 
@@ -1283,7 +1313,7 @@ encoded request size, unique `(kind,id)`, and same-checksum path aliases with
 `superRefine`. Add every reconciliation category from the approved addendum to
 `errors.ts`, plus `control_generation_required`,
 `control_generation_in_progress`, `control_generation_conflict`, and
-`control_generation_mismatch`, and
+`control_generation_superseded`, `control_generation_mismatch`, and
 `control_generation_history_exhausted`. Task 1 does not mount routes, inspect
 files, start Chromium, or connect PostgreSQL.
 
@@ -1294,8 +1324,9 @@ export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
 node --test apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/contracts.test.ts src/auth.test.ts
-corepack pnpm --dir apps/browser-service build
+cd apps/browser-service
+corepack pnpm exec vitest run src/contracts.test.ts src/auth.test.ts
+corepack pnpm build
 ```
 
 Expected: tests PASS; build emits `apps/browser-service/dist`.
@@ -1371,7 +1402,8 @@ test("bundled Chromium cannot emit QUIC or WebRTC UDP", async () => {
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/network-policy.test.ts src/egress-proxy.test.ts src/chromium-egress.integration.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/network-policy.test.ts src/egress-proxy.test.ts src/chromium-egress.integration.test.ts
 ```
 
 Expected: FAIL because policy and proxy do not exist.
@@ -1455,7 +1487,8 @@ assertion.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/network-policy.test.ts src/egress-proxy.test.ts src/chromium-egress.integration.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/network-policy.test.ts src/egress-proxy.test.ts src/chromium-egress.integration.test.ts
 ```
 
 Expected: PASS for alternate IP forms, rebinding, redirect revalidation,
@@ -1520,7 +1553,9 @@ test("handoff drains old runtime before minting a new generation", async () => {
   const state = await createReadyStartupStateWithRuntime();
   const oldProcessNonce = state.processNonce;
   pauseRuntimeDrain();
-  const handoff = state.createControlGeneration(newApiRequest, drainRuntime);
+  const handoff = state.createControlGeneration(
+    newApiRequest, liveRequestContext, drainRuntime,
+  );
   await runtimeDrainStarted();
   expect(state.liveHealth()).toMatchObject({
     status: "live_unreconciled",
@@ -1541,20 +1576,107 @@ test("handoff drains old runtime before minting a new generation", async () => {
 
 test("exact handoff replay is idempotent and concurrent takeover is fenced", async () => {
   pauseRuntimeDrain();
-  const winner = state.createControlGeneration(apiARequest, drainRuntime);
+  const winner = state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  );
   await runtimeDrainStarted();
-  await expect(state.createControlGeneration(apiBRequest, drainRuntime))
+  await expect(state.createControlGeneration(
+    apiBRequest, liveRequestContextB, drainRuntime,
+  ))
     .rejects.toMatchObject({ category: "control_generation_in_progress" });
   releaseRuntimeDrain();
   const accepted = await winner;
-  await expect(state.createControlGeneration(apiARequest, drainRuntime))
+  await expect(state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  ))
     .resolves.toEqual(accepted);
+  expect(drainRuntime).toHaveBeenCalledTimes(1);
+});
+
+test("replacement adopts one pre-mint drain after owner transport dies", async () => {
+  pauseRuntimeDrain();
+  const old = state.createControlGeneration(
+    apiARequest, requestContextA, drainRuntime,
+  );
+  await runtimeDrainStarted();
+  requestContextA.abortTransport();
+  const replacement = state.createControlGeneration(
+    apiBRequest, requestContextB, drainRuntime,
+  );
+  releaseRuntimeDrain();
+  await expect(old).rejects.toMatchObject({
+    category: "control_generation_superseded",
+  });
+  await expect(replacement).resolves.toMatchObject({
+    apiInstanceId: apiBRequest.apiInstanceId,
+  });
+  await expect(state.createControlGeneration(
+    apiARequest, retriedRequestContextA, drainRuntime,
+  )).rejects.toMatchObject({ category: "control_generation_superseded" });
+  expect(drainRuntime).toHaveBeenCalledTimes(1);
+});
+
+test("multiple orphan replacements share one drain and only latest mints", async () => {
+  pauseRuntimeDrain();
+  const a = state.createControlGeneration(
+    apiARequest, requestContextA, drainRuntime,
+  );
+  await runtimeDrainStarted();
+  requestContextA.abortTransport();
+  const b = state.createControlGeneration(
+    apiBRequest, requestContextB, drainRuntime,
+  );
+  requestContextB.expireDeadline();
+  const c = state.createControlGeneration(
+    apiCRequest, requestContextC, drainRuntime,
+  );
+  releaseRuntimeDrain();
+  await expect(a).rejects.toMatchObject({
+    category: "control_generation_superseded",
+  });
+  await expect(b).rejects.toMatchObject({
+    category: "control_generation_superseded",
+  });
+  await expect(c).resolves.toMatchObject({
+    apiInstanceId: apiCRequest.apiInstanceId,
+  });
+  expect(state.controlGenerationMintCount()).toBe(1);
+  expect(drainRuntime).toHaveBeenCalledTimes(1);
+});
+
+test("history capacity cannot replace an orphan or start another drain", async () => {
+  await seedAcceptedControlGenerationTombstones(1_023);
+  pauseRuntimeDrain();
+  const orphan = state.createControlGeneration(
+    apiARequest, requestContextA, drainRuntime,
+  );
+  void orphan.catch(() => undefined);
+  await runtimeDrainStarted();
+  requestContextA.abortTransport();
+  await expect(state.createControlGeneration(
+    apiBRequest, requestContextB, drainRuntime,
+  )).rejects.toMatchObject({
+    category: "control_generation_history_exhausted",
+  });
+  releaseRuntimeDrain();
+  await runtimeDrainSettled();
+  expect(state.currentHandoffOwner()).toMatchObject({
+    tuple: apiARequest,
+    orphaned: true,
+    phase: "pre_mint",
+  });
+  await expect(state.createControlGeneration(
+    apiARequest, retriedRequestContextA, drainRuntime,
+  )).rejects.toMatchObject({ category: "control_generation_in_progress" });
+  expect(state.currentControlGeneration()).toBeNull();
   expect(drainRuntime).toHaveBeenCalledTimes(1);
 });
 
 test("new API generation permits a changed digest after complete drain", async () => {
   const first = await reconcileReadyGeneration(state, apiARequest, digestA);
-  const second = await state.createControlGeneration(apiBRequest, drainRuntime);
+  const second = await state.createControlGeneration(
+    apiBRequest, liveRequestContextB, drainRuntime,
+  );
   expect(second.processNonce).toBe(first.processNonce);
   await expect(state.reconcile(
     requestFor(second, digestB), reconcileOnce,
@@ -1562,9 +1684,15 @@ test("new API generation permits a changed digest after complete drain", async (
 });
 
 test("old handoff replay is tombstoned and cannot replace current generation", async () => {
-  const a = await state.createControlGeneration(apiARequest, drainRuntime);
-  const b = await state.createControlGeneration(apiBRequest, drainRuntime);
-  await expect(state.createControlGeneration(apiARequest, drainRuntime))
+  const a = await state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  );
+  const b = await state.createControlGeneration(
+    apiBRequest, liveRequestContextB, drainRuntime,
+  );
+  await expect(state.createControlGeneration(
+    apiARequest, liveRequestContextA, drainRuntime,
+  ))
     .resolves.toEqual(a);
   expect(state.currentControlGeneration()).toEqual(b);
   expect(drainRuntime).toHaveBeenCalledTimes(2);
@@ -1575,11 +1703,15 @@ test("old handoff replay is tombstoned and cannot replace current generation", a
 
 test("handoff history fails closed at its process-lifetime bound", async () => {
   await seedAcceptedControlGenerationTombstones(1_024);
-  await expect(state.createControlGeneration(unknownApiRequest, drainRuntime))
+  await expect(state.createControlGeneration(
+    unknownApiRequest, liveRequestContext, drainRuntime,
+  ))
     .rejects.toMatchObject({
       category: "control_generation_history_exhausted",
     });
-  await expect(state.createControlGeneration(knownReplayRequest, drainRuntime))
+  await expect(state.createControlGeneration(
+    knownReplayRequest, liveRequestContext, drainRuntime,
+  ))
     .resolves.toEqual(knownHistoricalResult);
   expect(drainRuntime).not.toHaveBeenCalled();
 });
@@ -1625,9 +1757,13 @@ Assert two process instances receive different 43-character process nonces;
 multiple handoffs in one process retain that process nonce and receive
 different 43-character generation nonces. Wrong/stale process or generation
 performs no callback. Same API identity with a different idempotency key,
-reused key with another API identity, pre-mint drain timeout/partial drain, and shutdown
-during handoff all fail closed. Exact retry resumes one pending drain and
-mints at most once. `beginDraining()` closes admission permanently; health
+reused key with another API identity, pre-mint drain failure, and shutdown
+during handoff all fail closed. Test transport abort and request deadline
+expiry separately. A live owner cannot be stolen; an orphan replacement adopts
+one shared drain; superseded handlers/retries never mint; multiple sequential
+owner crashes still invoke the physical drain once. Service-process crash
+starts a fresh identity with no pending wave. `beginDraining()` closes
+admission permanently; health
 objects contain no path, checksum, key, URL, public browser ID, capability, or
 unscoped control-generation nonce.
 
@@ -1780,7 +1916,8 @@ same process/generation/digest retry resumes deterministically to convergence.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/startup-state.test.ts src/reconciliation.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/startup-state.test.ts src/reconciliation.test.ts
 ```
 
 Expected: FAIL because startup state and reconciliation modules do not exist.
@@ -1794,6 +1931,7 @@ export type StartupAdmission = {
   processNonce: string;
   createControlGeneration(
     request: CreateControlGenerationV1,
+    context: ControlGenerationRequestContext,
     drainRuntime: (admission: ControlGenerationDrainAdmission) => Promise<void>,
   ): Promise<ControlGenerationV1>;
   requireReady(binding: ControlGenerationBinding): {
@@ -1825,8 +1963,15 @@ export type ControlGenerationBinding = {
 };
 
 export type ControlGenerationDrainAdmission = {
+  // Aborted only by service shutdown or terminal wave failure, never by one
+  // owner request closing or being superseded.
   readonly signal: AbortSignal;
-  assertCurrent(): void;
+  assertWaveActive(): void;
+};
+
+export type ControlGenerationRequestContext = {
+  readonly transportSignal: AbortSignal;
+  readonly deadlineAtMs: number;
 };
 
 export function createStartupState(deps?: {
@@ -1837,16 +1982,29 @@ export function createStartupState(deps?: {
 Generate exactly 32 bytes with `node:crypto.randomBytes` for process identity
 and each successful control generation, encode unpadded base64url, and never
 persist or log either nonce. Process nonce never changes within the process.
-Serialize control handoff and reconciliation separately. Starting handoff
-synchronously closes admission, aborts active reconciliation, clears
-readiness/cache, and invokes the idempotent bounded runtime-drain callback.
-Mint a generation only after that callback proves every runtime resource
-closed. Preserve pending tuple and completed drain progress after a pre-mint
-server drain timeout so exact retry converges. Cache a minted result before
-response delivery so caller timeout/loss also converges. Enforce exact replay and collision/concurrency rules
-from Locked private contracts. Retain at most 1,024 accepted tuple/result
-tombstones without eviction for process lifetime; unknown tuple at capacity
-fails closed while known replay remains available.
+Serialize control handoff and reconciliation separately. Under the handoff
+mutex, keep exactly one service-owned wave with current tuple owner, request
+transport signal, absolute deadline, shared drain promise, and phase
+`pre_mint | minted`. Starting a wave synchronously closes admission, aborts
+active reconciliation, clears readiness/cache, and invokes the bounded
+runtime-drain callback once. The shared promise continues if its owner request
+dies; its `ControlGenerationDrainAdmission` is wave-scoped and aborts only for
+service shutdown or terminal drain failure, never owner replacement. Before
+mint, an authenticated new tuple may replace only an owner whose
+transport is aborted/closed or deadline expired; it atomically adopts the same
+promise and tombstones the old tuple as `control_generation_superseded`.
+Every handler rechecks ownership under the mutex after awaits and immediately
+before mint, so an old handler/retry cannot mint or regain ownership. A live
+owner returns `control_generation_in_progress` to other tuples. Only the
+current live owner mints after the shared drain proves every resource closed.
+After mint, forbid supersession and cache the result before response delivery,
+so caller timeout/loss converges by exact replay; the next different tuple
+starts a normal new full-drain wave. Enforce exact collision rules from Locked
+private contracts. Retain at most 1,024 pending/superseded/completed tuple
+tombstones without eviction for process lifetime. Reserve history capacity
+before accepting an owner or replacement; at capacity, an unknown tuple
+cannot adopt an orphan drain and fails closed while known completed or
+superseded replay remains deterministic.
 
 Validate process and control generation before calling filesystem code. Cache
 only a successful exact `(processNonce,controlGenerationNonce,digest)` result;
@@ -1973,8 +2131,9 @@ identity, capability, or grant.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/startup-state.test.ts src/reconciliation.test.ts
-corepack pnpm --dir apps/browser-service build
+cd apps/browser-service
+corepack pnpm exec vitest run src/startup-state.test.ts src/reconciliation.test.ts
+corepack pnpm build
 ```
 
 Expected: tests PASS for fail-before-delete, quarantine retry, generation/digest
@@ -2100,7 +2259,8 @@ test("restore crash discards work and never publishes a profile", async () => {
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
 ```
 
 Expected: FAIL because profile store and registry do not exist.
@@ -2202,7 +2362,8 @@ idempotent and closes Chromium before preparing a writer profile.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts
 ```
 
 Expected: PASS for writer exclusion, snapshot isolation, every publication
@@ -2306,7 +2467,8 @@ test("bounds each result and complete action response", async () => {
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
 ```
 
 Expected: FAIL because operation engine and action cache do not exist.
@@ -2378,8 +2540,9 @@ transport failure. Never retry an operation.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
-corepack pnpm --dir apps/browser-service test
+cd apps/browser-service
+corepack pnpm exec vitest run src/evaluate-policy.test.ts src/operations.test.ts src/action-cache.test.ts
+corepack pnpm test
 ```
 
 Expected: PASS for all operations, stable/stale refs, payload bounds, origin
@@ -2499,6 +2662,28 @@ test("API takeover closes every old runtime resource before response", async () 
   expect(startupAdmission.readyHealth().status).toBe("unready");
 });
 
+test("replacement request adopts an orphaned pre-mint server drain", async () => {
+  pauseRuntimeDrain();
+  const old = postPrivateStreaming(
+    "/v1/control-generations", apiAHandoff,
+  );
+  await runtimeDrainStarted();
+  old.abortTransport();
+  const replacement = postPrivate(
+    "/v1/control-generations", apiBHandoff,
+  );
+  releaseRuntimeDrain();
+  expect((await replacement).body.apiInstanceId)
+    .toBe(apiBHandoff.apiInstanceId);
+  await expect(retryPrivate(
+    "/v1/control-generations", apiAHandoff,
+  )).resolves.toMatchObject({
+    status: 409,
+    body: { category: "control_generation_superseded" },
+  });
+  expect(runtimeDrainInvocationCount()).toBe(1);
+});
+
 test.each([
   "GET /health/live",
   "GET /health/ready",
@@ -2585,7 +2770,8 @@ test("shutdown aborts accepted reconciliation between filesystem calls", async (
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
 ```
 
 Expected: FAIL because transport modules do not exist.
@@ -2634,12 +2820,16 @@ Create `StartupAdmission` before listener bind. Mount authenticated
 generation headers and never returns the current generation. Control handoff
 validates process nonce and the strict API-instance/idempotency pair, closes
 admission and aborts reconciliation synchronously, clears ready/cache, and
-awaits the registry's idempotent full-runtime drain before returning 201.
-That drain closes sessions, contexts, all stream modes, grants, writers,
-timers, and uncommitted working profiles under the request's 60-second bound.
-Partial drain returns a typed failure without minting; exact retry resumes.
-Persist the process-local completed result/tombstone before sending 201, so a
-caller timeout or disconnect after mint recovers by exact replay.
+starts one service-owned registry full-runtime drain before returning 201.
+That shared drain closes sessions, contexts, all stream modes, grants,
+writers, timers, and uncommitted working profiles and is not cancelled by one
+request transport. Feed request close/abort plus its absolute 60-second
+deadline into `ControlGenerationRequestContext`. Under the startup-state
+handoff mutex, a fresh tuple replaces only an orphaned pre-mint owner and
+awaits the same drain; live-owner concurrency remains 409 in-progress.
+Partial drain returns a typed failure without minting. Persist superseded
+tombstones and the minted result before any response, so old handlers/retries
+cannot mint and post-mint caller timeout/disconnect recovers by exact replay.
 
 Every later private request must authenticate both fencing headers before body
 parsing or route effects. A stale process or control generation returns typed
@@ -2690,7 +2880,10 @@ final-stage `FROM`. Re-run `imagetools inspect` against that complete pinned
 reference and require success before writing any other Dockerfile stage.
 
 Build dependencies with `node:22.22.1-bookworm-slim`, Corepack, and
-`corepack pnpm install --frozen-lockfile`. Final runtime starts from the exact
+`corepack pnpm install --frozen-lockfile`. Set the Browser Service package
+`WORKDIR` before every Dockerfile Corepack invocation; `dockerfile.test.ts`
+rejects any Corepack command that precedes that stage's package `WORKDIR`.
+Final runtime starts from the exact
 digest-pinned Noble Playwright reference, copies the exact Node `22.22.1`
 runtime from the Node stage, copies frozen production dependencies and build,
 and runs as `pwuser`. Only `/var/lib/firecrawl-browser` is writable.
@@ -2711,7 +2904,9 @@ install, preflight before start, and non-root user. It also requires exact
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node apps/browser-service/src/runtime-preflight.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+cd apps/browser-service
+corepack pnpm exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+cd ../..
 docker build --pull --no-cache --target browser-test -t firecrawl-local-browser-service:browser-test-1 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:browser-test-1 src/runtime-preflight.mjs
 docker run --rm --entrypoint corepack firecrawl-local-browser-service:browser-test-1 pnpm exec vitest run src/chromium-egress.integration.test.ts src/replay-restore.integration.test.ts
@@ -2849,6 +3044,19 @@ it("retries one handoff identity without changing its bytes", async () => {
 });
 
 it.each([
+  "control_generation_in_progress",
+  "control_generation_conflict",
+  "control_generation_superseded",
+  "control_generation_history_exhausted",
+])("preserves typed bootstrap policy category %s", async category => {
+  fetchMock.mockResolvedValueOnce(typedPrivateError(category));
+  await expect(client.createControlGeneration(
+    handoffRequest, bootstrapContext,
+  )).rejects.toMatchObject({ category });
+  expect(onControlGenerationMismatch).not.toHaveBeenCalled();
+});
+
+it.each([
   "getLive", "getReady", "reconcile", "createSession", "getSession",
   "closeSession", "executeAction", "createRelayGrant", "revokeRelayGrant",
   "fetchArtifact", "finalizeProfile", "discardProfile",
@@ -2981,6 +3189,11 @@ either during an exact retry. `BrowserServiceBootstrapRequestContext` carries
 no fencing generation. `BrowserServiceRequestContext` requires process and
 control-generation nonces and automatically sends both exact headers on every
 non-bootstrap method. Callers cannot override or omit them.
+`createControlGeneration` preserves typed
+`control_generation_in_progress`, `control_generation_conflict`,
+`control_generation_superseded`, and
+`control_generation_history_exhausted` responses for coordinator startup
+policy; only scoped mismatch invokes the permanent current-binding close hook.
 
 `discoverLive` parses only process identity and never accepts a returned
 generation. Scoped `getLive` parses only `live_unreconciled`, `reconciling`,
@@ -3259,6 +3472,11 @@ it("hands off service control before migrations or database recovery", async () 
   const startup = startApiWithBrowserCoordinator();
   await controlGenerationRequestStarted();
   expect(runMigrations).not.toHaveBeenCalled();
+  expect(databasePool.connect).not.toHaveBeenCalled();
+  expect(createDatabaseBackedBrowserStores).not.toHaveBeenCalled();
+  expect(bindApiListener).not.toHaveBeenCalled();
+  expect(startWorkers).not.toHaveBeenCalled();
+  expect(startOperationalRetention).not.toHaveBeenCalled();
   expect(interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
   expect(loadSnapshot).not.toHaveBeenCalled();
   releaseControlGenerationResponse();
@@ -3279,6 +3497,27 @@ it("hands off service control before migrations or database recovery", async () 
     "gate:open",
     "browser-retention:start",
   ]);
+});
+
+it("handoff failure exits before database or API side effects", async () => {
+  createControlGeneration.mockRejectedValue(controlHandoffUnavailable());
+  await expect(startApiWithBrowserCoordinator()).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  expect(runMigrations).not.toHaveBeenCalled();
+  expect(databasePool.connect).not.toHaveBeenCalled();
+  expect(createDatabaseBackedBrowserStores).not.toHaveBeenCalled();
+  expect(bindApiListener).not.toHaveBeenCalled();
+  expect(startWorkers).not.toHaveBeenCalled();
+  expect(startOperationalRetention).not.toHaveBeenCalled();
+});
+
+it("browser-disabled API still owns and runs its migrations", async () => {
+  await startApi({ LOCAL_BROWSER_SERVICE_ENABLED: "false" });
+  expect(createBrowserReconciliationCoordinator).not.toHaveBeenCalled();
+  expect(runMigrations).toHaveBeenCalledTimes(1);
+  expect(events.indexOf("migrations"))
+    .toBeLessThan(events.indexOf("api:listener"));
 });
 
 it("API-only restart drains old service work and accepts changed state", async () => {
@@ -3360,32 +3599,37 @@ it("serializes concurrent API startups and fences the earlier winner", async () 
   });
 });
 
-it.each(["before_service_commit", "after_service_commit_before_response"])(
-  "retries one in-process handoff identity after transport loss %s",
-  async lossPoint => {
-    const api = createApiProcessWithFixedInstanceIdentity();
-    loseControlTransportAt(lossPoint);
-    await expect(api.start()).rejects.toThrow();
-    await api.retryStartupInSameProcess();
-    expect(api.controlRequestBodies()).toHaveLength(2);
-    expect(api.controlRequestBodies()[1]).toBe(api.controlRequestBodies()[0]);
-    expect(api.controlGenerationMintCount()).toBe(1);
-    expect(api.databaseRecoveryCount()).toBe(1);
-  },
-);
+it("replays one in-process tuple after post-mint response loss", async () => {
+  const api = createApiProcessWithFixedInstanceIdentity();
+  loseControlTransportAt("after_service_mint_before_response");
+  await expect(api.start()).rejects.toThrow();
+  await api.retryStartupInSameProcess();
+  expect(api.controlRequestBodies()).toHaveLength(2);
+  expect(api.controlRequestBodies()[1]).toBe(api.controlRequestBodies()[0]);
+  expect(api.controlGenerationMintCount()).toBe(1);
+  expect(api.databaseRecoveryCount()).toBe(1);
+});
 
 it.each([
-  { crashPoint: "before_control_request_send", expectedTotalMints: 1 },
-  { crashPoint: "after_service_mint_before_response", expectedTotalMints: 2 },
+  { crashPoint: "before_control_request_send", drains: 1, mints: 1 },
+  { crashPoint: "during_pre_mint_drain", drains: 1, mints: 1 },
+  { crashPoint: "after_service_mint_before_response", drains: 2, mints: 2 },
 ])("replacement API uses a fresh tuple after process crash $crashPoint",
-  async ({ crashPoint, expectedTotalMints }) => {
+  async ({ crashPoint, drains, mints }) => {
     const crashed = createApiProcess();
     await crashApiProcessAt(crashed, crashPoint);
     const replacement = createApiProcessForSameServiceAndDatabase();
     await replacement.start();
     expect(replacement.apiInstanceId).not.toBe(crashed.apiInstanceId);
     expect(replacement.idempotencyKey).not.toBe(crashed.idempotencyKey);
-    expect(service.controlGenerationMintCount()).toBe(expectedTotalMints);
+    expect(service.runtimeDrainCount()).toBe(drains);
+    expect(service.controlGenerationMintCount()).toBe(mints);
+    if (crashPoint === "during_pre_mint_drain") {
+      await expect(service.retryTuple(crashed.controlTuple))
+        .rejects.toMatchObject({
+          category: "control_generation_superseded",
+        });
+    }
     expect(crashed.databaseRecoveryCount()).toBe(0);
     expect(replacement.databaseRecoveryCount()).toBe(1);
     expect(replacement.startupGate.assertOpen()).toMatchObject({
@@ -3741,7 +3985,7 @@ normal mutation lease: coordinator already owns closed, drained epoch. This
 avoids deadlock while retention is paused. Snapshot then retains every live,
 unknown, cleanup-state, or failed-recovery intent still present.
 
-- [ ] **Step 6: Implement recovery-first reconciliation coordinator**
+- [ ] **Step 6: Implement handoff-first reconciliation coordinator**
 
 Expose one lifecycle object:
 
@@ -3809,18 +4053,28 @@ for that process lifetime. For each discovered Browser Service process nonce,
 generate one 32-byte base64url idempotency key and freeze the exact control
 request bytes. `acquireControlGeneration()` calls `gate.close()`, pauses
 browser-state retention, discovers live process identity, then posts that
-exact handoff request. It retries response loss/timeout with the same tuple and
-bytes. If live process identity changes, abandon the old request, generate one
-new handoff key for the new process, and retry within the same outer startup
+exact handoff request. An exact-byte retry may recover a cached minted result
+or join a still-live owner, but cannot revive a pre-mint orphan or superseded
+tuple. `control_generation_superseded` fails this API startup; only a fresh API
+process with a fresh API instance/key tuple can adopt that service-owned drain.
+If live process identity changes, abandon the old request, generate one new
+handoff key for the new process, and retry within the same outer startup
 budget. It returns only after response process/API identity match and service
 drain has completed, carrying the original still-closed API drain token forward
 to initialization. No migration, database recovery, cleanup-intent access,
 snapshot query, or claim about interrupted Chromium occurs before this return.
 
-On every enabled API startup, including first startup, `index.ts` invokes
-`acquireControlGeneration()` before applying database migrations. It then
-applies migrations and calls `initializeAfterMigrations()` with that exact
-handoff. Under the existing mutex, initialization first activates the durable
+On every enabled API startup, including first startup, `index.ts` constructs
+the closed gate/client/coordinator and invokes `acquireControlGeneration()`
+before opening PostgreSQL for startup work or applying database migrations.
+Only after confirmed handoff does it apply migrations, then call
+`initializeAfterMigrations()` with that exact handoff to run every remaining
+coordinator phase. Pool configuration and `createBrowserStartupGate({ pool })`
+may be constructed before handoff only if construction is lazy and performs no
+connection, query, migration, or database-backed store initialization. Do not
+bind listeners, construct DB-backed browser stores, start workers, or start
+any retention before handoff succeeds. Under the existing mutex,
+initialization first activates the durable
 database control fence using the locked-row/scoped-live protocol above. This
 waits for every older cross-process mutation holding the row and rejects a
 superseded handoff. Only after activation and its post-commit service recheck
@@ -3923,7 +4177,10 @@ Wrap browser-state file creation, profile publication/discard, checkpoint
 materialization/cleanup, and retention deletion in
 `gate.withBrowserStateMutationLease("filesystem_and_database", ...)`. Make the
 browser phase call `waitUntilOpen(signal)` before each iteration. `index.ts`
-starts coordinator after migrations and before browser routes admit work.
+must construct the coordinator and finish `acquireControlGeneration()` before
+migrations, then run migrations and invoke `initializeAfterMigrations()`
+before browser routes admit work. No combined `start()` method may hide or
+reorder this boundary.
 
 This gate is mandatory dependency for later mutation boundaries: Task 9
 session/profile/run create, attach, transition, and stop; Task 10 action and
@@ -5353,6 +5610,7 @@ Verify content hashes and preserve existing artifact compatibility."
 ### Task 12: Preserve direct Browser and scrape Interact APIs
 
 **Files:**
+- Modify: `apps/api/src/controllers/v2/types.ts`
 - Modify: `apps/api/src/controllers/v2/browser.ts`
 - Create: `apps/api/src/controllers/v2/browser.test.ts`
 - Modify: `apps/api/src/controllers/v2/scrape-browser.ts`
@@ -5430,6 +5688,11 @@ call browser-state store, capability store, grant store, artifact attachment,
 or filesystem mutators directly. List/read may use `assertOpen()`; create,
 execute, delete, Interact, and stop rely on service-level mutation leases and
 map lease rejection to sanitized `browser_state_unavailable` 503.
+Because the browser controller imports shared `controllers/v2/types.ts`, that
+file enters browser import closure. Mechanically replace its remaining legacy
+closed-object `.strict()` calls with equivalent Zod 4 `z.strictObject()`
+declarations without changing fields, refinements, defaults, or public
+behavior; controller compatibility tests cover the imported schemas.
 
 - [ ] **Step 4: Replace local scrape Interact loop**
 
@@ -5471,7 +5734,7 @@ typed failures, no local provider fallback, and terminal stop.
 - [ ] **Step 6: Commit controller integration**
 
 ```bash
-git add apps/api/src/controllers/v2/browser.ts apps/api/src/controllers/v2/browser.test.ts apps/api/src/controllers/v2/scrape-browser.ts apps/api/src/controllers/v2/scrape-browser.test.ts apps/api/src/lib/scrape-interact/browser-agent.ts
+git add apps/api/src/controllers/v2/types.ts apps/api/src/controllers/v2/browser.ts apps/api/src/controllers/v2/browser.test.ts apps/api/src/controllers/v2/scrape-browser.ts apps/api/src/controllers/v2/scrape-browser.test.ts apps/api/src/lib/scrape-interact/browser-agent.ts
 apps/api/.husky/_/pre-commit
 git commit -m "feat: route browser APIs through local runtime" -m "Preserve direct Browser and scrape Interact contracts while routing
 sessions and one-job prompt or code runs through local boundaries.
@@ -5694,6 +5957,8 @@ expect(events).toEqual([
 expect(harnessParent.interruptUnfinishedBrowserWork).not.toHaveBeenCalled();
 expect(harnessParent.recoverCleanupIntents).not.toHaveBeenCalled();
 expect(harnessParent.startLocalRetentionService).not.toHaveBeenCalled();
+expect(harnessParent.runApplicationMigrations).not.toHaveBeenCalled();
+expect(apiChild.runApplicationMigrations).toHaveBeenCalledTimes(1);
 ```
 
 Add an API-only restart case after creating one replay checkpoint, committing
@@ -5734,6 +5999,11 @@ different root from a request or inserts an intermediate layer. Keep
 `LOCAL_BROWSER_SERVICE_ENABLED=false` in both Compose and
 `.env.example.local`. Never mount Docker
 socket or adapter token in this task.
+Remove the API service's pre-start dependency on `app-db-migrate` in the
+rendered local Compose topology. PostgreSQL health may gate process launch,
+but only API process may invoke application migrations, after its successful
+Browser Service control handoff. Keep migration sidecars available for other
+explicit workflows without making local API startup depend on one.
 
 - [ ] **Step 4: Implement exact harness lifecycle**
 
@@ -5786,10 +6056,13 @@ Return live handle and generated environment to harness, spawn API, then wait
 for authenticated ready whose process/generation/digest equal coordinator's
 binding.
 Remove existing harness-parent imports/calls that run
-`interruptUnfinishedBrowserWork`, cleanup-intent recovery, or
+`runApplicationMigrations`, `interruptUnfinishedBrowserWork`,
+cleanup-intent recovery, or
 `createLocalRetentionService`; API `index.ts` is sole operational, artifact,
-and browser-state retention owner. Never wait ready before API spawn and never
-start any retention from harness. On cleanup, signal API and wait while its
+browser-state retention, and migration-order owner. Harness may create and
+health-check disposable PostgreSQL but cannot migrate it. Never wait ready
+before API spawn and never start any retention from harness. On cleanup,
+signal API and wait while its
 coordinator stops monitor and its one retention service, remove Browser
 Service, drop disposable PostgreSQL, then remove owned root. Configure API and
 service with the same generated direct-root mapping. Missing Docker or Podman
@@ -5809,7 +6082,10 @@ live/API-handoff/migrations/recovery/reconcile/ready order, including API-only
 restart fencing. Compose
 config exits 0, image builds from committed digest, Browser Service has no
 `ports`, feature remains false, only API publishes `127.0.0.1:3002`, override
-environment is rejected, two invocations share no identity/state/database,
+environment is rejected, rendered API has no `app-db-migrate` dependency,
+the harness parent migration spy remains zero while child API owns one
+migration event after handoff,
+two invocations share no identity/state/database,
 cleanup is registered before creation, injected failure/signal at every
 creation boundary cleans in reverse order exactly once, partial container run
 is removed, and cleanup removes only owned resources.
@@ -5951,81 +6227,89 @@ events, exact final output, and complete cleanup.
 - [ ] **Step 4: Add checked stale-contract scanner and mutation fixtures**
 
 Add `check:browser-stale-contracts` as
-`tsx src/cli/browser-stale-contract-scan.ts`. The scanner owns an exact product
-production-file manifest and fails if any entry is absent. Do not scan test or
-snip files because their rejection fixtures intentionally contain forbidden
-literals. Do not scan generated `pnpm-lock.yaml`; frozen-lock checks own it.
-Do not include the scanner source itself in its product manifest because it
-necessarily contains every forbidden rule literal; its dedicated test imports
-and validates scanner structure and behavior directly.
+`tsx src/cli/browser-stale-contract-scan.ts`. A checked discovery/import
+closure, not a hand-maintained file list, defines the production scan set.
+Export pure `discoverBrowserContractSources(workspaceRoot)`,
+`resolveLocalImportClosure(entryPaths, workspaceRoot)`, and
+`scanSources([{path,text}])`; the CLI unions discovery plus closure and refuses
+to rule-scan an incomplete inventory.
 
 ```ts
-export const browserContractProductionFiles = [
-  "apps/browser-service/contracts/private-v1.contract.json",
-  "apps/browser-service/package.json",
-  "apps/browser-service/tsconfig.json",
-  "apps/browser-service/Dockerfile",
-  "apps/browser-service/src/runtime-preflight.mjs",
-  "apps/browser-service/src/config.ts",
-  "apps/browser-service/src/contracts.ts",
-  "apps/browser-service/src/contract-inventory.ts",
-  "apps/browser-service/src/errors.ts",
-  "apps/browser-service/src/auth.ts",
-  "apps/browser-service/src/network-policy.ts",
-  "apps/browser-service/src/egress-proxy.ts",
-  "apps/browser-service/src/chromium-launch-policy.ts",
-  "apps/browser-service/src/startup-state.ts",
-  "apps/browser-service/src/reconciliation.ts",
-  "apps/browser-service/src/profile-store.ts",
-  "apps/browser-service/src/session-registry.ts",
-  "apps/browser-service/src/replay-restore.ts",
-  "apps/browser-service/src/evaluate-policy.ts",
-  "apps/browser-service/src/operations.ts",
-  "apps/browser-service/src/action-cache.ts",
-  "apps/browser-service/src/streams.ts",
-  "apps/browser-service/src/artifacts.ts",
-  "apps/browser-service/src/server.ts",
-  "apps/browser-service/src/index.ts",
-  "apps/api/package.json",
-  "apps/api/src/config.ts",
-  "apps/api/src/lib/local-runtime-config.ts",
-  "apps/api/src/db/migrations/0007_browser_control_generation.sql",
-  "apps/api/src/db/migrations/0008_browser_adapter_bindings.sql",
-  "apps/api/src/db/schema/public.ts",
-  "apps/api/src/lib/scrape-interact/browser-service-contracts.ts",
-  "apps/api/src/lib/scrape-interact/browser-service-client.ts",
-  "apps/api/src/lib/scrape-interact/replay-store.ts",
-  "apps/api/src/lib/scrape-interact/browser-agent.ts",
-  "apps/api/src/lib/browser-state/filesystem-store.ts",
-  "apps/api/src/lib/browser-state/store.ts",
-  "apps/api/src/lib/browser-state/types.ts",
-  "apps/api/src/lib/browser-state/capability-store.ts",
-  "apps/api/src/lib/browser-state/proxy-grant-store.ts",
-  "apps/api/src/lib/browser-runtime/startup-gate.ts",
-  "apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts",
-  "apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts",
-  "apps/api/src/lib/browser-runtime/protocol.ts",
-  "apps/api/src/lib/browser-runtime/execution-adapter.ts",
-  "apps/api/src/lib/browser-runtime/orchestrator.ts",
-  "apps/api/src/lib/browser-runtime/action-normalization.ts",
-  "apps/api/src/lib/browser-runtime/action-coordinator.ts",
-  "apps/api/src/lib/browser-runtime/proxy-urls.ts",
-  "apps/api/src/lib/browser-runtime/artifacts.ts",
-  "apps/api/src/lib/artifacts/manifest.ts",
-  "apps/api/src/lib/artifacts/local-manifest.ts",
-  "apps/api/src/services/local-retention-worker.ts",
-  "apps/api/src/controllers/internal/browser-runs.ts",
-  "apps/api/src/routes/internal.ts",
-  "apps/api/src/controllers/v2/browser.ts",
-  "apps/api/src/controllers/v2/scrape-browser.ts",
-  "apps/api/src/controllers/v2/browser-proxy.ts",
-  "apps/api/src/routes/v2.ts",
-  "apps/api/src/index.ts",
-  "apps/api/src/harness.ts",
-  "apps/api/src/harness-browser-service.ts",
-  "compose.local.yaml",
-  ".env.example.local",
-] as const;
+export const browserContractDiscovery = {
+  recursiveTypeScriptRoots: [
+    "apps/browser-service/src",
+    "apps/api/src/lib/browser-state",
+    "apps/api/src/lib/browser-runtime",
+    "apps/api/src/lib/scrape-interact",
+    "apps/api/src/db/schema",
+  ],
+  recursiveDatabaseGlobs: [
+    "apps/api/src/db/migrations/*browser*.sql",
+  ],
+  closureEntryPoints: [
+    "apps/api/src/lib/local-runtime-config.ts",
+    "apps/api/src/services/local-retention-worker.ts",
+    "apps/api/src/controllers/internal/browser-runs.ts",
+    "apps/api/src/controllers/v2/browser.ts",
+    "apps/api/src/controllers/v2/scrape-browser.ts",
+    "apps/api/src/controllers/v2/browser-proxy.ts",
+    "apps/api/src/harness-browser-service.ts",
+  ],
+  scanOnlyBridgeFiles: [
+    "apps/api/src/config.ts",
+    "apps/api/src/controllers/v2/types.ts",
+    "apps/api/src/routes/internal.ts",
+    "apps/api/src/routes/v2.ts",
+    "apps/api/src/index.ts",
+    "apps/api/src/harness.ts",
+  ],
+  explicitProductionRoots: [
+    "apps/browser-service/contracts/private-v1.contract.json",
+    "apps/browser-service/package.json",
+    "apps/browser-service/tsconfig.json",
+    "apps/browser-service/Dockerfile",
+    "apps/browser-service/src/runtime-preflight.mjs",
+    "apps/api/package.json",
+    "compose.local.yaml",
+    ".env.example.local",
+  ],
+  requiredProductionPaths: [
+    "apps/api/src/lib/browser-state/filesystem-store-internal.ts",
+    "apps/api/src/lib/browser-state/transitions.ts",
+    "apps/api/src/lib/browser-state/process-identity.ts",
+    "apps/api/src/lib/browser-state/legacy-compatibility.ts",
+    "apps/api/src/lib/scrape-interact/replay-envelope.ts",
+  ],
+  taskPlan:
+    "docs/superpowers/plans/2026-07-19-browser-service-and-api.md",
+  reviewedExclusions: [
+    {
+      id: "test_or_negative_fixture",
+      suffix: /(?:\.test|\.spec|\.integration\.test)\.[cm]?[jt]sx?$/,
+      requireMatch: true,
+    },
+    {
+      id: "snip_fixture",
+      prefix: "apps/api/src/__tests__/snips/",
+      requireMatch: true,
+    },
+    {
+      id: "scanner_rule_literal_source",
+      exact: "apps/api/src/cli/browser-stale-contract-scan.ts",
+      requireMatch: true,
+    },
+    {
+      id: "generated_lockfile",
+      exact: "apps/browser-service/pnpm-lock.yaml",
+      requireMatch: true,
+    },
+    {
+      id: "generated_or_vendor_tree",
+      prefixes: ["apps/browser-service/dist/", "node_modules/"],
+      requireMatchWhenPresent: true,
+    },
+  ],
+} as const;
 
 export const browserSchemaValidationFiles = [
   "apps/browser-service/src/contracts.ts",
@@ -6044,17 +6328,62 @@ export const browserSchemaValidationFiles = [
 ] as const;
 ```
 
-Export pure `scanSources([{path,text}])` and a CLI wrapper. Use TypeScript's
-compiler AST for call/property/initializer structure and bounded lexical rules
-for SQL/YAML/env/text. Report stable rule ID, path, line, and sanitized match;
-never rewrite files. Lock these rules:
+Recursively include every production `apps/browser-service/src/**/*.ts` and
+every production TypeScript file under the three API library roots. Exclude
+tests only after discovery, never by pruning a directory before enumeration.
+Recursively include API database schema TypeScript and every browser-named SQL
+migration. Add the explicit controller, service, config, entrypoint, harness,
+Compose, environment, package, contract, Dockerfile, and runtime roots above.
+Parse this plan's `Create:`/`Modify:` paths and require every
+task-touched production path to be discovered, import-closed, or covered by
+one exact reviewed exclusion.
+
+Starting from every discovered/explicit TypeScript root, resolve local static
+imports, re-exports, and string-literal dynamic imports to a fixed point.
+Support extensionless files, `.js` specifiers mapping to source `.ts`/`.tsx`,
+directory `index.ts`, and repository tsconfig path aliases. Reject unresolved
+local imports. The recursive directory roots and `closureEntryPoints` seed
+that closure. Generic API config/index/harness/route aggregators are
+`scanOnlyBridgeFiles`: scan their own complete text, but do not let unrelated
+v0/v1/application imports redefine browser-contract ownership. Shared
+`controllers/v2/types.ts` is also a scanned bridge: Task 12 removes its own
+legacy `.strict()` call, while its `../v1/types` dependency is an exact
+`reviewed_non_browser_boundary` and does not import all legacy v1 contracts.
+
+For every bridge file, maintain a checked exact import classification keyed by
+normalized resolved target: `browser_follow` or
+`reviewed_non_browser_boundary`. Recursively close every `browser_follow`
+target. A browser target classified non-browser, an import absent from the
+classification, a removed/renamed target, or a new import fails
+`inventory_bridge_import_unclassified`. This is a scope boundary, not a
+forbidden-file exclusion, and cannot hide any import reachable from a browser
+closure entrypoint. Prefer dedicated browser lifecycle/route modules as
+closure roots and keep generic bridges limited to registration calls. The
+resulting normalized set plus bridge texts is checked production inventory and
+lexical-rule input. Browser-schema AST rules still use the narrower explicit
+schema subset above.
+
+Reviewed exclusions may identify only tests/negative fixtures, snips, the
+scanner's own rule-literal source, generated files, or vendor trees. Each exact
+exclusion must match its declared candidate (or, for generated/vendor trees,
+must match when that tree exists); stale or broadened exclusions fail
+`inventory_stale_exclusion`. A discovered production path absent from the
+inventory fails `inventory_discovery_unlisted`; a resolved imported path absent
+from it fails `inventory_import_unclosed`; a task-touched production path that
+escaped both fails `inventory_task_path_uncovered`. Missing required paths
+fail separately. Only after all inventory checks pass may rule scanning start.
+
+Use TypeScript's compiler AST for call/property/initializer structure and
+bounded lexical rules for SQL/YAML/env/text. Report stable rule ID, path, line,
+and sanitized match; never rewrite files. Lock these rules:
 
 - `legacy_root_config`: reject namespace/profile-root identifiers and AST root
   composition that joins/resolves `canonicalRoot`, `stateRoot`, or
   `localBrowserStateRoot` with a namespace or literal `checkpoints` segment.
 - `legacy_checkpoint_layer`: reject quoted/backtick `checkpoints` path segments,
   including terminal, slash, and backslash forms.
-- `legacy_zod_strict`: reject direct `\.strict\s*\(` in every product source;
+- `legacy_zod_strict`: reject direct `\.strict\s*\(` in every discovered or
+  import-closed production source;
   closed schemas use `z.strictObject()`.
 - `bare_url_validator`: in `browserSchemaValidationFiles`, reject AST calls to
   `z.url()` or `z.string().url()`.
@@ -6063,7 +6392,7 @@ never rewrite files. Lock these rules:
   `canonicalUuidSchema` in each of exactly
   `apps/browser-service/src/contracts.ts` and
   `apps/api/src/lib/scrape-interact/browser-service-contracts.ts`.
-  Unrelated application config remains in the product manifest for all lexical
+  Unrelated application config remains in the checked inventory for lexical
   rules but is explicitly outside browser-schema validator ownership.
 - `typescript_node_test`: reject `node --test` commands targeting `.ts` or
   `.tsx`; `.mjs` bootstrap tests remain allowed.
@@ -6084,35 +6413,67 @@ never rewrite files. Lock these rules:
   `stdout,result,stderr,exitCode,killed`; reject `fromCache`, missing/extra
   keys, missing exported `CodeRunResult`, or an alias targeting another schema.
 
-`browser-stale-contract-scan.test.ts` table-drives at least one known-bad
-in-memory source for every rule and asserts exact rule ID/path/line. Include
-plain, payload, JSON, and arbitrary-suffix snake/camel database column forms;
-both UUID call forms; multiline/direct
-`.strict (` syntax, quoted/backtick/backslash checkpoint segments, each split
-activation family, and all legacy acceptance shapes. UUID allowlist fixtures
+`browser-stale-contract-scan.test.ts` creates an isolated temporary workspace
+and always deletes it in `finally`. Table-drive every lexical/AST rule twice:
+once by writing a new production file under
+`apps/browser-service/src/discovered/`, and once by importing a helper outside
+the configured roots from a discovered API source. Put the forbidden pattern
+in the new file and require the corresponding rule finding, proving neither
+directory discovery nor import closure silently omits it. Include plain,
+payload, JSON, arbitrary-suffix snake/camel database columns, multiline
+`.strict\n  (`, direct `.strict (`, and quoted/backtick/backslash checkpoint
+segments.
+
+Separate closure fixtures cover two-hop imports, re-exports, string-literal
+dynamic imports, tsconfig aliases, `.js`→`.ts`, extensionless resolution, and
+directory `index.ts`; every transitive file appears once in normalized sorted
+inventory. A bridge fixture classifies one browser registration import and
+proves its two-hop forbidden helper is scanned. Another classifies an
+unrelated v1/v2 schema import as a reviewed non-browser boundary and proves it
+does not enter browser-contract inventory; changing either classification or
+adding an unclassified bridge import fails before rule scanning. Real-tree
+inventory must contain `controllers/v2/types.ts` but exclude
+`controllers/v1/types.ts`; changing that exact boundary classification fails.
+Deleting a
+required path, injecting a discovered path that an
+instrumented inventory drops, and injecting an imported path that an
+instrumented closure drops must produce distinct missing-required,
+`inventory_discovery_unlisted`, and `inventory_import_unclosed` failures before
+rule scanning. Add a task-plan fixture whose production `Modify:` path escapes
+both discovery and closure and expect `inventory_task_path_uncovered`.
+
+Every reviewed exclusion has positive match coverage; rename/delete its
+candidate and expect `inventory_stale_exclusion`. Test/snip/scanner/generated
+fixtures remain excluded, while a production import of an excluded test or
+scanner file fails closed instead of hiding the edge. UUID allowlist fixtures
 prove exact two definitions pass while a third, renamed, moved, or wrong-file
 call fails. Code-result fixtures prove the exact schema/alias passes while
 added `fromCache`, missing `killed`, absent alias, or wrong alias target fails.
-Manifest-missing fixture fails before scanning; real product manifest has zero
-findings. A scanner-self test verifies its manifest/rule exports and a CLI
-fixture returns exit 1 for one bad temporary source and 0 for clean input. No
-negative fixture is added to the production or browser-schema allowlist.
+The real-tree discovery/import closure contains all five required previously
+omitted helpers, covers every task-touched production path, and has zero rule
+findings. CLI fixtures return exit 1 for bad/incomplete temporary trees and 0
+for clean closed input.
 
 ```bash
 pnpm --dir apps/api exec vitest run src/cli/browser-stale-contract-scan.test.ts
 pnpm --dir apps/api check:browser-stale-contracts
 ```
 
-Expected: every mutation fixture proves its stale category fails, exact
-allowlists pass, manifest is complete, and real production files exit 0.
+Expected: every directory/import mutation proves its stale category fails,
+all closure forms resolve, exclusions stay exact, required/task-touched paths
+are covered, and the real discovered/import-closed production inventory exits
+0.
 
 - [ ] **Step 5: Run deterministic regression**
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
-corepack pnpm --dir apps/browser-service install --frozen-lockfile
-corepack pnpm --dir apps/browser-service test
-corepack pnpm --dir apps/browser-service build
+cd apps/browser-service
+test "$(corepack pnpm --version)" = "10.33.0"
+corepack pnpm install --frozen-lockfile
+corepack pnpm test
+corepack pnpm build
+cd ../..
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/db/migrate.integration.test.ts src/lib/browser-runtime src/lib/browser-state src/lib/scrape-interact src/controllers/internal/browser-runs.test.ts src/controllers/v2/browser.test.ts src/controllers/v2/browser-proxy.test.ts src/controllers/v2/scrape-browser.test.ts
 pnpm --dir apps/api exec vitest run src/cli/browser-stale-contract-scan.test.ts
 pnpm --dir apps/api check:browser-stale-contracts
@@ -6136,8 +6497,11 @@ zero model-tool events, and checked stale-contract enforcement."
 
 ## Final verification for this plan
 
-- [ ] Prepend installed Node `22.22.1`; assert `node --version` is
-  `v22.22.1` and `corepack pnpm --version` is `10.33.0`.
+- [ ] Prepend installed Node `22.22.1`; from process cwd
+  `apps/browser-service`, assert `node --version` is `v22.22.1` and
+  `corepack pnpm --version` returns exactly `10.33.0`.
+- [ ] Search this plan for Browser Service Corepack calls that pass pnpm's
+  `--dir` option instead of changing process cwd first; expect zero matches.
 - [ ] Run Browser Service frozen install, test, and build through Corepack;
   expect all PASS and no lockfile change. `pnpm list --depth 0` must report the
   11 exact direct versions from Task 1, including production TypeScript
@@ -6152,14 +6516,19 @@ zero model-tool events, and checked stale-contract enforcement."
   snippets for permissive UUID/URL validators; expect only the shared local
   primitive definitions to call `.uuid()` and no bare `.url()`. Both sides
   reject uppercase UUIDs and file/mailto/ftp/credential URLs.
-- [ ] Run the Task 15 checked scanner and its mutation-fixture suite over every
-  exact product runtime/config/schema/controller/store/harness/Compose/env path
-  in its manifest. Expect all stale mutations to fail with their exact rule IDs
-  and real product tree to report zero findings. Negative tests and scanner
-  rule source are structurally excluded, never lexical exceptions. Within the
+- [ ] Run Task 15 checked discovery/import-closure scanner and its temporary
+  mutation suite. Require recursive production roots, transitive local import
+  closure, five named omitted helpers, and every task-touched production path
+  in normalized inventory. Require every scan-only bridge import to retain an
+  exact browser-follow/non-browser-boundary classification; unclassified
+  changes fail, browser imports close recursively, and unrelated aggregator
+  imports do not expand scope. Directory-discovered and imported forbidden files
+  must fail with exact rule IDs; missing closure, stale exclusions, or escaped
+  task paths fail before scanning. Real tree reports zero findings. Negative
+  tests and scanner rule source are exact structural exclusions. Within the
   explicit browser-schema subset, bare UUID calls are AST-allowlisted only in
   two named `canonicalUuidSchema` declarations and bare URL calls are absent;
-  direct `.strict(` calls are absent across the full product manifest.
+  direct `.strict(` calls are absent across the discovered closed inventory.
 
   ```bash
   pnpm --dir apps/api exec vitest run \
@@ -6234,12 +6603,16 @@ zero model-tool events, and checked stale-contract enforcement."
   closure, changed digest reconciliation, old-API stale rejection, and ready
   only for matching process/generation/digest. Every HTTP/WS stale response
   synchronously closes only its matching API binding.
-- [ ] Lose handoff transport before/after service commit, crash the API process
-  before request send/after service mint, race two API instances, and restart
-  Browser Service during handoff. Same-process exact replay mints once; true
-  replacement uses a fresh tuple/full drain and may mint again; concurrent
-  takeover serializes; process change abandons old handoff; no database
-  recovery runs before confirmed service and durable mutation drains.
+- [ ] Lose handoff transport before/during drain/after service mint, crash API
+  before request send/during pre-mint drain/after service mint, race two live
+  API instances, and restart Browser Service during handoff. Post-mint exact
+  replay mints once. During pre-mint drain, a fresh replacement tuple adopts
+  the one service-owned drain, while old handler/retry returns superseded;
+  repeat across multiple owner crashes and expect one physical drain/one mint.
+  A live owner cannot be stolen. After prior mint, true replacement performs a
+  new full drain and may mint again. At tombstone capacity, unknown replacement
+  fails without state change. Process restart creates a fresh identity; no
+  database recovery runs before confirmed service and durable mutation drains.
 - [ ] Restart Browser Service; expect process nonce change closes API gate,
   completes a new handoff, then interrupts durable work and reconciles once.
   A same-process generation change means this API was superseded: it closes
@@ -6361,8 +6734,9 @@ zero model-tool events, and checked stale-contract enforcement."
   publication.
 - Contract drift: one canonical V1 inventory locks every route, field, type,
   bound, status, header, and response cap; Browser Service and API consume and
-  fingerprint it independently. Checked production-manifest scanning plus
-  positive mutation fixtures reject every named stale contract.
+  fingerprint it independently. Checked production-root discovery, fixed-point
+  import closure, and positive mutation fixtures reject every named stale
+  contract or uncovered production path.
 - Reconciliation safety: complete authority validates before deletion; only
   recognized old orphans enter collision-free same-root quarantine preserving
   full source paths. Planning rejection changes nothing; execution failure may
