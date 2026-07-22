@@ -61,36 +61,73 @@ as an in-scope concurrent race.
 Held trusted parents make identity-pinned public source acquisition safe under
 serialized service ownership. New public data still uses one atomic
 private-to-public no-replace syscall so collision, crash, and publication state
-have exact semantics. Native rename source is always private staging; public
-source deletion never uses the native publisher.
+have exact semantics. Protected working/staging/canary cleanup may use the same
+native primitive only for its authenticated public-to-private deletion move.
 
 ## Trusted namespace provisioning
 
-Reserved layout:
+The Docker named volume is mounted only at the trusted parent
+`/var/lib/firecrawl-browser-volume`. Browser Service state root is its child
+`/var/lib/firecrawl-browser-volume/state`, never the mountpoint itself:
 
 ```text
-<browser-state-root>/.profile-publish-staging/
-  intents/
-  bundles/
+/var/lib/firecrawl-browser-volume/
+  .firecrawl-browser-initialized-v1
+  state/
+    profiles/
+    .profile-publish-staging/
+      intents/
+      bundles/
 ```
 
-Trusted deployment init exclusively creates the browser-state root,
-`.profile-publish-staging`, `intents`, and `bundles` from a held
-non-attacker-writable volume parent before Browser Service starts. Absent
-creation uses nonrecursive `mkdir(..., 0700)` and treats `EEXIST` as failure in
-that init run. Init opens each result with `O_DIRECTORY | O_NOFOLLOW`, verifies
-identity, syncs each child and parent, then drops privileges before service
-exec. It never clears a directory from an earlier run; a separate validation
-mode accepts existing roots only when their metadata/identity is valid and
-leaves all contents untouched so Browser Service can recover restart intents.
+The init container verifies fixed `/usr/bin/flock` from its pinned util-linux
+package against the image's checked-in path/version/binary-digest allowlist.
+With umask `0077`, its fixed command is
+`/usr/bin/flock --exclusive --timeout 60
+/var/lib/firecrawl-browser-volume <node22>
+scripts/init-state-volume.mjs`. The path is the already-provisioned trusted
+volume-parent directory itself; `flock` opens/locks that existing inode, holds
+the lock in the parent for the entire child lifetime, and kernel-releases it on
+exit/crash. It never uses `-o`, a creatable lock path, marker file, or child
+state path as lock object. Init-new and validate-existing create no lock
+artifact. The `.mjs` never calls/emulates flock. It opens the same parent with
+`O_DIRECTORY | O_NOFOLLOW`, requires exact provisioned parent identity, and
+selects mode only under this launcher. No marker and no `state` selects
+`init-new`; matching initialization marker selects `validate-existing`;
+marker/state disagreement or unexpected reserved child fails. Marker records
+completed initialization only and never supplies mutual exclusion. Selection
+cannot be overridden or repaired after inspection.
 
-Browser Service is validation-only for all four staging ancestors. It never
-calls mkdir, chmod, chown, rename, repair, or recursive cleanup to establish
-the staging root, `intents`, or `bundles`. It opens each through its held parent
-with `O_DIRECTORY | O_NOFOLLOW`, then rejects absence, links,
+`init-new` exclusively creates `state`, `profiles`,
+`.profile-publish-staging`, `intents`, and `bundles` one segment at a time
+through held parent descriptors. Every create uses nonrecursive
+`mkdir(..., 0700)` and treats `EEXIST` as failure. Before release, init uses
+`fchown` to exact UID/GID `1000:1000`, `fchmod` to exact `0700`, revalidates
+type/dev/ino/owner/mode/link count with no-follow handles, fsyncs children
+bottom-up, and fsyncs each containing parent. It sets the volume parent to exact
+`root:1000`/`0750`, then exclusively writes marker bytes
+`firecrawl-browser-volume-v1\n` as exact `root:root`/`0600`, fsyncs marker and
+parent, and releases the lock. `validate-existing` requires those same parent,
+marker, child, and content invariants.
+`validate-existing` performs the same held-handle validation but never creates,
+chowns, chmods, removes, renames, truncates, or repairs anything. It leaves all
+contents untouched for recovery.
+
+Browser Service is validation-only for `state`, pre-created `profiles`, and all
+staging ancestors. It never calls mkdir, chmod, chown, rename, repair, or
+recursive cleanup to establish them. It opens each through its held parent with
+`O_DIRECTORY | O_NOFOLLOW`, then rejects absence, links,
 non-directories, wrong owner, any mode other than `0700`, zero link count,
 disallowed filesystem, or changed parent chain. It preserves valid existing
 intents, temps, wrappers, and payloads for bounded recovery.
+
+After init completes, Browser Service opens validated `state` and pre-created
+`profiles`; reconciliation places those held descriptors/identities into root
+evidence before any scaffold, canary, intent recovery, or general Task 3 scan.
+No code lazily creates `profiles`. The API container does
+not mount this named volume read-write or read-only; it receives reconciliation
+data over the authenticated service protocol. A future explicit API filesystem
+requirement needs a separate design review and is not implied here.
 
 Exact invariants for `.profile-publish-staging`, `intents`, `bundles`,
 `profiles`, every profile UUID directory, and every `working`, `staging`, and
@@ -102,8 +139,8 @@ mount ID for its actual source and target parent. Existing valid `intents` and
 `bundles` survive restart unchanged for recovery. Unknown or invalid reserved
 entries fail readiness; they are never eagerly deleted.
 
-No public profile directory is created by this provisioning path. Profile
-scaffolding itself uses atomic publication below.
+No profile UUID directory is created by provisioning. Profile scaffolding
+itself uses atomic publication below the pre-created `profiles` parent.
 
 ## Filesystem and mount proof
 
@@ -158,18 +195,22 @@ becomes `cleaned` only after private absence/sync. Canary leaves remain protecte
 while exact intent exists; orphan fails readiness.
 
 The only nonfatal `ENOENT` rule is canary same-attempt replay. Native prechecks
-and fresh statfs/statx must succeed; stable intent must bind the exact source
-identity and leaves; and post-call canonical proof must find source absent plus
+and fresh statfs/statx must succeed. Controller first returns
+`native_resolved/atomic_publish_source_missing` with no locations and performs
+no classification, cleanup, retry, or admission action. Reducer must next emit
+the exact separate `observe_locations` effect. Stable intent must bind the exact
+source identity and selectors, and its `locations_observed` must find source absent plus
 either the exact matching public canary target for publication replay or the
 exact matching private deletion identity for cleanup replay. The latter uses
 the attempt-zero root identity plus manifest/cursor-consistent remaining tree.
-Normalize that result to `atomic_publish_replay_completed`, advance or finish
-the expected durable phase, accept the current call's mount proof, and do not
-close admission. Persist replay-completed when filling a null classification;
+Only reducer then normalizes to `atomic_publish_replay_completed`, advances or
+finishes the expected durable phase, accepts the current call's mount proof,
+and leaves admission open. Persist replay-completed when filling a null classification;
 if classification is already durable, validate it unchanged and use the replay
 result only as current-process proof. A mismatch, both/neither unexplained,
-wrong phase/attempt, or any other `ENOENT` is
-`atomic_publish_binding_invalid` and globally fail-stops.
+wrong phase/attempt, or any other `ENOENT` makes reducer emit
+`close_admission/binding_invalid`, wait for its observation, then record global
+fail-stop. Controller never normalizes source-missing itself.
 
 If durable `deleting` evidence already places the canary in its private deletion
 tree, or its cursor proves that tree partially/fully removed, recovery skips the
@@ -210,12 +251,14 @@ Each manifest remains at most 25,000 entries, 33,554,432 encoded bytes, and
 filesystem-entry total is exactly 25,000 user payload + 1,024 scratch + 4,096
 metadata = 30,120; categories never borrow from each other.
 
-A generation-scoped reservation ledger updates synchronously before any await,
-open, create, copy, hash read, intent temp, wrapper, or canary effect. Concurrent
-operations serialize that synchronous reservation through admission; a
-would-be count or byte over limit fails before effect. Reservations never
+A generation-scoped reservation ledger updates only through a reducer-emitted
+`reserve_budget` effect observed before any await/open/create/copy/hash/temp/
+wrapper/canary effect. Concurrent operations serialize controller execution of
+that request through admission; a would-be count or byte over limit returns a
+closed rejection observation before filesystem effect. Reservations never
 refund in-process after an ambiguous or close-unverified result. Restart
-re-enumerates and reserves all durable state before cleanup or classification.
+uses explicit enumerate/read/reserve effects for all durable state before
+cleanup or classification.
 Exactly-at-maximum restart must succeed without creating normal work; the next
 normal/canary/metadata/payload entry or byte fails synchronously.
 
@@ -427,8 +470,9 @@ may be zero bytes, but writer prepare rejects aggregate `byteSize === 0` as
 `profile_schema_empty` before staging. This includes root-only trees and trees
 containing any number of zero-byte files/directories; entry count never
 substitutes for profile bytes.
-`classification.nativeCode` is the module-private wrapper's normalized durable
-result, so raw `atomic_publish_source_missing` never appears there.
+`classification.nativeCode` is reducer-normalized durable result after separate
+location observation, so raw `atomic_publish_source_missing` never appears
+there.
 
 Kind and target are inseparable: `canary` requires `canary_parent` plus
 non-null `canaryProof`, and `privateSource` binds its exact proof leaf;
@@ -487,7 +531,7 @@ durable `aborting_prepublication` with null classification and outcome
    `planned`, exact locators/hash/size/count, and null inode evidence.
 3. Create/write/fsync exact temp through authenticated
    `private_manifest_temp_file`, then publish temp to absent stable filename via
-   capability-only native no-replace and sync `intents`.
+   reconciliation-controlled native no-replace and sync `intents`.
 4. Open/hash/size the stable file, capture dev/ino/mode, and persist/fsync phase
    `manifest_published` with identityManifest phase `published` before any
    cleanup/source mutation.
@@ -565,8 +609,9 @@ canary same-attempt `ENOENT` resolution satisfying every narrow replay
 predicate; `atomic_publish_exists` classifies conflict when trusted locations
 match. Other native codes may classify unpublished or ambiguous. A target match
 may classify published after an error only through the explicit canary replay
-rule or when the wrapper proves the syscall succeeded before a later wrapper
-failure; evidence/error precedence and global fail-stop remain preserved.
+rule or when the controller proves the syscall succeeded before a later
+controller failure; evidence/error precedence and global fail-stop remain
+preserved.
 
 `publicSource` is required in every phase for prepare/finalize and null for
 other kinds. It is derived from authenticated held source, not request text.
@@ -655,12 +700,513 @@ temp with no stable intent and no wrapper is likewise removed. Multiple temps,
 a cursor skip, mutated immutable evidence, a temp without stable plus any
 wrapper, or malformed/unknown temp fails readiness without cleanup.
 
+## Reconciliation-owned capability and effect boundary
+
+`reconciliation.ts` is the sole owner of the `AnchoredRoot`, `BoundGeneration`,
+and `PreReadyRecoveryAuthority` WeakMaps, every held directory/file object, and
+every raw descriptor. Opaque objects may cross existing ProfileStore/Registry
+APIs, but only reconciliation can resolve, mint, move, or consume their backing
+records. The atomic engine never accepts or returns those opaque objects, a raw
+fd, a native binding, a procfd/path, or a callback that exposes one.
+
+`atomic-directory-publication.ts` is a pure canonical reducer plus durable
+effect protocol. Its closed data-only interface is:
+
+```ts
+type AtomicNativeMoveV1 = "profile_publish" | "canary_publish" |
+  "profile_source_to_private" | "canary_source_to_private";
+
+declare const flightIdBrand: unique symbol;
+type FlightSemanticId = Readonly<{ [flightIdBrand]: true }>;
+type FlightEffectId = Readonly<{ effect: true; [flightIdBrand]: true }>;
+type FlightPartialCreateId = Readonly<{
+  partialCreate: true;
+  [flightIdBrand]: true;
+}>;
+
+type AtomicObjectEvidenceV1 = Readonly<{
+  dev: string;
+  ino: string;
+  mode: number;
+  size: number;
+  contentSha256: Sha256 | null;
+  evidenceDigest: Sha256;
+}>;
+
+type AtomicObjectRoleV1 = "trusted_parent" | "state_root" |
+  "profiles_parent" | "staging_root" | "intents_parent" |
+  "bundles_parent" | "wrapper" | "private_source" | "payload_entry" |
+  "intent_temp" | "intent_stable" | "manifest_temp" | "manifest_stable" |
+  "private_deletion" | "public_source" | "public_target";
+
+type AtomicEffectKindV1 =
+  | "reserve_budget" | "release_budget"
+  | "create_and_pin_wrapper" | "create_and_pin_directory" |
+    "create_and_pin_file" | "create_and_pin_temp_file" |
+    "cleanup_partial_create"
+  | "open_pin_handle" | "revalidate_handle" | "close_handle" |
+    "enumerate_directory" | "read_file_chunk"
+  | "populate_payload_entry" | "copy_payload_chunk" |
+    "write_file_chunk" | "canonicalize_tree_step" | "hash_content_chunk"
+  | "fsync_file" | "fsync_directory" | "fsync_parent"
+  | "persist_intent" | "replace_intent" | "remove_intent" |
+    "persist_manifest" | "remove_manifest"
+  | "native_no_replace" | "observe_locations"
+  | "remove_file" | "remove_directory" | "remove_root"
+  | "resolve_adoption" | "adopt_generation" | "release_publication" |
+    "close_admission";
+
+type CanonicalLocationEvidenceV1 = Readonly<{
+  state: "absent" | "match" | "other";
+  objectId: FlightSemanticId | null;
+  dev: string | null;
+  ino: string | null;
+  mode: number | null;
+  evidenceDigest: Sha256;
+}>;
+
+type AtomicRawNativeCodeV1 = "success" | "atomic_publish_exists" |
+  "atomic_publish_source_missing" | "atomic_publish_unsupported" |
+  "atomic_publish_cross_device" | "atomic_publish_binding_invalid" |
+  "atomic_publish_denied" | "atomic_publish_invalid_argument" |
+  "atomic_publish_io";
+
+type AtomicEffectRequestV1 =
+  | Readonly<{
+      kind: "reserve_budget" | "release_budget";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      reservation: "payload_entries" | "payload_bytes" | "stable_files" |
+        "scratch_files" | "manifest_bytes" | "other_metadata_bytes";
+      count: number;
+      byteSize: number;
+    }>
+  | Readonly<{
+      kind: "create_and_pin_wrapper" | "create_and_pin_directory" |
+        "create_and_pin_file" | "create_and_pin_temp_file";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      role: AtomicObjectRoleV1;
+      parentId: FlightSemanticId;
+      leaf: string;
+      parentEvidenceDigest: Sha256;
+      mode: 384 | 448;
+      expectedAbsence: true;
+    }>
+  | Readonly<{
+      kind: "cleanup_partial_create";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      partialId: FlightPartialCreateId;
+    }>
+  | Readonly<{
+      kind: "open_pin_handle";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      role: AtomicObjectRoleV1;
+      parentId: FlightSemanticId;
+      leaf: string;
+      flags: "directory_nofollow" | "file_read_nofollow" |
+        "file_write_nofollow" | "path_nofollow";
+      expected: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "revalidate_handle" | "close_handle" |
+        "enumerate_directory" | "read_file_chunk";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      role: AtomicObjectRoleV1;
+      objectId: FlightSemanticId;
+      cursor: number;
+      byteLength: number;
+      expected: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "populate_payload_entry" | "canonicalize_tree_step";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      rootId: FlightSemanticId;
+      cursor: number;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "copy_payload_chunk" | "write_file_chunk";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      sourceFileId: FlightSemanticId | null;
+      inlineBytes: Uint8Array | null;
+      destinationFileId: FlightSemanticId;
+      offset: number;
+      byteLength: number;
+      expectedChunkSha256: Sha256;
+      expectedResultSha256: Sha256;
+    }>
+  | Readonly<{
+      kind: "hash_content_chunk";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      objectId: FlightSemanticId;
+      offset: number;
+      byteLength: number;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "fsync_file" | "fsync_directory" | "fsync_parent";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      role: AtomicObjectRoleV1;
+      objectId: FlightSemanticId;
+      expected: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "persist_intent" | "replace_intent" | "persist_manifest";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      expectedPhase: AtomicPublishIntentV1["phase"] | null;
+      canonicalBytes: Uint8Array;
+      contentDigest: Sha256;
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      expectedStable: AtomicObjectEvidenceV1 | Readonly<{ absent: true }>;
+    }>
+  | Readonly<{
+      kind: "remove_intent" | "remove_manifest";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      stableObjectId: FlightSemanticId;
+      expectedStable: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "native_no_replace" | "observe_locations";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      move: AtomicNativeMoveV1;
+      sourceParentId: FlightSemanticId;
+      sourceId: FlightSemanticId | null;
+      sourceLeaf: string;
+      targetParentId: FlightSemanticId;
+      targetLeaf: string;
+      expectedSource: AtomicObjectEvidenceV1;
+      expectedTarget: AtomicObjectEvidenceV1 | Readonly<{ absent: true }>;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "remove_file" | "remove_directory" | "remove_root";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      role: AtomicObjectRoleV1;
+      parentId: FlightSemanticId;
+      leaf: string;
+      objectId: FlightSemanticId;
+      expected: AtomicObjectEvidenceV1;
+      manifestSha256: Sha256;
+      cursor: number;
+    }>
+  | Readonly<{
+      kind: "resolve_adoption" | "adopt_generation" |
+        "release_publication";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      authorityDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "close_admission";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      reason: "binding_invalid" | "ambiguous" | "unsupported" |
+        "cross_device" | "denied" | "io" | "close_unverified";
+      evidenceDigest: Sha256;
+    }>;
+
+type AtomicEffectObservationV1 =
+  | Readonly<{
+      kind: "effect_rejected";
+      effectId: FlightEffectId;
+      requestKind: AtomicEffectKindV1;
+      code: "budget_exceeded" | "binding_invalid" | "conflict" |
+        "unsupported" | "denied" | "io" | "close_unverified";
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "effect_completed";
+      effectId: FlightEffectId;
+      requestKind: Exclude<
+        AtomicEffectKindV1,
+        "native_no_replace" | "observe_locations" |
+          "create_and_pin_wrapper" | "create_and_pin_directory" |
+          "create_and_pin_file" | "create_and_pin_temp_file" |
+          "open_pin_handle" |
+          "enumerate_directory" | "read_file_chunk" |
+          "canonicalize_tree_step" | "hash_content_chunk" |
+          "cleanup_partial_create" |
+          "resolve_adoption" | "adopt_generation" |
+          "release_publication"
+      >;
+      evidenceDigest: Sha256;
+      count: number;
+      byteSize: number;
+    }>
+  | Readonly<{
+      kind: "create_and_pin_completed";
+      effectId: FlightEffectId;
+      requestKind: "create_and_pin_wrapper" | "create_and_pin_directory" |
+        "create_and_pin_file" | "create_and_pin_temp_file";
+      handleId: FlightSemanticId;
+      evidence: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "existing_handle_pinned";
+      effectId: FlightEffectId;
+      handleId: FlightSemanticId;
+      evidence: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "create_and_pin_partial";
+      effectId: FlightEffectId;
+      requestKind: "create_and_pin_wrapper" | "create_and_pin_directory" |
+        "create_and_pin_file" | "create_and_pin_temp_file";
+      partialId: FlightPartialCreateId;
+      stage: "entry_created" | "handle_opened" | "fstat_failed";
+      entryCreated: true;
+      handleOpened: boolean;
+      evidence: AtomicObjectEvidenceV1 | null;
+      code: "binding_invalid" | "denied" | "io";
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "partial_create_cleanup_observed";
+      effectId: FlightEffectId;
+      partialId: FlightPartialCreateId;
+      state: "absent";
+      parentSynced: true;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "partial_create_cleanup_failed";
+      effectId: FlightEffectId;
+      partialId: FlightPartialCreateId;
+      stage: "close" | "identity_verify" | "remove" |
+        "absence_verify" | "parent_fsync";
+      state: "present" | "unknown" | "absent_unsynced";
+      parentSynced: false;
+      code: "binding_invalid" | "denied" | "io" |
+        "close_unverified";
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "directory_observed";
+      effectId: FlightEffectId;
+      cursor: number;
+      entries: ReadonlyArray<Readonly<{
+        leaf: string;
+        role: AtomicObjectRoleV1;
+        objectId: FlightSemanticId;
+        type: "file" | "directory";
+        evidenceDigest: Sha256;
+      }>>;
+      done: boolean;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "file_chunk_observed";
+      effectId: FlightEffectId;
+      cursor: number;
+      byteSize: number;
+      bytesBase64: string;
+      contentDigest: Sha256;
+      eof: boolean;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "native_resolved";
+      effectId: FlightEffectId;
+      rawCode: AtomicRawNativeCodeV1;
+      nativePrecheckEvidenceDigest: Sha256;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "locations_observed";
+      effectId: FlightEffectId;
+      source: CanonicalLocationEvidenceV1;
+      target: CanonicalLocationEvidenceV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "content_observed";
+      effectId: FlightEffectId;
+      requestKind: "canonicalize_tree_step" | "hash_content_chunk";
+      cursor: number;
+      byteSize: number;
+      contentDigest: Sha256;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "authority_observed";
+      effectId: FlightEffectId;
+      requestKind: "resolve_adoption" | "adopt_generation" |
+        "release_publication";
+      adopted: boolean;
+      authorityDigest: Sha256;
+      evidenceDigest: Sha256;
+    }>;
+
+type ApplyAtomicEffectV1 = (
+  request: AtomicEffectRequestV1,
+) => Promise<AtomicEffectObservationV1>;
+```
+
+Each controller invocation owns one non-exported semantic registry with an
+active flight nonce and `WeakMap<FlightSemanticId, HeldRecord>`. Initial semantic IDs are
+minted only for immutable held-authority inputs acquired before reducer start.
+Every later semantic ID is minted only in the typed observation that created/opened/
+discovered/pinned its exact object; the reducer cannot construct an ID. Each
+record binds role, operation, parent ID, canonical leaf, held handle, startup
+binding, and dev/ino/mode/size/hash evidence. Unknown/foreign/stale IDs reject
+before effect.
+
+Create-and-pin effects are composite only inside an already-held protected
+parent. Wrapper/directory creation executes exact `mkdirat(mode)`, then
+`openat(O_DIRECTORY | O_NOFOLLOW)`, then `fstat`. File/temp creation executes
+exact `openat(O_CREAT | O_EXCL | O_NOFOLLOW, mode)`, then `fstat`. Success is one
+`create_and_pin_completed` observation with new `handleId` and complete
+evidence; no
+following `open_pin_handle` is legal. That open effect is only for an existing
+leaf with exact expected evidence.
+
+Failure before entry creation is ordinary `effect_rejected`. Failure after
+creation returns `create_and_pin_partial` before cleanup and mints a one-use
+`FlightPartialCreateId` in a separate private WeakMap. Reducer must emit
+`cleanup_partial_create`. As one specified composite effect, controller closes
+the partial handle when present and requires verified closure, reopens/stats the
+canonical leaf through the held protected parent, establishes or compares exact
+dev/ino/type/mode against the exclusive-creation record, and uses `unlinkat` or
+`unlinkat(..., AT_REMOVEDIR)` for that identity. It proves leaf absence, fsyncs
+the held containing parent, and only then returns exactly
+`partial_create_cleanup_observed` with `state: "absent"` and
+`parentSynced: true`.
+
+Failure at close, identity verification, remove, absence proof, or parent fsync
+returns `partial_create_cleanup_failed` with exact stage/state and
+`parentSynced: false`. Controller retains the partial ID/record, reducer emits
+global fail-stop, and neither may advance phase/cursor, release reservation,
+remove stable intent, or attempt another entry. Controller never silently
+closes, unlinks, or treats absent-but-unsynced as durable cleanup.
+
+Effect IDs derive only from flight nonce plus reducer step counter and bind one
+request/observation; they never identify filesystem objects. Semantic IDs,
+partial-create IDs, and effect IDs are flight-local opaque objects, never
+strings. Canonical
+intent/manifest encoders reject them, logs never render them, and no ID is
+persisted or returned publicly. At most 4,096 semantic plus partial-create IDs
+exist, including at most 1,024 partial-create IDs; discovery and cleanup reuse
+them sequentially. Normal terminal/drain emits required close effects, then
+revokes registry epoch and drops records. Partial-cleanup or close-unverified
+fail-stop instead retains affected IDs/records until process exit; admission is
+closed and they cannot be used for another effect. No ID is ever reused.
+Restart opens stable locators through fresh reducer effects
+and typed observations remint new IDs from durable locator/evidence bytes.
+
+Object IDs, native moves, selectors, inline bytes, and observations are closed
+semantic data, not descriptors or unrestricted paths. `sourceFileId` XOR
+`inlineBytes` is required for copy/write; inline bytes equal `byteLength`, and
+all leaves pass the operation-kind grammar. The reducer accepts durable state plus at most
+one observation whose effect ID/kind exactly matches its outstanding request.
+It returns exactly one typed effect or one terminal result—never a batch and
+never “continue and also mutate.” Unknown, duplicate, out-of-order, mismatched,
+or replayed observations fail closed. It performs no I/O, imports no
+reconciliation/ProfileStore/Registry module, owns no WeakMap, and cannot invoke
+the addon.
+
+Directory observations contain at most 256 entries and 65,536 encoded bytes;
+file observations contain at most 65,536 decoded bytes. Their storage is
+reserved before controller read and released only by a later reducer effect.
+The reducer validates canonical leaf/base64/content hashes and streams larger
+records across monotonic cursors; no unbounded discovery is hidden in a helper.
+
+The reconciliation-owned controller implements `ApplyAtomicEffectV1`. For a
+native request it resolves exact semantic IDs against its WeakMap without I/O
+and calls a private
+`withNativeOperands` scope. Only the synchronous callback body can see
+`{sourceDirectoryFd, sourceLeaf, targetDirectoryFd, targetLeaf}`; it invokes
+the fixed native binding and returns no operand. The controller converts the
+raw native result/precheck digest only; locations require the reducer's next
+separate effect. No operand is stored in an effect request/observation, promise,
+closure that outlives the callback, log, or exported value.
+
+Before the first reducer call only, reconciliation may acquire/validate/lease
+the trusted volume→state→`profiles`/staging authority and construct
+`PreReadyRecoveryAuthority`. That acquisition does not enumerate/read intent,
+wrapper, payload, manifest, source, or target contents; recovery discovery
+starts with reducer-emitted `enumerate_directory`/`open_pin_handle`/
+`read_file_chunk` effects. If acquisition fails before reducer start,
+reconciliation closes only the handles opened by that failed acquisition and
+performs no namespace mutation. After reducer start, every filesystem action,
+reservation change, handle open/close, computation read, native call, adoption,
+and release occurs only in response to the reducer's single outstanding typed
+effect. Controller helpers cannot perform an unrequested mkdir/open/read/write/
+fsync/rename/unlink/close or budget mutation.
+
+Ordering is fixed for every loop and expands every earlier protocol step:
+
+1. Reconciliation validates and leases held volume/state/`profiles`/staging
+   roots and constructs `PreReadyRecoveryAuthority` before engine recovery.
+2. Reservation is `reserve_budget`; wrapper/tree construction is one
+   `create_and_pin_*` followed directly by required `fsync_parent`—never a
+   second open. Payload population repeats `populate_payload_entry`, composite
+   create-and-pin,
+   `copy_payload_chunk` or `write_file_chunk`, hash/canonicalize, `fsync_file`,
+   postorder `fsync_directory`, and close. Each effect is separately observed.
+   A partial-create observation branches immediately to the single composite
+   cleanup effect; its internal close→identity verify→remove→absence proof→
+   containing-parent fsync order is fixed. Reducer resumes only from observed
+   `absent/parentSynced`; any failed stage retains partial ID and intent under
+   fail-stop.
+3. Initial intent and manifest publication sequence is reserve, composite temp
+   creation with `create_and_pin_temp_file`, chunk writes, file fsync,
+   `persist_intent|persist_manifest`, location
+   observation, parent fsync, and close. Later intent transition uses the same
+   sequence with `replace_intent`. Stable record removal is
+   `remove_intent|remove_manifest` followed by parent fsync and budget release.
+   Immutable manifests have no replace effect; a replacement request is outside
+   the closed union and fails parsing.
+4. Profile/canary/source movement is exactly `native_no_replace`,
+   raw `native_resolved`, separate `observe_locations`, then reducer
+   classification and required source/target parent fsync effects. In
+   particular source-missing carries no locations/admission decision; no native
+   result implies observation, normalization, sync, or fail-stop.
+5. Cleanup first persists the next cursor using step 3, then emits exactly one
+   `remove_file|remove_directory|remove_root`, observes it, fsyncs its parent,
+   closes any handle, and releases its reservation. It cannot advance cursor or
+   remove the next identity in the same reducer step.
+6. Reconciliation resolves its own authority only for `resolve_adoption`. The
+   reducer first completes durable adopted intent replacement, then emits
+   `adopt_generation`; release follows durable discard/cleaned transitions and
+   exact `release_publication`. Reconciliation verifies its authority record,
+   durably
+   commits `adopted`, then mints/moves `BoundGeneration` into its own WeakMap and
+   Registry/ProfileStore ownership before releasing the operation lock. No
+   observer can see adopted state without the corresponding live capability;
+   crash after durable commit is recovered from the same authority evidence.
+7. Every exit emits required `close_handle` effects in reverse ownership order;
+   only observed releases emit `release_budget`. Failure to close follows the
+   existing close-unverified fail-stop and never licenses implicit cleanup.
+
+Imports are one-way: `reconciliation.ts` imports the pure engine and private
+native loader; the engine never imports reconciliation, startup, ProfileStore,
+Registry, server, or index modules. This prevents circular authority and raw-fd
+escape.
+
 ## Private construction and atomic publication
 
 All new profile, state, generation, and copied nested directories are built
 below profile-only private `payload`. Canary proof directories use their exact
 private proof leaf instead. The private namespace is trusted against concurrent
-mutation, so `mkdir` followed by no-follow open/fstat is permitted only there.
+mutation, so the composite create-and-pin mkdir/open/fstat effect is permitted
+only there; no caller observes an unpinned successful creation.
 
 For one operation:
 
@@ -677,9 +1223,9 @@ For one operation:
    `ready` with exact source evidence.
 6. Immediately revalidate admission, full source and target chains, pinned
    source, target absence, statfs type, `st_dev`, and native mount preconditions.
-7. Pass authenticated kind-specific private-source and target capabilities to the
-   module-private wrapper; it alone extracts fds/leaves and invokes native
-   `renameNoReplace`.
+7. Reducer emits the exact semantic `native_no_replace` request. The
+   reconciliation-owned controller resolves its held records and invokes native
+   `renameNoReplace` only inside `withNativeOperands`.
 8. Whether native returns success or throws any code, run the location-proof
    algorithm below before classifying, cleaning, retrying, or adopting.
 9. Persist `classified` before acting. On proved publication, sync wrapper and
@@ -709,13 +1255,14 @@ After destination is proved and `renamed` is durable:
    private wrapper/temps, and planned private deletion leaf.
 2. Persist `source_deleting/pending` with closed private
    `delete-<operation-id>` destination leaf before source mutation.
-3. Under exclusive profile-operation lock, authenticate
-   `protected_public_source` from held source locator/dev/ino/mode/checksum and
-   full service-owned `0700` parent chain. Authenticate absent private deletion
-   target under exact operation wrapper.
-4. Wrapper revalidates both capabilities immediately before calling native
-   no-replace from held public parent/source leaf into private wrapper/deletion
-   leaf, then revalidates immediately after every result. No strings/fds escape.
+3. Under exclusive profile-operation lock, reconciliation authenticates the
+   protected public source from held locator/dev/ino/mode/checksum and full
+   service-owned `0700` parent chain, then authenticates the absent private
+   deletion target under the exact operation wrapper.
+4. Controller revalidates both held records immediately before callback-scoped
+   native no-replace from public parent/source leaf into private
+   wrapper/deletion leaf, then revalidates after every result. No operand/fd
+   escapes the callback.
 5. Resolve public source and private deletion leaf against original pin. Only
    source-absent plus matching private leaf is moved; source-match plus private
    absence is unmoved. Any other tuple is ambiguous. Sync both parents, then
@@ -749,7 +1296,7 @@ and perform this bounded proof:
    authenticated publication or cleanup replay supplies this proof. A
    cursor-proved fully removed/cleaned canary only finishes its own durable
    records and cannot authorize another operation's mount-sensitive work.
-2. Rewalk exact capability chains: root→profiles→profile→state for profile data,
+2. Rewalk exact held chains: root→profiles→profile→state for profile data,
    root→staging→`intents` for intent/manifest files, or both protected public
    source and private operation wrapper for source deletion. Compare every
    dev/ino/mode/device component with captured evidence.
@@ -780,13 +1327,15 @@ evidence.
 
 ## Operation-specific adoption authority
 
-Before ProfileStore construction, Task 3 derives a fieldless
-`PreReadyRecoveryAuthority` from the immutable reconciliation snapshot and
-persisted Task 3 manifests. Its module-private record contains exact referenced
+Before ProfileStore construction or atomic-engine recovery,
+`reconciliation.ts` derives a fieldless `PreReadyRecoveryAuthority` and stores
+its record in its sole-owner WeakMap. Inputs are the immutable reconciliation
+snapshot and persisted Task 3 manifests. The record contains exact referenced
 profile locators/checksums, expected namespace scaffolds, cleanup/quarantine
-decisions, and process/control/snapshot binding. Intent recovery consumes it
-before ready installation and never issues a database query. It does not depend
-on a ProfileStore, Registry, or process-local session token.
+decisions, and process/control/snapshot binding. Engine observations contain
+only its digest and adoption decision, never the authority object/record.
+Recovery issues no database query and does not depend on a ProfileStore,
+Registry, or process-local session token.
 
 - `scaffold`: pre-ready authority adopts only a complete empty three-state
   schema that the snapshot/manifest identifies as required namespace. No store
@@ -830,7 +1379,8 @@ stored digest alone can neither adopt nor delete.
 
 Startup order is fixed:
 
-1. Load/validate native addon; open and validate pre-created staging roots.
+1. Load/validate native addon; open and validate pre-created `state`, `profiles`,
+   and staging roots from the held trusted volume parent.
 2. Capture immutable database snapshot plus existing Task 3 manifest evidence
    and build `PreReadyRecoveryAuthority`; readiness remains false.
 3. Enumerate and reserve every intent/temp/wrapper plus its possible public
@@ -841,9 +1391,9 @@ Startup order is fixed:
 5. Only after no unresolved intent owns a public locator may general Task 3
    enumeration, plan publication, quarantine, or mutation begin. Recapture and
    seal resulting root/snapshot/manifest evidence.
-6. Consume the internal outcome, construct generation-scoped ProfileStore from
-   held recovered capabilities, atomically install authority/store/result, and
-   flip ready.
+6. Reconciliation consumes the internal outcome, constructs generation-scoped
+   ProfileStore from its own held recovered records, atomically installs
+   authority/store/result, and flips ready.
 
 Task 3 never quarantines or mutates an intent-owned source/target. Release is
 crash-safe without a third location: durable `discarding` records outcome
@@ -856,18 +1406,22 @@ can never be mistaken for adopted state.
 
 ## Capability transfer and release
 
-Successful generation publication constructs `BoundProfileGeneration`
-directly from the still-open payload handle, target pin/evidence, and retained
-held root→`profiles`→profile→state parent leases. It does not reopen target by
-pathname. A module-private WeakMap atomically moves the operation record from
-`publishing` to `live`; only then may wrapper cleanup begin.
+After successful publication, the engine returns only a semantic adoption
+effect. Under the operation lock, reconciliation uses the still-open target
+pin/evidence and retained root→`profiles`→profile→state leases, persists the
+authorized adopted transition, and constructs `BoundGeneration` directly in
+its sole-owner WeakMap without pathname reopen. It atomically moves that record
+from `publishing` to `live` and attaches Registry/ProfileStore ownership before
+releasing the lock; only then may wrapper cleanup begin. The engine never sees
+or mints `BoundGeneration`.
 
-The live record owns generation pin, each ancestor/parent lease, intent lease,
-startup binding, and adoption state. Registry/store attachment consumes that
-record exactly once. Transition produces a newly pinned destination capability
-before consuming the source. Normal close drains operations, releases intent
-ownership when permitted, closes generation first, then state, profile,
-`profiles`, and root leases in reverse order, attempting every close.
+The reconciliation-owned live record holds generation pin, every ancestor/
+parent lease, intent lease, startup binding, and adoption state. Registry/store
+attachment consumes it exactly once through reconciliation-owned methods.
+Transition pins destination before consuming source. Normal close drains
+operations, releases intent ownership when permitted, and reconciliation closes
+generation, state, profile, `profiles`, and root leases in reverse order while
+attempting every close.
 
 Forged, stale, foreign, double-consumed, or closed objects fail before effect.
 A close-then-throw with verified closure reaches zero retained fds. A true
@@ -877,8 +1431,9 @@ attempt, retains process-local fail-stop records, and cannot be cleared or
 retried in-process. Process exit clears OS fds; only a fresh process may run
 durable intent recovery and restore readiness.
 
-No public API or callback receives a raw fd, procfd path, native binding,
-staging path, intent, or unwrapped capability.
+No public API, engine input/output, or callback outside reconciliation's
+synchronous `withNativeOperands` scope receives a raw fd, procfd path, native
+binding, staging path, intent, or unwrapped capability.
 
 ## Native boundary and ABI
 
@@ -904,38 +1459,37 @@ Preflight requires compiled `napiVersion === 8` and numeric
 `process.versions.napi >= 8`, freezes the validated wrapper, and logs source as
 the constant `bundled_package_relative`; it never logs or accepts a path.
 
-Raw native object stays module-private. Production wrapper accepts only these
-runtime-authenticated discriminated source capabilities:
+Raw native object stays module-private to the service loader consumed only by
+the reconciliation controller. The isolated preflight script may load the
+fixed artifact to validate shape but exposes no object/operand to service code.
+The pure engine emits four `native_no_replace` moves plus explicit
+`persist_intent`/`persist_manifest` effects for the two private-temp record
+publications; it never
+accepts native operands or authority capabilities. Reconciliation maps each
+move against records in its own WeakMaps:
 
-- `private_profile_payload_dir`: scaffold/working/prepare/finalize held
-  operation wrapper plus exact `payload` leaf;
-- `private_canary_proof_dir`: canary held operation wrapper plus exact
-  `proof-<operation-id>-0` leaf;
-- `private_intent_temp_file`: held `intents` parent plus exact initial-intent
-  temp and planned stable intent leaf;
-- `private_manifest_temp_file`: held `intents` parent plus exact planned
-  manifest temp/stable locators and bytes hash/size; or
-- `protected_public_source`: either prepare/finalize held working/staging source
-  or exact published canary target, with intent-bound locator/dev/ino/mode/hash
-  and service-owned `0700` chain.
+- `profile_publish`: profile operation wrapper plus exact `payload` to exact
+  absent public profile/generation leaf;
+- `canary_publish`: canary wrapper plus exact `proof-<operation-id>-0` to exact
+  absent public canary leaf;
+- initial `persist_intent`: exact initial-intent temp to absent stable intent;
+- `persist_manifest`: exact planned manifest temp/hash/size to absent stable
+  manifest;
+- `profile_source_to_private`: exact held working/staging public source to
+  absent private `delete-<operation-id>`; or
+- `canary_source_to_private`: exact held public canary to absent private
+  `deletion-<operation-id>-0`.
 
-Target capabilities are equally closed: an exact absent public profile/canary,
-stable intent, or stable manifest leaf for publication; exact private
-`delete-<operation-id>` only for prepare/finalize public-source movement; and
-exact private `deletion-<operation-id>-0` only for canary public-source
-movement. Profile publication is only wrapper/`payload`; canary publication is
-only wrapper/`proof-<operation-id>-0`; intent and manifest publication is only
-their planned private temps. The protected-public source variant exists only
-for a move into its matching private deletion capability.
-
-Each is a fieldless token backed by separate module-private WeakMap record.
-Wrapper accepts a matching authenticated target capability, revalidates
-source/target identity, binding, owner/mode/device/mount, and admission before
-and after call, and alone extracts dirfds/leaves. No public/general string, fd,
-path, or union-forging overload exists. Wrong discriminator/pair, public source
-for publication, cross-kind wrapper leaf, or protected source with a
-nonprivate/mismatched deletion target globally fail-stops. Generic C export
-remains unchanged.
+For each mapping, reducer first emits and observes explicit revalidation effects
+for source/target/root leases and admission. The requested native call performs
+its specified internal fstat/statx prechecks; controller performs no extra
+filesystem read before/after it. Reducer then emits explicit location
+observation/revalidation effects. Only synchronous `withNativeOperands`
+extracts dirfds/leaves and calls the generic C export. No general string/fd/path
+overload, capability adapter,
+or exported operand constructor exists. Wrong move/kind/phase/leaf pair,
+public source for publication, or mismatched private deletion target globally
+fail-stops. Generic C export remains unchanged.
 
 `renameNoReplace`:
 
@@ -963,14 +1517,13 @@ Stable internal codes and mandatory action:
 - `EXDEV` or unequal device/mount precheck → `atomic_publish_cross_device`: run
   location proof, close readiness, clean only proved-unpublished private state,
   retain ambiguous or published evidence, no fallback.
-- `ENOENT` → internal native `atomic_publish_source_missing`: run canonical
-  proof. Only the fully authenticated canary same-attempt publication/cleanup
-  replay predicates normalize to `atomic_publish_replay_completed`, advance the
-  expected phase, and preserve admission. Every other case normalizes to
-  `atomic_publish_binding_invalid`, closes admission globally, cleans only
-  proved-unpublished private state, and retains all other evidence. The raw
-  source-missing code never escapes the module-private wrapper or enters a
-  durable intent.
+- `ENOENT` → raw `atomic_publish_source_missing` observation with native
+  precheck digest and no locations/action. Reducer must request separate
+  canonical location observation. Only fully authenticated canary same-attempt
+  publication/cleanup replay normalizes to `atomic_publish_replay_completed`
+  and preserves admission. Every other case requires observed
+  `close_admission/binding_invalid` before fail-stop/authorized cleanup. Raw
+  source-missing never enters a durable intent.
 - `EBADF`, `ENOTDIR`, `ELOOP`, or `ESTALE` →
   `atomic_publish_binding_invalid`: run location proof, close admission, clean
   only proved-unpublished private state, and retain all other evidence.
@@ -979,25 +1532,26 @@ Stable internal codes and mandatory action:
   readiness closed until a fresh process reconciles.
 - invalid arity, fd, or leaf → `atomic_publish_invalid_argument`: reject before
   syscall; prove source location, close admission because production supplied
-  an invalid capability, then clean only proved-private state.
+  an invalid internal operand binding, then clean only proved-private state.
 - any other errno → `atomic_publish_io`: run location proof, fail closed, and
   permanently close process-global admission/readiness until process exit;
   clean only proved-unpublished private state and retain all other evidence for
   fresh-process recovery. It is never downgraded to operation-local failure.
 
-Error precedence is exact. First validate invocation/prechecks, then perform
-post-call canonical proof. `ENOENT` may override binding-invalid action only by
-the complete canary replay predicate above. For other errors, a proved target
+Error precedence is exact. First validate invocation/prechecks, return raw
+native observation, then let reducer request post-call canonical proof.
+`ENOENT` may override binding-invalid action only after the complete canary
+replay predicate above. For other errors, a proved target
 match follows published recovery/adoption only when evidence proves the syscall
-succeeded before a later wrapper failure. Ambiguous location always retains
+succeeded before a later controller failure. Ambiguous location always retains
 evidence and closes admission. Code-specific action applies after that proof;
 no generic “target exists” rule suppresses binding failure. This makes cleanup
 and admission deterministic.
 
-The TypeScript wrapper validates exact native object keys/version once,
-runtime-authenticates held handles, and maps the internal source-missing code to
-replay-completed or binding-invalid before returning/persisting a typed result.
-Tests may fake wrapper capability/admission state, but never native
+The private native loader validates exact object keys/version once. The
+reconciliation controller authenticates held records but returns source-missing
+unchanged; reducer alone normalizes after a separately observed location tuple.
+Tests may fake pure effect scheduling/admission state, but never native
 rename results in integration or recovery tests. Production cannot select a
 module path.
 
@@ -1034,15 +1588,17 @@ the current process.
   discard. Never invoke or infer a native publication result.
 - Stable canary with proof `planned`/`published` before cleanup: run fresh
   prechecks/statfs/statx and replay the exact attempt-zero publication. Success
-  follows normal proof. `ENOENT` advances as published only when durable source
-  identity and canonical source-absent/public-target-match proof satisfy the
-  narrow replay rule; otherwise global binding-invalid fail-stop applies.
+  returns raw native result, then requires separate location effect. Source
+  missing advances as published only when durable source identity and canonical
+  source-absent/public-target-match observation satisfy the narrow replay rule;
+  otherwise reducer requests binding-invalid admission closure.
 - Stable canary with proof `deleting`: skip original publication. If the public
   canary remains and private deletion leaf is absent, replay its exact cleanup
   move. If public is absent and the exact private deletion root remains, replay
   that same move, including when its remaining tree matches a partial cursor;
-  qualifying `ENOENT` supplies current mount proof, then private cleanup resumes
-  at the durable cursor. If the cursor proves the private root fully removed,
+  source-missing followed by qualifying separate observation supplies current
+  mount proof, then private cleanup resumes at the durable cursor. If the cursor
+  proves the private root fully removed,
   or proof is `cleaned`, finish manifest/intent cleanup without any original
   publication replay or requirement that either original publication leaf
   exist. Another operation needing mount proof must use a new canary after this
@@ -1113,7 +1669,10 @@ content fails readiness. If target matches payload despite error, classify by
 location as published and retain intent; errno never overrides evidence.
 
 Explicit crash seams: initial temp write/sync/publish/intents-sync; allocated
-intent sync; wrapper mkdir/open/sync; payload mkdir/open/sync; building temp
+intent sync; every composite create after mkdir/open/fstat and before success
+observation; partial cleanup before/after handle close, identity open/fstat,
+unlink/rmdir, absence proof, containing-parent fsync, and cleanup observation;
+wrapper mkdir/open/sync; payload mkdir/open/sync; building temp
 write/sync/rename/dir-sync; each child create/write/file-sync/directory-sync;
 ready transition; immediately before/during/after native syscall; source/target
 location opens; root rewalk; classification sync; source-parent sync;
@@ -1128,42 +1687,157 @@ cleanup retains stable intent and exact remaining evidence for restart.
 
 ## Build, loading, Docker, and preflight
 
-`node-gyp` is pinned in Browser Service lockfile. `binding.gyp` compiles the
-Linux C addon with `NAPI_VERSION=8`, warnings-as-errors, and a native test
-target that exercises the same errno mapper. Package `install` invokes
-`scripts/build-native.mjs`; it rejects non-Linux targets and verifies expected
-artifact and exact object shape. Generated `build/` output is ignored and never
-committed.
+No `node-gyp`, `binding.gyp`, downloaded headers, native-build npm dependency,
+or lockfile change is part of this design. `scripts/build-native.mjs` rejects
+non-Linux or non-Node-22 execution, resolves real `process.execPath`, derives
+the header root only as
+`dirname(dirname(realpath(process.execPath)))/include/node`, and requires exact
+local `node_api.h`, `node_api_types.h`, and `node_version.h`. It never downloads
+or searches another header tree.
 
-The test target compiles the same syscall function with a test-only macro that
-blocks on inherited pipe/eventfd barriers immediately before and after
-`renameat2`. It adds no production export, environment switch, or runtime code
-path. Production build rejects the test macro; production native object remains
-the exact three-property interface above.
+Compiler selection is deterministic: use executable regular file
+`/usr/bin/gcc` when present; otherwise resolve `cc` from the inherited fixed
+build-stage `PATH`, canonicalize its realpath, require it under `/usr/bin`, and
+record/verify its `--version` bytes. `CC`, `CFLAGS`, `CPPFLAGS`, `LDFLAGS`, npm
+compiler settings, shell interpolation, and arbitrary compiler paths are
+rejected.
 
-`preinstall` checks platform, architecture, exact Node runtime, and build inputs
-without loading an artifact that does not exist yet. Install builds and
-load-checks addon. `prebuild`, `pretest`, and `prestart` require exact interface
-and N-API versions. Startup root preflight validates staging/public invariants,
+Build locking belongs to `scripts/run-native-build.mjs`, not the compiler
+script. Package scripts invoke the runner with closed target `production` or
+`all`. The runner sets umask `0077`, creates exact `build/` with Node filesystem
+APIs, verifies fixed `/usr/bin/flock`, then spawns exactly
+`/usr/bin/flock --exclusive --timeout 60
+build/.atomic-directory-publication-build.lock <real-node22>
+scripts/build-native.mjs <target>`. The lock parent holds across the entire
+compiler child and kernel-releases on exit/crash. `build-native.mjs` never calls
+flock or creates the build root; direct invocation is unsupported and package/
+Docker entrypoints use only the runner. Host tests verify
+path/version; Task 6 builder/test images additionally verify `/usr/bin/flock`
+comes from pinned util-linux and matches a checked-in version/binary-digest
+allowlist in `native/toolchain-allowlist.json`. Browser runtime does not contain
+or need flock; only the separate init image retains it at runtime.
+
+Native inputs are split exactly:
+
+- `native/atomic-directory-publication-addon.c`: production Node-API/syscall
+  entrypoint;
+- `native/atomic-directory-publication-errors.c` and `.h`: shared errno map;
+- `native/atomic-directory-publication-test-hooks.c` and `.h`: test-only
+  pipe/eventfd barriers around the real syscall; and
+- `native/atomic-directory-publication-errors.test.c`: standalone errno-map
+  test main.
+
+Every translation unit compiles separately. Addon objects use fixed ordered
+flags `-fPIC -std=c11 -DNAPI_VERSION=8 -Wall -Wextra -Werror -O2 -MD`, one
+derived Node include argument, then exact `-MF <unique-depfile> -c <source> -o
+<unique-object>`. Production addon/errors objects live under
+`build/obj/production/`; test addon/errors/hooks objects live under
+`build/obj/test/` and add exact `-DATOMIC_PUBLISH_TEST_HOOKS=1`; standalone
+errno-test main/errors objects live under `build/obj/errno-test/` and use no
+Node include or test-hook macro, with exact flags
+`-std=c11 -Wall -Wextra -Werror -O2 -MD`. Each object has its own
+same-basename `.d`;
+multi-source compilation and shared depfiles are forbidden.
+
+Link commands are separate fixed argv: `-shared` links production objects to
+`build/Release/atomic_directory_publication.node`; `-shared` links test objects
+to `build/Test/atomic_directory_publication_test.node`; ordinary executable
+linking produces `build/Test/atomic-directory-publication-errors.test`. The
+runner executes that standalone binary directly after `all`, requires exit
+zero, then load-checks both `.node` outputs. Test hooks add no production export,
+environment switch, or runtime path; production linkage rejects hook symbols.
+
+The script parses every `-MD` depfile including continuations/escaping,
+canonicalizes every dependency, rejects missing/duplicate/out-of-root paths,
+and hashes every dependency byte. Allowed roots are only repository native
+sources, the derived Node prefix header root, `/usr/include`, and the canonical
+compiler include root returned by `<compiler> -print-file-name=include`.
+Per-output canonical digests also bind compiler binary bytes, realpath,
+`--version`, `-dumpmachine`, `-dumpfullversion`, real Node executable/version,
+platform/architecture, exact compile/link argv, and
+`scripts/build-native.mjs`, runner bytes, and toolchain-allowlist bytes.
+
+Attestation also records/hashes the GCC driver's `-dumpspecs`,
+`-print-search-dirs`, and `-print-libgcc-file-name` results. For each of
+`cc1`, `as`, `collect2`, and `ld`, the script resolves
+`-print-prog-name=<tool>`, records canonical path/version, and hashes regular
+binary bytes. Link steps emit fixed map/trace files; every resolved startup
+object, archive, shared-library input, and compiler-runtime file in that trace
+is canonicalized, inventoried, and hashed when readable. Final ELF `DT_NEEDED`
+entries are recorded as names plus resolved image-build inventory where
+available. Missing/unresolvable required tool or trace input fails build.
+
+Exact digest sidecars are
+`build/Release/atomic_directory_publication.inputs.sha256`,
+`build/Test/atomic_directory_publication_test.inputs.sha256`, and
+`build/Test/atomic-directory-publication-errors.test.inputs.sha256`. Each binds
+only its transitive objects/dependencies plus shared tool identity; each output
+has a distinct attestation. Fixed dot-prefixed staging files under the lock are
+created `O_EXCL`, fsynced, shape-checked, renamed to exact output/depfile/digest
+paths, and directory-fsynced. At invocation start under the lock, the script
+validates/removes only exact build-owned stale staging paths from a killed prior
+run; foreign type/owner/symlink fails. It then recompiles every translation unit
+and relinks every output selected by `production|all`, even when all existing
+outputs, depfiles, and digests match. Existing final artifacts remain only until
+their rebuilt replacements are fully verified. Digests, depfiles, tool
+inventory, and link traces are audit attestations only and are never cache keys,
+up-to-date checks, or skip conditions. This unconditional rebuild prevents
+stale reuse across unobserved `cc1`/assembler/linker/startup/library changes.
+Generated `build/` content is ignored and never committed.
+
+Production build additionally emits distinct runtime checksum attestation
+`build/Release/atomic-directory-publication.node.sha256`. Its exact canonical
+UTF-8 bytes are one fixed-key JSON object plus newline:
+`{"interfaceVersion":"1.0.0","napiVersion":8,"sha256":"<64 lowercase hex>"}\n`.
+The hash is computed from final verified
+`atomic_directory_publication.node` bytes after link and before atomic
+attestation publication. Unknown/missing/reordered fields, whitespace other
+than final newline, noncanonical number/string, wrong hash, or mismatched
+version fails. This file attests runtime artifact bytes only; `.d`,
+`.inputs.sha256`, maps, traces, objects, and tool inventory remain build-only
+audit artifacts and are never substituted for it.
+
+`preinstall` checks platform, architecture, exact Node runtime, flock path, and
+build inputs without loading an artifact that does not exist yet.
+`build:native` is exactly `node scripts/run-native-build.mjs production`;
+`build:native:test` is exactly `node scripts/run-native-build.mjs all`;
+`test:native` runs the latter runner and its standalone/load checks. Install and
+prebuild use `build:native`; pretest uses `build:native:test`; prestart only
+hashes the already-built production addon, parses the exact runtime checksum
+attestation, requires hash/interface/N-API match, then validates ELF, ABI, and
+the loaded three-property interface. It never compiles and never trusts input
+audit sidecars for runtime integrity.
+Startup root preflight validates staging/public invariants,
 statfs allowlist, device and mount IDs, then performs a private positive canary
 and no-replace conflict canary on actual persistent filesystem. Any missing
 artifact, symbol, support, or proof leaves readiness false.
 
-Browser Service Docker builder/test stage installs pinned Node, `python3`,
-`make`, and C compiler packages; final digest-pinned runtime copies compiled
-`.node` plus production files only. Runtime contains no compiler or package
-manager cache. Artifact is built for final architecture/libc; no downloaded
-prebuild exists. Docker tests inspect stages, run preflight in test and final
-images, and run persistent-volume canaries as final non-root UID. Compose's
-volume-init step exclusively creates browser-state root plus all reserved
-staging children as exact runtime UID/mode before first service start and
-validation-only preserves valid restart state thereafter. Browser Service only
-validates them and fails if any is absent or invalid.
+Current Task 4 proves deterministic host compilation/loading and unprivileged
+filesystem semantics only. It does not claim image, different-UID, privileged
+mount, read-only mount, bind-mount-ID, or named-volume acceptance on the host.
+Those require the exact downstream Docker harness.
 
-Task 6 still owns Dockerfile creation, but its plan/tests must be revised before
-implementation to carry these native builder, artifact, UID, volume-init, and
-canary requirements. A native-enabled Task 4 cannot be called deployable until
-that Task 6 gate passes.
+Original master-plan Task 6 remains owner of `src/server.ts`, `src/index.ts`,
+`Dockerfile`, and `src/dockerfile.test.ts`. Its amendment must add a compiler
+only to builder/test stages, run the deterministic script there, and copy only
+the verified production `.node`, exact runtime checksum attestation, and
+runtime application files into the final image. Final runtime contains no
+compiler, headers, depfiles, input-hash
+sidecars, test addon, flock/util-linux, build cache, or package-manager cache.
+The same Dockerfile defines a separate init target containing pinned util-linux
+`/usr/bin/flock`, Node 22, init script, and allowlist verification but no
+Browser server. Task 6 also adds init tests and image-level different-UID,
+read-only, bind/cross-mount, native preflight, and final UID `1000:1000` checks
+after server/index exist.
+
+Original Task 14 remains owner of `compose.local.yaml`, local wrapper/harness,
+and named-volume lifecycle. Its amendment mounts the named volume only at
+`/var/lib/firecrawl-browser-volume` for init and Browser Service, never API;
+runs locked `init-new|validate-existing` before Browser Service; passes child
+`state` as service root; and runs restart/persistent-volume/canary acceptance.
+No Task 4 completion claim includes those deferred files or tests. Native Task
+4 is host-complete but not deployable/locally activated until Task 6 and Task 14
+acceptance gates pass.
 
 ## RED and adversarial verification
 
@@ -1177,32 +1851,81 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   after the actual `renameat2` syscall; parent coordinates child `SIGKILL` at
   both barriers without timing sleeps, then a fresh process accepts either
   atomic pre-state or atomic post-state and runs durable recovery;
-- different-UID attacker prepopulates collision/corruption fixtures and swaps
+- current host tests prepopulate collision/corruption fixtures and swap
   configured root/ancestor pathnames before startup capture; held-chain and
-  init owner/mode validation reject them before publication. Tests do not claim
-  attacker mutation inside a validated service-owned parent;
-- privileged/same-UID test harness may force owner/mode/mount/held-chain drift
-  only to prove deterministic global fail-stop, never supported recovery under
-  that out-of-scope compromise;
-- real `EEXIST`, invalid leaf/fd, closed fd, noncanary missing source,
-  non-directory fd, denied parent, and read-only behavior with stable codes;
-  noncanary missing source must surface binding-invalid and close admission.
-  Real `ENOTEMPTY` is
-  asserted only when the current allowlisted filesystem returns it, while the
-  compiled errno mapper always proves `ENOTEMPTY` shares conflict handling;
-- real cross-mount source/target using test container mounts, same-device bind
-  mount-ID mismatch where supported, disallowed NFS-style statfs fixtures, and
-  zero fallback;
+  init metadata validation reject them before publication. Different-UID and
+  privileged owner/mount mutations are deferred to Task 6's Docker harness;
+- deferred privileged/same-UID image fixtures force owner/mode/mount/held-chain
+  drift only to prove deterministic global fail-stop, never supported recovery
+  under that out-of-scope compromise;
+- real host `EEXIST`, invalid leaf/fd, closed fd, noncanary missing source, and
+  non-directory fd behavior with stable codes; denied-parent/read-only mount
+  cases run in the deferred Task 6 image harness. Noncanary missing source must
+  surface binding-invalid and close admission. Real `ENOTEMPTY` is asserted
+  only when the current allowlisted filesystem returns it, while the compiled
+  errno mapper always proves `ENOTEMPTY` shares conflict handling;
+- current host tests reject injectable disallowed statfs identities and prove
+  zero fallback. Deferred Task 6 image tests own real cross-mount source/target,
+  same-device bind mount-ID mismatch, read-only, and privileged mount fixtures;
 - native test binary exercising every errno mapping, including separate and
   aliased `ENOTSUP`/`EOPNOTSUPP` compilation branches and internal
   `atomic_publish_source_missing` for `ENOENT`;
-- exact native export stays three properties; wrapper accepts exact
-  private-profile-payload, private-canary-proof, intent-temp, manifest-temp,
-  and protected-public-source discriminators only with their kind-compatible
-  targets. It rejects forged/raw/string/fd/cross-kind overloads and proves
-  profile publication, canary publication, initial intent publication,
-  manifest publication, prepare/finalize source move, and canary source move
-  use real native no-replace;
+- build-runner tests create `build/` before lock invocation, assert exact
+  `/usr/bin/flock --exclusive --timeout 60` argv with real Node 22, serialize
+  concurrent builders, release on killed/crashed child, and prove timeout has no
+  compiler effect. Compiler tests assert separate fixed argv/object/unique-`.d`
+  graphs for production addon, test addon/hooks, and errno executable; reject
+  multi-source/shared depfiles; hash every allowed dependency/tool/script; and
+  inventory/hash driver specs, subordinate tools, link inputs, and final needed
+  libraries. Two consecutive matching invocations still recompile/relink every
+  selected object/output; matching attestations never skip work. Killed-build
+  exact staging is safely recovered under lock, while foreign staging fails.
+  Standalone errno runner and both addon load checks must pass. Runtime checksum
+  tests require exact canonical JSON/newline and reject addon-byte, checksum,
+  interface, N-API, field-order, extra-field, and whitespace tampering;
+- Docker build/init tests verify fixed flock path, pinned util-linux
+  version/binary digest from `native/toolchain-allowlist.json`, and absence of
+  flock from Browser runtime. Deferred Task 6 init tests serialize concurrent
+  starters by locking the pre-existing trusted parent directory, create no lock
+  artifact, release on timeout/exit/SIGKILL, prove marker
+  mode selection, exclusive held-parent creation/bottom-up fsync, exact UID/GID
+  `1000:1000` plus `0700`, and zero repair in existing mode. Browser validation
+  receives pre-created `profiles` before scaffold/canary/recovery;
+- final-image tests prove only production `.node` and
+  `atomic-directory-publication.node.sha256` are copied from native build
+  outputs; input dep/hash sidecars, objects, maps, traces, and test outputs are
+  absent. Prestart rejects independent tampering of addon or attestation before
+  service initialization;
+- deferred Task 14 rendered-Compose tests prove only init and Browser Service
+  mount the named volume at `/var/lib/firecrawl-browser-volume`, API has no
+  volume mount, service root is exact child `state`, init gates service start,
+  and activation remains false until final acceptance commit;
+- exact native export stays three properties; reducer tests cover every closed
+  effect kind and require exactly one matching observation before the next
+  effect. Composite create-and-pin tests prove exact directory/file syscall
+  sequences, success returns one ID/full evidence with no second open, and
+  partial failure returns a one-use partial ID before explicit cleanup. Cleanup
+  tests require close when applicable, protected-parent identity verification,
+  exact unlink/rmdir, absence proof, and containing-parent fsync before the
+  sole `absent/parentSynced` success observation. Injected failure/crash at each
+  syscall boundary retains partial ID and stable intent, emits no phase/cursor/
+  reservation advance, and fail-stops on close/remove/fsync failure;
+- fresh-process partial-create recovery tests cover crash after mkdir/open/fstat
+  and after remove but before parent fsync/observation. Lost flight IDs grant no
+  authority: recovery remints from stable intent plus exact locator/evidence,
+  completes manifest-authorized cleanup, fsyncs parent, and removes intent only
+  afterward. Existing-entry open requires exact evidence. Injected controller spies fail on any
+  unrequested reserve/create/open/
+  read/write/hash/fsync/native/observe/remove/record/close/adopt/release call,
+  including crash recovery. Only reconciliation-owned callback scope sees
+  native operands, and all profile/canary/intent/manifest/source moves use real
+  native no-replace;
+- selector tests require exact parent/object IDs, canonical leaves, flags,
+  evidence, offsets/lengths/hashes, and inline-bytes XOR source ID. Create/open/
+  discovery observations alone mint IDs with full evidence. Forged, persisted,
+  cross-flight, over-4,096, post-terminal, and post-drain IDs reject before I/O;
+  restart remints IDs only by stable-locator enumeration/open observations.
+  Controller syscall spies prove no hidden reads or selector reconstruction;
 - missing/corrupt addon, malformed/extra exports, interface mismatch, compiled
   N-API mismatch, and runtime N-API incompatibility keep readiness false;
 - child process `SIGKILL` at every durable crash seam, followed by a fresh real
@@ -1216,11 +1939,13 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   proves both locations, and performs no public unlink. Orphans fail readiness;
 - deterministic same-attempt canary `ENOENT` replay fixtures cover exact
   private-proof-absent/public-target-match publication and exact
-  public-target-absent/private-deletion-match cleanup. Both require successful
-  fresh native prechecks/statfs/statx, normalize to replay-completed, advance
-  phase, and keep admission open. Wrong attempt/phase/source evidence, changed
-  inode/hash/parent, both/neither unexplained, profile publication, and every
-  other `ENOENT` normalize to binding-invalid and close admission globally;
+  public-target-absent/private-deletion-match cleanup. Native observation first
+  returns raw source-missing with no locations/admission effect; reducer then
+  emits exactly one location observation. Only matching observation normalizes
+  replay-completed and keeps admission open. Wrong attempt/phase/evidence,
+  changed inode/hash/parent, both/neither unexplained, profile publication, and
+  every other source-missing require a separately observed
+  `close_admission/binding_invalid` before global fail-stop;
 - canary recovery already at private deletion, partial manifest cursor, fully
   removed private root, and proof `cleaned` skips original publication and
   finishes exact private/record cleanup without requiring the original proof or
@@ -1268,23 +1993,26 @@ Real compiled-addon integration tests, not mocked rename results, cover:
 - valid but snapshot-unreferenced committed publication is never adopted:
   source deletion recovers, intent releases target, intent disappears before
   Task 3 plan, and only then Task 3 quarantine may move it across every crash;
-- publication returns a capability backed by original payload fd and held
-  ancestors without pathname reopen; forced privileged chain drift fails global
-  admission before later use;
+- reconciliation mints `BoundGeneration` from its original target pin and held
+  ancestors without pathname reopen; engine receives no capability/fd.
+  Deferred privileged chain drift fails global admission before later use;
 - all success/failure paths attempt all closes; close-then-throw reaches zero
   fds; true close rejection permanently blocks current process; restart closes
   old OS fds and recovers from durable intent;
-- host and final-image canaries on actual persistent filesystem.
+- current host canaries on an unprivileged local filesystem; final-image UID,
+  init-new/validate-existing, named-volume, mount, and persistent-restart
+  canaries only in deferred Task 6/14 Docker acceptance.
 
-Fakes are limited to wrapper admission/capability scheduling for deterministic
-await boundaries. Atomicity, errno, mount, crash, location, and recovery claims
-use compiled C addon and real filesystem/process boundaries. Existing Task 3
+Fakes are limited to pure effect scheduling and controller admission boundaries.
+Current atomicity, errno, crash, location, and recovery claims use compiled C
+addon and real unprivileged filesystem/process boundaries; privileged/mount/
+volume claims use downstream Docker tests only. Existing Task 3
 public reconciliation and Task 4 replay/proxy/registry/Chromium/checksum tests
 remain passing. Shared persistent/schema integration suites run serially.
 
-## Exact expanded Task 4 file scope
+## Exact current and deferred file scope
 
-Existing Task 4 files remain in scope:
+Current Task 4 existing files in scope:
 
 - `apps/browser-service/src/profile-store.ts`
 - `apps/browser-service/src/profile-store.test.ts`
@@ -1301,58 +2029,112 @@ Existing Task 4 files remain in scope:
 
 Native publication adds exactly:
 
-- `apps/browser-service/native/atomic-directory-publication.c` (new)
+- `apps/browser-service/native/atomic-directory-publication-addon.c` (new)
+- `apps/browser-service/native/atomic-directory-publication-errors.c` (new)
 - `apps/browser-service/native/atomic-directory-publication-errors.h` (new)
+- `apps/browser-service/native/atomic-directory-publication-test-hooks.c` (new)
+- `apps/browser-service/native/atomic-directory-publication-test-hooks.h` (new)
 - `apps/browser-service/native/atomic-directory-publication-errors.test.c`
   (new)
-- `apps/browser-service/binding.gyp` (new)
+- `apps/browser-service/native/toolchain-allowlist.json` (new)
+- `apps/browser-service/scripts/run-native-build.mjs` (new)
+- `apps/browser-service/scripts/run-native-build.test.mjs` (new)
 - `apps/browser-service/scripts/build-native.mjs` (new)
+- `apps/browser-service/scripts/build-native.test.mjs` (new)
+- `apps/browser-service/scripts/check-atomic-publication-rollback.mjs` (new)
+- `apps/browser-service/scripts/check-atomic-publication-rollback.test.mjs`
+  (new)
 - `apps/browser-service/src/atomic-directory-publication.ts` (new)
 - `apps/browser-service/src/atomic-directory-publication.test.ts` (new)
 - `apps/browser-service/src/atomic-directory-publication.integration.test.ts`
   (new)
+- `apps/browser-service/src/atomic-directory-publication-native.ts` (new)
+- `apps/browser-service/src/atomic-directory-publication-native.test.ts` (new)
 - `apps/browser-service/src/atomic-publication-manifest.ts` (new)
 - `apps/browser-service/src/atomic-publication-manifest.test.ts` (new)
+- `apps/browser-service/src/atomic-publication-observability.ts` (new)
+- `apps/browser-service/src/atomic-publication-observability.test.ts` (new)
 - `apps/browser-service/src/runtime-preflight.mjs`
 - `apps/browser-service/src/runtime-preflight.test.mjs`
 - `apps/browser-service/package.json`
-- `apps/browser-service/pnpm-lock.yaml`
 - `.gitignore`
 
-Design/plan alignment adds exactly:
+No native dependency is added, so `binding.gyp` does not exist and
+`apps/browser-service/pnpm-lock.yaml` changes only if another independently
+required package change demands it. This spec revision changes exactly:
 
 - `docs/superpowers/specs/2026-07-22-atomic-directory-publication-design.md`
-- `docs/superpowers/specs/2026-07-21-browser-service-plan-hardening-design.md`
-- `docs/superpowers/plans/2026-07-19-browser-service-and-api.md`
 
-Task 6 retains ownership of `apps/browser-service/Dockerfile` and
-`apps/browser-service/src/dockerfile.test.ts`; its revised exact scope adds
-`apps/browser-service/scripts/init-state-volume.mjs` and
-`apps/browser-service/scripts/init-state-volume.test.mjs`. The Compose task
-adds init-service/volume wiring in `compose.local.yaml`,
-`scripts/local-firecrawl`, and `scripts/local-firecrawl.test.mjs`. No generated
-`.node`, native test binary, `build/`, or `node_modules/` content enters a
-commit.
+Deferred original master-plan Task 6 amendment owns exactly:
+
+- `apps/browser-service/src/server.ts`
+- `apps/browser-service/src/server.test.ts`
+- `apps/browser-service/src/index.ts`
+- `apps/browser-service/Dockerfile`
+- `apps/browser-service/src/dockerfile.test.ts`
+- `apps/browser-service/scripts/init-state-volume.mjs` (new)
+- `apps/browser-service/scripts/init-state-volume.test.mjs` (new)
+
+It wires current observability into server/index, copies the rollback checker
+and production addon, and runs image/init/mount acceptance. None is pulled into
+Task 4 before server/index exist.
+
+Deferred original master-plan Task 14 amendment owns exactly:
+
+- `compose.local.yaml`
+- `.env.example.local`
+- `scripts/local-firecrawl`
+- `scripts/local-firecrawl.test.mjs`
+- `apps/api/package.json`
+- `apps/api/src/harness.ts`
+- `apps/api/src/harness-browser-service.ts`
+- `apps/api/src/harness-browser-service.test.ts`
+
+It owns init-service/volume/API-no-mount wiring, rollback-wrapper invocation,
+and the final local activation commit. No generated `.node`, runtime checksum
+attestation, native test binary, object, depfile, input-hash sidecar, map, trace,
+`build/`, or `node_modules/` content enters a commit.
 
 ## Rollout and observability
 
-Roll out fail-closed from first native-enabled image; never support mixed safe
-and unsafe publication modes. Before traffic, emit one structured
-`atomic_publish_preflight` event containing platform, architecture,
-`interfaceVersion`, compiled/runtime N-API versions, source constant
-`bundled_package_relative`, allowlisted filesystem name, and sanitized result.
-Do not log paths, fds, numeric owners, profile/generation/operation IDs,
-checksums, mount IDs, or raw errno text.
+Task 4 lands fail-closed code with local service activation still disabled. It
+does not change `LOCAL_BROWSER_SERVICE_ENABLED`. Task 6 builds/tests the image
+while the flag remains false. Only Task 14's final downstream acceptance commit,
+after image, init, named-volume restart, API-no-mount, and persistent canary
+checks pass, may set local `LOCAL_BROWSER_SERVICE_ENABLED=true` in
+`compose.local.yaml` and its documented local default. No earlier commit or
+runtime auto-detection enables it; mixed safe/unsafe publication is unsupported.
 
-Emit bounded counters for attempts, successes, conflicts, unsupported,
-cross-device, binding-invalid, denied, I/O failures, recovered-unpublished,
-recovered-published, ambiguous recovery, orphan/temporary state, and
-close-unverified. Alert on unsupported, cross-device, binding-invalid,
-ambiguous, orphan, close-unverified, or repeated conflicts. Health exposes only
-existing sanitized `browser_unavailable`; details remain private diagnostics.
+Current `atomic-publication-observability.ts` owns sanitized bounded counters
+and threshold-to-alert-event policy; `reconciliation.ts` emits through its
+injected sink. Before traffic, it emits one `atomic_publish_preflight` event
+containing platform, architecture, `interfaceVersion`, compiled/runtime N-API
+versions, source constant `bundled_package_relative`, allowlisted filesystem
+name, and sanitized result. It counts attempts, successes, conflicts,
+unsupported, cross-device, binding-invalid, denied, I/O failures,
+recovered-unpublished, recovered-published, ambiguous recovery,
+orphan/temporary state, and close-unverified. Alert events cover unsupported,
+cross-device, binding-invalid, ambiguous, orphan, close-unverified, and bounded
+repeated-conflict thresholds. Paths, fds, numeric owners, IDs, checksums, mount
+IDs, and raw errno text never enter events.
 
-Acceptance requires host tests, compiled native integration, two image builds,
-restart/crash recovery, volume-init permissions, and real persistent-volume
-canary. Rollback may deploy an older image only after an offline checker proves
-no unresolved native intent or wrapper. Never delete the reserved namespace to
-make an old image start.
+Deferred Task 6 `src/index.ts` wires that sink and `src/server.ts` exposes only
+existing sanitized `browser_unavailable`; its tests prove alert events remain
+private diagnostics. Deferred Task 14 `scripts/local-firecrawl` treats failed
+preflight/readiness as startup failure but does not implement a second metrics
+path.
+
+Current `scripts/check-atomic-publication-rollback.mjs` plus its test owns the
+offline read-only checker. It opens the exact child state root, validates held
+layout/owner/mode, and succeeds only when no stable/temp intent, wrapper,
+manifest, canary, or private deletion remains. It never mutates or offers a
+force option. Task 6 copies it into the image; Task 14's local wrapper invokes
+it before any requested downgrade. Rollback may deploy an older image only
+after checker success. Never delete reserved state to make rollback pass.
+
+Current acceptance is host build hashing, addon shape, pure reducer/controller
+tests, unprivileged native integration, and crash recovery. Deferred Task 6
+adds two deterministic image builds and image/init/UID/mount checks. Deferred
+Task 14 adds locked init mode selection, API-no-mount Compose topology, service
+restart, real named-volume canary, rollback invocation, and final flag
+activation. Claims do not move earlier than their owning task.
