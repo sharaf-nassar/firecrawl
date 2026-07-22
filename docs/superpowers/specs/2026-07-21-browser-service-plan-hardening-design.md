@@ -190,7 +190,10 @@ mutex, Browser Service owns one handoff wave: current tuple owner, owner
 transport liveness and absolute deadline, one shared drain promise, phase
 `pre_mint | minted | failed`, and bounded tuple tombstones. First owner closes admission
 synchronously, aborts in-flight reconciliation, clears readiness/cache, and
-starts exactly one physical drain/close operation. That service-owned promise
+publishes the wave plus one shared deferred promise before invoking the drain
+callback. Synchronous callback reentry or shutdown therefore observes and joins
+the published wave instead of creating or overwriting one. The callback settles
+that deferred exactly once. Its service-owned promise
 closes/revokes every session, Chromium context, stream, relay grant, writer,
 timer, and uncommitted profile working copy and continues independently if its
 owner HTTP transport dies.
@@ -243,6 +246,13 @@ returns superseded, exact failed replay returns its cached 503, and an unknown t
 mint. An orphan then requires service restart for a fresh process namespace.
 After completed A then B, replay A returns A's historical response but cannot
 replace current B generation. Neither nonce is persisted or logged.
+
+Tuple lookup order is exact under the mutex: resolve known exact replay first;
+for every unknown tuple, check and tentatively reserve one of the 1,024 slots
+before evaluating API-identity/idempotency-key collision semantics. At capacity
+an unknown colliding tuple therefore returns
+`control_generation_history_exhausted`, while known replay remains
+deterministic. Below capacity, collision rejection releases the tentative slot.
 
 Both health routes use the same bearer key, correlation ID, and bounded
 deadline authentication as every private route. They are never public.
@@ -351,16 +361,32 @@ type ReconciliationResultV1 = {
 ```
 
 Reconciliation inspects at most 25,000 managed filesystem entries in addition
-to the 25,000 request references; exceeding either cap fails before deletion.
+to the 25,000 request references. One global counter includes each managed
+namespace root and increments as each descendant file or directory is yielded
+from `replay/`, `profiles/`, or `quarantine/`, including nested profile content,
+plan manifests, temporary files, and completion markers. On entry 25,001 it
+aborts before stat, open, read, or hash of that entry. Walk depth is at most 64;
+every relative path is at
+most 1,024 UTF-8 bytes and every segment at most 255 UTF-8 bytes. Checkpoint
+files must be at most 2 MiB before read. Each profile file is at most 64 MiB and
+one generation tree at most 256 MiB, enforced while streaming the walk.
+The counter is created once per reconciliation and never reset or deduplicated;
+authority, enumeration, identity, revalidation, recovery, and retry walks all
+consume the same total.
+Exceeding any bound fails before deletion.
 Response counts are nonnegative safe integers no greater than 25,000 each. API
 accepts the result only when process nonce, generation nonce, and digest equal
 its request and all result fields pass the closed schema.
 
 The authenticated service key proves the caller is an API. Process nonce binds
 to one live Browser Service process; control generation fences API ownership.
-Wrong, stale, or malformed process/generation values return
-`reconciliation_nonce_mismatch` or `control_generation_mismatch` and cannot
-alter filesystem or readiness.
+Category precedence is exact and cannot alter filesystem or readiness:
+oversized reference count or encoded body returns
+`reconciliation_snapshot_too_large` with 413; malformed JSON/schema, path,
+checksum, alias, or digest returns `reconciliation_snapshot_invalid` with 400;
+a structurally valid stale process returns `reconciliation_nonce_mismatch`
+with 409; and a valid current-process but stale generation returns
+`control_generation_mismatch` with 409.
 
 For one process/control generation:
 
@@ -373,7 +399,11 @@ For one process/control generation:
 - A completed new generation under the same process permits a new digest only
   because handoff proved all prior service runtime closed and cleared cache.
 - A failed attempt is not cached as success. Exact retry may finish recovery
-  from its safe quarantine state.
+  from its validated durable reconciliation manifest.
+- The startup state publishes one reconciliation-flight record and shared
+  deferred before invoking the execute callback. Synchronous reentry joins that
+  flight, and synchronous draining aborts it; neither can duplicate execution
+  or overwrite the flight.
 
 ### API snapshot authority
 
@@ -434,32 +464,125 @@ work and start browser retention.
 
 ## Filesystem reconciliation
 
-Browser Service validates the complete request before destructive work. For
-each reference it resolves from the configured canonical root, rejects any
-symlink or root escape, requires the expected regular file or profile
-generation directory shape, and verifies the type-specific canonical SHA-256.
-Directory walks reject symlinks, special files, unexpected hard links, and
-entries outside the committed profile-generation grammar.
+Browser Service requires Linux procfs fd anchoring. It opens the canonical root
+once with `O_DIRECTORY | O_NOFOLLOW`, walks every component through held
+directory handles using `/proc/self/fd/<parentFd>/<segment>`, and rejects
+startup reconciliation as `reconciliation_filesystem_unsafe` when procfs fd
+anchoring is unavailable. It creates and opens quarantine parents one component
+at a time with `O_NOFOLLOW`. Source and destination parent handles stay open
+through rename, both directory fsyncs, identity revalidation, delete, and final
+fsync. Rename and removal use only procfd-anchored parent paths, never the
+original validated string, so an ancestor symlink swap cannot redirect work
+outside the root. A changed leaf type or identity fails closed.
+
+Every non-cleanup filesystem await is bracketed by the reconciliation
+admission checks before and after it. All held handles close unconditionally in
+raw `finally` blocks without admission checks; close is required cleanup after
+abort and cannot be skipped by a closed gate.
+
+Browser Service validates the complete request before destructive work.
+Checkpoint authority is exactly one regular file matching
+`replay/<owner>/<scrape>/<canonical-lowercase-uuid>.json`. Profile authority is
+exactly a generation directory matching
+`profiles/<canonical-lowercase-profile-uuid>/{committed|staging|working}/`
+`<canonical-lowercase-generation-uuid>/`, never a file. Unknown files or names
+at the `profiles/`, profile, and state namespace levels fail closed. Inside a
+generation, bounded regular files/directories form the canonical tree. Every
+regular file requires `nlink === 1`; every symlink, socket, FIFO, device, or
+other special entry is unsafe.
+
+Task 3 and Task 4 share one canonical profile-tree algorithm. Walk at depth at
+most 64 and sort entries by raw UTF-8 relative-path bytes. The root is encoded
+with `path:""`; descendants use NFC slash-separated paths with segments at
+most 255 bytes and total paths at most 1,024 bytes. Serialize whitespace-free
+UTF-8 JSON with fixed key order
+`{"version":1,"entries":[{"path":"","type":"directory","mode":448,"size":0,"sha256":null}]}`:
+`type` is `directory` or `file`, `mode` is the low permission bits as a decimal
+integer, directories use `size:0,sha256:null`, and files use exact byte size and
+lowercase content SHA-256. The profile checksum is SHA-256 of those exact JSON
+bytes. Per-file and cumulative byte limits are enforced during the walk.
 
 If any authoritative reference is missing, corrupt, unsafe, or unreadable,
 reconciliation fails, readiness remains false, and nothing is deleted.
 
 After all authorities validate, Browser Service enumerates only checked-in
-managed namespaces and computes an in-memory plan. It retains every listed
+managed namespaces and computes the deterministic candidate plan that must be
+persisted below before candidate mutation. It retains every listed
 path, including cleanup intents and current/latest/active generations. It may
 remove only an unreferenced, recognized service-owned committed, staging,
 working, or checkpoint entry older than the existing 10-minute grace period.
-Unknown names fail readiness and are never guessed or deleted.
+For a directory candidate, age is its maximum descendant mtime including the
+directory itself, not its root mtime alone. Unknown names fail readiness and
+are never guessed or deleted.
 
-Removal first atomically renames each candidate within the same canonical root
-to `quarantine/<processNonce>/<controlGenerationNonce>/<full-source-path>`,
-fsyncs the parent, then deletes the quarantine entry and fsyncs again. A
-partial failure leaves readiness false; retry with the same
-process/generation/digest can continue idempotently. A later generation may
-validate and finish an old-generation quarantine only after its complete new
-authority snapshot proves the original path is unreferenced. Readiness flips
-to true exactly once, only after the whole validated plan completes. No cleanup
-starts from a partial, stale, wrong-generation, or conflicting snapshot.
+Before moving the first candidate, persist one immutable canonical plan at
+`quarantine/<processNonce>/<controlGenerationNonce>/.plans/`
+`<snapshotDigest>/plan.json`. Exact plan-directory grammar permits only
+`plan.tmp`, `plan.json`, `complete.tmp`, and `complete`. The manifest contains
+fixed-key `version`, process nonce, generation nonce, snapshot digest, and
+sorted entries. Each entry records full source and destination relative paths,
+recognized type, immutable identity SHA-256, byte count, source/destination
+parent path plus device/inode/mode identity, and the exact phase model below.
+Field names/order equal Task 3's `ReconciliationPlanV1`; device and inode are
+canonical unsigned decimal strings and entries sort by raw UTF-8 source then
+destination path. `phaseModel:1` is immutable; observed phase comes only from
+the source/destination state machine.
+Checkpoint identity hashes type/mode/size/content SHA; profile identity hashes
+the canonical tree representation. Manifest JSON is at most 64 MiB.
+
+Create `plan.tmp` with `O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600, write the
+canonical bytes, fsync the file, rename it to `plan.json`, then fsync the plan
+directory and `.plans` parent through held handles. Quarantine parent creation
+may precede this write, but each new directory is immediately opened and its
+held parent fsynced; the full empty skeleton is durable before `plan.tmp`. No
+candidate move/delete may precede the manifest. A crash after temp-file fsync
+resumes only by validating and publishing those exact bytes. Same tuple/
+digest retry loads and validates the durable manifest rather than rebuilding
+from mutable quarantine state.
+
+Before `plan.tmp` exists, only the exact empty directory skeleton reserved for
+that tuple/digest is valid. Retry revalidates source/parent identities before
+publishing the manifest. Any destination bytes, nonempty candidate directory,
+or unexpected entry without valid temp/manifest is unsafe untouched.
+
+For each manifest item, source-only means revalidate exact identity, rename by
+held parent handles, fsync both source and destination parents, revalidate the
+moved identity, delete, then fsync destination parent. Destination-only means
+validate its expected identity, fsync both recorded parents before delete,
+delete, then fsync destination parent. Both absent means fsync destination
+parent before recording/counting completion. Both present or any type,
+identity, parent-identity, or byte mismatch fails unsafe without touching
+either. A delete followed by fsync failure remains incomplete; retry performs
+the destination fsync and counts that entry once.
+
+The manifest remains until every entry delete and required fsync completes.
+Then create mode-0600 `complete.tmp` with
+`O_CREAT | O_EXCL | O_NOFOLLOW`, write/fsync exact fixed-key version, manifest
+SHA-256, retained, and removed fields, atomically rename to `complete`, and
+fsync the plan directory. A temp-only retry validates and publishes those exact
+bytes. A current exact retry validates `plan.json` plus `complete` and returns
+the same counts. A later authority-valid reconciliation
+may crash-safely remove an older completed manifest, marker, and empty plan
+directory only after removing empty destination parents bottom-up from manifest
+paths, with a held-parent fsync after each unlink/rmdir. Manifest is removed
+only after every candidate hierarchy is gone. A completion-only crash state
+with no quarantine bytes or nonempty destination directory is cleanup-only;
+any partial quarantine without a valid manifest, or a modified/forged manifest
+or marker, fails unsafe untouched.
+
+`retained` is the number of unique authoritative paths validated. `removed` is
+the number of manifest entries this reconciliation must converge, including
+validated pending older manifests; each counts exactly once whether completed
+before or during this attempt. Exact retry returns identical counts. Old
+process/generation recovery enumerates only validated manifests after current
+authority validation, validates every quarantined byte against its expected
+identity, and never reconstructs a plan from destination paths.
+
+A partial failure leaves readiness false. A later generation may finish an
+old-generation manifest only after its complete new authority snapshot proves
+every original source unreferenced. Readiness flips to true exactly once, only
+after every validated plan completes. No cleanup starts from a partial, stale,
+wrong-generation, or conflicting snapshot.
 
 Once the API opens its gate, normal retention again owns cleanup-intent files
 and database compare-and-set updates. Browser Service startup reconciliation
@@ -603,6 +726,11 @@ generation-scoped reconciliation cache, quarantine-safe filesystem plan, and
 readiness latch before session/profile registry can become ready.
 Its failed handoff tombstone makes physical-drain failure terminal for the
 exact tuple while allowing only a fresh tuple's complete idempotent redrain.
+Its reconciliation boundary persists immutable plan manifests before candidate
+mutation, executes through procfd-anchored held directory handles, and shares
+the exact bounded canonical profile-tree identity with Task 4. Manifest phases
+and completion markers make retry counts deterministic across process and
+generation crashes.
 Profile/session creation remains impossible until handoff and reconciliation
 succeed. Its tests use fixture roots and injected snapshots; no database
 credentials enter Browser Service.
@@ -701,8 +829,15 @@ New tests in the implementation plan must prove:
 - handoff, health, and reconciliation reject missing auth, expired deadlines,
   unknown fields, malformed process/generation/idempotency/hash/path values,
   excess references, and excess bytes;
+- reconciliation maps oversized references/body to snapshot-too-large,
+  malformed schema/path/checksum/alias/digest to snapshot-invalid, valid stale
+  process to nonce-mismatch, and valid stale generation to generation-mismatch
+  before filesystem execution;
 - handoff mints a generation only after closing every old service runtime
   resource and clearing readiness/cache while process nonce remains stable;
+- handoff wave and reconciliation flight/deferred are published before their
+  callbacks; synchronous callback reentry and shutdown join/abort one flight
+  without duplicate execution or overwritten state;
 - exact API identity/idempotency replay mints once; conflicting/concurrent
   takeover fails closed and later completed takeover fences prior API;
 - API crash or request deadline during pre-mint drain lets one fresh tuple
@@ -718,6 +853,9 @@ New tests in the implementation plan must prove:
 - a failed replacement cannot resurrect its superseded predecessor, and failed
   tombstones consume the same 1,024-entry history capacity as every accepted
   tuple;
+- unknown tuples check/reserve history capacity before collision semantics;
+  at-cap unknown collision returns history exhausted, below-cap collision
+  releases its reservation, and known replay stays deterministic at capacity;
 - A→B→replay-A returns historical A without changing current B; tuple history
   capacity accepts known replay, preserves superseded tombstones, and rejects
   unknown orphan replacement without eviction or a second drain;
@@ -734,10 +872,27 @@ New tests in the implementation plan must prove:
   active/latest generations, and unresolved cleanup intents;
 - missing or corrupt authoritative files cause zero deletion and remain
   unready;
-- traversal, absolute paths, symlinks, special files, hard-link ambiguity, and
-  checksum aliases fail closed;
-- only recognized, unreferenced entries older than 10 minutes enter quarantine;
-- partial quarantine/delete failure remains unready and exact retry completes;
+- profile authority is a canonical UUID generation directory, never a file;
+  wrong UUID/name/namespace entries, traversal, absolute paths, symlinks,
+  sockets/FIFOs/devices, hard links, and checksum aliases fail closed;
+- Task 3 and Task 4 share exact UTF-8-sorted type/mode/size/content-SHA tree
+  encoding and enforce depth 64, checkpoint 2 MiB, profile-file 64 MiB,
+  profile-tree 256 MiB, and path/segment bounds during walks;
+- the global managed-entry counter includes every nested namespace and manifest
+  entry and stops at 25,001 before stat/read/hash; descendant maximum mtime,
+  not generation-root mtime, controls the 10-minute grace period;
+- procfd-anchored held directory handles survive ancestor symlink swaps; every
+  non-cleanup filesystem await has before/after admission checks, while raw
+  finally closes all handles after abort;
+- canonical immutable plan manifest is durable before candidate mutation;
+  corrupt/forged/missing-manifest quarantine and source/destination identity
+  mismatches fail unsafe untouched;
+- crashes after plan fsync/rename, candidate rename, either parent fsync,
+  delete, post-delete fsync, completion marker, or manifest cleanup resume exact
+  phases and counts; delete-then-fsync failure retries fsync and counts once;
+- new process/generation recovery validates authority then enumerates validated
+  manifests only, verifies quarantine bytes, and never reconstructs a plan from
+  destination paths;
 - no database migration/recovery/snapshot begins before confirmed service
   handoff drain; API opens browser work/retention only after matching
   process/generation/digest response and ready health;
