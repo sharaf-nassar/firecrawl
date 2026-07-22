@@ -86,6 +86,12 @@ handshake and awaited `onAccepted` authorization barrier. Host callbacks must
 send the three locked headers; no host task may infer first-callback authority
 from an action row.
 
+After revising that host plan, require this stale-contract scan to exit zero:
+
+```bash
+! rg -n '0\.144\.5|observer\.onAccepted\(processId\)|processId: string' docs/superpowers/plans/2026-07-19-browser-host-execution-and-operations.md
+```
+
 All Browser Service host commands deliberately prepend the already installed
 Node `22.22.1` directory:
 
@@ -172,6 +178,10 @@ subject and every body line are at most 72 characters.
   deadline-aware Browser Service client.
 - `apps/api/src/lib/scrape-interact/browser-service-contracts.ts` — API-owned
   closed V1 schemas and canonical-inventory fingerprint.
+- `apps/api/src/lib/browser-state/filesystem-store.ts` — sole canonical
+  storage-state file owner under direct `replay/<owner>/<scrape>/...` paths.
+- `apps/api/src/lib/scrape-interact/replay-store.ts` — checkpoint metadata,
+  cleanup intents, and file-backed replay-request reconstruction.
 - `apps/api/src/lib/browser-runtime/startup-gate.ts` — fail-closed browser work
   and browser-state mutator/retention gate.
 - `apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts` —
@@ -328,7 +338,7 @@ type StorageStateV1 = {
       }>;
     }>;
   }>;
-}; // canonical encoded StorageStateV1 <= 16 MiB
+}; // canonical encoded StorageStateV1 <= 2 MiB
 
 type ReplayBrowserSettingsV1 = {
   headers: Record<string, string>; // <= 256 valid HTTP fields, <= 64 KiB total
@@ -363,7 +373,7 @@ type ReplayCheckpointV1 = {
   checkpointId: Id;
   statePath: RelativeStatePath;
   checksum: Sha256;                // canonical StorageStateV1 file bytes
-  byteSize: number;                // those bytes; integer 1..16_777_216
+  byteSize: number;                // those bytes; integer 1..2_097_152
   storageState: StorageStateV1;
   finalUrl: HttpUrl;
   fingerprint: {
@@ -624,6 +634,9 @@ credential-bearing, relative, and over-8,192-character URLs on both sides.
   browser launch/context proxy accepts `{server,bypass}`;
   `connectOverCDP()` is Chromium-only and lower fidelity than Playwright
   protocol, so typed operations use the owned Playwright context.
+- [TypeScript Compiler API](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API):
+  `createSourceFile()` parses JavaScript/TypeScript into an AST that can be
+  traversed with `forEachChild()` without emitting or executing source.
 - [Chromium proxy bypass rules](https://chromium.googlesource.com/chromium/src/+/312b6bf/net/docs/proxy.md):
   Chromium implicitly bypasses localhost and link-local destinations;
   `<-loopback>` subtracts that implicit bypass so the validating proxy sees
@@ -717,6 +730,7 @@ Vitest 4.1.9:
     "express": "5.2.1",
     "ipaddr.js": "2.4.0",
     "playwright": "1.61.1",
+    "typescript": "5.9.3",
     "ws": "8.21.1",
     "zod": "4.4.3"
   },
@@ -725,7 +739,6 @@ Vitest 4.1.9:
     "@types/node": "22.20.1",
     "@types/ws": "8.18.1",
     "tsx": "4.23.1",
-    "typescript": "5.9.3",
     "vitest": "4.1.9"
   },
   "engines": { "node": "22.22.1" },
@@ -791,9 +804,12 @@ node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs
 
 Expected: `v22.22.1`, `10.33.0`, both frozen commands and lockfile tests pass,
 and list reports exactly Express `5.2.1`, `ipaddr.js` `2.4.0`, Playwright
-`1.61.1`, `ws` `8.21.1`, Zod `4.4.3`, `@types/express` `5.0.6`,
-`@types/node` `22.20.1`, `@types/ws` `8.18.1`, `tsx` `4.23.1`, TypeScript
-`5.9.3`, and Vitest `4.1.9` as direct dependencies. Playwright reports its
+`1.61.1`, TypeScript `5.9.3`, `ws` `8.21.1`, Zod `4.4.3`,
+`@types/express` `5.0.6`,
+`@types/node` `22.20.1`, `@types/ws` `8.18.1`, `tsx` `4.23.1`, and Vitest
+`4.1.9` as direct dependencies. `typescript` must appear
+only in production `dependencies`; the other five type/test packages remain
+development-only. Playwright reports its
 1.61.1-pinned Chromium executable through `chromium.executablePath()`; Tasks 2
 and 4 fail if that exact executable is absent.
 
@@ -1107,11 +1123,12 @@ array, symbol, undefined, function, and bigint rejection before encoding.
 
 `auth.ts` uses `timingSafeEqual`, rejects expired deadlines or deadlines over
 5 minutes away, and returns `{ correlationId, deadline: Date }`. `config.ts`
-validates `PORT`, `BROWSER_SERVICE_API_KEY`, `BROWSER_PROFILE_ROOT`,
-`LOCAL_BROWSER_STATE_ROOT`, `BROWSER_STATE_NAMESPACE` as canonical lowercase
-UUID, `MAX_BROWSER_SESSIONS`, and every bound used below. Resolve all managed
-paths under `<canonical root>/<namespace>/`; reconciliation and cleanup never
-accept a request-supplied root or namespace.
+validates `PORT`, `BROWSER_SERVICE_API_KEY`, `LOCAL_BROWSER_STATE_ROOT`,
+`MAX_BROWSER_SESSIONS`, and every bound used
+below. `LOCAL_BROWSER_STATE_ROOT` itself is the canonical deployment-isolated
+root shared with API. Resolve `replay/`, `profiles/`, and `quarantine/`
+directly beneath it; reconciliation and cleanup never accept a
+request-supplied root or insert another intermediate root layer.
 
 Add `processNonceSchema`, canonical lowercase UUID/path/SHA-256 reference
 schemas, `reconciliationRequestV1Schema`, `reconciliationResultV1Schema`, and
@@ -1371,6 +1388,20 @@ test("in-flight reconciliation cannot cache readiness after draining", async () 
   });
   expect(state.readyHealth().status).toBe("unready");
 });
+
+test("cached same-digest success cannot return after draining", async () => {
+  const state = createStartupStateWithCachedReturnPause();
+  await state.reconcile(validRequestFor(state), reconcileOnce);
+  const replay = state.reconcile(validRequestFor(state), reconcileOnce);
+  await state.cachedReturnReached();
+  state.beginDraining();
+  state.releaseCachedReturn();
+  await expect(replay).rejects.toMatchObject({
+    category: "reconciliation_required",
+  });
+  expect(reconcileOnce).toHaveBeenCalledTimes(1);
+  expect(state.readyHealth().status).toBe("unready");
+});
 ```
 
 Assert two process instances receive different 43-character nonces; a wrong
@@ -1390,6 +1421,7 @@ test("validates all authorities before quarantining one old orphan", async () =>
     oldUnreferencedCheckpoint: true,
   });
   const result = await reconcileBrowserState(fixture.root, fixture.request, {
+    admission: fixture.admission,
     now: () => new Date("2026-07-21T12:00:00.000Z"),
   });
   expect(result).toMatchObject({
@@ -1399,8 +1431,14 @@ test("validates all authorities before quarantining one old orphan", async () =>
     corrupt: 0,
     ready: true,
   });
-  expect(await fixture.exists("checkpoints/referenced.json")).toBe(true);
-  expect(await fixture.exists("checkpoints/orphan.json")).toBe(false);
+  expect(await fixture.exists(
+    "replay/owner-a/scrape-a/11111111-1111-4111-8111-111111111111.json",
+  ))
+    .toBe(true);
+  expect(await fixture.exists(
+    "replay/owner-a/scrape-a/22222222-2222-4222-8222-222222222222.json",
+  ))
+    .toBe(false);
 });
 
 test("one corrupt authority causes zero deletion", async () => {
@@ -1413,14 +1451,17 @@ test("one corrupt authority causes zero deletion", async () => {
     fixture.request,
     fixture.deps,
   )).rejects.toMatchObject({ category: "reconciliation_reference_corrupt" });
-  expect(await fixture.exists("checkpoints/orphan.json")).toBe(true);
+  expect(await fixture.exists(
+    "replay/owner-a/scrape-a/22222222-2222-4222-8222-222222222222.json",
+  ))
+    .toBe(true);
 });
 
 test("execution failure changes only the exact planned quarantine entry", async () => {
   const fixture = await createMultipleOrphanFixture();
   fixture.failAfterFirstRename();
   await expect(reconcileBrowserState(fixture.root, fixture.request, fixture.deps))
-    .rejects.toMatchObject({ category: "reconciliation_execution_failed" });
+    .rejects.toMatchObject({ category: "reconciliation_cleanup_failed" });
   expect(await fixture.locationOf(fixture.first)).toBe(
     `quarantine/${fixture.processNonce}/${fixture.first.relativePath}`,
   );
@@ -1433,15 +1474,17 @@ test("execution failure changes only the exact planned quarantine entry", async 
 });
 
 test("equal basenames preserve complete managed source namespaces", async () => {
-  const fixture = await createEqualBasenameFixture("state.bin");
+  const fixture = await createEqualBasenameFixture(
+    "33333333-3333-4333-8333-333333333333.json",
+  );
   fixture.failAfterAllQuarantineRenames();
   await expect(reconcileBrowserState(fixture.root, fixture.request, fixture.deps))
-    .rejects.toMatchObject({ category: "reconciliation_execution_failed" });
+    .rejects.toMatchObject({ category: "reconciliation_cleanup_failed" });
   expect(fixture.quarantineDestinations()).toEqual([
-    `${fixture.quarantine}/checkpoints/state.bin`,
-    `${fixture.quarantine}/profiles/a/committed/state.bin`,
-    `${fixture.quarantine}/profiles/a/staging/state.bin`,
-    `${fixture.quarantine}/profiles/a/working/state.bin`,
+    `${fixture.quarantine}/replay/owner-a/scrape-a/33333333-3333-4333-8333-333333333333.json`,
+    `${fixture.quarantine}/profiles/a/committed/33333333-3333-4333-8333-333333333333.json`,
+    `${fixture.quarantine}/profiles/a/staging/33333333-3333-4333-8333-333333333333.json`,
+    `${fixture.quarantine}/profiles/a/working/33333333-3333-4333-8333-333333333333.json`,
   ]);
 });
 
@@ -1453,6 +1496,35 @@ test("new process resumes an old-nonce quarantine after crash", async () => {
   )).resolves.toMatchObject({ ready: true });
   expect(await restarted.oldNonceQuarantineEntries()).toEqual([]);
   expect(await restarted.unrelatedEntryBytes()).toEqual(fixture.originalBytes);
+});
+
+test("draining stops before the next reconciliation filesystem call", async () => {
+  const fixture = await createMultipleOrphanFixture();
+  fixture.pauseAfterFirstRenameBeforeFsync();
+  const attempt = fixture.startThroughAdmission();
+  await fixture.firstRenameCompleted();
+  fixture.startupState.beginDraining();
+  expect(fixture.reconciliationSignal.aborted).toBe(true);
+  fixture.releaseFilesystemPause();
+  await expect(attempt).rejects.toMatchObject({
+    category: "reconciliation_required",
+  });
+  expect(fixture.filesystemCallsAfterPause()).toEqual([]);
+  expect(fixture.startupState.readyHealth().status).toBe("unready");
+});
+
+test("draining aborts an authority walk before any mutation", async () => {
+  const fixture = await createStateFixture({ referencedCheckpoint: true });
+  fixture.pauseAfterFirstAuthorityRead();
+  const attempt = fixture.startThroughAdmission();
+  await fixture.firstAuthorityReadCompleted();
+  fixture.startupState.beginDraining();
+  fixture.releaseFilesystemPause();
+  await expect(attempt).rejects.toMatchObject({
+    category: "reconciliation_required",
+  });
+  expect(fixture.filesystemCallsAfterPause()).toEqual([]);
+  expect(fixture.mutations()).toEqual([]);
 });
 ```
 
@@ -1490,9 +1562,15 @@ export type StartupAdmission = {
     request: ReconciliationRequestV1,
     execute: (
       request: ReconciliationRequestV1,
+      admission: ReconciliationExecutionAdmission,
     ) => Promise<ReconciliationResultV1>,
   ): Promise<ReconciliationResultV1>;
   beginDraining(): void;
+};
+
+export type ReconciliationExecutionAdmission = {
+  readonly signal: AbortSignal;
+  assertAdmitted(): void;
 };
 
 export function createStartupState(deps?: {
@@ -1506,10 +1584,15 @@ process. Validate nonce before calling filesystem code. Cache only successful
 same-digest result; preserve current readiness on conflicting replay. A failed
 attempt remains retryable and unready. `requireReady()` throws
 `reconciliation_required` outside `ready` and after draining.
-`reconcile()` itself rejects draining before nonce/digest callback invocation,
-and rechecks draining after awaited filesystem work before caching success.
-Once `beginDraining()` runs, no accepted or in-flight reconciliation may call
-new filesystem work, publish a cached result, or return readiness to true.
+`reconcile()` creates one private `AbortController` per accepted execution and
+passes its signal plus `assertAdmitted()` checkpoint to the callback. It
+rejects draining before nonce/digest callback invocation and rechecks after
+awaited filesystem work before caching success. It also rechecks draining
+immediately before returning an existing same-nonce/digest cached success.
+`beginDraining()` aborts the controller synchronously before returning. No
+accepted, cached, or in-flight
+reconciliation may start a later filesystem call, publish a cached result, or
+return readiness to true.
 
 - [ ] **Step 5: Implement validate-plan-quarantine reconciliation**
 
@@ -1517,6 +1600,7 @@ Expose this filesystem-only boundary:
 
 ```ts
 export type ReconciliationDependencies = {
+  admission: ReconciliationExecutionAdmission;
   now?: () => Date;
   gracePeriodMs?: number;
   maxManagedEntries?: number;
@@ -1531,22 +1615,24 @@ export function canonicalizeReconciliationSnapshot(
 export async function reconcileBrowserState(
   canonicalRoot: string,
   request: ReconciliationRequestV1,
-  deps?: ReconciliationDependencies,
+  deps: ReconciliationDependencies,
 ): Promise<ReconciliationResultV1>;
 ```
 
 First parse the complete closed request, recompute digest, and validate every
-authority. `canonicalRoot` is constructed once at startup from configured
-`LOCAL_BROWSER_STATE_ROOT/BROWSER_STATE_NAMESPACE`; no route, snapshot, API,
-or harness request can replace it. Resolve only root-relative paths beneath
-that owned canonical namespace. Reject
+authority. `canonicalRoot` is the configured `LOCAL_BROWSER_STATE_ROOT`
+itself; no route, snapshot, API, harness request, or namespace parameter can
+replace or extend it. Preserve existing database path grammar exactly as
+`replay/<owner>/<scrape>/<uuid>.json`, resolved directly under this root.
+Resolve only root-relative paths beneath that owned root. Reject
 symlinks, root escapes, special files, hard-link ambiguity, unrecognized
 directory grammar, and checksum mismatch. Check checkpoint canonical JSON SHA
 over the storage-state-only file bytes and profile-generation canonical tree
 SHA by the foundation algorithms; never expect a checkpoint envelope on disk.
 
-Only after all authorities pass, enumerate at most 25,000 entries in checked-in
-checkpoint, profile committed/staging/working, and quarantine namespaces.
+Only after all authorities pass, enumerate at most 25,000 entries in the
+existing `replay/` tree plus new profile committed/staging/working and
+quarantine namespaces.
 Retain every reference, including cleanup intents and active/latest profile
 generations supplied by API. Eligible deletion requires recognized ownership,
 absence from snapshot, and age greater than 10 minutes. Build and freeze a
@@ -1554,8 +1640,9 @@ sorted deletion plan before the first mutation. Each item records full
 root-relative source path, recognized namespace/type, file/tree identity
 SHA-256, byte count, and deterministic destination:
 `quarantine/<processNonce>/<full-root-relative-source-path>`. Preserve every
-source path segment (`checkpoints/...`, `profiles/<id>/committed/...`,
-`staging/...`, `working/...`) rather than basename or a lossy encoding. Validate
+source path segment (`replay/<owner>/<scrape>/...`,
+`profiles/<id>/committed/...`, `staging/...`, `working/...`) rather than
+basename or a lossy encoding. Validate
 each segment with `RelativeStatePath`, create parents one segment at a time
 under directory handles, and reject traversal, symlinks, hard-link ambiguity,
 or root escape.
@@ -1586,6 +1673,19 @@ construction. Once execution begins, an error reports bounded counts for the
 exact completed/moved plan prefix, keeps readiness unready, and leaves all
 authorities, unrelated entries, and unexecuted plan items unchanged. Never
 attempt rollback rename after an fsync/error boundary; exact retry converges.
+
+Before every individual filesystem call during authority validation, tree
+enumeration, planning revalidation, quarantine parent creation, rename,
+directory fsync, and delete, call both
+`admission.signal.throwIfAborted()` and `admission.assertAdmitted()`. An
+already-running syscall may complete after draining begins; repeat the checks
+immediately after every await, so after it returns no later filesystem call
+starts. The
+service route passes the exact admission object received from
+`StartupAdmission.reconcile()` into `reconcileBrowserState()` without replacing
+its signal. Admission abort always maps to `reconciliation_required`, not
+`reconciliation_cleanup_failed`; it preserves any already completed exact
+plan prefix for the next same-digest retry.
 
 Log one bounded aggregate record containing category, correlation ID, state,
 counts, duration, and result. Test captured logs contain none of request paths,
@@ -1665,10 +1765,29 @@ test("real Chromium restores storage before its first network request", async ()
   });
   expect(restored.preRestoreNetworkRequests).toBe(0);
   expect(restored.documentValues).toEqual(EXPECTED_STORAGE_VALUES);
-  expect(restored.exportedCanonicalBytes).toEqual(
-    restored.checkpointStorageCanonicalBytes,
+  expect(restored.requestFileCanonicalBytes).toEqual(
+    restored.checkpointFileCanonicalBytes,
   );
-  expect(restored.exportedChecksum).toBe(restored.checkpointStorageChecksum);
+  expect(restored.exportedSemanticBytes).toEqual(
+    restored.requestSemanticBytes,
+  );
+  expect(restored.checkpointFileChecksum).toBe(
+    sha256(restored.checkpointFileCanonicalBytes),
+  );
+});
+
+test("accepts foundation-canonical storage with unsorted semantic arrays", async () => {
+  const restored = await restoreRealCheckpoint({
+    preserveUnsortedCookieOriginAndIndexedDbArrays: true,
+  });
+  expect(restored.requestFileCanonicalBytes).toEqual(
+    restored.checkpointFileCanonicalBytes,
+  );
+  expect(restored.exportedSemanticBytes).toEqual(
+    restored.requestSemanticBytes,
+  );
+  expect(restored.exportedSemanticBytes)
+    .not.toEqual(restored.checkpointFileCanonicalBytes);
 });
 
 test("checkpoint file is canonical storage bytes, not an envelope", async () => {
@@ -1678,6 +1797,8 @@ test("checkpoint file is canonical storage bytes, not an envelope", async () => 
     wrongByteSizeMetadata(),
     wrongChecksumMetadata(),
     requestStorageDifferentFromFile(),
+    pathWithInsertedNamespaceBeforeReplay(),
+    pathWithDoubledReplaySegment(),
   ]) {
     const harness = await createFreshReplayHarness(fixture);
     await expect(harness.restore()).rejects.toMatchObject({
@@ -1739,16 +1860,22 @@ proxy, or Chromium side effects. Replay may use no profile or a new profile
 with null generation; the latter begins empty and may publish only after a
 successful session close.
 
-Restore checkpoints only from UUID-derived paths under
-`LOCAL_BROWSER_STATE_ROOT`. `CreateSessionV1` carries the already validated
-complete `ReplayCheckpointV1` metadata and storage payload. Resolve
+Restore checkpoints only from foundation paths under
+`LOCAL_BROWSER_STATE_ROOT`. Require exact
+`replay/<owner>/<scrape>/<uuid>.json` grammar, then resolve exactly once as
+`join(canonicalRoot, statePath)`. Reject an inserted namespace, doubled
+`replay/replay`, or any other prefix; never prepend a second root segment.
+`CreateSessionV1` carries the already validated complete
+`ReplayCheckpointV1` metadata and storage payload. Resolve
 `statePath`, open root-confined with no symlink following, and read at most
-16 MiB + 1. The file contains only canonical `StorageStateV1` UTF-8 JSON bytes,
+2 MiB + 1. The file contains only canonical `StorageStateV1` UTF-8 JSON bytes,
 never a full checkpoint envelope. Require raw file length equals request
 `byteSize`, raw SHA-256 equals request `checksum`, parse the file with the
-closed `StorageStateV1` schema, canonicalize it, and require its canonical
-bytes equal both the raw bytes and canonical request `storageState` bytes.
-Reject any raw/canonical/request byte, checksum, shape, or value mismatch
+closed `StorageStateV1` schema, canonicalize with the existing foundation
+stable-JSON algorithm (sorted object keys, original array order), and require
+those file-canonical bytes equal both raw bytes and the request storage state
+encoded by the same algorithm. This is the only byte/checksum authority.
+Reject any raw/file-canonical/request byte, checksum, shape, or value mismatch
 before profile/proxy/Chromium creation. After launch, perform this exact order
 with no page creation, navigation, locator,
 script evaluation, listener that can initiate work, access to Chromium's
@@ -1762,15 +1889,18 @@ const context = await chromium.launchPersistentContext(
 );
 await context.setStorageState(checkpoint.storageState);
 const accepted = await context.storageState({ indexedDB: true });
-verifyCanonicalStorageState(accepted, checkpoint.storageState);
+verifySemanticallyEquivalentStorageState(accepted, checkpoint.storageState);
 ```
 
-`verifyCanonicalStorageState()` independently validates the bounded closed
-schema, sorts cookie/origin/localStorage/database/store/record/index arrays by
-their stable identity keys, preserves record order where identity is absent,
-omits absent optional fields, emits fixed-key whitespace-free UTF-8 JSON, and
-requires exact canonical bytes, byte count, and SHA-256 equal the expected
-request/file storage payload. It does not manually write cookies,
+`verifySemanticallyEquivalentStorageState()` independently validates the
+bounded closed schema, then normalizes both request and immediate Playwright
+export by sorting cookie/origin/localStorage/database/store/record/index arrays
+by stable identity keys, preserving record order where identity is absent,
+omitting absent optional fields, and emitting fixed-key whitespace-free UTF-8
+JSON. Require those two semantic-normalized byte strings to match. Never
+compare semantic-normalized export bytes or hash to raw file bytes/checksum;
+foundation-valid files may preserve a different array order. It does not
+manually write cookies,
 `localStorage`, or IndexedDB. Only after equality may the registry select the
 automatic blank page or create one, load `finalUrl`, then compare exact final
 URL and bounded title/body hashes. Do not replay saved actions or side effects.
@@ -1803,9 +1933,11 @@ Expected: PASS for writer exclusion, snapshot isolation, every publication
 crash point, corrupt-reference readiness, 600-second idle and 3600-second
 absolute maxima, shorter caller limits, and close idempotency. Real bundled
 Chromium proves cookies, localStorage, and IndexedDB exist before first
-navigation; sinks prove no pre-restore request. Canonical byte/checksum
-and request/file storage mismatch, full-envelope file, timeout, and forced
-crash leave no Chromium launch or registry/profile publication.
+navigation; sinks prove no pre-restore request. Unsorted but foundation-
+canonical arrays restore through semantic comparison. File/request canonical
+byte/checksum mismatch, semantic request/export mismatch, full-envelope file,
+timeout, and forced crash leave no Chromium launch or registry/profile
+publication.
 
 - [ ] **Step 6: Commit profile lifecycle**
 
@@ -1815,8 +1947,8 @@ apps/api/.husky/_/pre-commit
 git commit -m "feat: persist browser profile generations" -m "Create isolated Chromium working copies and publish writable profile
 generations through a checksummed two-phase protocol.
 
-Verify storage-only replay bytes against request metadata before Chromium
-and enforce session writer, idle, and absolute lifetime rules."
+Verify storage-only replay bytes against request metadata before
+Chromium, then enforce session writer, idle, and lifetime rules."
 ```
 
 ### Task 5: Execute typed operations once
@@ -1905,10 +2037,22 @@ Expected: FAIL because operation engine and action cache do not exist.
 
 - [ ] **Step 3: Implement constrained evaluate and stable snapshots**
 
-Parse one TypeScript expression. Reject assignment, update, `new`, import,
-functions, classes, tagged templates, and identifiers that provide network,
-storage, dynamic code, workers, or navigation mutation. Permit explicit
-read/call members rooted at `document`, `location`, and `args`.
+Import the exact production dependency `typescript@5.9.3` and parse one source
+string with `ts.createSourceFile(..., ts.ScriptTarget.Latest, true,
+ts.ScriptKind.TS)`. Require zero parse diagnostics and exactly one
+`ExpressionStatement`; unwrap only parenthesized expressions. Traverse the
+compiler AST with `ts.forEachChild()` and an explicit `SyntaxKind` allowlist.
+Reject assignment, update, `new`, import, functions, classes, tagged
+templates, and identifiers that provide network, storage, dynamic code,
+workers, or navigation mutation. Permit explicit read/call members rooted at
+`document`, `location`, and `args`. Do not add a handwritten tokenizer,
+regular-expression parser, or fallback parser.
+
+Export `parseAndValidateEvaluateExpression(source)` from
+`evaluate-policy.ts`. Tests assert the compiler parser accepts the supported
+expression grammar, rejects every forbidden AST node before page evaluation,
+and that package metadata places `typescript` in `dependencies`, never only
+`devDependencies`.
 
 Snapshots create server-held locator refs capped at 500 and return at most
 40,000 characters for `snapshotExcerpt`; `get_text` returns at most 40,000
@@ -2011,6 +2155,18 @@ test("passive stream rejects input", async () => {
   expect(await closeCode(socket)).toBe(1008);
 });
 
+test("CDP upgrade completes only after the session writer is held", async () => {
+  pauseWriterAcquisition();
+  const upgrade = openStream("cdp", cdpGrant);
+  expect(await promiseState(upgrade)).toBe("pending");
+  releaseWriterAcquisition();
+  const socket = await upgrade;
+  expect(session.writerHeld).toBe(true);
+  socket.close();
+  await socketClosed(socket);
+  expect(session.writerHeld).toBe(false);
+});
+
 test("artifact capture is explicit and bounded", async () => {
   const artifact = await captureArtifact(session, {
     kind: "screenshot", format: "png", fullPage: false,
@@ -2068,6 +2224,21 @@ test("accepted reconciliation cannot resurrect readiness during shutdown", async
   });
   expect(startupAdmission.readyHealth().status).toBe("unready");
 });
+
+test("shutdown aborts accepted reconciliation between filesystem calls", async () => {
+  const accepted = postReconciliationPausedAfterFirstRename(validSnapshot);
+  await accepted.firstRenameCompleted();
+  const shutdown = server.beginShutdown();
+  expect(accepted.signal.aborted).toBe(true);
+  accepted.releaseFilesystemPause();
+  await shutdown;
+  expect(accepted.filesystemCallsAfterPause()).toEqual([]);
+  expect(accepted.response()).toMatchObject({
+    status: 503,
+    body: { category: "reconciliation_required" },
+  });
+  expect(startupAdmission.readyHealth().status).toBe("unready");
+});
 ```
 
 - [ ] **Step 2: Run tests and verify red**
@@ -2090,8 +2261,10 @@ expiry, and one connection; retain only SHA-256.
 CDP holds the writer for its connection. Parse one JSON object per frame; cap
 frames at 256 KiB and outstanding IDs at 64. Reject binary, batch, malformed,
 duplicate-ID, unsolicited-response, administrative, permission, download, and
-target-creation commands. Validate URL-bearing commands and keep egress rules
-active beneath CDP. Never return the DevTools endpoint.
+target-creation commands. Complete the authenticated WebSocket upgrade only
+after the session writer is acquired; hold it until downstream socket close on
+success, error, cancellation, or deadline. Validate URL-bearing commands and
+keep egress rules active beneath CDP. Never return the DevTools endpoint.
 
 - [ ] **Step 4: Implement bounded artifact capture**
 
@@ -2123,10 +2296,13 @@ contract bounds elsewhere. Reconciliation validates service key, correlation,
 deadline capped at 60 seconds, nonce, schema, and digest before calling
 `StartupAdmission.reconcile()`. That method checks non-draining admission
 synchronously before invoking its filesystem callback and again before
-caching success/opening readiness. A listener-accepted reconciliation that
-reaches admission after `beginDraining()` fails without filesystem access; a
-callback already in flight cannot cache success or resurrect readiness after
-draining. Every create/action/grant/artifact/stream/profile
+caching success/opening readiness. Pass its exact execution admission object
+through the route callback to `reconcileBrowserState()`. A listener-accepted
+reconciliation that reaches admission after `beginDraining()` fails without
+filesystem access. An in-flight callback observes synchronous abort and may
+finish only its current syscall; it starts no later filesystem call, cannot
+cache success, and cannot resurrect readiness. Every
+create/action/grant/artifact/stream/profile
 route invokes `requireReady()` before touching registry or filesystem.
 
 `beginShutdown()` synchronously closes admission and initiates listener close,
@@ -2173,7 +2349,8 @@ The final stage copies no tests or dev dependencies.
 `dockerfile.test.ts` parses every `FROM`, package metadata, and lockfile. It
 requires the Playwright tag `v1.61.1-noble`, an `@sha256:` plus 64 lowercase
 hex digest, exact package/lock Playwright `1.61.1`, Node base `22.22.1`, frozen
-install, preflight before start, and non-root user.
+install, preflight before start, and non-root user. It also requires exact
+`typescript@5.9.3` in production dependencies and in the final image.
 
 - [ ] **Step 7: Run server tests and two real no-cache image builds**
 
@@ -2187,6 +2364,7 @@ docker run --rm --entrypoint corepack firecrawl-local-browser-service:browser-te
 docker build --pull --no-cache -t firecrawl-local-browser-service:test-1 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-1 --version
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-1 -p 'require("playwright/package.json").version'
+docker run --rm --entrypoint node firecrawl-local-browser-service:test-1 --input-type=module -e 'const m=await import("./dist/evaluate-policy.js");m.parseAndValidateEvaluateExpression("document.title")'
 docker image inspect firecrawl-local-browser-service:test-1 --format '{{.Config.User}}'
 docker build --pull --no-cache --target browser-test -t firecrawl-local-browser-service:browser-test-2 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:browser-test-2 src/runtime-preflight.mjs
@@ -2194,6 +2372,7 @@ docker run --rm --entrypoint corepack firecrawl-local-browser-service:browser-te
 docker build --pull --no-cache -t firecrawl-local-browser-service:test-2 apps/browser-service
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 --version
 docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 -p 'require("playwright/package.json").version'
+docker run --rm --entrypoint node firecrawl-local-browser-service:test-2 --input-type=module -e 'const m=await import("./dist/evaluate-policy.js");m.parseAndValidateEvaluateExpression("document.title")'
 docker image inspect firecrawl-local-browser-service:test-2 --format '{{.Config.User}}'
 ```
 
@@ -2201,7 +2380,9 @@ Expected: tests PASS; both builds succeed from committed digest; each image
 reports `v22.22.1`, `1.61.1`, and user `pwuser`. Re-run the raw-manifest
 hash and require it equals Dockerfile digest after both builds. Both images
 also pass positive-control-proven egress/UDP and storage-restore tests using
-their bundled Chromium; an unavailable proof fails the build gate.
+their bundled Chromium. Both final production images execute the constrained
+evaluate parser smoke successfully, proving `typescript@5.9.3` is present at
+runtime. An unavailable proof fails the build gate.
 
 - [ ] **Step 8: Commit service transport**
 
@@ -2211,8 +2392,8 @@ apps/api/.husky/_/pre-commit
 git commit -m "feat: serve private browser sessions" -m "Add authenticated session, action, profile, artifact, health, live-view,
 and CDP transports around persistent Chromium.
 
-Close admission before listeners and prevent reconciliation from restoring
-readiness during ordered shutdown."
+Close admission before listeners and prevent reconciliation from
+restoring readiness during ordered shutdown."
 ```
 
 ### Task 7: Add typed API client and local feature gate
@@ -2282,9 +2463,11 @@ it("binds reconciliation to current live nonce and closed result", async () => {
     .mockResolvedValueOnce(jsonResponse(200, reconciliationResult))
     .mockResolvedValueOnce(jsonResponse(200, readyHealth));
   expect(await client.getLive(context)).toEqual(liveHealth);
-  expect(await client.reconcile(snapshot, context)).toEqual(
+  const canonicalBody = canonicalReconciliationRequestJson(snapshot);
+  expect(await client.reconcile(canonicalBody, context)).toEqual(
     reconciliationResult,
   );
+  expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(canonicalBody);
   expect(await client.getReady(context)).toEqual(readyHealth);
 });
 
@@ -2337,10 +2520,11 @@ reconciliation timeout capped at 60 seconds,
 `BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS=5000`, and
 `BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS=30000`, plus
 absolute `BROWSER_ADAPTER_TOKEN_FILE`. Enabled mode requires local
-persistence, browser-state root, canonical lowercase UUID
-`BROWSER_STATE_NAMESPACE`, private HTTP service URL, and key. Adapter
-token absence keeps only host callbacks/prompt/code execution unavailable; it
-does not disable direct Browser create/list/delete.
+persistence, one canonical `LOCAL_BROWSER_STATE_ROOT`, private HTTP service
+URL, and key. That configured root is the direct shared filesystem boundary;
+neither API nor service appends an environment namespace layer. Adapter token
+absence keeps only host callbacks/prompt/code execution unavailable; it does
+not disable direct Browser create/list/delete.
 
 Validate attempts 1..8, initial backoff 100..5,000 ms, maximum backoff greater
 than or equal to initial and at most 10,000 ms, startup budget 5,000..60,000
@@ -2369,7 +2553,7 @@ profile finalize/discard, and these closed startup methods:
 getLive(context: BrowserServiceRequestContext): Promise<LiveHealthV1>;
 getReady(context: BrowserServiceRequestContext): Promise<ReadyHealthV1 | UnreadyHealthV1>;
 reconcile(
-  request: ReconciliationRequestV1,
+  canonicalRequestBody: string,
   context: BrowserServiceRequestContext,
 ): Promise<ReconciliationResultV1>;
 ```
@@ -2384,6 +2568,11 @@ URLs in public errors.
 `getReady` accepts 200 ready or 503 unready, and `reconcile` caps deadline and
 encoded body at 60 seconds and 16 MiB. All three always send bearer key,
 correlation ID, and absolute deadline.
+
+`reconcile()` accepts only Task 8's already canonical UTF-8 request string,
+sends that exact string as the body, and never reparses or reserializes it.
+This preserves byte identity across same-nonce retries while response parsing
+remains bounded and strict.
 
 All other client methods lock literal method/path/status and parse the exact
 request/response schema before or after transport. Artifact fetch validates
@@ -2481,9 +2670,13 @@ it("closes admission synchronously and exposes mutation drain", async () => {
 });
 
 it("loads every nondeleted authority in one repeatable-read snapshot", async () => {
-  await seedCheckpoint({ statePath: "checkpoints/a.json" });
+  await seedCheckpoint({
+    statePath: "replay/owner-a/scrape-a/44444444-4444-4444-8444-444444444444.json",
+  });
   await seedProfileGeneration({ statePath: "profiles/a/committed/1" });
-  await seedCleanupIntent({ statePath: "checkpoints/old.json" });
+  await seedCleanupIntent({
+    statePath: "replay/owner-a/scrape-a/55555555-5555-4555-8555-555555555555.json",
+  });
   const snapshot = await loadBrowserReconciliationSnapshot(pool);
   expect(snapshot.references.map(reference => reference.kind).sort()).toEqual([
     "profile_generation",
@@ -2491,6 +2684,33 @@ it("loads every nondeleted authority in one repeatable-read snapshot", async () 
     "replay_checkpoint_cleanup_intent",
   ]);
   expect(snapshot.snapshotDigest).toMatch(/^[a-f0-9]{64}$/);
+});
+
+it("reconciles populated foundation replay paths without moving them", async () => {
+  const existing = await seedFoundationCheckpointAndCleanupIntent({
+    checkpointPath:
+      "replay/owner-a/scrape-a/66666666-6666-4666-8666-666666666666.json",
+    cleanupPath:
+      "replay/owner-a/scrape-a/77777777-7777-4777-8777-777777777777.json",
+    cleanupWriterIdentity: "live",
+  });
+  await coordinator.initialize();
+  expect(existing.checkpointRow.statePath).toBe(
+    "replay/owner-a/scrape-a/66666666-6666-4666-8666-666666666666.json",
+  );
+  expect(await reloadCheckpointPath(existing.checkpointRow.id)).toBe(
+    existing.checkpointRow.statePath,
+  );
+  expect(await reloadCleanupIntentPath(existing.cleanupIntent.id)).toBe(
+    existing.cleanupIntent.statePath,
+  );
+  expect(await filesystem.read(existing.checkpointRow.statePath))
+    .toEqual(existing.checkpointBytes);
+  expect(filesystem.rename).not.toHaveBeenCalled();
+  expect(filesystem.write).not.toHaveBeenCalled();
+  expect(startupGate.assertOpen()).toMatchObject({
+    processNonce: VALID_NONCE,
+  });
 });
 
 it("snapshots only after an in-flight database mutation drains", async () => {
@@ -2514,18 +2734,39 @@ it("snapshots only after an in-flight database mutation drains", async () => {
   ]));
 });
 
-it("materializes only canonical StorageStateV1 bytes", async () => {
-  const checkpoint = await persistReplayCheckpoint(validCompleteCheckpoint);
+it("reconstructs replay request from metadata plus canonical state file", async () => {
+  const marker = "file-only-indexeddb-marker-7cba";
+  const capture = checkpointCaptureWithStorageMarker(marker);
+  const checkpoint = await persistReplayCheckpoint(capture);
   const bytes = await filesystem.read(checkpoint.statePath);
   expect(bytes).toEqual(canonicalStorageStateBytes(
-    validCompleteCheckpoint.storageState,
+    capture.storageState,
   ));
-  expect(JSON.parse(bytes.toString("utf8"))).toEqual(
-    validCompleteCheckpoint.storageState,
+  const request = await loadReplayCheckpointForBrowserService(
+    checkpoint.ownerId, checkpoint.scrapeId, gate,
   );
+  expect(request.storageState).toEqual(capture.storageState);
+  expect(bytes.toString("utf8")).toContain(marker);
+  const persisted = await loadCheckpointAndEnvelopeJson(checkpoint.scrapeId);
+  expect(JSON.stringify(persisted.checkpointRow)).not.toContain(marker);
+  expect(JSON.stringify(persisted.envelope)).not.toContain(marker);
   expect(JSON.parse(bytes.toString("utf8"))).not.toHaveProperty("statePath");
   expect(checkpoint.byteSize).toBe(bytes.length);
   expect(checkpoint.checksum).toBe(sha256(bytes));
+  expect(checkpointRowColumns()).not.toContain("storage_state");
+});
+
+it("fails replay reconstruction on missing or corrupt state file", async () => {
+  for (const fixture of [missingStateFile(), checksumMismatchStateFile(),
+    noncanonicalStateFile(), oversizedStateFile(2 * 1024 * 1024 + 1)]) {
+    const harness = await createFreshReplayStoreHarness(fixture);
+    await expect(harness.loadForBrowserService()).rejects.toMatchObject({
+      category: "replay_unavailable",
+    });
+    expect(harness.checkpointRow()).not.toHaveProperty("storageState");
+    expect(harness.browserClient.createSession).not.toHaveBeenCalled();
+    await harness.dispose();
+  }
 });
 ```
 
@@ -2612,6 +2853,82 @@ it("holds same failed runtime nonce for cooldown", async () => {
   expect(serviceClient.reconcile).toHaveBeenCalledTimes(8);
 });
 
+it("retries byte-identical reconciliation after partial execution", async () => {
+  serviceClient.reconcile
+    .mockRejectedValueOnce(reconciliationCleanupFailed())
+    .mockResolvedValueOnce(reconciliationResult);
+  await coordinator.initialize();
+  expect(reconcileBodies).toHaveLength(2);
+  expect(reconcileBodies[1]).toEqual(reconcileBodies[0]);
+  expect(reconcileDigests).toEqual([snapshotDigest, snapshotDigest]);
+  expect(loadSnapshot).toHaveBeenCalledTimes(1);
+});
+
+it("recovers a lost success response through same-digest cache", async () => {
+  serviceClient.reconcile
+    .mockRejectedValueOnce(responseLostAfterServiceCommit())
+    .mockResolvedValueOnce(reconciliationResult);
+  await coordinator.initialize();
+  expect(reconcileBodies[1]).toEqual(reconcileBodies[0]);
+  expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(1);
+  expect(loadSnapshot).toHaveBeenCalledTimes(1);
+  expect(startupGate.assertOpen()).toMatchObject({ snapshotDigest });
+});
+
+it("restarts closed recovery and snapshot when nonce changes", async () => {
+  serviceClient.reconcile.mockRejectedValueOnce(new TransportClosedError());
+  serviceClient.getLive
+    .mockResolvedValueOnce(liveHealthFor(OLD_NONCE))
+    .mockResolvedValueOnce(liveHealthFor(NEW_NONCE));
+  await coordinator.initialize();
+  expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(2);
+  expect(loadSnapshot).toHaveBeenCalledTimes(2);
+  expect(reconcileBodiesFor(OLD_NONCE)).toHaveLength(1);
+  expect(reconcileBodiesFor(NEW_NONCE)).toHaveLength(1);
+  expect(reconcileBodiesFor(NEW_NONCE)[0])
+    .not.toEqual(reconcileBodiesFor(OLD_NONCE)[0]);
+});
+
+it("rechecks live nonce after snapshot before the first post", async () => {
+  pauseAfterFrozenSnapshotFor(OLD_NONCE);
+  const initialization = coordinator.initialize();
+  await frozenSnapshotReached();
+  restartServiceWithNonce(NEW_NONCE);
+  releaseFrozenSnapshotPause();
+  await initialization;
+  expect(reconcileBodiesFor(OLD_NONCE)).toEqual([]);
+  expect(interruptUnfinishedBrowserWork).toHaveBeenCalledTimes(2);
+  expect(loadSnapshot).toHaveBeenCalledTimes(2);
+  expect(reconcileBodiesFor(NEW_NONCE)).toHaveLength(1);
+});
+
+it("new API process recovers cached success for the same service nonce", async () => {
+  await serviceCommitThenCrashBeforeGateOpen(firstCoordinator);
+  const restarted = createCoordinatorForSameDatabaseAndService();
+  await restarted.initialize();
+  expect(restarted.reconcileBodies[0]).toEqual(firstCoordinator.frozenBody);
+  expect(restarted.filesystemExecutionCount).toBe(
+    firstCoordinator.filesystemExecutionCount,
+  );
+  expect(restarted.serviceCacheHitCount).toBe(1);
+  expect(restarted.startupGate.assertOpen()).toMatchObject({ snapshotDigest });
+});
+
+it("stop aborts retry and cannot reopen the gate", async () => {
+  pauseReconcileAttempt();
+  const initialization = coordinator.initialize();
+  await reconcileAttemptStarted();
+  const stopping = coordinator.stop();
+  expect(reconcileAttemptSignal.aborted).toBe(true);
+  releaseReconcileAttempt();
+  await stopping;
+  await expect(initialization).rejects.toMatchObject({
+    category: "browser_state_unavailable",
+  });
+  expect(startBrowserRetention).not.toHaveBeenCalled();
+  expect(() => startupGate.assertOpen()).toThrow();
+});
+
 it("runs non-browser retention once when browser feature is disabled", async () => {
   const app = await startApi({ LOCAL_BROWSER_SERVICE_ENABLED: "false" });
   await retentionClock.runOneIteration();
@@ -2637,6 +2954,29 @@ exhaustion throws sanitized `browser_state_unavailable` so API startup fails
 and registered cleanup runs. Runtime exhaustion keeps API alive but gate
 closed; same failed nonce cannot start another cycle for 30,000 ms. A changed
 nonce or explicit `checkNow()` starts one new coalesced bounded cycle.
+
+For each observed live service nonce, closed recovery runs exactly once, then
+the coordinator captures one immutable repeatable-read snapshot and canonical
+UTF-8 serialization of the complete reconciliation request. Freeze those
+bytes and its digest before attempt 1. A retry for partial execution,
+transport failure, timeout, or a response lost after service success resends
+the byte-identical body; it never reruns cleanup recovery or reloads the
+snapshot while the nonce remains stable. The service's same-nonce,
+same-digest cached result makes lost-response replay safe. Validation or auth
+failure is nonretryable.
+
+Read authenticated live health immediately before every POST, including
+attempt 1 after snapshot freeze and every retry. If its nonce differs, abort
+the old attempt loop and discard its frozen request. Keep the gate closed,
+pause retention, obtain a new drain epoch, rerun unfinished-work and cleanup-
+intent recovery, capture one new snapshot, and freeze a new request for the
+new nonce. A crash or restart between attempts can never receive the old
+nonce's request. The four-attempt and 250/500/1,000 ms backoff limits apply to
+each coalesced nonce cycle. One 60-second outer startup budget spans all nonce
+changes during `initialize()`; it never resets on service churn. Each runtime
+cycle has its own 60-second budget. Runtime exhaustion holds that nonce for
+the 30-second cooldown. Explicit `checkNow()` may override cooldown but still
+creates only one new coalesced cycle.
 
 - [ ] **Step 3: Run focused tests and verify red**
 
@@ -2822,6 +3162,25 @@ responses equal requested nonce/digest. Then `gate.open(drain, binding)` and
 start browser-state retention. Each request deadline is the smaller of its
 configured timeout and the remaining 60,000 ms startup budget.
 
+For one observed service nonce, run closed recovery once and serialize the
+complete request once with the canonical Task 1 encoder. Freeze the exact
+UTF-8 body, references, and digest for that nonce cycle. Every same-nonce
+attempt, including partial-execution error, transport loss, timeout, or lost
+success response, posts those byte-identical bytes. Recheck live health
+immediately before every POST, including attempt 1. If the nonce changed,
+abort and discard the old cycle before any
+post, obtain a new closed/drained epoch, rerun recovery, capture one new
+snapshot, and freeze one new body. Never send an old-nonce body to a new
+process or recapture a different digest under a stable nonce.
+
+A same-nonce restart of the API repeats closed recovery and snapshot from the
+durable database. If canonical bytes/digest match the service's already cached
+successful request, replay returns that result and the new gate may open. A
+different digest for a service nonce that already reports ready is a
+conflicting replay and fails closed. `stop()` aborts the current request or
+backoff, waits for the mutex, and permanently prevents later gate open or
+retention start.
+
 `checkNow()` fetches ready health. Any 503, changed nonce, changed digest,
 transport/auth/schema error, or process restart closes gate immediately and
 runs the same recovery sequence. Concurrent detections share one promise. Old
@@ -2851,15 +3210,28 @@ still runs the non-browser phases exactly once per interval. Shutdown stops
 coordinator/monitor first when present, then the single retention service,
 then database. Tests use call counts to reject duplicate timers/owners.
 
-Update `replay-store.ts` materialization under one browser-state mutation lease.
-Canonicalize and write only `StorageStateV1` bytes to `state_path`; fsync/rename
-first, then persist byte size/SHA-256 plus complete checkpoint metadata and
-request storage payload in PostgreSQL. Reads reconstruct the complete
-`ReplayCheckpointV1` request from the database and never infer envelope fields
-from the file. Cleanup/reconciliation checksum always covers the
-storage-state-only bytes. Existing full-envelope files are not silently
-rewritten; startup validation fails closed until an explicit foundation
-migration regenerates or removes them.
+Preserve foundation replay ownership. `filesystem-store.ts` remains sole owner
+of root-confined `StorageStateV1` write/read/delete at exact
+`replay/<owner>/<scrape>/<uuid>.json` paths. `replay-store.ts` remains owner of
+checkpoint metadata rows and cleanup intents. Under one browser-state
+mutation lease, use the existing stable canonical JSON algorithm to write
+only storage-state bytes, fsync/rename first, then persist existing metadata:
+`state_path`, final URL, fingerprint, byte size, and SHA-256. Do not add a
+storage payload column or an unrelated schema migration.
+
+For replay session creation, validate the owned checkpoint row and envelope,
+then read through existing `BrowserStateFilesystem.readCheckpoint()` while
+the gate/lease is valid. Require direct-root path grammar, the foundation
+2 MiB file/metadata bound, byte count, SHA-256, and closed canonical
+`StorageStateV1`. Reconstruct `ReplayCheckpointV1` from database metadata plus
+that parsed file for the Browser Service request. Browser Service independently
+reopens the same direct-root path and compares request/file bytes. The private
+HTTP envelope may retain its 16 MiB transport cap, but a checkpoint over 2 MiB
+is rejected before transport. Existing populated foundation checkpoint and
+cleanup-intent paths are read in place; never rewrite a database path, move a
+file to a new root layer, or add a PostgreSQL storage-state column.
+No filesystem-layout migration is added because the direct-root foundation
+layout remains canonical.
 
 Wrap browser-state file creation, profile publication/discard, checkpoint
 materialization/cleanup, and retention deletion in
@@ -3030,32 +3402,44 @@ it("separates strict model wire operations from trusted internal operations", ()
   }).success).toBe(true);
 });
 
-it("persists exact job and supervisor before adapter dispatch", async () => {
-  adapter.executePromptRun.mockImplementation(async input => {
-    expect(await loadRunBinding(input.runId)).toEqual({
-      adapterJobId: input.adapterJobId,
-      adapterSupervisorId: input.adapterSupervisorId,
-      adapterProcessId: null,
+it.each(["prompt", "code"] as const)(
+  "persists exact job and supervisor before %s adapter dispatch",
+  async mode => {
+    const harness = await createFreshAdapterHarness(mode);
+    harness.onAdapterExecute(async input => {
+      expect(await harness.loadRunBinding(input.runId)).toEqual({
+        adapterJobId: input.adapterJobId,
+        adapterSupervisorId: input.adapterSupervisorId,
+        adapterProcessId: null,
+      });
+      expect(await harness.loadCapabilityBinding(input.runId)).toMatchObject({
+        adapterJobId: input.adapterJobId,
+        adapterSupervisorId: input.adapterSupervisorId,
+        adapterProcessId: null,
+        activatedAt: null,
+      });
+      await input.onAccepted({
+        adapterJobId: input.adapterJobId,
+        adapterSupervisorId: input.adapterSupervisorId,
+        adapterProcessId: 4242,
+      });
+      expect(harness.acceptedBinding()).toEqual({
+        adapterJobId: input.adapterJobId,
+        adapterSupervisorId: input.adapterSupervisorId,
+        adapterProcessId: 4242,
+      });
+      return mode === "prompt" ? validPromptResult : validCodeResult;
     });
-    expect(await loadCapabilityBinding(input.runId)).toMatchObject({
-      adapterJobId: input.adapterJobId,
-      adapterSupervisorId: input.adapterSupervisorId,
-      adapterProcessId: null,
-      activatedAt: null,
-    });
-    await input.observer.onAccepted({
-      adapterJobId: input.adapterJobId,
-      adapterSupervisorId: input.adapterSupervisorId,
+    await harness.execute();
+    expect(await harness.loadRunBinding()).toMatchObject({
       adapterProcessId: 4242,
     });
-    return validPromptResult;
-  });
-  await orchestrator.executePrompt(interactInput);
-  expect(await loadRunBinding(runId)).toMatchObject({ adapterProcessId: 4242 });
-  expect(await loadCapabilityBinding(runId)).toMatchObject({
-    adapterProcessId: 4242, activatedAt: expect.any(Date),
-  });
-});
+    expect(await harness.loadCapabilityBinding()).toMatchObject({
+      adapterProcessId: 4242, activatedAt: expect.any(Date),
+    });
+    await harness.dispose();
+  },
+);
 
 it("rejects wrong first-callback job and stale process bindings", async () => {
   await persistAndActivateAdapterBinding(validBinding);
@@ -3077,6 +3461,113 @@ it("restart recovery revokes unactivated and stale adapter capability", async ()
   expect(await capabilityState(runId)).toBe("revoked");
   await expect(activateAdapterProcess(validBinding))
     .rejects.toMatchObject({ category: "capability_denied" });
+});
+
+it("migrates a populated valid legacy capability after dropping not null", async () => {
+  const legacy = await seedLegacyCapability({ adapterProcessId: 4242 });
+  await runMigration("0007_browser_adapter_bindings.sql");
+  expect(await loadMigratedCapability(legacy.id)).toMatchObject({
+    adapterProcessId: null,
+    adapterJobId: null,
+    adapterSupervisorId: null,
+    activatedAt: null,
+    revokedAt: expect.any(Date),
+  });
+});
+
+it("aborts populated migration before any change for noncanonical job", async () => {
+  const before = await seedPopulatedLegacyDatabase({
+    actionAdapterJobId: VALID_JOB_ID.toUpperCase(),
+    capabilityAdapterProcessId: 4242,
+  });
+  await expect(runMigration("0007_browser_adapter_bindings.sql"))
+    .rejects.toThrow("browser_adapter_job_id_preflight_failed");
+  expect(await dumpLegacySchemaAndRows()).toEqual(before);
+  expect(await migrationWasRecorded("0007_browser_adapter_bindings.sql"))
+    .toBe(false);
+});
+
+it("rolls back both activation rows when capability CAS fails", async () => {
+  await persistStartingBinding(validBindingWithoutProcess);
+  injectFailureAfterRunActivationUpdate();
+  await expect(activateAdapterProcess(validBinding))
+    .rejects.toMatchObject({ category: "capability_denied" });
+  expect(await loadRunBinding(runId)).toMatchObject({
+    state: "starting", adapterProcessId: null,
+  });
+  expect(await loadCapabilityBinding(runId)).toMatchObject({
+    adapterProcessId: null, activatedAt: null,
+  });
+});
+
+it("allows exactly one concurrent adapter activation", async () => {
+  await persistStartingBinding(validBindingWithoutProcess);
+  const results = await Promise.allSettled([
+    activateAdapterProcess(validBinding),
+    activateAdapterProcess(validBinding),
+  ]);
+  expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+  expect(await loadRunBinding(runId)).toMatchObject({
+    state: "running", adapterProcessId: validBinding.adapterProcessId,
+  });
+});
+
+it("does not execute code before the same accepted binding barrier", async () => {
+  const activation = deferred<void>();
+  activateAdapterProcess.mockReturnValueOnce(activation.promise);
+  adapter.executeCodeRun.mockImplementation(async input => {
+    const acceptance = input.onAccepted(validBinding);
+    markCodeRunnerAtBarrier();
+    await acceptance;
+    markUserSourceExecuted();
+    return validCodeResult;
+  });
+  const execution = orchestrator.executeCode(codeInput);
+  await codeRunnerReachedBarrier();
+  expect(userSourceExecuted()).toBe(false);
+  activation.resolve();
+  await execution;
+  expect(userSourceExecuted()).toBe(true);
+});
+
+it("waits for one internal CDP relay handshake before code source", async () => {
+  const harness = await createAcceptedCodeAdapterHarness();
+  harness.pauseInternalCdpWriterAcquisition();
+  const execution = harness.execute();
+  await harness.internalCdpUpgradeStarted();
+  expect(harness.userSourceExecuted()).toBe(false);
+  expect(harness.internalCdpOpenCount()).toBe(1);
+  harness.releaseInternalCdpWriter();
+  await harness.internalCdpUpgradeCompleted();
+  await execution;
+  expect(harness.userSourceExecuted()).toBe(true);
+  expect(harness.writerHeldDuringSource()).toBe(true);
+  expect(harness.writerHeldAfterTerminal()).toBe(false);
+});
+
+it("rejects code binding mismatch and restart before source execution", async () => {
+  for (const mode of ["wrong_job", "wrong_supervisor", "restart"] as const) {
+    const harness = await createFreshCodeAdapterHarness(mode);
+    await expect(harness.execute()).rejects.toMatchObject({
+      category: "capability_denied",
+    });
+    expect(harness.userSourceExecuted()).toBe(false);
+    expect(harness.callbacksSent()).toBe(0);
+    await harness.dispose();
+  }
+});
+
+it("cancels accepted code and persists no late unvalidated result", async () => {
+  const harness = await createAcceptedRunningCodeHarness();
+  const execution = harness.execute();
+  await harness.userSourceStarted();
+  await orchestrator.stopSession(harness.sessionId, "requested");
+  await expect(execution).rejects.toMatchObject({ category: "cancelled" });
+  expect(harness.adapter.cancelExecutionRun).toHaveBeenCalledWith(
+    harness.runId, "requested",
+  );
+  expect(harness.processTreeAlive()).toBe(false);
+  expect(await harness.persistedOutput()).toBeNull();
 });
 ```
 
@@ -3109,6 +3600,9 @@ END $$;
 ALTER TABLE browser_interact_actions
   ALTER COLUMN adapter_job_id TYPE uuid USING adapter_job_id::uuid;
 
+ALTER TABLE browser_capabilities
+  ALTER COLUMN adapter_process_id DROP NOT NULL;
+
 UPDATE browser_interact_runs
 SET state = 'interrupted', finished_at = COALESCE(finished_at, now()),
     error_category = COALESCE(error_category, 'adapter_binding_migration'),
@@ -3119,15 +3613,14 @@ UPDATE browser_interact_runs
 SET adapter_process_id = NULL
 WHERE adapter_process_id IS NOT NULL;
 
+UPDATE browser_capabilities
+SET revoked_at = COALESCE(revoked_at, now()), adapter_process_id = NULL;
+
 ALTER TABLE browser_interact_runs
   ADD COLUMN adapter_job_id uuid,
   ADD COLUMN adapter_supervisor_id uuid;
 
-UPDATE browser_capabilities
-SET revoked_at = COALESCE(revoked_at, now()), adapter_process_id = NULL;
-
 ALTER TABLE browser_capabilities
-  ALTER COLUMN adapter_process_id DROP NOT NULL,
   ADD COLUMN adapter_job_id uuid,
   ADD COLUMN adapter_supervisor_id uuid,
   ADD COLUMN activated_at timestamptz;
@@ -3140,6 +3633,14 @@ the transaction rolls back with zero partial migration. Do not lowercase,
 coerce, delete, or quarantine legacy rows. Migration tests seed each invalid
 form, require the named failure, and verify schema/data are byte-for-byte
 unchanged before retry with corrected data.
+
+The preflight must complete before any DDL or data mutation. After the valid
+action cast, drop capability `adapter_process_id` `NOT NULL` before either run
+or capability process values are cleared. Seed at least one otherwise valid,
+populated legacy capability and prove migration succeeds, revokes it, clears
+its process, and retains its policy/audit fields. A noncanonical legacy action
+job ID in that same populated fixture aborts the transaction before the drop,
+updates, casts, new columns, constraints, or migration record are observable.
 
 Add exact checks: adapter process ID is null or a positive integer; run
 `adapter_job_id` and `adapter_supervisor_id` are both null or both non-null;
@@ -3194,13 +3695,19 @@ export type AdapterPendingBinding = Omit<
   AdapterAuthorizationBinding,
   "adapterProcessId"
 > & { adapterProcessId: null };
+
+export type AdapterPendingAuthorizationInput = {
+  adapterJobId: string;
+  adapterSupervisorId: string;
+  onAccepted(binding: AdapterAuthorizationBinding): Promise<void>;
+};
 ```
 
 Every runtime schema uses `canonicalUuidSchema` for job/supervisor IDs and a
-positive integer schema for process ID. `PromptRunInput` carries the pending
-job/supervisor pair and an async `observer.onAccepted(binding)` callback. The
-adapter must await that promise successfully before launching Codex, executing
-user code, or sending any callback.
+positive integer schema for process ID. Both prompt and code inputs extend the
+same pending authorization input. The adapter must await `onAccepted()`
+successfully before launching Codex, executing user code, opening its relay,
+or sending any callback.
 
 ```ts
 import { z } from "zod";
@@ -3222,45 +3729,45 @@ const internalJsonValueSchema: z.ZodType<unknown> = z.lazy(() => z.union([
 ]));
 
 export const browserOperationSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("snapshot") }).strict(),
-  z.object({ kind: z.literal("click"), ref: internalRefSchema }).strict(),
-  z.object({
+  z.strictObject({ kind: z.literal("snapshot") }),
+  z.strictObject({ kind: z.literal("click"), ref: internalRefSchema }),
+  z.strictObject({
     kind: z.literal("fill"), ref: internalRefSchema,
     value: internalTextSchema,
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("type"), ref: internalRefSchema,
     value: internalTextSchema,
     delayMs: z.number().int().min(0).max(250),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("press"), ref: internalRefSchema,
     key: z.string().min(1).max(64),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("select"), ref: internalRefSchema,
     values: z.array(z.string().max(512)).max(20),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("scroll"),
     deltaX: z.number().int().min(-10_000).max(10_000),
     deltaY: z.number().int().min(-10_000).max(10_000),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("wait"),
     milliseconds: z.number().int().min(0).max(30_000),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("get_text"), ref: internalRefSchema.optional(),
-  }).strict(),
-  z.object({ kind: z.literal("get_url") }).strict(),
-  z.object({
+  }),
+  z.strictObject({ kind: z.literal("get_url") }),
+  z.strictObject({
     kind: z.literal("navigate"), url: httpUrlSchema,
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("evaluate"), expression: internalTextSchema,
     args: z.record(z.string(), internalJsonValueSchema),
-  }).strict(),
+  }),
 ]);
 
 export type BoundedPageState = {
@@ -3320,88 +3827,88 @@ export interface ModelDecisionEnvelopeV1 {
 
 // Internal API/Browser Service validation. Never use this for raw model output.
 export const modelDecisionV1Schema = z.discriminatedUnion("type", [
-  z.object({
+  z.strictObject({
     version: z.literal(1),
     type: z.literal("action"),
     action: browserOperationSchema,
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     version: z.literal(1),
     type: z.literal("final"),
     output: z.string().max(256 * 1024),
-  }).strict(),
+  }),
 ]);
 
 const modelWireRefSchema = z.string().min(1).max(128);
 const modelWireTextSchema = z.string().max(20_000);
-const emptyModelWireArgsSchema = z.object({}).strict()
+const emptyModelWireArgsSchema = z.strictObject({})
   .transform((): Record<string, never> => ({}));
 
 export const modelWireBrowserOperationV1Schema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("snapshot") }).strict(),
-  z.object({ kind: z.literal("click"), ref: modelWireRefSchema }).strict(),
-  z.object({
+  z.strictObject({ kind: z.literal("snapshot") }),
+  z.strictObject({ kind: z.literal("click"), ref: modelWireRefSchema }),
+  z.strictObject({
     kind: z.literal("fill"),
     ref: modelWireRefSchema,
     value: modelWireTextSchema,
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("type"),
     ref: modelWireRefSchema,
     value: modelWireTextSchema,
     delayMs: z.number().int().min(0).max(250),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("press"),
     ref: modelWireRefSchema,
     key: z.string().min(1).max(64),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("select"),
     ref: modelWireRefSchema,
     values: z.array(z.string().max(512)).max(20),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("scroll"),
     deltaX: z.number().int().min(-10_000).max(10_000),
     deltaY: z.number().int().min(-10_000).max(10_000),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("wait"),
     milliseconds: z.number().int().min(0).max(30_000),
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("get_text"),
     ref: modelWireRefSchema.nullable(),
-  }).strict(),
-  z.object({ kind: z.literal("get_url") }).strict(),
-  z.object({
+  }),
+  z.strictObject({ kind: z.literal("get_url") }),
+  z.strictObject({
     kind: z.literal("navigate"),
     url: httpUrlSchema,
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     kind: z.literal("evaluate"),
     expression: modelWireTextSchema,
     args: emptyModelWireArgsSchema,
-  }).strict(),
+  }),
 ]);
 
 export const modelWireDecisionV1Schema = z.discriminatedUnion("type", [
-  z.object({
+  z.strictObject({
     version: z.literal(1),
     type: z.literal("action"),
     action: modelWireBrowserOperationV1Schema,
-  }).strict(),
-  z.object({
+  }),
+  z.strictObject({
     version: z.literal(1),
     type: z.literal("final"),
     output: z.string().max(256 * 1024),
-  }).strict(),
+  }),
 ]);
 
-export const modelDecisionEnvelopeV1Schema = z.object({
+export const modelDecisionEnvelopeV1Schema = z.strictObject({
   decision: modelWireDecisionV1Schema,
-}).strict();
+});
 
 function normalizeModelWireBrowserOperationV1(
   operation: ModelWireBrowserOperationV1,
@@ -3466,13 +3973,8 @@ export const PROMPT_LOOP_POLICY_V1 = {
   maxRuntimeMs: 300_000,
 } as const;
 
-export type PromptRunInput = {
+export type PromptRunInput = AdapterPendingAuthorizationInput & {
   runId: string;
-  adapterJobId: string;
-  adapterSupervisorId: string;
-  observer: {
-    onAccepted(binding: AdapterAuthorizationBinding): Promise<void>;
-  };
   prompt: string;
   initialObservation: ObservationV1 & { type: "initial"; sequence: 0 };
   model: "gpt-5.6-terra";
@@ -3480,6 +3982,14 @@ export type PromptRunInput = {
   decisionSchemaVersion: 1;
   observationSchemaVersion: 1;
   loopPolicy: typeof PROMPT_LOOP_POLICY_V1;
+  deadline: Date;
+  correlationId: string;
+};
+
+export type CodeRunInput = AdapterPendingAuthorizationInput & {
+  runId: string;
+  language: "node" | "python" | "bash";
+  source: string;
   deadline: Date;
   correlationId: string;
 };
@@ -3496,6 +4006,29 @@ export type PromptRunResult = {
     observationSchemaVersion: 1;
   };
 };
+
+const boundedCodeTextSchema = z.string().superRefine((value, context) => {
+  if (Buffer.byteLength(value, "utf8") > 256 * 1024) {
+    context.addIssue({ code: "custom", message: "code output exceeds bound" });
+  }
+});
+
+export const codeRunResultSchema = z.strictObject({
+  stdout: boundedCodeTextSchema,
+  result: boundedCodeTextSchema,
+  stderr: boundedCodeTextSchema,
+  exitCode: z.number().int().min(0).max(255),
+  killed: z.boolean(),
+}).superRefine((value, context) => {
+  const total = Buffer.byteLength(value.stdout, "utf8") +
+    Buffer.byteLength(value.result, "utf8") +
+    Buffer.byteLength(value.stderr, "utf8");
+  if (total > 512 * 1024) {
+    context.addIssue({ code: "custom", message: "code result exceeds bound" });
+  }
+});
+
+export type CodeRunResult = z.infer<typeof codeRunResultSchema>;
 ```
 
 `protocol.ts` owns both internal and model-wire schemas; import the canonical
@@ -3526,17 +4059,25 @@ ref to internal omission, retains empty evaluate args as `{}`, and returns
 unchanged internal `ModelDecisionV1`. Envelope/schema/semantic mismatches map
 to `model_protocol_error`. `protocol.test.ts` locks every wire variant, both
 normalization special cases, all rejections, and proves internal evaluate args
-remain available to trusted API/Browser Service callers. `PromptRunInput`,
+remain available to trusted API/Browser Service callers. Prompt and code inputs
+share the new pending authorization fields; their remaining fields,
 `PromptRunResult`, action callbacks, ledger rows, and observations retain their
-existing shapes except that every action result now uses the strict bounded
-`BrowserOperationResultV1` from Locked private contracts. Protocol tests reject
-wrong kind/result pairs, cyclic/unsupported JSON-safe values, every bound
-overflow, and encoded observations over 64 KiB.
+existing shapes. Every action result uses the strict bounded
+`BrowserOperationResultV1` from Locked private contracts. Protocol tests
+reject wrong kind/result pairs, cyclic/unsupported JSON-safe values, every
+bound overflow, and encoded observations over 64 KiB.
 
-Keep `CodeRunInput` restricted to run ID, language, source, deadline, and
-correlation ID. The public request cannot set model, effort, policy/schema
-versions, callback URL, endpoint, token, command, mount, environment, or
-network. The unavailable adapter throws typed 503 categories.
+Beyond the shared server-generated authorization fields, keep `CodeRunInput`
+restricted to run ID, language, source, deadline, and correlation ID. Source
+is at most 100,000 characters and deadline at most 300 seconds. The public
+request cannot set adapter binding, model, effort, policy/schema versions,
+callback URL, endpoint, token, command, mount, environment, or network.
+Validate every code return with `codeRunResultSchema`; reject unknown fields,
+per-field output over 256 KiB, aggregate text over 512 KiB, and invalid exit
+status before persistence. Cancellation aborts the adapter call, kills its
+process tree, waits for terminal `killed: true`, revokes capability, and
+persists no unvalidated output. The unavailable adapter throws typed 503
+categories.
 
 - [ ] **Step 5: Implement durable adapter binding, session create, and stop**
 
@@ -3556,25 +4097,42 @@ calling the host adapter, generate canonical job and supervisor UUIDs. Under
 one mutation lease and database transaction, CAS the same run
 `queued -> starting`, persist job+supervisor with null process, and issue one
 pending capability containing the identical pair, null process, and null
-activation. Commit before `executePromptRun`; a failed CAS dispatches nothing.
+activation. Commit before `executePromptRun` or `executeCodeRun`; a failed CAS
+dispatches nothing.
 Browser-operation/replay runs never receive adapter fields.
 
-Pass job+supervisor to `executePromptRun`. Its async `onAccepted` observer
-requires the adapter to echo both plus a positive process ID. Under one short
-mutation lease, CAS the exact still-starting run and exact unrevoked pending
-capability from null process/activation to the same process ID/current
-activation timestamp, then transition run to `running`. Wrong job,
+Pass job+supervisor to the prompt or code adapter call. Its async `onAccepted`
+callback requires the adapter to echo both plus a positive process ID. Under
+one short mutation lease and one database transaction, lock the exact run and
+capability. Issue one run `UPDATE` that atomically CASes
+`state='starting', adapter_process_id IS NULL` to
+`state='running', adapter_process_id=<pid>` while matching run/job/supervisor.
+In the same transaction, CAS the exact unrevoked pending capability from null
+process/activation to the same process ID/current activation timestamp. Each
+statement must affect exactly one row; any mismatch, injected error, or
+concurrent loser rolls back both writes and exposes no intermediate invalid
+row. Wrong job,
 supervisor, state, process reuse, revoked/expired capability, or zero affected
 rows returns `capability_denied`, cancels adapter job, revokes capability, and
-terminates run/session. The adapter awaits observer success before any model,
+terminates run/session. The adapter awaits callback success before any model,
 code, or callback work, closing the first-callback race.
+
+After successful code activation, the adapter opens exactly one authenticated
+`/internal/browser-runs/:runId/cdp` WebSocket with the persisted job,
+supervisor, and process headers. It treats successful HTTP 101 only after
+Browser Service writer acquisition as `relay_ready`; user source cannot start
+before that barrier. Prompt mode never opens this relay. Busy, failed, stale-
+binding, gate-close, cancellation, or deadline handshake closes/revokes the
+relay and executes zero source. Close the code relay and wait for Browser
+Service writer release before accepting terminal code result or reporting
+cancellation.
 
 Callback authorization loads run and one active capability by run ID and
 requires exact persisted job/supervisor/process equality before reading or
 preparing any action. On API/adapter restart,
 `interruptUnfinishedBrowserWork()` interrupts queued, starting, and running
 work and revokes pending/active capabilities without clearing bindings. A
-later observer or callback from the old process cannot reactivate them.
+later acceptance or callback from the old process cannot reactivate them.
 
 Create `capability-store.ts` in this task with gate-leased pending issue,
 joint activation CAS, exact binding lookup, revoke, expiry, and startup
@@ -3582,16 +4140,18 @@ recovery methods needed above. It stores only token hash and never exposes raw
 token after issuance. Task 10 extends this same required store with action
 policy redemption/accounting; it does not create a second capability owner.
 
-Prompt execution uses short leases for run/capability creation and the
+Prompt and code execution use short leases for run/capability creation and the
 binding/activation transitions, then releases every lease before obtaining
-initial observation and calling `executePromptRun` once. Never hold a mutation
-lease across the up-to-300-second host job. Action callbacks take their own
-Task 10 leases. After host return, acquire fresh leases for validated output,
-usage/count persistence, capability revocation, and terminal run/session
-transitions. Validate output
+initial observation when needed and calling the matching adapter method once.
+Never hold a mutation lease across the up-to-300-second host job. Action
+callbacks take their own Task 10 leases. After host return, acquire fresh
+leases for validated output, usage/count persistence, capability revocation,
+and terminal run/session transitions. Validate prompt output
 <=256 KiB, `turnCount <= 26`, `actionCount <= 25`, zero tool/approval counts,
-and counts equal durable action ledger totals before success. Revoke capability
-in `finally`. Persist sanitized usage/counts and terminal state.
+and counts equal durable action ledger totals before success. Validate code
+through exact `codeRunResultSchema` before storing its existing response
+fields. Revoke capability in `finally`. Persist sanitized usage/counts and
+terminal state.
 
 Stop uses one short lease to claim cleanup owner, releases it while cancelling
 adapter, then uses bounded leases for capability/grant revocation, Browser
@@ -3606,12 +4166,14 @@ orphan best-effort. Service failure still leaves durable terminal state.
 pnpm --dir apps/api exec vitest run --no-file-parallelism src/db/migrate.integration.test.ts src/lib/browser-state/store.integration.test.ts src/lib/browser-state/capability-store.test.ts src/lib/browser-runtime/protocol.test.ts src/lib/browser-runtime/execution-adapter.test.ts src/lib/browser-runtime/orchestrator.test.ts
 ```
 
-Expected: PASS for migration/null/immutability constraints, durable pending and
-active binding, wrong-job first callback, wrong supervisor/process, stale
-capability after restart, correct persisted binding, create rollback, profile
-lock, replay failure, one outer prompt call, exact loop policy, count
-verification, duplicate stop, execution/stop/reconciliation races, mutation
-drain, no host-held lease, profile crash boundaries, and unavailable adapters.
+Expected: PASS for populated legacy migration, null/immutability constraints,
+durable pending and active binding, atomic activation rollback and concurrent
+winner, wrong-job first callback, wrong supervisor/process, stale capability
+after restart, prompt/code acceptance barriers, bounded code results,
+cancellation, correct persisted binding, create rollback, profile lock, replay
+failure, one outer prompt call, exact loop policy, count verification,
+duplicate stop, execution/stop/reconciliation races, mutation drain, no
+host-held lease, profile crash boundaries, and unavailable adapters.
 
 - [ ] **Step 7: Commit orchestration boundary**
 
@@ -3734,6 +4296,36 @@ it("authenticates persisted adapter binding before first action", async () => {
   expect(accepted.status).toBe(200);
   expect(await actionCount(activeRun.id)).toBe(1);
 });
+
+it("holds a short mutation lease through internal CDP relay setup", async () => {
+  pauseBrowserServiceWriterAcquisition();
+  const relay = openInternalCodeCdp(exactPersistedHeaders);
+  await privateRelayGrantCreated();
+  const drain = startupGate.close("service_restart");
+  expect(await promiseState(drain.drained)).toBe("pending");
+  releaseBrowserServiceWriterAcquisition();
+  const socket = await relay;
+  await expect(drain.drained).resolves.toBeUndefined();
+  expect(socket.readyState).toBe(WebSocket.OPEN);
+  expect(browserServiceWriterHeld(runId)).toBe(true);
+  socket.close();
+  await expect(browserServiceWriterReleased(runId)).resolves.toBeUndefined();
+});
+
+it.each(["busy", "stale_binding", "gate_closed", "connect_failed"])(
+  "runs no code and revokes the relay grant when CDP setup is %s",
+  async failure => {
+    configureInternalCodeCdpFailure(failure);
+    await expect(executeCodeRun(validCodeInput)).rejects.toMatchObject({
+      category: expect.stringMatching(
+        /browser_state_unavailable|browser_unavailable|capability_denied/,
+      ),
+    });
+    expect(codeSourceLaunchCount()).toBe(0);
+    expect(await activePrivateRelayGrantCount(runId)).toBe(0);
+    expect(browserServiceWriterHeld(runId)).toBe(false);
+  },
+);
 ```
 
 Add tests for `prepared -> rejected_no_effect`, Browser Service proven
@@ -3893,6 +4485,18 @@ upgrade or artifact ingestion. The action endpoint then parses
 `ObservationV1` with 64 KiB total and 40,000-character excerpt limits. This is
 an authenticated host action callback, not an MCP or Codex browser relay.
 
+For the internal code CDP route, hold one short API mutation lease while
+redeeming the capability, creating the private Browser Service relay grant,
+and awaiting the upstream HTTP 101. Browser Service acquires the session
+writer before returning 101, so that response is the adapter's `relay_ready`
+barrier. Recheck the gate immediately before opening upstream. On gate close,
+binding failure, busy writer, cancellation, deadline, or connect failure,
+revoke the private grant before releasing the lease and execute no code.
+Release the API lease immediately after successful handshake; relay frames do
+not hold it. Keep the Browser Service writer for the socket lifetime, then
+close the downstream relay and await writer release before accepting terminal
+code output.
+
 Map `model_protocol_error -> 502`, `action_limit_exceeded -> 429`,
 `action_outcome_unknown -> 502` plus terminal session,
 `capability_denied|target_blocked -> 403`, `concurrency_exceeded -> 429`,
@@ -3911,15 +4515,17 @@ Expected: PASS for every action transition, prepare-before-dispatch,
 execute-once, matching replay, mismatch, no-effect continuation, duplicate
 side-effect rejection, repeated read-only operations, cap, deadline,
 cancellation, strict result validation/bounds, serialization ambiguity without
-caching, unknown outcome termination, recovery, and redaction.
+caching, unknown outcome termination, recovery, internal code relay readiness,
+grant revocation, writer release, and redaction.
 
 - [ ] **Step 8: Commit action coordinator**
 
 ```bash
 git add apps/api/src/lib/browser-runtime/action-normalization.ts apps/api/src/lib/browser-runtime/action-normalization.test.ts apps/api/src/lib/browser-runtime/action-coordinator.ts apps/api/src/lib/browser-runtime/action-coordinator.test.ts apps/api/src/lib/browser-state/capability-store.ts apps/api/src/lib/browser-state/capability-store.test.ts apps/api/src/controllers/internal/browser-runs.ts apps/api/src/controllers/internal/browser-runs.test.ts apps/api/src/routes/internal.ts apps/api/src/index.ts apps/api/src/lib/browser-state/store.ts
 apps/api/.husky/_/pre-commit
-git commit -m "feat: coordinate browser actions durably" -m "Persist every model action before dispatch, authorize it through
-exact durable adapter and capability identity, and execute it at most once.
+git commit -m "feat: coordinate browser actions durably" -m "Persist every model action before dispatch and authorize it through
+exact durable adapter and capability identity. Execute each action at
+most once.
 
 Cache known callback results, reject identity mismatches, and terminate
 ambiguous outcomes."
@@ -4153,11 +4759,16 @@ count mismatch or nonzero tool/approval events as `model_protocol_error`.
 If gate closes during host execution, coordinator interruption owns terminal
 recovery; controller does not persist output through an unleased fallback.
 
-Code path keeps existing output/stdout/result/stderr/exit fields through the
-same adapter abstraction. Stop cancels current execution, revokes authority
-and proxy URLs, closes browser/profile, persists one terminal state, and is
-idempotent. Remove local Gemini/cloud fallback; preserve hosted behavior only
-when the local feature is disabled.
+Code path creates the same durable pending job/supervisor capability, passes
+the common server-generated authorization input to `executeCodeRun`, and
+requires its awaited acceptance before source or relay work. Validate the
+strict bounded `CodeRunResult`, then keep existing output/stdout/result/stderr/
+exit fields through the same adapter abstraction. Wrong or stale acceptance
+executes no source and persists no output. Stop aborts the adapter, waits for
+the killed code process tree, revokes authority and proxy URLs, closes
+browser/profile, persists one terminal state, and is idempotent. Remove local
+Gemini/cloud fallback; preserve hosted behavior only when the local feature is
+disabled.
 
 - [ ] **Step 5: Run public controller tests**
 
@@ -4166,7 +4777,8 @@ pnpm --dir apps/api exec vitest run src/controllers/v2/browser.test.ts src/contr
 ```
 
 Expected: PASS for direct compatibility, prompt/code response fields, one
-outer adapter job, action/turn accounting, replay, domains, profile locking,
+outer adapter job, code acceptance-before-source, strict code result bounds,
+code cancellation, action/turn accounting, replay, domains, profile locking,
 typed failures, no local provider fallback, and terminal stop.
 
 - [ ] **Step 6: Commit controller integration**
@@ -4213,6 +4825,32 @@ it("does not open private stream when gate closes before redeem", async () => {
   expect(browserClient.createRelayGrant).not.toHaveBeenCalled();
   expect(browserClient.openStream).not.toHaveBeenCalled();
 });
+
+it("does not open upstream when gate closes after private grant", async () => {
+  pauseAfterPrivateGrantCreation();
+  const relay = openProxy(passiveToken, "passive");
+  await privateGrantCreated();
+  const drain = startupGate.close("service_restart");
+  expect(await promiseState(drain.drained)).toBe("pending");
+  releasePrivateGrantPause();
+  await expect(relay).rejects.toMatchObject({ code: 1013 });
+  expect(browserClient.openStream).not.toHaveBeenCalled();
+  expect(browserClient.revokeRelayGrant).toHaveBeenCalledTimes(1);
+  await drain.drained;
+});
+
+it("releases startup lease after handshake, not stream lifetime", async () => {
+  pauseOpenStreamHandshake();
+  const relay = openProxy(passiveToken, "passive");
+  await openStreamHandshakeStarted();
+  const drain = startupGate.close("service_restart");
+  expect(await promiseState(drain.drained)).toBe("pending");
+  completeOpenStreamHandshake();
+  const socket = await relay;
+  await drain.drained;
+  expect(socket.readyState).toBe(WebSocket.OPEN);
+  socket.close();
+});
 ```
 
 - [ ] **Step 2: Run test and verify red**
@@ -4232,9 +4870,16 @@ Serve fixed same-origin HTML/JS/CSS with no token/page interpolation and
 Hash and atomically redeem token, verify permission/session/expiry/use, mint a
 one-use private relay grant, and connect with service identity. Proxy
 controller injects Task 11 leased grant store; redeem/use mutation and bounded
-private relay-grant creation share one mutation lease. If gate closes before
-lease acquisition, close WebSocket 1013 and make no Browser Service call. Cap
-messages
+private relay-grant creation plus successful
+`browserClient.openStream()` handshake share one bounded mutation lease.
+Immediately before starting the handshake, call `startupGate.assertOpen()`
+again while still holding that lease. If the gate closed after grant creation,
+revoke the exact private grant inside the lease, close WebSocket 1013, and make
+no upstream connection. If connect fails, synchronously revoke the exact
+private grant before releasing the lease. Release the startup mutation lease
+immediately after successful handshake and before relaying the first frame;
+never hold it for the stream lifetime. If gate closes before lease acquisition,
+close WebSocket 1013 and make no Browser Service call. Cap messages
 at 64 KiB; apply backpressure and bidirectional close/cancellation. Require
 configured API Origin for view streams; CDP may omit Origin but needs CDP
 grant. Never log tokens, private URLs, CDP payloads, or page input.
@@ -4246,7 +4891,9 @@ pnpm --dir apps/api exec vitest run src/controllers/v2/browser-proxy.test.ts
 ```
 
 Expected: PASS for permission separation, expiry, replay, owner binding,
-stop revocation, CSRF/origin, bounds, backpressure, and disconnect cleanup.
+stop revocation, pre/post-grant gate-close races, handshake failure revocation,
+lease release before stream lifetime, CSRF/origin, bounds, backpressure, and
+disconnect cleanup.
 
 - [ ] **Step 5: Commit public proxy**
 
@@ -4273,14 +4920,14 @@ Add restrictive viewer headers, origin checks, bounds, and revocation."
 
 Prove the harness builds `firecrawl-local-browser-service:harness`, starts one
 fresh uniquely named owned container per invocation with a generated service
-key, service-generated process nonce, generated state namespace, temporary
-state bind, disposable API database,
+key, service-generated process nonce, temporary canonical state-root bind,
+disposable API database,
 and unique Compose/container project identity. Expose only a harness-owned
 allocated loopback port, wait for authenticated liveness, pass exact API
 environment before API spawn, wait for API-confirmed matching readiness after
 API reconciliation, and remove container/root/database on success, failure,
 or signal. Never reuse or attach to a pre-existing Browser Service, API
-database, state root, namespace, container, or port.
+database, state root, container, or port.
 
 ```ts
 it("registers cleanup before creating any owned resource", async () => {
@@ -4301,8 +4948,6 @@ it("rejects every external Browser Service override", async () => {
     "BROWSER_SERVICE_URL",
     "BROWSER_SERVICE_API_KEY",
     "LOCAL_BROWSER_STATE_ROOT",
-    "BROWSER_PROFILE_ROOT",
-    "BROWSER_STATE_NAMESPACE",
     "TEST_APPLICATION_DATABASE_URL",
     "APPLICATION_DATABASE_URL",
   ]) {
@@ -4315,12 +4960,11 @@ it("rejects every external Browser Service override", async () => {
   }
 });
 
-it("uses a fresh owned root namespace and API database each run", async () => {
+it("uses a fresh owned root and API database each run", async () => {
   const first = await startAndStopHarness();
   const second = await startAndStopHarness();
   expect(second.containerName).not.toBe(first.containerName);
   expect(second.stateRoot).not.toBe(first.stateRoot);
-  expect(second.stateNamespace).not.toBe(first.stateNamespace);
   expect(second.databaseName).not.toBe(first.databaseName);
   expect(second.processNonce).not.toBe(first.processNonce);
   expect(first.cleaned).toEqual({ container: true, root: true, database: true });
@@ -4383,11 +5027,12 @@ Expected: FAIL because lifecycle helper does not exist.
 Build `apps/browser-service`, run on backend network with no published port,
 2 CPUs, 4 GiB memory/no swap, 1 GiB noexec/nosuid tmpfs, and shared
 `browser-state:/var/lib/firecrawl-browser`. Healthcheck authenticated live
-state only; API coordinator establishes ready state. Pass private URL/key and
-one operator-supplied canonical `BROWSER_STATE_NAMESPACE` to both API and
-Browser Service, plus reconciliation limits to API. Each namespace resolves
-below the volume root; neither process accepts a different root from a
-request. Keep `LOCAL_BROWSER_SERVICE_ENABLED=false` in both Compose and
+state only; API coordinator establishes ready state. Mount the same volume at
+the same `LOCAL_BROWSER_STATE_ROOT` for API and Browser Service, and pass
+private URL/key plus reconciliation limits to API. `replay/`, `profiles/`, and
+`quarantine/` are direct children of that root; neither process accepts a
+different root from a request or inserts an intermediate layer. Keep
+`LOCAL_BROWSER_SERVICE_ENABLED=false` in both Compose and
 `.env.example.local`. Never mount Docker
 socket or adapter token in this task.
 
@@ -4398,8 +5043,8 @@ Service only for exact `pnpm test:snips:local-browser`. Before any build/run,
 reject the override variables
 listed in Step 1 when inherited from caller environment; the harness creates
 and overwrites none of them from external input. Generate cryptographically
-random invocation ID, service key, and state namespace. Precompute random
-collision-resistant root path, application-database/container name, Browser
+random invocation ID and service key. Precompute random collision-resistant
+root path, application-database/container name, Browser
 Service container name, network/project identity, and loopback port before
 creating any resource. Register one idempotent cleanup object plus SIGINT,
 SIGTERM, `beforeExit`, startup-error, and final synchronous `exit` fallback
@@ -4412,20 +5057,23 @@ Cleanup owns explicit creation-state flags and always runs reverse creation
 order: remove the precomputed Browser Service container name with idempotent
 force-remove (covering a runtime that created it before returning failure),
 drop/remove the exact disposable application database/container, then remove
-the exact root. A second cleanup call is a no-op. Unregister handlers only
+the exact root and its precomputed sibling ownership marker. A second cleanup
+call is a no-op. Unregister handlers only
 after cleanup settles. It never glob-matches names, follows symlinks, removes
 an unmarked path, drops an externally named database, or touches a resource
 whose invocation ownership token differs.
 
 After registration, atomically create the empty mode-0700 root at the
-precomputed path and ownership marker, then create a fresh PostgreSQL instance
-and database under the precomputed identity, then run Browser Service. Fail if
-root/database/container already exists, root resolves outside harness temp
-parent, root has unexpected entries, or any ownership marker mismatches.
+precomputed path and a sibling ownership marker under the harness temp parent;
+the marker is never mounted inside the canonical root. Then create a fresh
+PostgreSQL instance and database under the precomputed identity, then run
+Browser Service. Fail if root/database/container already exists, root resolves
+outside harness temp parent, root has unexpected entries, or any ownership
+marker mismatches.
 Container name, network/project identity, loopback port, bind source, API
-database URL, and namespace all derive from this invocation. Reconciliation
-is allowed only against this owned canonical root/namespace; never accept an
-arbitrary path or clean an unmanaged root.
+database URL, and canonical root all derive from this invocation.
+Reconciliation is allowed only against this owned root; never accept an
+arbitrary path, append another root component, or clean an unmanaged root.
 
 Browser Service alone generates its 32-byte process nonce. Harness reads it
 from authenticated live health, requires canonical 43-character base64url,
@@ -4441,9 +5089,9 @@ and browser-state retention owner. Never wait ready before API spawn and never
 start any retention from harness. On cleanup, signal API and wait while its
 coordinator stops monitor and its one retention service, remove Browser
 Service, drop disposable PostgreSQL, then remove owned root. Configure API and
-service with same generated state root mapping and namespace. Missing Docker
-or Podman uses existing missing-runtime error; do not install or start an
-unmanaged process.
+service with the same generated direct-root mapping. Missing Docker or Podman
+uses existing missing-runtime error; do not install or start an unmanaged
+process.
 
 - [ ] **Step 5: Run harness and Compose checks**
 
@@ -4470,7 +5118,7 @@ git commit -m "feat: add private browser service runtime" -m "Run Browser Servic
 a shared durable state volume.
 
 Pre-register reverse cleanup for fresh harness containers, state roots,
-namespaces, and application databases."
+and application databases."
 ```
 
 ### Task 15: Add Browser, Interact, and real-Codex smoke contracts
@@ -4575,6 +5223,13 @@ job, supervisor, and process headers separately. Each returns 403 with zero
 action rows/effects. Restart the adapter, replay the old exact headers, and
 require stale capability denial; the new job's persisted triple succeeds.
 
+Run a second controlled code fixture that reads a known DOM marker through the
+internal CDP relay and prints one exact result. Assert one internal CDP open,
+zero source execution before adapter acceptance and `relay_ready`, one Browser
+Service writer for the source lifetime, and writer release after success and
+cancellation. Wrong or stale binding headers, busy writer, gate close, and
+connect failure must create no source process and leave no active relay grant.
+
 The host-execution plan must run:
 
 ```bash
@@ -4618,8 +5273,8 @@ and zero model-tool events."
   `v22.22.1` and `corepack pnpm --version` is `10.33.0`.
 - [ ] Run Browser Service frozen install, test, and build through Corepack;
   expect all PASS and no lockfile change. `pnpm list --depth 0` must report the
-  11 exact direct versions from Task 1, including Vitest `4.1.9`; no direct
-  dependency may contain a range or tag.
+  11 exact direct versions from Task 1, including production TypeScript
+  `5.9.3` and Vitest `4.1.9`; no direct dependency may contain a range or tag.
 - [ ] Run Browser Service TypeScript tests only through `vitest run`; inspect
   Tasks 1-6 files for explicit
   `import { describe, expect, test, vi } from "vitest"`. Run only the two `.mjs`
@@ -4630,19 +5285,56 @@ and zero model-tool events."
   snippets for permissive UUID/URL validators; expect only the shared local
   primitive definitions to call `.uuid()` and no bare `.url()`. Both sides
   reject uppercase UUIDs and file/mailto/ftp/credential URLs.
+- [ ] Scan this plan and generated contract sources for obsolete
+  `<root>/<namespace>`, `checkpoints/`, `BROWSER_STATE_NAMESPACE`,
+  `BROWSER_PROFILE_ROOT`, `z.object(...).strict()`, invalid TypeScript
+  `node --test` commands, PostgreSQL storage-state payload columns, split
+  activation wording, and missing `CodeRunResult`; expect no positive/stale
+  use outside explicit rejection scans and negative tests. Bare UUID
+  calls appear only inside the two shared `canonicalUuidSchema` definitions;
+  bare URL calls appear nowhere.
+
+  ```bash
+  ! rg -n 'BROWSER_STATE_NAMESPACE|BROWSER_PROFILE_ROOT|checkpoints/' \
+    apps/browser-service/src apps/api/src/lib/browser-runtime \
+    apps/api/src/lib/scrape-interact/browser-service-contracts.ts
+  ! rg -n 'z\.object\([^;]*\)\.strict\(\)|z\.string\(\)\.url\(\)|z\.url\(' \
+    apps/browser-service/src apps/api/src/lib/browser-runtime \
+    apps/api/src/lib/scrape-interact/browser-service-contracts.ts
+  test "$(rg -n 'z\.string\(\)\.uuid\(\)|z\.uuid\(' \
+    apps/browser-service/src apps/api/src/lib/browser-runtime \
+    apps/api/src/lib/scrape-interact/browser-service-contracts.ts | wc -l)" \
+    -eq 2
+  ! rg -n 'node --test[^" ]*.*\.test\.ts' \
+    apps/browser-service/package.json apps/api/package.json
+  ! rg -n 'storage_state_payload|storageStatePayload' \
+    apps/api/src/db/migrations/0007_browser_adapter_bindings.sql \
+    apps/api/src/db/schema/public.ts
+  rg -n 'export type CodeRunResult = z\.infer<typeof codeRunResultSchema>;' \
+    apps/api/src/lib/browser-runtime/protocol.ts
+  ```
 - [ ] Run `0007_browser_adapter_bindings.sql` migration tests transactionally.
   Invalid/noncanonical legacy action job IDs fail preflight with zero data/DDL
-  change. Valid migration interrupts unfinished legacy runs, revokes old
-  capabilities, and enforces pending/activated/null/immutable constraints.
+  change. A populated valid legacy capability succeeds because `NOT NULL`
+  drops before nulling; migration interrupts unfinished legacy runs, revokes
+  old capabilities, and enforces pending/activated/null/immutable constraints.
 - [ ] Run Task 9/10 adapter authorization tests. Before host work, expect run
   and capability to persist equal canonical job/supervisor IDs; accepted
-  process activates both once. Wrong first-callback job, wrong supervisor/
-  process, pending/revoked capability, and stale restart identity perform zero
-  action writes; exact persisted binding succeeds.
+  process activates both in one transaction exactly once. Injected failure
+  rolls back both rows. Prompt and code await the same acceptance barrier;
+  wrong first-callback job, wrong supervisor/process, pending/revoked
+  capability, and stale restart identity perform zero action/source writes;
+  exact persisted binding succeeds. Code source additionally waits for one
+  authenticated internal CDP handshake whose HTTP 101 follows Browser Service
+  writer acquisition; failed setup revokes its grant and executes no source.
 - [ ] Run `pnpm --dir apps/api build`; expect PASS.
 - [ ] Run Task 15 focused API tests; expect all PASS.
 - [ ] Run Task 8 database integration tests with `--no-file-parallelism`;
-  expect snapshot/recovery/restart/retention ordering PASS.
+  expect snapshot/recovery/restart/retention ordering PASS. A populated
+  foundation `replay/<owner>/<scrape>/<uuid>.json` checkpoint and cleanup
+  intent reconcile in place with unchanged database paths and no file move.
+  PostgreSQL contains metadata only; replay reconstruction reads and validates
+  canonical `StorageStateV1` from the direct-root file.
 - [ ] Run `pnpm --dir apps/api harness pnpm test:snips:local-browser`; expect
   lifecycle cases PASS and host execution unavailable until its plan lands.
 - [ ] Run
@@ -4650,7 +5342,8 @@ and zero model-tool events."
   expect exit 0.
 - [ ] Resolve Playwright raw manifest again; expect digest equals committed
   Dockerfile digest. Build Browser Service twice with `--pull --no-cache`;
-  expect Node `v22.22.1`, Playwright `1.61.1`, and `pwuser` both times.
+  expect Node `v22.22.1`, Playwright `1.61.1`, production TypeScript `5.9.3`,
+  constrained evaluate parser smoke, and `pwuser` both times.
 - [ ] In both digest-pinned `browser-test` images, run real bundled-Chromium
   egress tests. Require positive controls plus zero private HTTP/WS hits, proxy
   observation/rejection for top-level and subresources across localhost,
@@ -4659,14 +5352,17 @@ and zero model-tool events."
 - [ ] In both `browser-test` images, run replay restore tests. Require cookies,
   localStorage, and IndexedDB equality immediately after `setStorageState`, no
   pre-restore network, state-path file containing only canonical
-  `StorageStateV1` bytes, exact request/file/export byte/checksum equality, and
-  zero Chromium/profile publication on envelope-file, mismatch, timeout, or
-  crash.
+  `StorageStateV1` bytes, exact foundation-canonical request/file checksum
+  equality, and semantic-normalized request/export equality, including
+  unsorted foundation arrays. Expect zero Chromium/profile publication on
+  envelope-file, mismatch, timeout, or crash.
 - [ ] Run
   `docker compose --project-name firecrawl --project-directory . -f compose.yaml -f compose.local.yaml build browser-service api`;
   expect exit 0.
 - [ ] Inspect Compose; expect only API published on `127.0.0.1:3002`.
-- [ ] With flag false, expect typed local unavailable behavior and no fallback.
+- [ ] With local flag false, expect the existing hosted branch unchanged. With
+  local flag true, install Gemini/Fireworks/Firecrawl Cloud spies, run prompt
+  and code cases, and expect zero provider/cloud calls or fallback.
 - [ ] With browser flag false and local persistence enabled, advance one
   retention interval; expect operational and artifact phases once, browser
   phase zero, and no coordinator. With flag true, expect one API owner and no
@@ -4676,16 +5372,23 @@ and zero model-tool events."
 - [ ] Restart Browser Service; expect nonce change closes API gate, old work is
   interrupted, one reconciliation occurs, and gate reopens only after matching
   ready nonce/digest.
+- [ ] Inject partial reconciliation, lost response, API crash before gate open,
+  and service nonce change between attempts. Same-nonce attempts send
+  byte-identical body/digest and use cached success; nonce change reruns closed
+  recovery and captures one new immutable snapshot. Retry/backoff/budget/
+  cooldown stay bounded, and stop cannot reopen the gate.
 - [ ] Inject reconciliation validation/planning errors; expect zero mutation.
   Inject rename/delete/fsync failures after execution starts; expect only the
   exact sorted plan prefix moved/deleted, all unrelated entries unchanged,
   readiness closed, and same-digest retry convergence. Equal basenames across
-  checkpoint/profile committed/staging/working paths never collide.
+  replay/profile committed/staging/working paths never collide.
 - [ ] Race shutdown against accepted and in-flight reconciliation; expect
   `StartupAdmission.reconcile()` to reject/withhold success, no new filesystem
   call after draining, and no readiness resurrection after listener close.
-- [ ] Search local paths for Gemini, Fireworks, and Firecrawl Cloud fallback;
-  expect none.
+- [ ] Hold proxy setup after private-grant creation, close the gate, then
+  release it; expect grant revocation and no upstream open. Successful relay
+  setup holds the mutation lease through handshake, releases it before stream
+  lifetime, and revokes the private grant on connect failure.
 - [ ] Inspect action tests: every accepted proposal persists `prepared` before
   dispatch; matching known callback replays do not dispatch; hash mismatch
   fails; each strict result/response cap is enforced; unsupported/cyclic/
@@ -4693,13 +5396,14 @@ and zero model-tool events."
   `outcome_unknown` and terminates run/session; no action auto-retries.
 - [ ] Run harness twice with hostile inherited override variables. Expect
   override rejection before container launch, then two clean runs with unique
-  container/project, nonce, namespace, root, port, key, and disposable API
+  container/project, nonce, root, port, key, and disposable API
   database. Inject failure/signal after registration, root, database, partial
   container run, and full run; expect cleanup was registered before creation,
   removes container/database/root in reverse order once, and touches no
   unmanaged resource.
 - [ ] After host plan, run real Codex smoke three times; expect three PASS runs,
-  contiguous ledgers, exact effect counts, zero tools/approvals, and cleanup.
+  contiguous ledgers, exact effect counts, zero tools/approvals, code
+  `relay_ready` ordering, and cleanup.
 - [ ] Run `git status --short`; expect clean after each commit.
 - [ ] Run actual repository hook before every commit; expect exit 0.
 
@@ -4715,9 +5419,10 @@ and zero model-tool events."
   evidence.
 - Adapter authorization: migration persists canonical job/supervisor identity
   on run/capability before dispatch; adapter acceptance atomically binds one
-  positive process before model/code/callback work. Callback headers, body,
-  run, and active capability must match; restart preserves audit identity while
-  revoking stale authority.
+  positive process in both rows before model/code/callback work. Prompt and
+  code inputs share the awaited acceptance contract and code output is closed
+  and bounded. Callback headers, body, run, and active capability must match;
+  restart preserves audit identity while revoking stale authority.
 - Action safety: API recomputes identity metadata, persists before dispatch,
   authorizes server-held policy, permits one in-flight action, never retries,
   caches known replay, rejects side-effect duplicates, permits repeated reads,
@@ -4729,8 +5434,9 @@ and zero model-tool events."
   grants remain distinct.
 - Limits and errors: 10,000 prompt characters, 40,000 snapshot characters,
   64 KiB observation, 1 MiB aggregate observations, 256 KiB final output,
-  25 actions, 26 turns, 300 seconds, and approved HTTP mappings appear in
-  implementation and tests.
+  256 KiB per code text field, 512 KiB aggregate code text, 25 actions,
+  26 turns, 300 seconds, and approved HTTP mappings appear in implementation
+  and tests.
 - Security: model receives no MCP, tools, browser transport, capability,
   endpoint, credential, shell, workspace, Docker, or arbitrary network;
   Browser Service remains private, manually proxies Chromium with
@@ -4742,28 +5448,38 @@ and zero model-tool events."
 - Startup authority: Browser Service is live before API, but no Browser route
   admits work until API recovery, one repeatable-read snapshot, reconciliation,
   and matching ready health succeed for current process nonce. Retention starts
-  afterward and restart repeats same sequence.
+  afterward and restart repeats same sequence. API and service share one direct
+  canonical root; existing `replay/...` paths remain unchanged.
 - Mutation drain: gate close rejects admission synchronously, then coordinator
   awaits all unified filesystem/database mutation leases before recovery. Dead
   cleanup-intent writers converge under exact process identity and CAS before
   snapshot; live/unknown writers remain authoritative.
 - Mutation coverage: session/profile/run transitions, actions, capabilities,
   grants, artifact attachment, stop, and controller-facing writes all use
-  short gate leases. Host execution and artifact streaming hold none; callback
-  and gate-close races either drain known completion or recover conservatively.
+  short gate leases. Public and internal code relay setup each hold one only
+  through upstream handshake, never stream lifetime. Code source starts only
+  after the internal relay is ready and its Browser Service writer is held.
+  Host execution and artifact streaming hold none; callback and gate-close
+  races either drain known completion or recover conservatively.
 - Ownership and retries: API process alone owns operational, artifact, and
   browser-state retention plus recovery; harness owns only fresh disposable
-  process/container/root/database lifecycle. Each cycle has 4 attempts,
-  250/500/1,000 ms backoff, 60-second budget, and 30-second runtime cooldown.
+  process/container/root/database lifecycle. Each nonce cycle has 4 attempts
+  and 250/500/1,000 ms backoff; one startup budget spans nonce churn and each
+  runtime cycle has a 60-second budget plus 30-second cooldown.
+  One nonce cycle freezes one request body; same-nonce retries are byte-exact,
+  while nonce change reruns closed recovery and snapshot capture.
 - Toolchain: every Browser Service install/test/build/start uses installed Node
   `22.22.1`, Corepack pnpm `10.33.0`, frozen lock, Playwright package/image
-  `1.61.1`, exact direct dependencies, Vitest `4.1.9`, and committed Noble
-  digest; two no-cache builds verify identities and real bundled Chromium.
+  `1.61.1`, production TypeScript parser `5.9.3`, exact direct dependencies,
+  Vitest `4.1.9`, and committed Noble digest; two no-cache builds verify
+  identities, evaluate parsing, and real bundled Chromium.
 - Replay restore: existing generation plus checkpoint is rejected. Otherwise
-  PostgreSQL/request carries complete checkpoint metadata while state path
-  contains only canonical storage bytes. Raw file/request/export bytes and
-  checksum must match before/after `setStorageState`, or all runtime/profile
-  work is discarded without publication.
+  PostgreSQL carries complete checkpoint metadata while the direct-root
+  `replay/...` file alone carries canonical storage bytes. API reconstructs the
+  request from both. Raw file and foundation-canonical request bytes/checksum
+  match; semantic-normalized request/export state matches after
+  `setStorageState`, or all runtime/profile work is discarded without
+  publication.
 - Contract drift: one canonical V1 inventory locks every route, field, type,
   bound, status, header, and response cap; Browser Service and API consume and
   fingerprint it independently.
