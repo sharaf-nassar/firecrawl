@@ -244,6 +244,10 @@ owner. At capacity, exact completed replay succeeds, exact superseded replay
 returns superseded, exact failed replay returns its cached 503, and an unknown tuple fails
 `control_generation_history_exhausted` without ownership change, drain, or
 mint. An orphan then requires service restart for a fresh process namespace.
+There is one shared history count and no transferable owner slot or separate
+superseded-tombstone allowance: with 1,023 accepted tuples an unknown orphan
+replacement may reserve tuple 1,024, while with 1,024 it is rejected before
+superseding the owner.
 After completed A then B, replay A returns A's historical response but cannot
 replace current B generation. Neither nonce is persisted or logged.
 
@@ -370,9 +374,11 @@ every relative path is at
 most 1,024 UTF-8 bytes and every segment at most 255 UTF-8 bytes. Checkpoint
 files must be at most 2 MiB before read. Each profile file is at most 64 MiB and
 one generation tree at most 256 MiB, enforced while streaming the walk.
-The counter is created once per reconciliation and never reset or deduplicated;
-authority, enumeration, identity, revalidation, recovery, and retry walks all
-consume the same total.
+The counter is created once per reconciliation and never reset. Charge each
+managed namespace root exactly once and each descendant when yielded; EOF and
+absent-entry probes do not charge. Descendant entries are never deduplicated
+across authority, enumeration, identity, revalidation, recovery, or retry walks,
+which all consume the same total.
 Exceeding any bound fails before deletion.
 Response counts are nonnegative safe integers no greater than 25,000 each. API
 accepts the result only when process nonce, generation nonce, and digest equal
@@ -515,12 +521,46 @@ For a directory candidate, age is its maximum descendant mtime including the
 directory itself, not its root mtime alone. Unknown names fail readiness and
 are never guessed or deleted.
 
+Before any record promotion, repair, candidate mutation, or cleanup, Browser
+Service read-only enumerates every plan directory and parses every temporary or
+final manifest and completion marker. It validates every quarantine byte and
+directory against those records and validates every pending entry's exact
+source/destination phase, parent identity, leaf type, and content/tree identity.
+For plan-bearing completed state, first require a valid final `complete` marker
+that exactly binds plan SHA, retained, and removed. The recorded source parent
+must open through a held procfd handle, match identity, and prove the source
+leaf absent. The recorded destination parent must likewise open, match, and
+prove its leaf absent, except after durable cleanup already removed an exact
+destination suffix. That completed-cleanup exception walks from the nearest
+surviving recorded or authorized ancestor through held procfd handles. It proves
+every absent suffix component matches the exact destination hierarchy recorded
+in the manifest, with no alternate leaf or unaccounted byte. It never applies
+to pending state, `complete.tmp`, an invalid marker, a missing source parent,
+or any arbitrary missing destination parent. Any failure leaves every record
+and candidate untouched. A final completion-only record has no paths to mutate
+or prior-plan authenticity; its strictly limited cleanup rule below does not
+infer either.
+
+The current logical reconciliation captures its workset exactly once after that
+read-only validation. Its unique cardinality is the union of newly eligible
+current entries and entries from plan-bearing manifests pending at capture.
+Reject before plan publication when adding the would-be entry 25,001; exactly
+25,000 succeeds. Manifests already completed at capture, including
+completion-only records, are historical cleanup state and contribute nothing.
+A contributing old plan contributes only its entries, never its own aggregate
+count. Duplicate workset source or destination paths are unsafe rather than
+silently deduplicated.
+
 Before moving the first candidate, persist one immutable canonical plan at
 `quarantine/<processNonce>/<controlGenerationNonce>/.plans/`
 `<snapshotDigest>/plan.json`. Exact plan-directory grammar permits only
-`plan.tmp`, `plan.json`, `complete.tmp`, and `complete`. The manifest contains
-fixed-key `version`, process nonce, generation nonce, snapshot digest, and
-sorted entries. Each entry records full source and destination relative paths,
+`plan.tmp`, `plan.json`, `complete.tmp`, and `complete`. No cleanup-copy record
+is permitted. The manifest contains fixed-key `version`, process nonce,
+generation nonce, snapshot digest, retained count, removed count, and sorted
+entries. `entries` contains only newly eligible current candidates; pending-old
+entries remain solely in their old manifests and affect only this plan's
+`removed` workset cardinality. Each current entry records full source and
+destination relative paths,
 recognized type, immutable identity SHA-256, byte count, source/destination
 parent path plus device/inode/mode identity, and the exact phase model below.
 Field names/order equal Task 3's `ReconciliationPlanV1`; device and inode are
@@ -553,36 +593,68 @@ delete, then fsync destination parent. Both absent means fsync destination
 parent before recording/counting completion. Both present or any type,
 identity, parent-identity, or byte mismatch fails unsafe without touching
 either. A delete followed by fsync failure remains incomplete; retry performs
-the destination fsync and counts that entry once.
+the destination fsync and counts that entry once. The manifest's `removed`
+field immutably stores the captured workset size and is bounded to a
+nonnegative safe integer no greater than 25,000. Exact retry uses that stored
+value and never rebuilds it from current manifest states.
 
 The manifest remains until every entry delete and required fsync completes.
 Then create mode-0600 `complete.tmp` with
 `O_CREAT | O_EXCL | O_NOFOLLOW`, write/fsync exact fixed-key version, manifest
 SHA-256, retained, and removed fields, atomically rename to `complete`, and
 fsync the plan directory. A temp-only retry validates and publishes those exact
-bytes. A current exact retry validates `plan.json` plus `complete` and returns
-the same counts. A later authority-valid reconciliation
-may crash-safely remove an older completed manifest, marker, and empty plan
-directory only after removing empty destination parents bottom-up from manifest
-paths, with a held-parent fsync after each unlink/rmdir. Manifest is removed
-only after every candidate hierarchy is gone. A completion-only crash state
-with no quarantine bytes or nonempty destination directory is cleanup-only;
-any partial quarantine without a valid manifest, or a modified/forged manifest
-or marker, fails unsafe untouched.
+bytes. For plan-bearing state, the completion marker is valid only when its
+manifest SHA-256 matches the exact plan bytes and both
+`complete.retained === plan.retained` and
+`complete.removed === plan.removed`. A current exact retry validates
+`plan.json` plus `complete` and returns the same counts.
+
+A later authority-valid reconciliation may crash-safely clean an older
+completed plan only after its final marker exact-binds it and a held recorded
+source parent proves source absence. Normally, a held recorded destination
+parent must match and prove its leaf absent; fsync both held parents before
+removing any still-existing empty destination directory and keep relevant
+handles through removal and held-parent fsync. After a cleanup crash, the
+completed-cleanup exception may replace only that destination-parent proof: a
+held nearest surviving recorded or authorized ancestor must prove the exact
+manifest-authorized destination suffix absent with no alternate leaf or
+unaccounted byte. Fsync the source parent and that ancestor before continuing.
+It then unlinks `plan.json`, fsyncs the plan directory, unlinks `complete`, and
+fsyncs again. Empty plan-directory ancestors follow with held-parent fsyncs. A
+crash between those record unlinks leaves one canonical final
+`complete` file, but that file cannot authenticate its deleted plan and is never
+path authority. Accept it only after global read-only validation proves its
+process/generation has zero quarantine leaves and zero unaccounted bytes. Its
+only remaining hierarchy must be the exact otherwise-empty authorized
+`.plans/<snapshotDigest>/complete` skeleton. It may authorize deleting only
+itself and now-empty digest/`.plans`/generation/process ancestors, never managed
+or quarantine content, and contributes no count. Its closed canonical fields,
+bounds, mode, and link count are syntax checks only; SHA/count values cannot
+authenticate the deleted plan. Forged-marker rejection applies to plan-bearing
+state. Arbitrary bytes outside that one canonical encoding, malformed bytes, a
+`complete.tmp` without a manifest, or any completion-only state with quarantine
+content or an unauthorized skeleton fails unsafe untouched.
 
 `retained` is the number of unique authoritative paths validated. `removed` is
-the number of manifest entries this reconciliation must converge, including
-validated pending older manifests; each counts exactly once whether completed
-before or during this attempt. Exact retry returns identical counts. Old
-process/generation recovery enumerates only validated manifests after current
-authority validation, validates every quarantined byte against its expected
-identity, and never reconstructs a plan from destination paths.
+the captured pending-only workset stored in the current immutable plan. Each
+workset entry counts exactly once even when its observed phase is already
+both-absent or it completes during the attempt. A manifest bearing valid final
+completion before capture is historical and contributes zero. Exact retry
+returns the stored count; it never recursively adds an older plan's aggregate
+or derives history from later completion states. Old process/generation
+recovery enumerates only validated manifests after current authority validation,
+validates every quarantined byte against its expected identity, and never
+reconstructs a plan from destination paths.
 
 A partial failure leaves readiness false. A later generation may finish an
 old-generation manifest only after its complete new authority snapshot proves
-every original source unreferenced. Readiness flips to true exactly once, only
-after every validated plan completes. No cleanup starts from a partial, stale,
-wrong-generation, or conflicting snapshot.
+every original source unreferenced. After the current plan is durably published,
+valid temporary records may be promoted, older captured pending plans execute
+and complete first, and the current plan executes and completes last. Historical
+or newly completed cleanup begins only after current completion is durable.
+Readiness flips to true exactly once, only after every validated plan completes.
+No cleanup starts from a partial, stale, wrong-generation, or conflicting
+snapshot.
 
 Once the API opens its gate, normal retention again owns cleanup-intent files
 and database compare-and-set updates. Browser Service startup reconciliation
@@ -856,6 +928,8 @@ New tests in the implementation plan must prove:
 - unknown tuples check/reserve history capacity before collision semantics;
   at-cap unknown collision returns history exhausted, below-cap collision
   releases its reservation, and known replay stays deterministic at capacity;
+  an orphan replacement is accepted as tuple 1,024 from exactly 1,023 accepted
+  tuples and rejected without owner change from exactly 1,024;
 - A→B→replay-A returns historical A without changing current B; tuple history
   capacity accepts known replay, preserves superseded tombstones, and rejects
   unknown orphan replacement without eviction or a second drain;
@@ -881,15 +955,33 @@ New tests in the implementation plan must prove:
 - the global managed-entry counter includes every nested namespace and manifest
   entry and stops at 25,001 before stat/read/hash; descendant maximum mtime,
   not generation-root mtime, controls the 10-minute grace period;
+- a positive traversal fixture with exactly 25,000 charged entries succeeds,
+  entry 25,001 fails before probing it, each managed namespace root charges
+  once, and EOF or absent-entry probes never charge;
 - procfd-anchored held directory handles survive ancestor symlink swaps; every
   non-cleanup filesystem await has before/after admission checks, while raw
   finally closes all handles after abort;
 - canonical immutable plan manifest is durable before candidate mutation;
   corrupt/forged/missing-manifest quarantine and source/destination identity
   mismatches fail unsafe untouched;
+- every plan and completion state plus every pending entry phase and identity is
+  validated read-only before mutation through held recorded parent handles;
+  completed plans prove source and destination absent, and their markers equal
+  plan SHA, retained, and removed exactly;
+- a crash after destination-directory removal but before plan unlink restarts,
+  proves the exact authorized absent suffix from a held surviving ancestor, and
+  completes cleanup; ancestor replacement or any unauthorized missing parent
+  fails unsafe untouched;
 - crashes after plan fsync/rename, candidate rename, either parent fsync,
   delete, post-delete fsync, completion marker, or manifest cleanup resume exact
   phases and counts; delete-then-fsync failure retries fsync and counts once;
+- the active plan stores one pending-only aggregate removed count; historical
+  completion and recursive old aggregates contribute zero, while its entries
+  contain current candidates only; union cardinality 25,000 succeeds and 25,001
+  fails before plan publication;
+- plan-first cleanup accepts a lone final completion marker only with global
+  proof of zero quarantine leaves and an exact empty authorized skeleton; it
+  deletes only that record and empty ancestors, never path content;
 - new process/generation recovery validates authority then enumerates validated
   manifests only, verifies quarantine bytes, and never reconstructs a plan from
   destination paths;
