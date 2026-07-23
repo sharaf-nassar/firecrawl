@@ -2031,18 +2031,35 @@ script. Package scripts invoke the runner with closed target `production` or
 APIs, and no-follow opens exact
 `build/.atomic-directory-publication-build.lock` with numeric
 `O_RDWR | O_CREAT | O_NOFOLLOW`, mode `0600`; it requires regular file/current
-uid/mode `0600`/link count one. It verifies fixed `/usr/bin/flock` and
-`--no-fork` support, then spawns exact argv `/usr/bin/flock --no-fork
---exclusive --timeout 60 9 <real-node22> scripts/build-native.mjs <target>`.
-The Node spawn `stdio` array is exactly stdin `ignore`, stdout/stderr `inherit`,
-indices 3..8 `ignore`, and index 9 the opened parent lock fd. Mapping a numeric
-parent fd to child fd 9 duplicates the same open file description with
-`FD_CLOEXEC` clear on child fd 9. Environment contains exact
-`ATOMIC_BUILD_LOCK_FD=9`; no other lock-fd value is accepted.
+uid/mode `0600`/link count one. The runner retains that descriptor and
+synchronously spawns `/usr/bin/flock` with exact argv
+`/usr/bin/flock --exclusive --timeout 60 9` and no command. The acquisition
+child's `stdio` array is exactly stdin `ignore`, stdout/stderr `inherit`,
+indices 3..8 `ignore`, and index 9 the runner's opened lock fd. Mapping the
+numeric parent fd to child fd 9 duplicates the same open file description
+(OFD). Excluding ordinary stdio descriptors 0..2, child fd 9 is the only
+inherited descriptor with `FD_CLOEXEC` clear; auxiliary descriptors 3..8 are
+closed by their `ignore` mappings. The helper applies `flock(2)` to that shared
+OFD. Its exit closes only the helper's duplicate; the runner's retained
+duplicate keeps the successful lock continuously held.
 
-`flock` locks fd 9 and `--no-fork` execs Node rather than retaining a wrapper
-that could explicitly unlock after only its direct child exits. Runner retains
-its duplicate until the exec child terminates, then verified-closes it. Locked
+Only exit status zero is successful acquisition. The runner waits for the
+helper to terminate, rejects a signal or every nonzero status including
+timeout, performs no staging inspection/removal and spawns no builder on those
+paths, then verified-closes its lock fd and fails. This close also releases an
+ambiguously acquired lock if the helper was killed after its `flock(2)` call.
+After status zero the runner revalidates its retained fd against the original
+no-follow lock record, then separately spawns exact argv
+`<real-node22> scripts/build-native.mjs <target>`. That Node spawn uses the same
+stdio mapping: stdin `ignore`, stdout/stderr `inherit`, indices 3..8 `ignore`,
+and the retained lock fd at child fd 9. Environment contains exact
+`ATOMIC_BUILD_LOCK_FD=9`; no other lock-fd value is accepted. There is no
+unlock/reacquire operation or interval between helper success and builder
+spawn: both mappings duplicate the runner's one continuously retained OFD.
+
+Runner retains its duplicate until the builder terminates, then
+verified-closes it. A builder spawn failure likewise causes no staging
+inspection by the runner and closes the retained fd before failure. Locked
 `build-native.mjs` first requires the env value, `fstatSync(9)` equality with
 the runner's no-follow lock record, and `/proc/self/fd/9` presence before any
 staging inspection. Every child it spawns—compiler identity probe, compilation,
@@ -2052,15 +2069,64 @@ bounded pipes, link stdout uses its O_EXCL trace fd, unused 3..8 are `ignore`.
 The inherited fd remains non-CLOEXEC across compiler-driver exec and its pinned
 `cc1`/assembler/collect2/linker descendants. Neither script closes fd 9.
 
-Consequently SIGKILL of runner, locked build script, or compiler driver cannot
-release the flock while any descendant still has fd 9. A new runner may open
-the lock leaf but its separate open file description blocks/times out in flock
-and cannot inspect/remove/create staging. Only after the last descendant exits
-and closes fd 9 can a new build acquire the lock, validate fd 9, and discard the
-old staging generation before creating another. `build-native.mjs` never calls
-flock or creates the build root; direct invocation without the inherited locked
-fd is unsupported and rejects before filesystem mutation. Package/Docker
-entrypoints use only the runner. Host tests verify path/version/flag support.
+Consequently SIGKILL of runner after builder spawn, locked build script, or
+compiler driver cannot release the flock while any builder descendant still
+has fd 9. SIGKILL of the runner before builder spawn releases the retained OFD
+after the acquisition helper exits and is safe because no process has
+inspected or mutated staging. A new runner may open the lock leaf but its
+separate open file description blocks/times out in flock and cannot
+inspect/remove/create staging. Only after the last runner, builder, or
+descendant duplicate closes can a new build acquire the lock, validate fd 9,
+and discard the old staging generation before creating another.
+`build-native.mjs` never calls flock or creates the build root; direct
+invocation without the inherited locked fd is unsupported and rejects before
+filesystem mutation. Package/Docker entrypoints use only the runner. Host
+tests verify the fixed path/version and fd-number acquisition form.
+
+Orphan-lock testing uses one closed module-only spawn seam in
+`run-native-build.mjs`, named `runNativeBuildOrphanFixtureForTest()`. It shares
+the exact production open, validation, fd mapping, synchronous flock
+acquisition, result check, post-acquisition validation, wait, and close
+implementation. Instead of the production builder, and before any staging
+inspection, it spawns only canonical checked-in
+`scripts/native-build-lock-orphan.fixture.mjs` with role `driver`. The function
+accepts no executable, argv, environment object, target, timeout, path, or
+callback. It requires all of these guards together: execution by canonical
+`scripts/run-native-build-test-driver.mjs`; exact inherited
+`VITEST=true`; exact `ATOMIC_BUILD_LOCK_TEST_MODE=orphan-v1`; fd 3 is a
+validated ready-pipe write end; fd 4 is a distinct validated release-pipe read
+end; and canonical fixture identity matches its no-follow regular-file record.
+Pipe type, direction, and nonaliasing are proved from `fstat` plus exact
+`/proc/self/fdinfo/3|4` access-mode flags. Any missing, extra, malformed,
+aliased, or nonpipe control descriptor rejects before opening the build lock.
+
+The production CLI path never calls or selects that function, accepts only
+target `production|all`, rejects every `ATOMIC_BUILD_LOCK_TEST_*` and
+`ATOMIC_BUILD_LOCK_FIXTURE_*` variable, and always resolves only
+`scripts/build-native.mjs`. Package scripts and Docker build targets invoke
+that production CLI path. They cannot name the test driver, fixture, role, or
+spawn seam. The final runtime image contains neither test file. Thus the seam
+cannot change production compiler argv/environment or substitute for a real
+compiler probe.
+
+In fixture mode the locked child receives the normal exact
+`ATOMIC_BUILD_LOCK_FD=9`, plus only
+`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`; fd 3, fd 4, and fd 9 are inherited.
+The driver forks/execs the same canonical fixture with role `descendant`,
+mapping the same three descriptors and adding only canonical decimal
+`ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`. The descendant validates its role,
+driver pid, fd types, and lock fd identity, writes one canonical
+UTF-8 record
+`{"event":"orphan-ready-v1","driverPid":<pid>,"descendantPid":<pid>}\n`
+to fd 3, closes fd 3, and blocks reading fd 4. Both pids are canonical positive
+JSON integers with no other fields or whitespace. After successful descendant
+spawn, the driver verified-closes its own fd 3 and fd 4 duplicates but retains
+fd 9, then remains alive until killed. The descendant accepts exact byte
+`0x01` followed by EOF, verified-closes fd 4 and fd 9, then exits zero; early
+EOF, extra bytes, signal, or malformed state fails. These fixture-only
+variables and fd 3/4 mappings never reach a production builder, gcc, `cc1`,
+assembler, linker, addon loader, or test executable.
+
 Current Task 4 owns the complete immutable Docker-init allowlist described
 below; Task 6
 builder/test/init images only consume it to verify `/usr/bin/flock`. Browser
@@ -2366,19 +2432,47 @@ Real compiled-addon integration tests, not mocked rename results, cover:
 - native test binary exercising every errno mapping, including separate and
   aliased `ENOTSUP`/`EOPNOTSUPP` compilation branches and internal
   `atomic_publish_source_missing` for `ENOENT`;
-- build-runner tests create `build/` before lock invocation, assert exact
-  `/usr/bin/flock --no-fork --exclusive --timeout 60 9` argv with real Node 22,
-  exact `ATOMIC_BUILD_LOCK_FD=9`, and Node stdio indices 3..8 ignored/fd 9
-  mapped from the verified lock handle. Real exec probes require fd 9 present
-  with CLOEXEC clear in build script, compiler driver, and pinned subtool.
-  Concurrent builders serialize and timeout has no compiler/staging effect.
-  A deterministic pipe barrier makes a compiler driver fork/exec a descendant
-  that retains fd 9, then SIGKILLs runner/build script/driver variants. A second
-  build must remain blocked with zero staging inspection/removal until that
-  descendant signals exit; only its final fd close admits the contender, which
-  then discards stale staging and fully rebuilds. Driver failure also proves the
-  current build spawns nothing further and leaves staging untouched rather than
-  racing orphan cleanup. Compiler tests assert every exact compile/link argv uses only
+- build-runner tests create `build/` before lock invocation and run exactly
+  `pnpm --dir apps/browser-service exec vitest run scripts/run-native-build.test.mjs`.
+  They assert the acquisition child argv is exactly
+  `/usr/bin/flock --exclusive --timeout 60 9`, contains no command or
+  process-replacement option, and exits successfully before a separate
+  real-Node-22 builder is spawned. Both children require indices 3..8 ignored
+  and fd 9 mapped from the runner's one verified lock handle; only the builder
+  receives exact
+  `ATOMIC_BUILD_LOCK_FD=9`. A real OFD probe locks through the helper, waits for
+  helper exit, and proves a separately opened contender still times out while
+  the runner retains its descriptor. Closing the runner's last duplicate then
+  admits that contender. Nonzero, timeout, signal, post-acquisition validation
+  failure, and builder-spawn failure tests assert verified close, zero builder
+  or later-child spawn where applicable, and zero staging
+  inspection/removal/mutation.
+  Real exec probes require fd 9 present with CLOEXEC clear in build script,
+  compiler driver, and pinned subtool. Concurrent builders serialize and
+  timeout has no compiler/staging effect. The closed orphan fixture test
+  creates distinct ready/release pipes, spawns exact
+  `scripts/run-native-build-test-driver.mjs` with guarded fixture mode and fd
+  3/4 mappings, and waits for the descendant's canonical ready record without
+  timing sleeps. It verifies both recorded live pids, then sends `SIGKILL` to
+  the fixture driver and waits for both that death and runner failure. While
+  the descendant remains blocked holding fd 9, a separately opened lock OFD
+  passed to exact `/usr/bin/flock --exclusive --nonblock 9` must report
+  contention, and a normal production runner contender must spawn no builder
+  and perform zero staging inspection/removal. The test writes the one release
+  byte and closes the release writer, waits for descendant exit and ready-pipe
+  EOF, and requires that already-waiting normal contender to acquire the lock,
+  discard any valid stale generation, and complete a full fresh build. No
+  timing sleep determines any transition. Fixture guard rejection tests cover
+  direct CLI selection, wrong launcher/mode/role, extra argv or prefixed
+  environment variables, invalid/aliased control fds, and noncanonical fixture
+  identity.
+
+  Separate real production builds retain the real gcc/compiler-driver/`cc1`
+  exec probe requiring inherited fd 9; the fixture can neither satisfy nor
+  replace that gate. Real build-script and compiler-driver failure tests prove
+  the current build spawns nothing further and leaves staging untouched rather
+  than racing orphan cleanup. Compiler tests assert every exact compile/link
+  argv uses only
   the fixed staging tree for object, unique depfile, map, binary/addon, and
   `-o`/`-MF` output; linker tests assert exact `-Wl,-Map,<staging-map>` and
   `-Wl,--trace`, with stdout wired to the exact pre-opened staging trace fd.
@@ -2620,6 +2714,10 @@ Native publication adds exactly:
 - `apps/browser-service/native/toolchain-allowlist.json` (new)
 - `apps/browser-service/scripts/run-native-build.mjs` (new)
 - `apps/browser-service/scripts/run-native-build.test.mjs` (new)
+- `apps/browser-service/scripts/run-native-build-test-driver.mjs` (new,
+  test-only)
+- `apps/browser-service/scripts/native-build-lock-orphan.fixture.mjs` (new,
+  test-only)
 - `apps/browser-service/scripts/build-native.mjs` (new)
 - `apps/browser-service/scripts/build-native.test.mjs` (new)
 - `apps/browser-service/scripts/check-atomic-publication-rollback.mjs` (new)
