@@ -29,7 +29,7 @@ Vitest 4.1.9, Playwright 1.61.1.
 
 ## Scope, prerequisites, and dirty-worktree rules
 
-Authoritative contract is committed spec `f18e5b275`:
+Authoritative contract is committed spec `ef47b9794`:
 `docs/superpowers/specs/2026-07-22-atomic-directory-publication-design.md`.
 Do not edit that spec while executing this plan.
 
@@ -159,7 +159,12 @@ ownership, and image/server/start acceptance is explicitly deferred.
   and standalone errno test.
 - `native/toolchain-allowlist.json` — Task-4-owned closed tool policy with
   complete concrete `amd64`/`arm64` Docker-init identity tuples.
-- `scripts/run-native-build.mjs` — umask/build-root/flock owner.
+- `scripts/run-native-build.mjs` — umask/build-root owner that retains the
+  lock OFD across separate acquisition and builder children.
+- `scripts/native-build-gcc-probe.test.mjs` — isolated, non-subreaper,
+  direct-compiler fd-9 inheritance probe.
+- `scripts/native-build-lock-orphan.fixture.mjs` — canonical test-only
+  descendant used by the controlled post-ready orphan proof.
 - `scripts/build-native.mjs` — direct compiler/linker, depfile parsing, complete
   tool/input attestations, fixed atomic outputs, unconditional rebuild.
 - `src/atomic-directory-publication-native.ts` — fixed artifact/checksum/ELF/
@@ -179,7 +184,7 @@ ownership, and image/server/start acceptance is explicitly deferred.
 
 ### Task 1: Build and load the split native boundary deterministically
 
-**Files:**
+**Files (19 paths):**
 - Create: `apps/browser-service/native/atomic-directory-publication-addon.c`
 - Create: `apps/browser-service/native/atomic-directory-publication-errors.c`
 - Create: `apps/browser-service/native/atomic-directory-publication-errors.h`
@@ -189,6 +194,8 @@ ownership, and image/server/start acceptance is explicitly deferred.
 - Create: `apps/browser-service/native/toolchain-allowlist.json`
 - Create: `apps/browser-service/scripts/run-native-build.mjs`
 - Create: `apps/browser-service/scripts/run-native-build.test.mjs`
+- Create: `apps/browser-service/scripts/native-build-gcc-probe.test.mjs`
+- Create: `apps/browser-service/scripts/native-build-lock-orphan.fixture.mjs`
 - Create: `apps/browser-service/scripts/build-native.mjs`
 - Create: `apps/browser-service/scripts/build-native.test.mjs`
 - Create: `apps/browser-service/src/atomic-directory-publication-native.ts`
@@ -222,22 +229,229 @@ foreign compiler, missing/wrong flock, malformed allowlist, direct compiler
 script invocation, concurrent runner serialization, lock timeout, killed-run
 staging recovery, and symlink/foreign-owner build entries.
 
-Lock tests require no-follow open of the exact lock leaf with numeric
+Lock tests require no-follow open of exact lock leaf with numeric
 `O_RDWR|O_CREAT|O_NOFOLLOW`, `0600`, then regular-file/current-uid/mode/link-
-count-one proof. Assert `/usr/bin/flock --no-fork --exclusive --timeout 60 9
-<real-node22> scripts/build-native.mjs <target>`, exact
-`ATOMIC_BUILD_LOCK_FD=9`, and Node `stdio` of stdin `ignore`, stdout/stderr
-`inherit`, fds 3..8 `ignore`, fd 9 mapped from the held lock. Every spawned
-probe/compiler/linker/test/loader child must map fd 9 to child fd 9; real exec
-probes prove it exists with `FD_CLOEXEC` clear in build script, compiler driver,
-and pinned subtool.
+count-one proof. Assert synchronous acquisition child argv exactly
+`/usr/bin/flock --exclusive --timeout 60 9`, with no command or
+process-replacement option. Its stdio is stdin `ignore`, stdout/stderr
+`inherit`, fds 3..8 `ignore`, and fd 9 mapped from runner-retained lock fd.
+Only status zero continues. Signal, nonzero/timeout, post-acquisition
+revalidation failure, or builder spawn failure must verified-close runner fd,
+spawn no builder or later child where applicable, and perform zero staging
+inspection/removal/mutation.
 
-Use a deterministic inherited-pipe barrier: compiler driver forks/execs a
-descendant retaining fd 9, then tests SIGKILL runner, build script, and driver
-variants. A contender must time out with zero staging inspection/removal until
-the descendant signals exit and closes fd 9; it then acquires, discards exact
-stale staging, and fully rebuilds. Driver failure spawns nothing later and
-leaves staging untouched for the next lock owner.
+After helper exits zero, prove runner's same OFD still excludes a separately
+opened contender. Revalidate retained fd, then separately spawn exact
+`<real-node22> scripts/build-native.mjs <target>` with the same 3..8/9 mapping
+and a fresh null-prototype environment containing exactly
+`PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
+`SOURCE_DATE_EPOCH=1`, and `ATOMIC_BUILD_LOCK_FD=9`. Retain the runner
+duplicate until builder termination and verified-close it. Every spawned
+probe/compiler/linker/test/loader child maps fd 9 to child fd 9.
+
+Before lock acquisition, reject inherited `NODE_OPTIONS`, `NODE_PATH`, every
+other case-insensitive `NODE_*` key, `TMPDIR`, `TMP`, `TEMP`, and every
+compiler-injection key/family listed in the spec. Builder and every compiler
+identity, compile, link, gcc-probe, executable, and loader spawn rebuild the
+same exact six-key environment in a fresh null-prototype object; none spreads
+`process.env`. Capture tests compare the complete key/value set byte-for-byte
+and prove `TMPDIR`, `TMP`, and `TEMP` are absent. Inject each named key,
+representative lowercase/mixed-case `NODE_*` keys, and one member of every
+closed compiler family; require rejection before flock, staging inspection, or
+child spawn.
+
+The production addon exposes exactly the three properties above. The fixed
+test addon exposes those same three plus one frozen `testHooks` property whose
+only properties are:
+
+```text
+becomeChildSubreaperForTest
+claimAdoptedChildForTest
+reapClaimedChildForTest
+```
+
+`becomeChildSubreaperForTest()` is synchronous and verifies
+`PR_SET_CHILD_SUBREAPER`/`PR_GET_CHILD_SUBREAPER`.
+`claimAdoptedChildForTest(evidence)` is synchronous, accepts only the closed
+role/pid/starttime/Node executable+hash/script+hash/fd9/adoptive-parent evidence
+record, verifies current direct-child adoption and exact `/proc` identity,
+opens/binds a pidfd, and returns only an opaque module-private handle that is
+the idempotency key for one reap job. `reapClaimedChildForTest(handle,
+exactPolicy)` is asynchronous and accepts only `2000/1000/1000` millisecond
+graceful/TERM/KILL bounds. Same handle plus byte-identical policy retrieves
+strict same Promise while starting, pending, or settled; mismatched policy or
+foreign/finalized handle rejects without modifying that job. The one job
+releases only the bound pidfd child, exact-PID reaps it without blocking Node's
+event loop, and returns the closed exit/signal union. Test shape/link tests
+reject these properties and symbols from production and require them in the
+test artifact. Test-addon files and symbols never enter the final image.
+
+Export only module seam `runNativeBuildOrphanFixtureForTest()` from
+`run-native-build.mjs`. It accepts no executable, argv, environment, target,
+timeout, path, token, or callback and reuses the exact production lock open,
+validation, fd mapping, synchronous no-command flock acquisition, result
+check, post-acquisition validation, wait, and verified-close implementation.
+It requires direct module invocation by canonical
+`scripts/run-native-build.test.mjs`, exact inherited `VITEST=true`, a
+test-addon call to `becomeChildSubreaperForTest()`, and canonical no-follow
+fixture identity. Production CLI accepts only `production|all`, rejects every
+`ATOMIC_BUILD_LOCK_TEST_*` and `ATOMIC_BUILD_LOCK_FIXTURE_*` key, never selects
+the seam, and resolves only `scripts/build-native.mjs`.
+
+The orphan harness creates one private mode-`0700` `fs.mkdtemp()` directory.
+It preflights fixed `/usr/bin/mkfifo` ownership/mode/realpath/hash and invokes
+exact argv `/usr/bin/mkfifo --mode=0600 -- <ready> <release>` without shell.
+Require distinct current-uid, mode-`0600`, link-count-one FIFO leaves. Use
+temporary `O_RDWR|O_NONBLOCK|O_NOFOLLOW` anchors only to rendezvous blocking
+ready-reader/release-writer harness endpoints with blocking ready-writer/
+release-reader fixture endpoints. Bind all endpoints by `fstat`, close anchors
+and unused duplicates, unlink names, and remove the empty directory while live
+descriptors remain the sole authority.
+
+Fixture mode spawns canonical fixture role `driver` with ready-write fd 3,
+release-read fd 4, lock fd 9, and exact driver environment
+`PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
+`ATOMIC_BUILD_LOCK_FD=9`, and
+`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`. Driver execs the same canonical
+fixture as role `descendant`, changes role to `descendant`, adds only canonical
+decimal `ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`, closes its fd 3/4 duplicates,
+retains fd 9, and waits. Descendant validates exact argv/environment, role,
+driver relationship, FIFO directions/nonaliasing, and lock identity. It emits
+the spec's exact canonical ready record with role
+`orphan_lock_descendant_v1`, driver/descendant pid+starttime, canonical Node
+and script identities/hashes, and fd9 device/inode/CLOEXEC-false evidence;
+then closes fd 3 and blocks on fd 4.
+
+Harness owns one monotonic orphan-cleanup record. `claimState` is exactly
+`unclaimed | claimed_unconsumed | reap_pending | reaped`; independent
+`releaseState` is exactly `not_attempted | written | closed | failed`.
+`unclaimed` carries one-way `claimAttempted`; `claimed_unconsumed` stores the
+one opaque handle; `reap_pending` stores the one idempotently retrieved native
+Promise; `reaped` stores its canonical result. Wrapper also owns
+`reapState: not_attempted | starting | pending | settled`, one-way
+`reapAttempted`, exact fixed policy, returned-Promise slot, and settled
+result/rejection slot.
+
+Release write owns independent one-way `releaseWriteAttempted` and
+`releaseWriteResult: not_attempted | written | failed`. Write failure stores
+exact errno or stable short-write code and remains terminal. Independent
+`releaseWriterCloseAttempted` plus
+`releaseWriterCloseResult: not_attempted | closed | failed` govern close
+regardless of release state. Set every FIFO endpoint's one-way close-attempt
+bit before its close boundary; each owner attempts close at most once.
+
+Success first validates ready record/live driver relationship, then SIGKILLs
+the driver only through its existing Node `ChildProcess` handle. Await that
+handle and runner settlement, require the retained runner lock duplicate truly
+closed using the saved-fd `EBADF` and `/proc/self/fd` identity scan, then wait
+at most monotonic `2000ms` for actual direct adoption by the harness subreaper
+while descendant and fd 9 remain live. Revalidate full Node executable,
+fixture script, pid/starttime, environment, adoptive-parent, and fd9 evidence;
+set `claimAttempted` before the synchronous native call. Only its acknowledged
+opaque return advances `unclaimed -> claimed_unconsumed`.
+
+Only after claim acknowledgement run the nonblocking contention proof. Then,
+if `releaseWriteAttempted=false`, set it true and in the same synchronous
+no-yield JavaScript turn call `fs.writeSync`/`write(2)` with exact byte `0x01`.
+Exact count one records `releaseWriteResult=written` and
+`releaseState=written`; error or short count records terminal failure. No
+Promise, callback, or pending-write state exists. Independently set
+`releaseWriterCloseAttempted=true` before the sole close and record its result;
+successful close advances `written -> closed`, close failure advances
+`written -> failed`, and write failure remains terminal `failed` while
+retaining the separate close result.
+
+After that close attempt, set `reapAttempted=true` and
+`reapState=starting` before calling native with stored opaque handle and exact
+literal `2000/1000/1000` policy. Native atomically creates at most one reap job
+and Promise keyed by that handle+policy. Same handle plus byte-identical policy
+while starting, pending, or settled returns strict `===` Promise identity and
+never repeats signal/wait. In the same JS run-to-completion turn, store the
+returned Promise, set wrapper `pending`, and record claim `reap_pending` before
+await/callback. Canonical resolution records wrapper `settled` then claim
+`reaped`; happy path requires exact-PID exit zero.
+
+Repeated cleanup dispatches only by phase:
+
+- `unclaimed`: when `claimAttempted=false`, set it before I/O; close ready
+  reader once, terminate/await only the canonical driver handle, await runner,
+  then bounded-adopt, revalidate live evidence, and claim exactly once. A
+  failed attempt remains `unclaimed` with recorded failure and never retries.
+- `claimed_unconsumed`: never repeat driver/adoption/evidence/fd9/claim.
+  When write is unattempted, set `releaseWriteAttempted` before one synchronous
+  exact-byte write; result storage may lag the attempt, but reentry never
+  writes again. Independently attempt writer close at most once. Then
+  initialize or recover wrapper reap: `not_attempted` sets
+  `reapAttempted`/`starting` before native; `starting` calls native again with
+  identical handle/policy solely to retrieve strict same Promise, stores it,
+  and advances `pending`; `pending` awaits only stored Promise; `settled`
+  returns stored result/rejection.
+- `reap_pending`: await only the stored Promise. Perform no driver, adoption,
+  evidence, fd9, claim, release, signal, or new native reap job. Resolution
+  records wrapper `settled`; rejection retains same Promise/rejection and
+  native exact-PID cleanup ownership.
+- `reaped`: return stored result and perform only identity-proved idempotent
+  descriptor/temp cleanup, with every close-attempt bit suppressing retries.
+
+After release starts, absent fd9, exit, or zombie state is valid and causes no
+return to live evidence. Pre-claim failure performs zero release write/close,
+raw signal, or raw/generic wait and reports honest cleanup failure. Post-claim
+release write/close failure still starts or retrieves only that handle's fixed
+native job/Promise. Final KILL-timeout keeps the test process alive on the one
+stored native Promise until exact reaping; it never starts another claim or
+native reap job. Production builder/compiler descendants receive no fixture
+selector or FIFO control fd.
+
+Inject failure/cancellation after ready, driver exit, adoption, evidence,
+claim acknowledgement, contention, release write, release close, Promise
+creation, pending Promise, and resolution. Bracket every transition and
+close-attempt bit. Synchronous-write injections run before
+`releaseWriteAttempted`, after its bit but before `writeSync`, after syscall
+before result storage, and after stored success/errno/short-count; only the
+first permits one write, every later reentry performs zero writes, and no async
+write state exists. Independently inject before/after close-attempt bit/syscall/
+result and prove write failure still closes once while a set close bit never
+closes twice.
+
+Reap-start injections run before `reapAttempted`, after wrapper `starting`,
+after native job/Promise creation, after native return before wrapper storage,
+after wrapper `pending`, and after settlement. Starting reentry with identical
+handle/policy must return strict `===` Promise and preserve one native job,
+policy, signal/wait sequence, and result/rejection. Test foreign/finalized/
+forged handles, every mismatched policy field, same-policy pending/settled
+retrieval, graceful exit, TERM, KILL, KILL-timeout retention, native claim/reap
+identity mismatch, and native resource/state-transition failures. Mismatch
+must not change original job, Promise identity, policy, result, pidfd, or
+resource counters.
+
+Require pidfd/async-work closure once after exact reap, retain only settled
+Promise/result until handle finalization, then release job references exactly
+once. Reenter cleanup from every captured phase and prove no repeated driver
+await, adoption, fd9 check, claim, write, close, native job creation, or signal.
+Stored `reaped` cleanup is identical and mutation-free on two repeats.
+
+Create separate `scripts/native-build-gcc-probe.test.mjs`. Run it first in a
+fresh Vitest process that never loads the test addon and never becomes a
+subreaper. After a normal production build provides compiler attestation, it
+acquires the production lock OFD and directly spawns the attested compiler
+with exact argv
+`<compiler> -x c -std=c11 -c <private>/source.fifo -o <private>/probe.o`, the
+same exact six-key compiler environment, and fd 9 mapped. A private verified
+mode-`0600` source FIFO plus one tracked asynchronous writer-open Promise
+blocks real `cc1`. Bind gcc and `cc1` pid/starttime, executable hashes,
+parentage, exact FIFO-bearing cmdline, and fd9 device/inode/CLOEXEC-false;
+require lock contention.
+
+The direct compiler probe uses the spec's non-overridable
+`5000/5000/2000/2000/5000` millisecond rendezvous/graceful/TERM/KILL/residual
+bounds and an event-driven state machine. Release exact source
+`int atomic_fd9_probe;\n` before any escalation, settle every writer Promise,
+handle early gcc exit with a saved-identity cancellation reader, signal only
+the direct gcc `ChildProcess` handle, and identity-scan residual `cc1` until
+gone. Require gcc exit zero and a valid relocatable `probe.o` on the happy
+path. Close all FIFO descriptors and remove only verified FIFO/output/private
+directory state after bounded cleanup. This direct non-subreaper proof cannot
+be replaced by the orphan fixture.
 
 `native/toolchain-allowlist.json` tests require exact top-level
 `schemaVersion:1` and `dockerInit`, with only concrete `amd64` and `arm64`
@@ -301,8 +515,9 @@ object with exact macros `-DATOMIC_PUBLISH_ERRNO_VARIANT_DISTINCT=1` and
 supplies its own synthetic `ENOTSUP`/`EOPNOTSUPP` values, rejects both/neither
 macros, and exercises the real conditional case graph without duplicate C
 cases. `main.o` calls both renamed symbols and requires identical unsupported
-mapping for alias and distinct constants. Production and test addons expose
-the same exact three properties; test barriers use inherited fds only.
+mapping for alias and distinct constants. Production addon exposes exactly
+three properties. Test addon exposes those three plus exact frozen
+`testHooks`; orphan cleanup uses only its closed evidence/opaque-handle API.
 
 Production loader always resolves its package-relative fixed Release artifact
 and accepts no path, environment selector, or test hook. Shape failures call
@@ -316,13 +531,14 @@ barrier child; that test-only loader is not exported or reachable in runtime.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
-cd apps/browser-service
-node --test scripts/run-native-build.test.mjs scripts/build-native.test.mjs src/runtime-preflight.test.mjs
-corepack pnpm exec vitest run src/atomic-directory-publication-native.test.ts
+pnpm --dir apps/browser-service exec vitest run scripts/native-build-gcc-probe.test.mjs
+pnpm --dir apps/browser-service exec vitest run scripts/run-native-build.test.mjs
+node --test apps/browser-service/scripts/build-native.test.mjs apps/browser-service/src/runtime-preflight.test.mjs
+pnpm --dir apps/browser-service exec vitest run src/atomic-directory-publication-native.test.ts
 ```
 
 Expected: FAIL because native sources, runner, compiler script, loader, and
-revised preflight do not exist.
+revised preflight, isolated compiler probe, and orphan fixture do not exist.
 
 - [ ] **Step 3: Implement runner and unconditional direct build**
 
@@ -334,27 +550,54 @@ and 1..128-byte ASCII leaves matching
 backslash, `.`, and `..`. It `fstat`s both directory fds, requires equal device,
 requires equal available `STATX_MNT_ID`, and invokes only
 `renameat2(..., RENAME_NOREPLACE)`. Return `undefined` only on success and
-expose stable code without raw errno/path/fd text. Test hooks bracket the real
-syscall on inherited fds and add no export or runtime selector.
+expose stable code without raw errno/path/fd text. Production exports nothing
+else. The test addon adds only frozen `testHooks` with the exact synchronous
+subreaper/claim and asynchronous opaque-handle reap API from Step 1.
 
-`run-native-build.mjs` accepts only `production|all`, sets umask `0077`, creates
-exact `build/` with Node APIs, no-follow opens exact lock leaf with numeric
+`run-native-build.mjs` accepts only `production|all`, runs closed inherited
+environment rejection before any child/filesystem action, sets umask `0077`,
+creates exact `build/` with Node APIs, and no-follow opens exact lock leaf with
+numeric
 `O_RDWR|O_CREAT|O_NOFOLLOW` and mode `0600`, and proves the locked record shape
-from Step 1. Verify fixed `/usr/bin/flock` plus `--no-fork`, then spawn this
-exact argv with no shell:
+from Step 1. Retain opened lock fd and synchronously spawn fixed
+`/usr/bin/flock` with this exact argv, no command, and no shell:
 
 ```text
-/usr/bin/flock --no-fork --exclusive --timeout 60 9
-<real-node22> scripts/build-native.mjs <production|all>
+/usr/bin/flock --exclusive --timeout 60 9
 ```
 
-Set exact `ATOMIC_BUILD_LOCK_FD=9`. Spawn stdio is `["ignore", "inherit",
-"inherit", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore",
-heldLockFd]`. Retain the parent duplicate until child termination, then
-verified-close it. Locked `build-native.mjs` rejects before mutation unless env
-is exactly `9`, `fstatSync(9)` matches the runner record, and `/proc/self/fd/9`
-exists. It propagates fd 9 at index 9 through every descendant, with 3..8
-ignored; neither script closes fd 9.
+Acquisition child stdio is `["ignore", "inherit", "inherit", "ignore",
+"ignore", "ignore", "ignore", "ignore", "ignore", heldLockFd]`. Wait for
+helper exit. On signal or any nonzero result, perform no staging access or
+builder spawn, verified-close retained fd, and fail. On status zero, revalidate
+retained fd against original lock record, then separately spawn exact
+`<real-node22> scripts/build-native.mjs <production|all>` with same stdio
+mapping and the exact six-key sanitized environment from Step 1. Retain runner
+duplicate until builder termination, then verified-close it. Builder spawn
+failure likewise closes retained fd without staging inspection. Both mappings
+duplicate one continuously retained OFD; never unlock/reacquire.
+
+Locked `build-native.mjs` rejects before mutation unless its complete
+environment is the exact six-key set, `ATOMIC_BUILD_LOCK_FD` is exactly `9`,
+`fstatSync(9)` matches runner record, and `/proc/self/fd/9` exists. It
+propagates fd 9 at index 9 through every descendant, with 3..8 ignored; neither
+script closes fd 9. The separate non-subreaper direct-compiler FIFO process
+verifies inherited fd 9 in actual gcc/compiler driver and pinned `cc1`; the
+closed orphan fixture cannot satisfy this gate.
+
+Implement the test-only module seam, canonical fixture, named-FIFO harness,
+subreaper activation, synchronous adopted-child claim, opaque handle, and
+asynchronous exact-PID reap from Step 1. Share production lock open,
+validation, fd mapping, synchronous no-command acquisition, result,
+revalidation, wait, and verified-close code. Guard the seam before lock open
+with canonical caller/fixture identity and exact `VITEST=true`. Production CLI
+cannot select or parameterize the seam and rejects every fixture/test selector.
+Implement one cleanup dispatcher over the exact `claimState`, `releaseState`,
+claim-attempt, release-write-attempt/result, release-close-attempt/result,
+wrapper `reapState`/`reapAttempted`/Promise/result, and endpoint-close-attempt
+fields from Step 1. Record each state/attempt before its external boundary.
+Never re-derive cleanup phase from `/proc`, descriptor liveness, or Promise
+state. Native owns handle+policy idempotency and strict same-Promise retrieval.
 
 Every build-script spawn declares its whole stdio array: stdin `ignore`, fds
 3..8 `ignore`, fd 9 mapped to inherited 9. Probe/compile/test/loader stdout and
@@ -369,6 +612,13 @@ require that realpath under `/usr/bin`, and bind its bytes/version. Derive
 headers only from real Node 22
 `process.execPath`. Compile every selected translation unit and relink every
 selected output on every run; attestations are never cache keys.
+
+Construct every builder/compiler/probe child environment from a shared
+null-prototype function returning exactly the six keys and values in Step 1.
+Never inherit, spread, or forward another key. Validate the closed inherited
+environment rejection before flock or compiler selection. Generated compiler
+argv rejects `-specs`, `--specs`, `-fplugin*`, `-B`, and response-file
+operands. Do not set or accept `TMPDIR`, `TMP`, or `TEMP`.
 
 Under the lock require fixed staging root
 `build/.atomic-directory-publication-stage/` absent, then create it and exact
@@ -560,20 +810,27 @@ outputs.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
-cd apps/browser-service
-node scripts/run-native-build.mjs all
-node --test scripts/run-native-build.test.mjs scripts/build-native.test.mjs src/runtime-preflight.test.mjs src/lockfile.test.mjs
-node --test --test-name-pattern='proves concrete amd64 and arm64 dockerInit tuples' scripts/build-native.test.mjs
-node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run src/atomic-directory-publication-native.test.ts
-node scripts/run-native-build.mjs production
-node src/runtime-preflight.mjs --phase=prestart
-corepack pnpm build
+node apps/browser-service/scripts/run-native-build.mjs all
+pnpm --dir apps/browser-service exec vitest run scripts/native-build-gcc-probe.test.mjs
+pnpm --dir apps/browser-service exec vitest run scripts/run-native-build.test.mjs
+node --test apps/browser-service/scripts/build-native.test.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs
+node --test --test-name-pattern='proves concrete amd64 and arm64 dockerInit tuples' apps/browser-service/scripts/build-native.test.mjs
+node apps/browser-service/scripts/run-native-build.mjs all
+pnpm --dir apps/browser-service exec vitest run src/atomic-directory-publication-native.test.ts
+node apps/browser-service/scripts/run-native-build.mjs production
+node apps/browser-service/src/runtime-preflight.mjs --phase=prestart
+pnpm --dir apps/browser-service build
 ```
 
 Expected: standalone errno runner exits zero; runner/build/preflight/loader
-tests PASS; both concrete Docker-init platform probes PASS without skip; both
-addon shapes PASS; runtime checksum PASS; build PASS.
+tests PASS; isolated non-subreaper real gcc/`cc1` fd-9 proof PASS before the
+separate subreaper orphan process; controlled post-ready orphan adoption,
+opaque claim, contention, FIFO release, phase reentry, injected write/close/
+claim/reap failures, graceful/TERM/KILL/KILL-timeout, and async exact-PID reap
+PASS; identical handle/policy calls return strict same Promise while forged/
+foreign/finalized handles and wrong policies reject; both concrete
+Docker-init platform probes PASS without skip; production exact-three and test
+exact-four/nested-three addon shapes PASS; runtime checksum and build PASS.
 
 - [ ] **Step 5: Review and commit exact Task 1 files**
 
@@ -581,7 +838,7 @@ Run requirements review, then quality review. Fix through same implementer and
 repeat GREEN plus both reviews until both pass.
 
 ```bash
-git add .gitignore apps/browser-service/native/atomic-directory-publication-addon.c apps/browser-service/native/atomic-directory-publication-errors.c apps/browser-service/native/atomic-directory-publication-errors.h apps/browser-service/native/atomic-directory-publication-test-hooks.c apps/browser-service/native/atomic-directory-publication-test-hooks.h apps/browser-service/native/atomic-directory-publication-errors.test.c apps/browser-service/native/toolchain-allowlist.json apps/browser-service/scripts/run-native-build.mjs apps/browser-service/scripts/run-native-build.test.mjs apps/browser-service/scripts/build-native.mjs apps/browser-service/scripts/build-native.test.mjs apps/browser-service/src/atomic-directory-publication-native.ts apps/browser-service/src/atomic-directory-publication-native.test.ts apps/browser-service/src/runtime-preflight.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/package.json
+git add .gitignore apps/browser-service/native/atomic-directory-publication-addon.c apps/browser-service/native/atomic-directory-publication-errors.c apps/browser-service/native/atomic-directory-publication-errors.h apps/browser-service/native/atomic-directory-publication-test-hooks.c apps/browser-service/native/atomic-directory-publication-test-hooks.h apps/browser-service/native/atomic-directory-publication-errors.test.c apps/browser-service/native/toolchain-allowlist.json apps/browser-service/scripts/run-native-build.mjs apps/browser-service/scripts/run-native-build.test.mjs apps/browser-service/scripts/native-build-gcc-probe.test.mjs apps/browser-service/scripts/native-build-lock-orphan.fixture.mjs apps/browser-service/scripts/build-native.mjs apps/browser-service/scripts/build-native.test.mjs apps/browser-service/src/atomic-directory-publication-native.ts apps/browser-service/src/atomic-directory-publication-native.test.ts apps/browser-service/src/runtime-preflight.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/package.json
 git diff --cached --name-only
 apps/api/.husky/_/pre-commit
 git diff --cached --name-only
@@ -589,10 +846,11 @@ git diff --cached --check
 git commit -m "feat: build atomic publication addon" -m "Compile split native sources with the fixed host toolchain and attest
 every dependency, tool, link input, and runtime artifact.
 
-Serialize unconditional builds and reject incompatible runtime loading."
+Retain one lock OFD across acquisition, builders, and compiler
+descendants while rejecting incompatible runtime loading."
 ```
 
-Expected cached names: exactly the 17 Task 1 paths; no original Task 4 file.
+Expected cached names: exactly the 19 Task 1 paths; no original Task 4 file.
 
 ### Task 2: Implement pure lifecycle and authenticated manifest codecs
 
@@ -641,7 +899,7 @@ flight semantic/effect/partial ID in durable bytes.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
-corepack pnpm exec vitest run src/atomic-publication-manifest.test.ts
+pnpm exec vitest run src/atomic-publication-manifest.test.ts
 ```
 
 Expected: FAIL because pure codec module does not exist.
@@ -659,8 +917,8 @@ Fixed-key canonical JSON has no whitespace and exactly one final newline.
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
-corepack pnpm exec vitest run src/atomic-publication-manifest.test.ts
-corepack pnpm build
+pnpm exec vitest run src/atomic-publication-manifest.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/atomic-publication-manifest.ts apps/browser-service/src/atomic-publication-manifest.test.ts
 git diff --cached --name-only
@@ -759,7 +1017,7 @@ WeakMaps and raw handles. Opaque `AnchoredRoot`, `BoundGeneration`, and
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run src/atomic-directory-publication.test.ts src/reconciliation.test.ts
+pnpm exec vitest run src/atomic-directory-publication.test.ts src/reconciliation.test.ts
 ```
 
 Expected: FAIL because reducer/effect protocol and reconciliation controller
@@ -843,8 +1101,8 @@ staging authority and construct reconciliation-owned fieldless
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run src/atomic-directory-publication.test.ts src/reconciliation.test.ts
-corepack pnpm build
+pnpm exec vitest run src/atomic-directory-publication.test.ts src/reconciliation.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/atomic-directory-publication.ts apps/browser-service/src/atomic-directory-publication.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts
 git diff --cached --name-only
@@ -892,7 +1150,7 @@ or privileged mutation here; those are deferred Task 6 Docker harness cases.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
+pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
 ```
 
 Expected: FAIL because mount/canary reducer states and effects are absent.
@@ -915,8 +1173,8 @@ manifest cursor. Cleaned canary cannot prove later work.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
-corepack pnpm build
+pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/atomic-directory-publication.ts apps/browser-service/src/atomic-directory-publication.test.ts apps/browser-service/src/atomic-directory-publication.integration.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts
 git diff --cached --name-only
@@ -993,7 +1251,7 @@ binding, or capability callback.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
+pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
 ```
 
 Expected: FAIL because private construction and persistence protocol are
@@ -1032,8 +1290,8 @@ adoption and public integration remain Task 6 work after deletion is GREEN.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-publication-manifest.test.ts src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
-corepack pnpm build
+pnpm exec vitest run --no-file-parallelism src/atomic-publication-manifest.test.ts src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/atomic-directory-publication.ts apps/browser-service/src/atomic-directory-publication.test.ts apps/browser-service/src/atomic-directory-publication.integration.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts
 git diff --cached --name-only
@@ -1094,7 +1352,7 @@ ProfileStore attachment; Task 7 installs those sealed capabilities.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts src/profile-store.test.ts
+pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts src/profile-store.test.ts
 ```
 
 Expected: FAIL because protected source move and cleanup cursor branches are
@@ -1124,8 +1382,8 @@ task may claim these behaviors GREEN.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts src/profile-store.test.ts
-corepack pnpm build
+pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/reconciliation.test.ts src/profile-store.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/atomic-directory-publication.ts apps/browser-service/src/atomic-directory-publication.test.ts apps/browser-service/src/atomic-directory-publication.integration.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts apps/browser-service/src/profile-store.ts apps/browser-service/src/profile-store.test.ts
 git diff --cached --name-only
@@ -1210,7 +1468,7 @@ traffic and keeps alerts private.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/atomic-publication-observability.test.ts src/reconciliation.test.ts src/startup-state.test.ts
+pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/atomic-publication-observability.test.ts src/reconciliation.test.ts src/startup-state.test.ts
 ```
 
 Expected: FAIL because complete recovery/adoption/startup/metrics branches are
@@ -1241,8 +1499,8 @@ retry. The prior installed generation, if any, is unchanged.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-publication-manifest.test.ts src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/atomic-publication-observability.test.ts src/reconciliation.test.ts src/startup-state.test.ts
-corepack pnpm build
+pnpm exec vitest run --no-file-parallelism src/atomic-publication-manifest.test.ts src/atomic-directory-publication.test.ts src/atomic-directory-publication.integration.test.ts src/atomic-publication-observability.test.ts src/reconciliation.test.ts src/startup-state.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/atomic-directory-publication.ts apps/browser-service/src/atomic-directory-publication.test.ts apps/browser-service/src/atomic-directory-publication.integration.test.ts apps/browser-service/src/atomic-publication-observability.ts apps/browser-service/src/atomic-publication-observability.test.ts apps/browser-service/src/reconciliation.ts apps/browser-service/src/reconciliation.test.ts apps/browser-service/src/startup-state.ts apps/browser-service/src/startup-state.test.ts
 git diff --cached --name-only
@@ -1293,7 +1551,7 @@ open. Playwright helper pages are not an egress oracle.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts src/profile-store.test.ts src/reconciliation.test.ts src/startup-state.test.ts
+pnpm exec vitest run --no-file-parallelism src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts src/profile-store.test.ts src/reconciliation.test.ts src/startup-state.test.ts
 ```
 
 Expected: FAIL until lifecycle uses finalized reconciliation-owned authority.
@@ -1311,8 +1569,8 @@ cleanup, and fail-stop semantics.
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 cd apps/browser-service
 node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts src/profile-store.test.ts src/reconciliation.test.ts src/startup-state.test.ts
-corepack pnpm build
+pnpm exec vitest run --no-file-parallelism src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts src/profile-store.test.ts src/reconciliation.test.ts src/startup-state.test.ts
+pnpm build
 cd ../..
 git add apps/browser-service/src/session-registry.ts apps/browser-service/src/session-registry.test.ts apps/browser-service/src/replay-restore.ts apps/browser-service/src/replay-restore.integration.test.ts apps/browser-service/src/egress-proxy.ts apps/browser-service/src/egress-proxy.test.ts
 git diff --cached --name-only
@@ -1409,25 +1667,27 @@ import, I/O import, authority/fd/path type in pure modules.
 
 ```bash
 export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
-cd apps/browser-service
-node scripts/run-native-build.mjs all
-node --test scripts/run-native-build.test.mjs scripts/build-native.test.mjs src/runtime-preflight.test.mjs src/lockfile.test.mjs scripts/check-atomic-publication-rollback.test.mjs
-node --test --test-name-pattern='proves concrete amd64 and arm64 dockerInit tuples' scripts/build-native.test.mjs
-node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication-native.test.ts src/atomic-directory-publication.integration.test.ts
-node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism src/atomic-publication-manifest.test.ts src/atomic-directory-publication.test.ts src/atomic-publication-observability.test.ts src/reconciliation.test.ts src/startup-state.test.ts src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts
-node scripts/run-native-build.mjs all
-corepack pnpm exec vitest run --no-file-parallelism
-node scripts/run-native-build.mjs production
-node src/runtime-preflight.mjs --phase=prestart
-corepack pnpm build
+node apps/browser-service/scripts/run-native-build.mjs all
+pnpm --dir apps/browser-service exec vitest run scripts/native-build-gcc-probe.test.mjs
+pnpm --dir apps/browser-service exec vitest run scripts/run-native-build.test.mjs
+node --test apps/browser-service/scripts/build-native.test.mjs apps/browser-service/src/runtime-preflight.test.mjs apps/browser-service/src/lockfile.test.mjs apps/browser-service/scripts/check-atomic-publication-rollback.test.mjs
+node --test --test-name-pattern='proves concrete amd64 and arm64 dockerInit tuples' apps/browser-service/scripts/build-native.test.mjs
+node apps/browser-service/scripts/run-native-build.mjs all
+pnpm --dir apps/browser-service exec vitest run --no-file-parallelism src/atomic-directory-publication-native.test.ts src/atomic-directory-publication.integration.test.ts
+node apps/browser-service/scripts/run-native-build.mjs all
+pnpm --dir apps/browser-service exec vitest run --no-file-parallelism src/atomic-publication-manifest.test.ts src/atomic-directory-publication.test.ts src/atomic-publication-observability.test.ts src/reconciliation.test.ts src/startup-state.test.ts src/profile-store.test.ts src/session-registry.test.ts src/replay-restore.integration.test.ts src/egress-proxy.test.ts
+node apps/browser-service/scripts/run-native-build.mjs all
+pnpm --dir apps/browser-service exec vitest run --no-file-parallelism
+node apps/browser-service/scripts/run-native-build.mjs production
+node apps/browser-service/src/runtime-preflight.mjs --phase=prestart
+pnpm --dir apps/browser-service build
 ```
 
 Expected: standalone errno runner, all bootstrap/native/reducer/controller/
-recovery/lifecycle tests, runtime checksum, and build PASS. Host tests make no
-different-UID, privileged mount, read-only mount, cross-mount, bind-mount-ID,
-named-volume, image, server, Compose, or activation claim.
+recovery/lifecycle tests, complete orphan phase/reentry/injection matrix,
+runtime checksum, and build PASS. Host tests make no different-UID, privileged
+mount, read-only mount, cross-mount, bind-mount-ID, named-volume, image, server,
+Compose, or activation claim.
 The two mandatory isolated Docker-init tuple probes claim only immutable base/
 OS/package/flock identity, not deferred Browser/init image acceptance.
 
@@ -1470,7 +1730,7 @@ with the init/Docker tests below and original Step 2 with their RED commands;
 then keep original Steps 3-5 in order. Replace original Docker Step 6 with the
 amended build/init implementation below, replace original Step 7 with exact
 image acceptance below, then perform one expanded original Step 8 commit. Net
-Task 6 files are:
+Task 6 scope is exactly these 11 paths:
 
 ```text
 apps/browser-service/src/streams.ts
@@ -1503,10 +1763,24 @@ corresponding original Steps 3-6:
    `firecrawl-browser-volume-v1\n` as `root:root/0600` with fsync. Validate mode
    performs zero create/chown/chmod/remove/rename/truncate/repair.
 3. Builder/test stages contain compiler/headers and run deterministic runner.
+   One tool stage acquires actual `pnpm` `10.33.0` only from literal
+   `https://registry.npmjs.org/pnpm/-/pnpm-10.33.0.tgz`, verifies literal SRI
+   `sha512-EFaLtKavtYyes2MNqQzJUWQXq+vT+rvmc58K55VyjaFJHp21pUTHatjrdXD1xLs9bGN7LLQb/c20f6gjyGSTGQ==`
+   before extraction, validates package version, fixed realpath, and direct
+   version output, then deletes the tarball. Builder/test stages copy that
+   verified extracted tree, create only the fixed direct symlink, and set
+   `WORKDIR /app/apps/browser-service`; Docker tests assert `pwd`, exact
+   realpath, direct `pnpm --version`, and package-relative Vitest resolution.
+   URL, SRI, version, destination, or symlink are not build args. No build or
+   acceptance command invokes Corepack or `npm install`.
    Final service image copies only production `.node`, runtime checksum, and
    application runtime—no compiler, headers, flock, util-linux, objects,
    depfiles, input attestations, test addon, maps/traces, build cache, or package
-   cache. Separate init target contains pinned util-linux/flock, Node 22, init
+   cache. It also excludes every test/fixture/FIFO file and rejects
+   `testHooks`, `becomeChildSubreaperForTest`,
+   `claimAdoptedChildForTest`, `reapClaimedChildForTest`, and
+   `orphan-ready-v1` from all runtime bytes. Separate init target contains
+   pinned util-linux/flock, Node 22, init
    script, allowlist, and no Browser server. Task 6 selects and verifies only
    the exact Task-4-owned `dockerInit[TARGETARCH]` tuple; it never generates,
    edits, widens, or commits `native/toolchain-allowlist.json`. Unsupported
@@ -1517,6 +1791,39 @@ corresponding original Steps 3-6:
 5. Docker harness owns different-UID collision/root-swap, privileged owner/mode
    drift, read-only mount, real cross-mount, same-device bind mount-ID, denied,
    disallowed filesystem, final UID `1000:1000`, and init preservation tests.
+
+The pinned Node tool stage has exact alias `browser-service-pnpm-tool` and runs
+this literal acquisition. `fetch` rejects redirects; the SRI comparison occurs
+before exclusive tarball creation/extraction:
+
+```Dockerfile
+RUN set -eu; \
+    mkdir -p /opt/pnpm/10.33.0; \
+    node --input-type=module -e 'import {createHash} from "node:crypto";import {writeFile} from "node:fs/promises";const url="https://registry.npmjs.org/pnpm/-/pnpm-10.33.0.tgz";const expected="sha512-EFaLtKavtYyes2MNqQzJUWQXq+vT+rvmc58K55VyjaFJHp21pUTHatjrdXD1xLs9bGN7LLQb/c20f6gjyGSTGQ==";const response=await fetch(url,{redirect:"error"});if(!response.ok)process.exit(1);const bytes=Buffer.from(await response.arrayBuffer());const actual=`sha512-${createHash("sha512").update(bytes).digest("base64")}`;if(actual!==expected)process.exit(1);await writeFile("/tmp/pnpm-10.33.0.tgz",bytes,{flag:"wx",mode:0o600})'; \
+    tar --extract --gzip --file /tmp/pnpm-10.33.0.tgz --directory /opt/pnpm/10.33.0 --strip-components=1; \
+    test "$(node -p 'require("/opt/pnpm/10.33.0/package.json").version')" = 10.33.0; \
+    ln -s /opt/pnpm/10.33.0/bin/pnpm.cjs /usr/local/bin/pnpm; \
+    test "$(realpath /usr/local/bin/pnpm)" = /opt/pnpm/10.33.0/bin/pnpm.cjs; \
+    test "$(/usr/local/bin/pnpm --version)" = 10.33.0; \
+    rm /tmp/pnpm-10.33.0.tgz
+```
+
+Each builder/test stage uses exactly:
+
+```Dockerfile
+COPY --from=browser-service-pnpm-tool /opt/pnpm/10.33.0 /opt/pnpm/10.33.0
+RUN ln -s /opt/pnpm/10.33.0/bin/pnpm.cjs /usr/local/bin/pnpm \
+    && test "$(realpath /usr/local/bin/pnpm)" = /opt/pnpm/10.33.0/bin/pnpm.cjs \
+    && test "$(/usr/local/bin/pnpm --version)" = 10.33.0
+WORKDIR /app/apps/browser-service
+```
+
+Dockerfile tests require exactly one `browser-service-pnpm-tool` stage plus
+exact literal URL/SRI/tree/symlink, and reject
+Corepack, npm/global installation, caller override, redirect following,
+pre-integrity extraction, mutable registry lookup, or a copied host pnpm.
+Final image requires `/opt/pnpm`, `/usr/local/bin/pnpm`, pnpm cache/store, and
+every pnpm package byte absent; direct `pnpm` resolution must fail.
 
 The Node base `FROM` uses the tuple's exact repository plus immutable index
 digest. Before package installation the stage proves its selected platform
@@ -1549,7 +1856,7 @@ RUN set -eu; \
 wildcard installation, missing base/platform/os/package/binary check, unknown
 architecture/field, or package acquisition outside this sequence. Builder,
 test, and init stages repeat all tuple checks after installation. Init target
-sets exact exec-form entrypoint:
+sets exact working directory plus exec-form entrypoint:
 
 Before either architecture build, the test reads the selected immutable tuple,
 requires every Node `FROM` equal the tuple's `nodeBaseRepository`, literal
@@ -1562,6 +1869,7 @@ check is mandatory and unskippable; Dockerfile and tests never write allowlist
 bytes.
 
 ```Dockerfile
+WORKDIR /app/apps/browser-service
 ENTRYPOINT ["/usr/bin/flock","--exclusive","--timeout","60","/var/lib/firecrawl-browser-volume","/usr/local/bin/node","scripts/init-state-volume.mjs"]
 ```
 
@@ -1594,8 +1902,9 @@ Dockerfile contains no variable or unresolved token.
 RED commands:
 
 ```bash
+export PATH=/home/mamba/.nvm/versions/node/v22.22.1/bin:$PATH
 node --test apps/browser-service/scripts/init-state-volume.test.mjs
-corepack pnpm --dir apps/browser-service exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
+pnpm --dir apps/browser-service exec vitest run src/streams.test.ts src/artifacts.test.ts src/server.test.ts src/dockerfile.test.ts
 ```
 
 GREEN/image acceptance runs as this one exact repository-root harness. It uses
@@ -1979,9 +2288,10 @@ for n in 1 2; do
   run_owned --user 0:0 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" "$init_image"
   run_owned --user 0:0 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" --entrypoint /bin/sh "$init_image" -ceu 'test "$(stat -c "%u:%g:%a" /var/lib/firecrawl-browser-volume)" = "0:1000:750"; test "$(stat -c "%u:%g:%a" /var/lib/firecrawl-browser-volume/state)" = "1000:1000:700"; test "$(stat -c "%u:%g:%a" /var/lib/firecrawl-browser-volume/.firecrawl-browser-initialized-v1)" = "0:0:600"; test "$(cat /var/lib/firecrawl-browser-volume/.firecrawl-browser-initialized-v1)" = "firecrawl-browser-volume-v1"; /usr/bin/flock --help >/dev/null'
   run_owned --user 1000:1000 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state --entrypoint node "$final_image" src/runtime-preflight.mjs --phase=prestart
-  run_owned --user 1000:1000 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e ATOMIC_IMAGE_CASE=native-and-mount --entrypoint corepack "$test_image" pnpm exec vitest run --no-file-parallelism src/atomic-directory-publication.integration.test.ts src/dockerfile.test.ts
+  run_owned --entrypoint /bin/sh "$test_image" -ceu 'test "$PWD" = /app/apps/browser-service; test "$(realpath "$(command -v pnpm)")" = /opt/pnpm/10.33.0/bin/pnpm.cjs; test "$(node -p "require(\"/opt/pnpm/10.33.0/package.json\").version")" = 10.33.0; test "$(pnpm --version)" = 10.33.0; test -x node_modules/.bin/vitest'
+  run_owned --user 1000:1000 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e ATOMIC_IMAGE_CASE=native-and-mount --entrypoint pnpm "$test_image" exec vitest run --no-file-parallelism src/atomic-directory-publication.integration.test.ts src/dockerfile.test.ts
   docker image inspect "$final_image" --format "{{.Config.User}}" | rg "^1000:1000$"
-  run_owned --entrypoint /bin/sh "$final_image" -ceu 'test -f build/Release/atomic_directory_publication.node; test -f build/Release/atomic-directory-publication.node.sha256; test ! -e /usr/bin/flock; test ! -e build/Test; test -z "$(find build -type f \( -name "*.o" -o -name "*.d" -o -name "*.map" -o -name "*.trace" -o -name "*.inputs.sha256" \) -print -quit)"; ! command -v gcc; ! command -v cc'
+  run_owned --entrypoint /bin/sh "$final_image" -ceu 'test -f build/Release/atomic_directory_publication.node; test -f build/Release/atomic-directory-publication.node.sha256; test ! -e /usr/bin/flock; test ! -e build/Test; test ! -e /opt/pnpm; test ! -e /usr/local/bin/pnpm; test ! -e /root/.local/share/pnpm; test ! -e /home/pwuser/.local/share/pnpm; test -z "$(find build -type f \( -name "*.o" -o -name "*.d" -o -name "*.map" -o -name "*.trace" -o -name "*.inputs.sha256" \) -print -quit)"; test -z "$(find . -type f \( -name "*test*" -o -name "*fixture*" -o -name "*.fifo" -o -name "pnpm.cjs" -o -name "pnpmrc" \) -print -quit)"; ! grep -aR -m1 -E "testHooks|becomeChildSubreaperForTest|claimAdoptedChildForTest|reapClaimedChildForTest|orphan-ready-v1" .; ! command -v gcc; ! command -v cc; ! command -v pnpm; ! command -v corepack'
   created_containers+=("$server")
   docker create --label "firecrawl.acceptance.namespace=${namespace}" --name "$server" --user 1000:1000 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e BROWSER_SERVICE_API_KEY=0123456789abcdef0123456789abcdef -e PORT=3010 "$final_image" >/dev/null
   docker start "$server" >/dev/null
@@ -2051,7 +2361,7 @@ for n in 1 2; do
   volume="${namespace}-state-${n}"
   test_image="${namespace}-test-${n}"
   for test_name in "different uid rejects held roots" "read only volume rejects startup" "cross mount rejects native publication" "same device bind mount id mismatch rejects publication" "privileged owner and mode drift fail stops" "denied parent rejects startup" "disallowed filesystem rejects startup"; do
-    run_owned --privileged --user 0:0 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e ATOMIC_IMAGE_CASE=privileged-mount --entrypoint corepack "$test_image" pnpm exec vitest run --no-file-parallelism src/dockerfile.test.ts -t "$test_name"
+    run_owned --privileged --user 0:0 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e ATOMIC_IMAGE_CASE=privileged-mount --entrypoint pnpm "$test_image" exec vitest run --no-file-parallelism src/dockerfile.test.ts -t "$test_name"
   done
 done
 
@@ -2271,10 +2581,21 @@ API-isolation, rollback, and persistent-canary acceptance pass."
   target locator digest, and entries.
 - [ ] Native build uses x64/arm64 allowlist, split translation units, unique
   staging depfiles, separately forced alias/distinct errno variants, inherited
-  fd-9 no-fork flock chain, exact staging-only compile/link/map/trace argv,
-  atomic checksum-last publication/recovery, unconditional second-build spawn
-  counts, pure/fixed-package loader validation, and a build immediately before
-  every addon load.
+  runner-retained fd-9 OFD across separate fixed-argv flock acquisition,
+  builder, and compiler descendants, exact staging-only compile/link/map/trace
+  argv, atomic checksum-last publication/recovery, unconditional second-build
+  spawn counts, pure/fixed-package loader validation, and a build immediately
+  before every addon load.
+- [ ] Closed orphan fixture guards canonical caller/fixture, verified named
+  FIFO endpoints, exact environments, and fd 9 identity. Cleanup monotonically
+  records `unclaimed -> claimed_unconsumed -> reap_pending -> reaped`,
+  independent release-write/close attempts, wrapper
+  `not_attempted -> starting -> pending -> settled`, and one native
+  handle+policy job/strict-same Promise across every success/failure reentry.
+  Deterministic ready/SIGKILL/adoption/synchronous
+  opaque claim/contention/FIFO release/asynchronous exact-PID reap cannot
+  replace the earlier separate non-subreaper real gcc/compiler-driver/`cc1`
+  fd-9 proof.
 - [ ] Task 1 commits complete concrete `amd64`/`arm64` `dockerInit` tuples and
   both isolated probes. Deferred Task 6 selects/verifies one tuple without
   editing the allowlist and extracts/compares addon plus checksum from two
@@ -2295,6 +2616,10 @@ API-isolation, rollback, and persistent-canary acceptance pass."
 - [ ] Deferred init owns trusted parent plus child state/profiles/staging,
   exact held fchown/chmod/fsync, marker, flock, validate-only preservation, and
   API-no-mount topology.
+- [ ] Deferred Task 6 acquires literal pnpm `10.33.0` tarball with pinned SRI,
+  verifies extracted version/realpath/direct execution, copies it only into
+  builder/test stages, sets exact test/init working directories, invokes no
+  Corepack acceptance path, and proves all pnpm files/cache absent at runtime.
 - [ ] Current rollback checker and metrics have exact owners; Task 6/14 only
   wire/copy/invoke them.
 - [ ] Local feature activation remains false until separate final Task 14
