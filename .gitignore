@@ -64,3 +64,5 @@ _local/
 
 
 apps/api/src/lib/scrape-interact/*.md
+
+/apps/browser-service/build/
