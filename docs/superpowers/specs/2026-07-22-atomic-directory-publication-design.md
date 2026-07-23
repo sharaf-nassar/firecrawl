@@ -1782,6 +1782,77 @@ Preflight requires compiled `napiVersion === 8` and numeric
 `process.versions.napi >= 8`, freezes the validated wrapper, and logs source as
 the constant `bundled_package_relative`; it never logs or accepts a path.
 
+Production service loading and `runtime-preflight.mjs` use the same
+inode-pinned synchronous loader exported by `runtime-preflight.mjs`; its
+direct-execution guard runs preflight, while
+`atomic-directory-publication-native.ts` imports only that closed loader
+function. Before touching the package leaf, it proves
+Linux procfs and the existing held-fd adapter: `/proc` has exact procfs magic,
+`/proc/self/fd` is accessible through the expected mount identity, and
+procfd-open/fstat round trips preserve a held descriptor's device/inode/type.
+It no-follow opens and holds the fixed package directory, then opens exact
+`atomic_directory_publication.node` through that held directory with numeric
+`O_RDONLY | O_NOFOLLOW`. It requires a current-uid, fixed-mode,
+link-count-one regular file and captures full bigint fstat identity including
+device, inode, size, mode, uid, gid, link count, mtime, and ctime.
+
+Checksum, ELF, and ABI validation read the held addon descriptor with
+positioned bounded reads; they never reopen the package pathname. The runtime
+checksum attestation is independently no-follow opened/held and parsed, and
+its SHA-256 must equal bytes hashed from the held addon inode. Before loading,
+the loader opens `/proc/self/fd/<heldAddonFd>` only for an identity probe,
+requires its fstat to equal the captured addon record, verifies fdinfo and
+procfs mount identity, then closes that probe while retaining the original
+addon fd.
+
+Node 22 documents loading from an ES module/custom flags as the direct
+`process.dlopen()` special case and requires a module object whose
+`module.exports` receives addon exports. The ESM loader therefore creates one
+module-private record with exactly one writable own property, `exports`,
+initially an extensible null-prototype object:
+
+```ts
+const moduleRecord = { exports: Object.create(null) };
+process.dlopen(
+  moduleRecord,
+  `/proc/self/fd/${heldAddonFd}`,
+  os.constants.dlopen.RTLD_NOW,
+);
+```
+
+Node 22 `process.dlopen()` is the sole load operation; the procfd string above
+is constructed only inside this loader and never returned/logged. The original
+addon fd remains open across `dlopen`. Immediately afterward, before reading
+exports, loader repeats procfs mount/fdinfo/procfd identity checks and requires
+the original addon's full fstat record unchanged. It does not re-open,
+re-stat, or require continued existence of the package pathname. A rename,
+unlink, or symlink replacement of that path therefore cannot select another
+inode.
+
+Only then does loader validate `moduleRecord.exports` as the exact
+three-property production ABI, create/freeze the path-free wrapper, and
+verified-close the checksum, addon, and held-directory descriptors. The raw
+module record and exports never escape. The frozen wrapper becomes visible
+only after every close succeeds; close-unverified is the existing global
+fail-stop.
+
+Direct `process.dlopen` intentionally bypasses CommonJS `require.cache`.
+Within one Node process the loader has exact
+`uninitialized | loading | loaded | failed` state. The first invocation is the
+only possible `dlopen`; a loaded repeat returns the same frozen wrapper
+identity, and a failed repeat returns the same frozen sanitized failure record
+without reopening or loading. Reentrant observation of `loading` fails closed.
+Runtime preflight and service startup may each load once only when they are
+separate Node process invocations; neither shares or fabricates a pathname
+cache entry.
+
+Every failure path closes each opened probe/attestation/addon/directory fd
+exactly once in reverse ownership order. Failure before `dlopen` executes no
+addon. `dlopen`, post-load identity, shape, or close failure permanently marks
+that loader invocation failed, exposes no exports, performs no fallback path
+load, and never retries. A partially initialized or shape-invalid addon can
+therefore make readiness fail but cannot become service authority.
+
 The separately linked test addon has exactly the production three properties
 plus one frozen `testHooks` property:
 
@@ -1910,16 +1981,28 @@ wait the TERM bound, send `SIGKILL` through that pidfd only if still live,
 then wait the final bound. It retries `EINTR` and uses exact
 `waitpid(pid, ..., WNOHANG)` after pidfd readiness to reap only the claimed
 child. Success returns the canonical frozen exit/signal union. Timeout after
-the KILL bound rejects with stable bounded-cleanup evidence, but the same
-native job retains the claim until an exact wait confirms reaping;
-test-process teardown cannot discard it. Test cancellation first releases the
-fixture FIFO, then retrieves/awaits this same Promise.
+the KILL bound rejects that same Promise with stable bounded-cleanup evidence
+as soon as the monotonic deadline is observed, regardless of whether exact
+reap has completed. Promise rejection is never delayed until reap.
+
+The first reap call also creates one separate ref'd native cleanup owner for
+the same pidfd/claim. Before the KILL deadline, Promise controller and cleanup
+owner share one serialized exact-wait state with no concurrent/double wait. If
+the child is reaped, the Promise settles normally and cleanup ownership ends.
+If the KILL deadline arrives first, ownership atomically transfers to the
+ref'd cleanup path, the Promise-side async work queues rejection and
+terminates, and only cleanup continues exact pidfd readiness plus
+`waitpid(pid, ...)`. The Promise worker may not remain blocked waiting for that
+reap before delivering rejection. The ref'd cleanup owner keeps the Node
+process alive and cannot be canceled/discarded by test teardown. Test
+cancellation first releases the fixture FIFO, then retrieves/awaits the same
+Promise; a deadline rejection still leaves native cleanup ownership active.
 
 After exact reap, native code closes pidfd and async resources exactly once,
 retains only the settled Promise/result reference needed for identical
 retrieval while the opaque handle remains live, and releases that reference
 and job record from the handle finalizer. A settled rejection with continuing
-exact-PID cleanup retains only resources required by that cleanup and releases
+exact-PID cleanup retains only the ref'd cleanup owner/resources and releases
 them after reap. No `waitpid(-1)`, generic adoption, sleep, or Node
 `ChildProcess` pid is accepted. Node-created flock, driver, compiler, builder,
 and contender children remain owned and reaped only by their libuv handles.
@@ -2471,9 +2554,10 @@ failure with driver/adoption/evidence state and does not claim the descendant
 was released or reaped. Bounded claim-policy escalation is used only after a
 claim handle exists. Release write or close failure after claim still starts
 or retrieves that handle's one fixed escalation. The final KILL-timeout case
-keeps the test process alive on the one stored native exact-PID Promise and
-reports the still-live pidfd evidence. This does not claim crash-proof
-cleanup, adoption from malformed evidence, or zero residue after whole-harness
+rejects the stored Promise at its deadline, reports still-live pidfd evidence,
+and keeps the test process alive through separate ref'd native exact-PID
+cleanup ownership until reap. This does not claim crash-proof cleanup,
+adoption from malformed evidence, or zero residue after whole-harness
 `SIGKILL`.
 
 Real gcc/`cc1` inheritance is a separate happy-path test, not an orphan
@@ -2863,6 +2947,28 @@ Real compiled-addon integration tests, not mocked rename results, cover:
 - native test binary exercising every errno mapping, including separate and
   aliased `ENOTSUP`/`EOPNOTSUPP` compilation branches and internal
   `atomic_publish_source_missing` for `ENOENT`;
+- Node-22 ESM loader integration opens the built production addon
+  `O_NOFOLLOW`, hashes the held inode, and successfully calls
+  `process.dlopen(moduleRecord, "/proc/self/fd/<heldFd>", RTLD_NOW)` while that
+  fd remains open. It requires
+  exact three-key exports and identical pre/post bigint fstat. Loader
+  cache tests require exactly one `dlopen`, same frozen wrapper identity on
+  repeat, same frozen failure on repeat, no `require.cache` entry, and
+  verified close on every pre/post-load failure.
+
+  A closed no-argument loader matrix copies the addon/checksum into private
+  package directories and performs fixed swaps after held-open/hash but before
+  `dlopen`: rename replacement, unlink plus invalid regular replacement, and
+  symlink to the distinct test addon. Every case loads the originally held
+  production device/inode, never the replacement; exact production exports
+  succeed, `/proc/self/maps` contains the held inode and excludes the unchecked
+  replacement inode, and test-addon-only initialization/exports remain absent.
+  Initial symlink, wrong procfs mount, procfd/fdinfo mismatch, held-inode
+  truncate/write metadata drift, checksum swap, shape drift, and close failure
+  all fail with zero fallback/retry. Barriers before and after `dlopen` prove
+  package pathname disappearance/replacement is neither reopened nor required,
+  while held-inode/procfd identity drift fails. An unchecked package-path inode
+  is never executed.
 - build-runner tests create `build/` before lock invocation. They first run
   exact command
   `pnpm --dir apps/browser-service exec vitest run scripts/native-build-gcc-probe.test.mjs`
@@ -2950,7 +3056,13 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   without changing the original job, Promise identity, policy, result, pidfd,
   or resource-close counters. Terminal tests require one pidfd/async-resource
   close after exact reap and only settled Promise/result retention until
-  handle finalization.
+  handle finalization. A native barrier holds exact reap beyond the post-KILL
+  monotonic deadline: the one Promise must reject at that deadline and an
+  event-loop heartbeat must run while the separate ref'd cleanup owner remains
+  active. Releasing the barrier then permits only that owner to perform exact
+  wait/reap and one resource close; process exit remains blocked until it
+  finishes. The Promise worker is required to have terminated at rejection and
+  cannot defer rejection until barrier release/reap.
 
   The earlier separate non-subreaper happy-path process directly spawns the
   attested gcc Node `ChildProcess` with fd9, the exact sanitized production
