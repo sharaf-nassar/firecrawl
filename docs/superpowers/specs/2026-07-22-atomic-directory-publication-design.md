@@ -1849,24 +1849,39 @@ with canonical fixture script realpath/hash and fixed descendant argv,
 device/inode with CLOEXEC clear. It opens a pidfd, binds it to the same live
 identity, records the exact direct-child claim in native state, and returns
 only after that claim is acknowledged. Any mismatch rejects without wait or
-signal. The returned module-private N-API External is opaque, single-use,
-non-forgeable, and accepted only by the same addon instance.
+signal. The returned module-private N-API External is opaque, non-forgeable,
+and accepted only by the same addon instance. The handle remains the opaque
+idempotency key for exactly one native reap job and any retrieval of that
+job's Promise.
 
-`reapClaimedChildForTest()` consumes that handle and accepts only the exact
-literal policy above. Its N-API Promise uses async work and never blocks Node's
-event loop: wait up to the graceful bound, send `SIGTERM` through the bound
-pidfd only if still live, wait the TERM bound, send `SIGKILL` through that
-pidfd only if still live, then wait the final bound. It retries `EINTR` and
-uses exact `waitpid(pid, ..., WNOHANG)` after pidfd readiness to reap only the
-claimed child. Success returns the canonical frozen exit/signal union.
-Timeout after the KILL bound rejects with stable bounded-cleanup evidence but
-retains the consumed claim internally until an exact wait confirms reaping;
+The first valid `reapClaimedChildForTest(handle, exactPolicy)` call atomically
+stores the exact policy and creates one native async job plus one N-API Promise
+before returning. Calls with the same handle and byte-identical policy while
+that job is starting, pending, or settled return the same JavaScript Promise
+identity and canonical result/rejection; they never create another job,
+duplicate authority, or repeat a signal/wait. A forged/foreign/finalized
+handle or any policy mismatch rejects without changing the existing job,
+Promise, policy, or child.
+
+That one Promise uses async work and never blocks Node's event loop: wait up to
+the graceful bound, send `SIGTERM` through the bound pidfd only if still live,
+wait the TERM bound, send `SIGKILL` through that pidfd only if still live,
+then wait the final bound. It retries `EINTR` and uses exact
+`waitpid(pid, ..., WNOHANG)` after pidfd readiness to reap only the claimed
+child. Success returns the canonical frozen exit/signal union. Timeout after
+the KILL bound rejects with stable bounded-cleanup evidence, but the same
+native job retains the claim until an exact wait confirms reaping;
 test-process teardown cannot discard it. Test cancellation first releases the
-fixture FIFO, then awaits this same escalation to completion. Every terminal
-path closes the pidfd/async resources and invalidates the handle exactly once.
-No `waitpid(-1)`, generic adoption, sleep, or Node `ChildProcess` pid is
-accepted. Node-created flock, driver, compiler, builder, and contender
-children remain owned and reaped only by their libuv handles.
+fixture FIFO, then retrieves/awaits this same Promise.
+
+After exact reap, native code closes pidfd and async resources exactly once,
+retains only the settled Promise/result reference needed for identical
+retrieval while the opaque handle remains live, and releases that reference
+and job record from the handle finalizer. A settled rejection with continuing
+exact-PID cleanup retains only resources required by that cleanup and releases
+them after reap. No `waitpid(-1)`, generic adoption, sleep, or Node
+`ChildProcess` pid is accepted. Node-created flock, driver, compiler, builder,
+and contender children remain owned and reaped only by their libuv handles.
 
 Production build/link/load rejects `testHooks` and all three hook symbols and
 remains the exact three-property ABI. Test-addon shape tests require exact four
@@ -2273,10 +2288,17 @@ Harness owns one monotonic orphan-cleanup record. Its `claimState` is exactly
 `releaseState` is exactly `not_attempted | written | closed | failed`.
 `unclaimed` also carries a one-way `claimAttempted` bit so a failed claim
 sequence is never retried. `claimed_unconsumed` stores the one opaque native
-handle, `reap_pending` stores the one Promise returned by consuming that
-handle, and `reaped` stores its canonical result. Release failure stores exact
-`write|close` stage and errno while remaining terminal `failed`; failed write
-is never retried. Independent `releaseWriterCloseAttempted` and
+handle, `reap_pending` stores the one idempotently retrieved native Promise,
+and `reaped` stores its canonical result. Wrapper reap startup has
+independent `reapState: not_attempted | starting | pending | settled`, a
+one-way `reapAttempted` bit, the exact fixed policy, and slots for the returned
+Promise and settled result/rejection.
+
+Release writing has independent one-way `releaseWriteAttempted` and
+`releaseWriteResult: not_attempted | written | failed` fields. Release failure
+stores exact `write|close` stage plus errno or stable short-write code while
+remaining terminal `failed`; failed/attempted write is never retried.
+Independent `releaseWriterCloseAttempted` and
 `releaseWriterCloseResult: not_attempted | closed | failed` fields govern
 descriptor close regardless of `releaseState`. The close-attempt bit is set
 before the close syscall boundary, and only a true bit suppresses a later
@@ -2296,15 +2318,23 @@ pid/starttime as adoptive parent. Only after the opaque claim handle is
 returned does a separately opened
 `/usr/bin/flock --exclusive --nonblock 9` contender have to report contention.
 Thus the only observed live holder is the claimed descendant's fd 9. Harness
-atomically records `claimed_unconsumed`, writes exact release byte `0x01`
-(`not_attempted -> written`), sets `releaseWriterCloseAttempted=true`, and
-closes the release writer (`written -> closed`,
-`releaseWriterCloseResult=closed`). Calling
-`reapClaimedChildForTest(handle, exactPolicy)` consumes the stored handle and
-records `reap_pending` before exposing/awaiting its one Promise. Descendant
-closes fd 4/fd 9 and exits zero; resolution records `reaped` with exact-PID
-exit zero. This test proves lock retention after the controlled post-ready
-parent kill.
+atomically records `claimed_unconsumed`, sets
+`releaseWriteAttempted=true`, and in that same synchronous no-yield turn calls
+`fs.writeSync`/`write(2)` for exact byte `0x01`. Exact return count one records
+`releaseWriteResult=written` and `releaseState=written`; error records exact
+errno and terminal `failed`. It then sets
+`releaseWriterCloseAttempted=true` and closes the release writer
+(`written -> closed`, `releaseWriterCloseResult=closed`).
+
+For reap startup, wrapper sets `reapAttempted=true` and
+`reapState=starting` before calling
+`reapClaimedChildForTest(handle, exactPolicy)`. In the same JavaScript
+run-to-completion turn it synchronously stores the returned Promise, advances
+wrapper state to `pending`, and records `claimState=reap_pending` before any
+await/callback can run. Descendant closes fd 4/fd 9 and exits zero; Promise
+resolution records wrapper `settled` and claim `reaped` with exact-PID exit
+zero. This test proves lock retention after the controlled post-ready parent
+kill.
 
 The guarantee is deliberately narrow. Unexpected driver failure before a
 valid ready record fails the test. Success, assertion failure, cancellation,
@@ -2321,24 +2351,35 @@ and repeated cleanup all dispatch only on the recorded phase:
   remains `unclaimed`, return the recorded cleanup failure without repeating
   driver wait, adoption, evidence, or claim.
 - `claimed_unconsumed`: never repeat driver handling, adoption, live evidence,
-  fd9 validation, or native claim. If release is `not_attempted`, attempt the
-  exact `0x01` write once, recording `written` or terminal `failed`. Write
-  failure never changes back from `failed` and never retries. Independently,
-  whenever `releaseWriterCloseAttempted=false`, the same invocation or any
-  reentry first sets it true, then issues the one close and records
-  `releaseWriterCloseResult=closed|failed`. Successful close advances
+  fd9 validation, or native claim. If `releaseWriteAttempted=false`, set it
+  true immediately before one synchronous no-yield `fs.writeSync`/`write(2)`
+  of exact byte `0x01`. Return count one records
+  `releaseWriteResult=written`; thrown error records `failed` plus exact errno;
+  any short count records terminal stable short-write failure. No Promise,
+  callback, or pending-write state exists. Once attempted is true, reentry
+  never writes again even if failure injection left result `not_attempted`.
+  Independently, whenever `releaseWriterCloseAttempted=false`, the same
+  invocation or any reentry first sets it true, then issues the one close and
+  records `releaseWriterCloseResult=closed|failed`. Successful close advances
   `written -> closed`; close failure advances `written -> failed`; after write
   failure, close result is recorded separately and `releaseState` remains
   `failed`. `releaseWriterCloseAttempted=true` is the only close no-op gate.
-  Thus a failure injected after write failure but before the close gate still
-  causes exactly one close attempt on reentry, while failure after the bit is
-  set never causes a second. Only after that close attempt, regardless of
-  release/write/close result, consume the existing claim handle exactly once
-  through `reapClaimedChildForTest(handle, exactPolicy)` and record
-  `reap_pending` before awaiting its fixed graceful/TERM/KILL escalation.
+
+  Only after that close attempt, initialize/recover reap startup. From
+  `reapState=not_attempted`, set `reapAttempted=true` and state `starting`
+  before calling native with the stored handle and exact policy; store its
+  returned Promise synchronously in the same JS turn, then set wrapper
+  `pending` and claim `reap_pending`. If failure is injected after native
+  return but before wrapper Promise storage, reentry sees `starting`, calls
+  native with the same handle/policy, receives the identical already-created
+  Promise, stores it, and advances to `pending`; it does not create a second
+  job or duplicate authority. `pending` only awaits that Promise. `settled`
+  returns the stored result/rejection without another native call.
 - `reap_pending`: perform no driver, adoption, evidence, fd9, claim, release,
-  signal, or new reap operation. Await only the already stored Promise; on its
-  canonical result advance once to `reaped`.
+  signal, or reap-start operation. Await only the already stored Promise; on
+  its canonical result set wrapper `settled` and advance claim once to
+  `reaped`; on rejection retain wrapper `settled`, the same Promise/rejection,
+  and native terminal-cleanup ownership.
 - `reaped`: perform only idempotent descriptor/temp cleanup. Each endpoint's
   close-attempt bit permits at most one actual close; already-absent temp
   leaves/directories are accepted only after their saved identity/absence
@@ -2348,7 +2389,8 @@ After release begins, the descendant may have closed fd9, exited, or become a
 zombie; those are valid claimed states. Neither `claimed_unconsumed` after its
 release attempt nor `reap_pending|reaped` requires live `/proc` evidence or
 fd9. Release failure never returns control to `unclaimed` and never causes a
-second write, close, adoption, claim, or reap.
+second write, close, adoption, claim, or native reap job. A recovery call made
+from wrapper `starting` is only idempotent retrieval of that same job/Promise.
 
 If driver termination cannot be awaited, adoption does not occur within the
 bound, evidence cannot be revalidated, or native claim rejects, cleanup has no
@@ -2356,11 +2398,11 @@ descendant authority: it neither writes/closes the release endpoint nor sends
 a raw signal nor performs a raw/generic wait. It reports an explicit cleanup
 failure with driver/adoption/evidence state and does not claim the descendant
 was released or reaped. Bounded claim-policy escalation is used only after a
-claim handle exists. Release write or close failure after claim still consumes
-that handle and uses its fixed escalation. The final KILL-timeout case keeps
-the test process alive on the one stored native exact-PID Promise and reports
-the still-live pidfd evidence. This does not claim crash-proof cleanup,
-adoption from malformed evidence, or zero residue after whole-harness
+claim handle exists. Release write or close failure after claim still starts
+or retrieves that handle's one fixed escalation. The final KILL-timeout case
+keeps the test process alive on the one stored native exact-PID Promise and
+reports the still-live pidfd evidence. This does not claim crash-proof
+cleanup, adoption from malformed evidence, or zero residue after whole-harness
 `SIGKILL`.
 
 Real gcc/`cc1` inheritance is a separate happy-path test, not an orphan
@@ -2806,6 +2848,24 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   the bit but before the close syscall, reentry performs zero closes; after
   either recorded close result, reentry also performs zero closes. All cases
   keep terminal release write state `failed` and never rewrite `0x01`.
+  Dedicated synchronous-write boundaries inject before
+  `releaseWriteAttempted`, after setting it but before `writeSync`, after the
+  syscall but before result storage, and after recorded success/errno/short
+  count. Only the first permits one write; every later reentry performs zero
+  writes, exposes no async pending write, and still performs the independently
+  gated close.
+
+  Reap-start boundaries inject before `reapAttempted`, after wrapper
+  `starting`, after native job/Promise creation, after native return but before
+  wrapper storage, after wrapper `pending`, and after settlement. The
+  post-return recovery call with identical handle/policy must return strict
+  `===` Promise identity, preserve one native job/signal/wait sequence, and
+  settle to the same result/rejection. Repeated pending/settled calls return
+  that same Promise. Forged handle and every mismatched policy field reject
+  without changing the original job, Promise identity, policy, result, pidfd,
+  or resource-close counters. Terminal tests require one pidfd/async-resource
+  close after exact reap and only settled Promise/result retention until
+  handle finalization.
 
   The earlier separate non-subreaper happy-path process directly spawns the
   attested gcc Node `ChildProcess` with fd9, the exact sanitized production
