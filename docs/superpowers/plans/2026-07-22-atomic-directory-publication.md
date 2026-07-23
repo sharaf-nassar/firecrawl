@@ -29,7 +29,7 @@ Vitest 4.1.9, Playwright 1.61.1.
 
 ## Scope, prerequisites, and dirty-worktree rules
 
-Authoritative contract is committed spec `ae4a48591`:
+Authoritative contract is committed spec `3d9d33785`:
 `docs/superpowers/specs/2026-07-22-atomic-directory-publication-design.md`.
 Do not edit that spec while executing this plan.
 
@@ -309,7 +309,10 @@ graceful/TERM/KILL bounds. Same handle plus byte-identical policy retrieves
 strict same Promise while starting, pending, or settled; mismatched policy or
 foreign/finalized handle rejects without modifying that job. The one job
 releases only the bound pidfd child, exact-PID reaps it without blocking Node's
-event loop, and returns the closed exit/signal union. Test shape/link tests
+event loop, and returns the closed exit/signal union. It also creates separate
+ref'd cleanup ownership: if KILL deadline precedes reap, same Promise rejects
+immediately, Promise worker ends, and only ref'd owner keeps process alive and
+continues serialized exact wait/reap/resource close. Test shape/link tests
 reject all four properties/symbols from production and require exact four
 top-level test-addon properties plus exact four nested hooks. Test-addon files
 and symbols never enter the final image.
@@ -443,10 +446,14 @@ After release starts, absent fd9, exit, or zombie state is valid and causes no
 return to live evidence. Pre-claim failure performs zero release write/close,
 raw signal, or raw/generic wait and reports honest cleanup failure. Post-claim
 release write/close failure still starts or retrieves only that handle's fixed
-native job/Promise. Final KILL-timeout keeps the test process alive on the one
-stored native Promise until exact reaping; it never starts another claim or
-native reap job. Production builder/compiler descendants receive no fixture
-selector or FIFO control fd.
+native job/Promise. At final KILL deadline, same Promise rejects immediately
+with stable bounded evidence even if exact reap is incomplete; rejection is
+never delayed until reap. Native atomically transfers sole serialized
+wait/reap ownership to a separate ref'd cleanup owner, terminates Promise-side
+work, and keeps Node process alive until that owner performs exact pidfd
+readiness/waitpid and closes resources once. It never starts another claim,
+native reap job, or concurrent wait. Production builder/compiler descendants
+receive no fixture selector or FIFO control fd.
 
 Inject failure/cancellation after ready, driver exit, adoption, evidence,
 claim acknowledgement, contention, release write, release close, Promise
@@ -475,6 +482,14 @@ Promise/result until handle finalization, then release job references exactly
 once. Reenter cleanup from every captured phase and prove no repeated driver
 await, adoption, fd9 check, claim, write, close, native job creation, or signal.
 Stored `reaped` cleanup is identical and mutation-free on two repeats.
+
+A native deterministic post-KILL barrier holds exact reap beyond deadline.
+Assert same Promise rejects at monotonic deadline while an event-loop heartbeat
+continues and process remains alive solely because ref'd cleanup owner is
+active. Promise worker must already be terminated. Releasing barrier permits
+only cleanup owner to exact-wait/reap and close pidfd/async/barrier resources
+once; process exit stays blocked until completion. Promise identity/rejection
+remains unchanged before and after cleanup.
 
 Create separate `scripts/native-build-gcc-probe.test.mjs`. Run it first in a
 fresh Vitest process that never loads the test addon and never becomes a
@@ -584,13 +599,58 @@ mapping for alias and distinct constants. Production addon exposes exactly
 three properties. Test addon exposes those three plus exact frozen
 `testHooks`; orphan cleanup uses only its closed evidence/opaque-handle API.
 
-Production loader always resolves its package-relative fixed Release artifact
-and accepts no path, environment selector, or test hook. Shape failures call
-the exported pure validator directly. Artifact/checksum/path corruption tests
-spawn a child from a copied package fixture whose own fixed `build/Release`
-contains the corrupt bytes; they never pass a path argument to production.
-Test-hook integration may load the fixed Test artifact only inside its spawned
-barrier child; that test-only loader is not exported or reachable in runtime.
+Production service and preflight use one inode-pinned synchronous loader
+exported by `runtime-preflight.mjs`; direct execution runs preflight, while
+`atomic-directory-publication-native.ts` imports only that closed function.
+It accepts no path, environment selector, or test hook. Before package access,
+prove Linux procfs magic/mount identity and held-fd procfd round trip. No-follow
+hold fixed package directory, then exact addon and checksum with numeric
+`O_RDONLY|O_NOFOLLOW`. Require current-uid/fixed-mode/nlink-one regular files
+and capture complete bigint addon identity: dev, ino, size, mode, uid, gid,
+nlink, mtime, and ctime.
+
+Hash/checksum/ELF/ABI reads use positioned bounded reads on held fds only.
+Never reopen a package pathname. Before load, open
+`/proc/self/fd/<heldAddonFd>` only as an identity probe, require full equality
+plus fdinfo/procfs identity, close probe, and retain original addon fd. Create
+module-private `{ exports: Object.create(null) }` and perform the sole load:
+
+```js
+process.dlopen(
+  moduleRecord,
+  `/proc/self/fd/${heldAddonFd}`,
+  os.constants.dlopen.RTLD_NOW,
+);
+```
+
+Original addon fd stays open across `dlopen`. Before reading exports, repeat
+procfs/fdinfo/procfd checks and require unchanged full fstat without package
+path existence. Only then validate exact three-property ABI and freeze the
+path-free wrapper. Raw module record/exports/procfd string never escape or log.
+Verified-close checksum, addon, and directory fds in reverse ownership order;
+publish wrapper only after all closes succeed.
+
+Use no `require()`, addon pathname load, CommonJS cache, or fallback.
+Module-private state is exactly `uninitialized|loading|loaded|failed`: first
+call is sole `dlopen`; loaded repeat returns same frozen wrapper identity;
+failed repeat returns same frozen sanitized failure without reopen/load;
+reentrant `loading` fails closed. Every failure closes each owned descriptor
+exactly once in reverse order. Pre-dlopen failure executes no addon; dlopen,
+post-load identity, shape, or close failure permanently fails and exposes no
+exports or retry.
+
+Loader tests use copied private package fixtures but never pass a path to
+production. Shape failures call pure validator directly. Fixed barriers swap
+path after held-open/hash and before/after `dlopen`: rename replacement,
+unlink+invalid regular replacement, and symlink to test addon must load only
+original held production dev/ino, with `/proc/self/maps` including held inode
+and excluding replacement/test initialization. Initial symlink, missing,
+corrupt/truncated held inode, checksum swap, wrong procfs/fdinfo/procfd,
+shape drift, and reverse-close failure fail without fallback/retry. Package
+path disappearance/replacement after hold remains irrelevant; held identity
+drift fails. Cache tests prove one dlopen, strict same wrapper/failure repeat,
+no `require.cache` entry, and exact close counts. Test addon loads only inside
+its spawned barrier child through its closed test-only held-fd loader.
 
 - [ ] **Step 2: Run RED**
 
@@ -853,6 +913,13 @@ by checksum. Prestart treats checksum as the last-published generation marker,
 hashes addon bytes, and verifies attestation before ELF/ABI/load checks. It
 never requires compiler, headers, flock, or build-only attestations.
 
+Implement the shared loader in `runtime-preflight.mjs` exactly as Step 1:
+procfs/held-directory/addon/checksum proof, positioned reads, one
+`process.dlopen(moduleRecord, procfd, RTLD_NOW)` while addon fd remains held,
+full pre/post identity, reverse verified close, closed loader state/cache, and
+no require/path fallback. `atomic-directory-publication-native.ts` imports only
+the closed loader and pure shape validator; it never opens or loads an addon.
+
 Patch only these script keys; do not replace the `scripts` object:
 
 ```json
@@ -903,7 +970,10 @@ foreign/finalized handles and wrong policies reject; both concrete
 Docker-init platform probes PASS without skip; production exact-three and test
 exact-four/nested-four addon shapes PASS; driver/descendant post-startup fd9
 preparation and all negative identity/order cases PASS; closed matrices prove
-real orphan/GCC/build-publication adapters; runtime checksum and build PASS.
+real orphan/GCC/build-publication adapters; held-fd `process.dlopen` swap/
+symlink/corruption/cache/close suites PASS; KILL-deadline Promise rejection,
+heartbeat, ref'd cleanup, process-liveness barrier PASS; runtime checksum and
+build PASS.
 
 - [ ] **Step 5: Review and commit exact Task 1 files**
 
@@ -2660,6 +2730,11 @@ API-isolation, rollback, and persistent-canary acceptance pass."
   argv, atomic checksum-last publication/recovery, unconditional second-build
   spawn counts, pure/fixed-package loader validation, and a build immediately
   before every addon load.
+- [ ] Runtime/preflight loader holds no-follow directory/addon/checksum fds,
+  reads/hash-validates held inodes, performs sole
+  `process.dlopen(moduleRecord, procfd, RTLD_NOW)` with addon fd open, repeats
+  full identity, reverse-closes, and caches same wrapper/failure without
+  `require`, path load, CommonJS cache, fallback, or retry.
 - [ ] Closed orphan fixture guards canonical caller/fixture, verified named
   FIFO endpoints, exact environments, and fd 9 identity. Cleanup monotonically
   records `unclaimed -> claimed_unconsumed -> reap_pending -> reaped`,
@@ -2670,6 +2745,10 @@ API-isolation, rollback, and persistent-canary acceptance pass."
   opaque claim/contention/FIFO release/asynchronous exact-PID reap cannot
   replace the earlier separate non-subreaper real gcc/compiler-driver/`cc1`
   fd-9 proof.
+- [ ] KILL deadline rejects same native Promise immediately while one separate
+  ref'd cleanup owner keeps process alive, serializes exact reap, and closes
+  resources once. Barrier/heartbeat/process-exit tests prove rejection does not
+  wait for reap and cleanup cannot be discarded.
 - [ ] Test addon has exact production three plus frozen `testHooks` with exact
   four nested hooks. Driver and descendant each perform canonical post-startup
   fd9 preparation before spawn/ready; module load and subreaper setup mutate no
