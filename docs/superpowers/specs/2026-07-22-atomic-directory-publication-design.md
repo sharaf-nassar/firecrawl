@@ -1782,6 +1782,96 @@ Preflight requires compiled `napiVersion === 8` and numeric
 `process.versions.napi >= 8`, freezes the validated wrapper, and logs source as
 the constant `bundled_package_relative`; it never logs or accepts a path.
 
+The separately linked test addon has exactly the production three properties
+plus one frozen `testHooks` property:
+
+```ts
+declare const atomicOrphanClaimBrand: unique symbol;
+
+type AtomicOrphanClaimHandle = Readonly<{
+  readonly [atomicOrphanClaimBrand]: true;
+}>;
+
+type AtomicOrphanReapPolicy = Readonly<{
+  gracefulTimeoutMs: 2000;
+  termTimeoutMs: 1000;
+  killTimeoutMs: 1000;
+}>;
+
+type AtomicDirectoryPublicationNativeTestV1 =
+  AtomicDirectoryPublicationNativeV1 &
+    Readonly<{
+      testHooks: Readonly<{
+        becomeChildSubreaperForTest(): void;
+        claimAdoptedChildForTest(
+          evidence: Readonly<{
+            role: "orphan_lock_descendant_v1";
+            pid: number;
+            starttime: string;
+            nodeExecutableRealpath: string;
+            nodeExecutableSha256: string;
+            scriptRealpath: string;
+            scriptSha256: string;
+            fd9Device: string;
+            fd9Inode: string;
+            adoptiveParentPid: number;
+            adoptiveParentStarttime: string;
+          }>,
+        ): AtomicOrphanClaimHandle;
+        reapClaimedChildForTest(
+          handle: AtomicOrphanClaimHandle,
+          policy: AtomicOrphanReapPolicy,
+        ): Promise<
+          | Readonly<{ kind: "exit"; code: number }>
+          | Readonly<{
+              kind: "signal";
+              signal: number;
+              coreDumped: boolean;
+            }>
+        >;
+      }>;
+}>;
+```
+
+`testHooks` has exactly those three functions and accepts no raw fd, path
+override, caller-selected token, executable choice, signal request, timeout,
+or generic pid. `becomeChildSubreaperForTest()` performs and verifies Linux
+`PR_SET_CHILD_SUBREAPER`/`PR_GET_CHILD_SUBREAPER`.
+
+The harness validates the live driver-parent relationship before killing the
+driver; native code does not attempt to prove that dead historical
+relationship. After adoption,
+`claimAdoptedChildForTest()` synchronously revalidates that the caller is the
+enabled subreaper and the descendant's current parent, plus exact
+pid/starttime, canonical Node executable realpath/hash, `/proc/<pid>/cmdline`
+with canonical fixture script realpath/hash and fixed descendant argv,
+`/proc/<pid>/environ` with the fixture's exact fixed environment, and fd 9
+device/inode with CLOEXEC clear. It opens a pidfd, binds it to the same live
+identity, records the exact direct-child claim in native state, and returns
+only after that claim is acknowledged. Any mismatch rejects without wait or
+signal. The returned module-private N-API External is opaque, single-use,
+non-forgeable, and accepted only by the same addon instance.
+
+`reapClaimedChildForTest()` consumes that handle and accepts only the exact
+literal policy above. Its N-API Promise uses async work and never blocks Node's
+event loop: wait up to the graceful bound, send `SIGTERM` through the bound
+pidfd only if still live, wait the TERM bound, send `SIGKILL` through that
+pidfd only if still live, then wait the final bound. It retries `EINTR` and
+uses exact `waitpid(pid, ..., WNOHANG)` after pidfd readiness to reap only the
+claimed child. Success returns the canonical frozen exit/signal union.
+Timeout after the KILL bound rejects with stable bounded-cleanup evidence but
+retains the consumed claim internally until an exact wait confirms reaping;
+test-process teardown cannot discard it. Test cancellation first releases the
+fixture FIFO, then awaits this same escalation to completion. Every terminal
+path closes the pidfd/async resources and invalidates the handle exactly once.
+No `waitpid(-1)`, generic adoption, sleep, or Node `ChildProcess` pid is
+accepted. Node-created flock, driver, compiler, builder, and contender
+children remain owned and reaped only by their libuv handles.
+
+Production build/link/load rejects `testHooks` and all three hook symbols and
+remains the exact three-property ABI. Test-addon shape tests require exact four
+top-level properties and exact three nested hook properties.
+
 Raw native object stays module-private to the service loader consumed only by
 the reconciliation controller. The isolated preflight script may load the
 fixed artifact to validate shape but exposes no object/operand to service code.
@@ -2025,9 +2115,33 @@ record/verify its `--version` bytes. `CC`, `CFLAGS`, `CPPFLAGS`, `LDFLAGS`, npm
 compiler settings, shell interpolation, and arbitrary compiler paths are
 rejected.
 
+Every compiler identity, compile, link, and gcc-probe spawn rebuilds its
+environment from one shared null-prototype constructor; it never spreads
+`process.env`. The exact compiler environment allowlist is
+`PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
+`SOURCE_DATE_EPOCH=1`, and `ATOMIC_BUILD_LOCK_FD=9`. No other key is present.
+It sets no `TMPDIR`, `TMP`, or `TEMP`; compiler defaults remain outside the
+service staging namespace and cannot become accepted staging grammar. Before
+lock acquisition or compiler selection, inherited environment validation
+rejects `TMPDIR`, `TMP`, `TEMP`,
+`LD_PRELOAD`, `LD_LIBRARY_PATH`, `GCC_EXEC_PREFIX`, `COMPILER_PATH`,
+`LIBRARY_PATH`, `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
+`OBJC_INCLUDE_PATH`, `DEPENDENCIES_OUTPUT`, `SUNPRO_DEPENDENCIES`,
+`GCC_SPECS`, `GCC_PLUGIN_PATH`, `PLUGIN_PATH`, every `GCC_*` or
+`COLLECT_GCC*` key, and every key with a case-insensitive underscore-delimited
+`SPEC`, `SPECS`, `PLUGIN`, or `PLUGINS` component. Exact compiler argv also
+forbids `-specs`, `--specs`, `-fplugin*`, `-B`, and response-file operands;
+the closed generated argv contains none. Rejection occurs before flock,
+staging inspection, or any child spawn. Tests inject every named key, one key
+from each rejected family, and every forbidden argv family; each must produce
+zero compiler/probe/staging activity. A capture test proves production builds
+and the isolated gcc probe receive byte-for-byte equal key sets and values,
+with all three temporary-directory variables absent.
+
 Build locking belongs to `scripts/run-native-build.mjs`, not the compiler
 script. Package scripts invoke the runner with closed target `production` or
-`all`. The runner sets umask `0077`, creates exact `build/` with Node filesystem
+`all`. The runner performs the closed environment preflight before these
+actions, then sets umask `0077`, creates exact `build/` with Node filesystem
 APIs, and no-follow opens exact
 `build/.atomic-directory-publication-build.lock` with numeric
 `O_RDWR | O_CREAT | O_NOFOLLOW`, mode `0600`; it requires regular file/current
@@ -2053,9 +2167,18 @@ no-follow lock record, then separately spawns exact argv
 `<real-node22> scripts/build-native.mjs <target>`. That Node spawn uses the same
 stdio mapping: stdin `ignore`, stdout/stderr `inherit`, indices 3..8 `ignore`,
 and the retained lock fd at child fd 9. Environment contains exact
-`ATOMIC_BUILD_LOCK_FD=9`; no other lock-fd value is accepted. There is no
-unlock/reacquire operation or interval between helper success and builder
-spawn: both mappings duplicate the runner's one continuously retained OFD.
+`PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
+`SOURCE_DATE_EPOCH=1`, and `ATOMIC_BUILD_LOCK_FD=9`, rebuilt in a fresh
+null-prototype object; no other key is present. The absolute Node 22
+executable and canonical script require no `NODE_*` setting. Runner preflight
+rejects inherited `NODE_OPTIONS`, `NODE_PATH`, and every other `NODE_*` key
+before lock acquisition, builder spawn, or staging inspection. Parameterized
+tests inject each named key plus representative lowercase/mixed-case variants
+and require zero builder spawn and zero staging inspection/removal/mutation;
+capture tests require the builder's exact six-key environment. No other
+lock-fd value is accepted. There is no unlock/reacquire operation or interval
+between helper success and builder spawn: both mappings duplicate the runner's
+one continuously retained OFD.
 
 Runner retains its duplicate until the builder terminates, then
 verified-closes it. A builder spawn failure likewise causes no staging
@@ -2091,41 +2214,157 @@ implementation. Instead of the production builder, and before any staging
 inspection, it spawns only canonical checked-in
 `scripts/native-build-lock-orphan.fixture.mjs` with role `driver`. The function
 accepts no executable, argv, environment object, target, timeout, path, or
-callback. It requires all of these guards together: execution by canonical
-`scripts/run-native-build-test-driver.mjs`; exact inherited
-`VITEST=true`; exact `ATOMIC_BUILD_LOCK_TEST_MODE=orphan-v1`; fd 3 is a
-validated ready-pipe write end; fd 4 is a distinct validated release-pipe read
-end; and canonical fixture identity matches its no-follow regular-file record.
-Pipe type, direction, and nonaliasing are proved from `fstat` plus exact
-`/proc/self/fdinfo/3|4` access-mode flags. Any missing, extra, malformed,
-aliased, or nonpipe control descriptor rejects before opening the build lock.
+callback. It requires direct module invocation by
+`scripts/run-native-build.test.mjs` under exact `VITEST=true`, after that
+harness calls `becomeChildSubreaperForTest()`. Production CLI never exposes
+this seam.
+
+Control uses two named FIFOs under a private mode-`0700`
+`fs.mkdtemp()` directory. Tests preflight fixed `/usr/bin/mkfifo` as a
+root-owned, executable, non-group/world-writable regular file, capture/recheck
+its realpath and byte hash, then invoke exact argv
+`/usr/bin/mkfifo --mode=0600 -- <ready> <release>` without a shell. Both leaves
+must be distinct current-uid, mode-`0600`, link-count-one `S_IFIFO` objects.
+Temporary `O_RDWR | O_NONBLOCK | O_NOFOLLOW` anchors permit opening the
+harness's blocking ready reader/release writer and fixture's blocking ready
+writer/release reader without deadlock. After all four endpoints are
+fstat-bound, anchors/unused duplicates close; FIFO names are unlinked and the
+empty private directory is removed. Live endpoints remain the only authority.
 
 The production CLI path never calls or selects that function, accepts only
 target `production|all`, rejects every `ATOMIC_BUILD_LOCK_TEST_*` and
 `ATOMIC_BUILD_LOCK_FIXTURE_*` variable, and always resolves only
 `scripts/build-native.mjs`. Package scripts and Docker build targets invoke
-that production CLI path. They cannot name the test driver, fixture, role, or
-spawn seam. The final runtime image contains neither test file. Thus the seam
-cannot change production compiler argv/environment or substitute for a real
-compiler probe.
+that production CLI path. They cannot name the fixture, role, or spawn seam.
 
 In fixture mode the locked child receives the normal exact
 `ATOMIC_BUILD_LOCK_FD=9`, plus only
 `ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`; fd 3, fd 4, and fd 9 are inherited.
+The driver environment is rebuilt rather than spread from `process.env` and
+contains exactly `PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
+`ATOMIC_BUILD_LOCK_FD=9`, and
+`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`.
 The driver forks/execs the same canonical fixture with role `descendant`,
 mapping the same three descriptors and adding only canonical decimal
-`ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`. The descendant validates its role,
-driver pid, fd types, and lock fd identity, writes one canonical
-UTF-8 record
-`{"event":"orphan-ready-v1","driverPid":<pid>,"descendantPid":<pid>}\n`
-to fd 3, closes fd 3, and blocks reading fd 4. Both pids are canonical positive
-JSON integers with no other fields or whitespace. After successful descendant
-spawn, the driver verified-closes its own fd 3 and fd 4 duplicates but retains
-fd 9, then remains alive until killed. The descendant accepts exact byte
-`0x01` followed by EOF, verified-closes fd 4 and fd 9, then exits zero; early
-EOF, extra bytes, signal, or malformed state fails. These fixture-only
-variables and fd 3/4 mappings never reach a production builder, gcc, `cc1`,
-assembler, linker, addon loader, or test executable.
+`ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`; its environment is otherwise the same
+exact fixed set with role `descendant`. The descendant validates its role,
+driver pid, exact argv/environment, fd types, and lock fd identity, then writes
+one canonical UTF-8 ready record containing exact event `orphan-ready-v1`,
+role `orphan_lock_descendant_v1`, driver pid/starttime, descendant
+pid/starttime, canonical Node executable realpath/hash, canonical fixture
+script realpath/hash, and fd9 device/inode/CLOEXEC-false evidence. No other
+fields or whitespace are valid. It closes fd 3 and blocks on fd 4. After
+descendant spawn, driver closes its own fd 3/4 duplicates but retains fd 9 and
+remains alive.
+
+Harness validates the complete ready record against live `/proc` evidence
+while driver is still the descendant's parent. Only then does it intentionally
+send `SIGKILL` to driver. The runner seam owns and awaits that Node
+`ChildProcess` through libuv, verified-closes its retained lock descriptor,
+and settles its fixed killed-driver result. Before any contention assertion,
+the harness awaits that settlement and scans `/proc/self/fd` with
+`readlink`/`fstat` to require that no remaining harness descriptor has the
+saved lock device/inode identity; a known saved descriptor, where available,
+must instead fail `fstat` with `EBADF`. This observation proves the
+runner/harness duplicate is gone.
+
+The harness then waits for the descendant's live parent to become the harness
+subreaper, revalidates the descendant's exact pid/starttime and still-open fd 9
+identity, and synchronously calls `claimAdoptedChildForTest()` with canonical
+evidence including the harness pid/starttime as adoptive parent. Only after the
+opaque claim handle is returned does a separately opened
+`/usr/bin/flock --exclusive --nonblock 9` contender have to report contention.
+Thus the only observed live holder is the claimed descendant's fd 9. Harness
+then writes exact release byte `0x01` and closes the release writer.
+Descendant closes fd 4/fd 9 and exits zero;
+`reapClaimedChildForTest(handle, exactPolicy)` must exact-PID reap and return
+exit zero. This test proves lock retention after the controlled post-ready
+parent kill.
+
+The guarantee is deliberately narrow. Unexpected driver failure before a
+valid ready record fails the test. On every post-ready assertion failure,
+cleanup closes the ready endpoint, writes the one release byte when the
+release endpoint remains valid, and closes it. If a claim handle exists,
+cleanup consumes it through the exact reap policy. If the canonical child has
+already been adopted but no handle exists, cleanup revalidates and claims it
+before the same reap; it never signals an unclaimed pid. Driver cleanup uses
+only its existing Node `ChildProcess` handle and awaits it through libuv. The
+final KILL-timeout case keeps the test process alive on native exact-PID
+cleanup and reports the still-live pidfd evidence. This does not claim
+crash-proof cleanup, adoption from malformed evidence, or zero residue after
+whole-harness `SIGKILL`.
+
+Real gcc/`cc1` inheritance is a separate happy-path test, not an orphan
+fixture. It runs first in a fresh dedicated
+`scripts/native-build-gcc-probe.test.mjs` Vitest process that never loads the
+test addon, never calls `PR_SET_CHILD_SUBREAPER`, and exits before the separate
+orphan-test process enables subreaping. Child-subreaper state is not inherited
+by this freshly forked process. The gcc probe makes no induced-kill or orphan
+reaping claim.
+
+After a normal production build supplies the compiler/input attestation, that
+process acquires the same lock OFD through the exact production acquisition
+protocol and directly spawns the attested compiler as a Node `ChildProcess`,
+mapping the OFD to fd 9, with exact probe argv
+`<compiler> -x c -std=c11 -c <private>/source.fifo -o <private>/probe.o`.
+It uses the exact production compiler environment specified above. The
+private mode-`0600` source FIFO uses the same verified mkfifo setup; its
+pathname and saved parent-directory/leaf identity remain available until all
+rendezvous cleanup completes. With no anchor left, one tracked asynchronous
+blocking writer open holds real `cc1` at the FIFO. Compiler stdout and stderr
+are separate bounded 64-KiB captures.
+
+While gcc/`cc1` are live, harness verifies gcc handle pid plus gcc/`cc1`
+pid/starttime, canonical `/proc/<pid>/exe` identities/hashes, exact source
+FIFO in the `cc1` cmdline, fd9 device/inode, CLOEXEC clear, parent
+relationship, and exact lock contention. It then writes exact UTF-8
+`int atomic_fd9_probe;\n`, closes writer, awaits gcc only through its libuv
+handle, requires exit zero and a valid relocatable `probe.o`, then
+validates/unlinks FIFO/output and removes the private directory.
+
+Probe control is one explicit event-driven state machine with fixed
+non-overridable bounds: writer rendezvous `5000ms`, graceful gcc exit
+`5000ms`, TERM `2000ms`, KILL `2000ms`, and residual-`cc1` disappearance
+`5000ms`. Transitions race the tracked writer-open Promise, the direct
+`ChildProcess` exit event, monotonic deadlines, and repeated identity-checked
+`/proc` observations scheduled with `setImmediate`; no sleep or elapsed delay
+is evidence of success. Once a canonical `cc1` appears, its pid/starttime,
+executable hash, parent, exact FIFO-bearing cmdline, and fd9 identity are
+bound.
+
+The state machine covers all three adverse orderings:
+
+- While gcc is live with no FIFO reader and the writer remains pending at the
+  rendezvous deadline, it no-follow opens the saved-identity FIFO as
+  `O_RDONLY | O_NONBLOCK`. This cancellation reader settles the one writer
+  open without replacing its Promise.
+- If gcc exits before writer settlement, it opens that same cancellation
+  reader immediately, settles the writer, and records early gcc exit as test
+  failure.
+- If gcc exits after writer rendezvous while a bound `cc1` remains blocked,
+  the already-open writer is released directly; no cancellation open is
+  needed.
+
+After writer settlement on every normal, assertion-failure, deadline, or
+early-exit path, harness writes the exact fixed source bytes and closes the
+writer. A cancellation reader, when present, remains open without reading
+through gcc exit and the residual-`cc1` scan, so buffered source remains
+available to a late reader; it then closes exactly once. This FIFO release
+always precedes process escalation. Harness first awaits the gcc libuv handle
+for the graceful bound. Only if gcc is still live after FIFO release does it
+send TERM through that same `ChildProcess` handle, await the TERM bound, then
+send KILL through that handle and await the KILL bound. It never signals a
+numeric gcc or `cc1` pid and never claims to reap `cc1`.
+
+After gcc exit, bounded `/proc` scans use both every saved `cc1` identity and
+the unique exact FIFO cmdline to catch a race-discovered survivor. Any such
+child must either already be gone or have the same identity reparented to PID
+1; harness requires its disappearance before closing the cancellation reader,
+unlinking the FIFO/output, or removing the private directory. Early gcc exit,
+TERM/KILL escalation, identity drift, or failure to observe disappearance is
+reported as failure with exact state/evidence. All writer-open Promises settle
+and all FIFO descriptors close on every terminal path; no blocking writer,
+descriptor, or unobserved successful cleanup remains.
 
 Current Task 4 owns the complete immutable Docker-init allowlist described
 below; Task 6
@@ -2166,7 +2405,8 @@ Native inputs are split exactly:
   entrypoint;
 - `native/atomic-directory-publication-errors.c` and `.h`: shared errno map;
 - `native/atomic-directory-publication-test-hooks.c` and `.h`: test-only
-  pipe/eventfd barriers around the real syscall; and
+  pipe/eventfd barriers around the real syscall plus the three closed test
+  hooks specified above; and
 - `native/atomic-directory-publication-errors.test.c`: standalone errno-map
   test main.
 
@@ -2367,6 +2607,14 @@ the verified production `.node`, exact runtime checksum attestation, and
 runtime application files into the final image. Final runtime contains no
 compiler, headers, depfiles, input-hash
 sidecars, test addon, flock/util-linux, build cache, or package-manager cache.
+It also contains no `run-native-build.test.mjs`,
+`native-build-gcc-probe.test.mjs`,
+`native-build-lock-orphan.fixture.mjs`, other `*.test.*` or fixture sources,
+test FIFO/temp content, `testHooks`,
+`becomeChildSubreaperForTest`, or
+`claimAdoptedChildForTest`/`reapClaimedChildForTest`. Deferred
+`src/dockerfile.test.ts` asserts those path/name/symbol absences and proves the
+production addon still has exactly three own properties.
 The same Dockerfile defines a separate init target containing pinned util-linux
 `/usr/bin/flock`, Node 22, init script, and allowlist verification but no
 Browser server. Task 6 also adds init tests and image-level different-UID,
@@ -2432,44 +2680,58 @@ Real compiled-addon integration tests, not mocked rename results, cover:
 - native test binary exercising every errno mapping, including separate and
   aliased `ENOTSUP`/`EOPNOTSUPP` compilation branches and internal
   `atomic_publish_source_missing` for `ENOENT`;
-- build-runner tests create `build/` before lock invocation and run exactly
-  `pnpm --dir apps/browser-service exec vitest run scripts/run-native-build.test.mjs`.
+- build-runner tests create `build/` before lock invocation. They first run
+  exact command
+  `pnpm --dir apps/browser-service exec vitest run scripts/native-build-gcc-probe.test.mjs`
+  to completion, then run exact command
+  `pnpm --dir apps/browser-service exec vitest run scripts/run-native-build.test.mjs`
+  in a fresh process. No process that enabled subreaping runs the gcc probe.
   They assert the acquisition child argv is exactly
   `/usr/bin/flock --exclusive --timeout 60 9`, contains no command or
   process-replacement option, and exits successfully before a separate
   real-Node-22 builder is spawned. Both children require indices 3..8 ignored
   and fd 9 mapped from the runner's one verified lock handle; only the builder
-  receives exact
-  `ATOMIC_BUILD_LOCK_FD=9`. A real OFD probe locks through the helper, waits for
-  helper exit, and proves a separately opened contender still times out while
-  the runner retains its descriptor. Closing the runner's last duplicate then
-  admits that contender. Nonzero, timeout, signal, post-acquisition validation
-  failure, and builder-spawn failure tests assert verified close, zero builder
-  or later-child spawn where applicable, and zero staging
-  inspection/removal/mutation.
-  Real exec probes require fd 9 present with CLOEXEC clear in build script,
-  compiler driver, and pinned subtool. Concurrent builders serialize and
-  timeout has no compiler/staging effect. The closed orphan fixture test
-  creates distinct ready/release pipes, spawns exact
-  `scripts/run-native-build-test-driver.mjs` with guarded fixture mode and fd
-  3/4 mappings, and waits for the descendant's canonical ready record without
-  timing sleeps. It verifies both recorded live pids, then sends `SIGKILL` to
-  the fixture driver and waits for both that death and runner failure. While
-  the descendant remains blocked holding fd 9, a separately opened lock OFD
-  passed to exact `/usr/bin/flock --exclusive --nonblock 9` must report
-  contention, and a normal production runner contender must spawn no builder
-  and perform zero staging inspection/removal. The test writes the one release
-  byte and closes the release writer, waits for descendant exit and ready-pipe
-  EOF, and requires that already-waiting normal contender to acquire the lock,
-  discard any valid stale generation, and complete a full fresh build. No
-  timing sleep determines any transition. Fixture guard rejection tests cover
-  direct CLI selection, wrong launcher/mode/role, extra argv or prefixed
-  environment variables, invalid/aliased control fds, and noncanonical fixture
-  identity.
+  receives the exact closed six-key environment ending in
+  `ATOMIC_BUILD_LOCK_FD=9`; `NODE_OPTIONS`, `NODE_PATH`, every other `NODE_*`,
+  `TMPDIR`, `TMP`, and `TEMP` are absent. Injection tests reject each family
+  before builder/staging activity. A real OFD probe locks through the helper,
+  waits for helper exit, and proves a separately opened contender still times
+  out while the runner retains its descriptor. Closing the runner's last
+  duplicate then admits that contender. Nonzero, timeout, signal,
+  post-acquisition validation failure, and builder-spawn failure tests assert
+  verified close, zero builder or later-child spawn where applicable, and zero
+  staging inspection/removal/mutation.
+  Concurrent builders serialize and timeout has no compiler/staging effect.
+  Harness becomes a verified subreaper, creates exact private named-FIFO
+  endpoints, and runs the closed orphan seam. After validating the canonical
+  ready record and live driver-parent relation, it kills the driver and awaits
+  runner settlement. It proves the runner/harness lock duplicate is closed by
+  `EBADF` or absence of the saved device/inode from every `/proc/self/fd`
+  entry, then proves the adopted descendant still has exact live fd9. It
+  synchronously claims that child, waits for claim acknowledgement, proves
+  nonblocking lock contention, releases the FIFO, and asynchronously reaps the
+  exact claimed pid under the fixed graceful/TERM/KILL policy. Tests reject
+  malformed evidence, wrong current adoptive-parent relation, role,
+  pid/starttime, Node executable, script cmdline/hash, fixed environment, fd9
+  identity, or CLOEXEC. They do not ask native code to validate the dead
+  original parent. Early unexpected driver failure is a test failure with the
+  exact cleanup sequence, not a crash-recovery claim.
 
-  Separate real production builds retain the real gcc/compiler-driver/`cc1`
-  exec probe requiring inherited fd 9; the fixture can neither satisfy nor
-  replace that gate. Real build-script and compiler-driver failure tests prove
+  The earlier separate non-subreaper happy-path process directly spawns the
+  attested gcc Node `ChildProcess` with fd9, the exact sanitized production
+  compiler environment, and a FIFO source that blocks real `cc1`. It verifies
+  live gcc/`cc1` pid/starttime/executable/fd9/CLOEXEC evidence and lock
+  contention, writes fixed source, awaits gcc only through libuv, validates
+  `probe.o`, and cleans the private directory. Its bounded no-sleep state
+  machine covers live-gcc/no-reader, pre-writer gcc exit, and post-rendezvous
+  gcc exit with blocked `cc1`: it opens the saved-identity cancellation reader
+  when needed, settles the tracked writer, always writes fixed source and
+  closes it, and releases FIFO before bounded libuv-handle TERM/KILL. It
+  requires every matching PID1-reparented `cc1` to disappear before unlink
+  without claiming to reap it. Environment tests reject every specified
+  injection, require temporary-directory variables absent, and compare exact
+  production/probe allowlists. Fixture result cannot satisfy this gate.
+  Real build-script and compiler-driver failure tests prove
   the current build spawns nothing further and leaves staging untouched rather
   than racing orphan cleanup. Compiler tests assert every exact compile/link
   argv uses only
@@ -2511,7 +2773,10 @@ Real compiled-addon integration tests, not mocked rename results, cover:
 - final-image tests prove only production `.node` and
   `atomic-directory-publication.node.sha256` are copied from native build
   outputs; input dep/hash sidecars, objects, maps, traces, and test outputs are
-  absent. Two independent `--no-cache` Docker builds per native supported
+  absent. They also assert absence of the test addon, orphan fixture, test
+  scripts/FIFO state, and all three test-hook names/symbols, while production addon
+  shape remains exactly three properties. Two independent `--no-cache` Docker
+  builds per native supported
   `TARGETARCH` extract those exact runtime paths and require byte/hash equality
   for both addon and canonical checksum plus embedded-addon-hash agreement.
   Prestart rejects independent tampering of addon or attestation before service
@@ -2714,7 +2979,7 @@ Native publication adds exactly:
 - `apps/browser-service/native/toolchain-allowlist.json` (new)
 - `apps/browser-service/scripts/run-native-build.mjs` (new)
 - `apps/browser-service/scripts/run-native-build.test.mjs` (new)
-- `apps/browser-service/scripts/run-native-build-test-driver.mjs` (new,
+- `apps/browser-service/scripts/native-build-gcc-probe.test.mjs` (new,
   test-only)
 - `apps/browser-service/scripts/native-build-lock-orphan.fixture.mjs` (new,
   test-only)
