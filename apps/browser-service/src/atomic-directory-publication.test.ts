@@ -8,13 +8,19 @@ import {
   ATOMIC_MAX_OBSERVATION_BYTES,
   ATOMIC_MAX_PARTIAL_CREATE_IDS,
   ATOMIC_MAX_TRACKED_IDS,
+  advanceAtomicCanaryCleanup,
+  createAtomicCanaryReducerState,
   createAtomicReducerState,
+  isAtomicCanaryProofV1,
   isAtomicControlLeafV1,
   isAtomicPayloadLeafV1,
   reduceAtomicPublication,
   type AtomicEffectObservationV1,
   type AtomicEffectRequestDraftV1,
+  type AtomicCanaryProofV1,
   type AtomicObjectEvidenceV1,
+  type AtomicReducerStepV1,
+  type CanonicalLocationEvidenceV1,
   type FlightEffectId,
   type FlightPartialCreateId,
   type FlightSemanticId,
@@ -60,6 +66,22 @@ function partialId(): FlightPartialCreateId {
   return Object.freeze({}) as FlightPartialCreateId;
 }
 
+function location(
+  state: CanonicalLocationEvidenceV1["state"],
+  objectId: FlightSemanticId | null,
+  objectEvidence: AtomicObjectEvidenceV1 | null,
+): CanonicalLocationEvidenceV1 {
+  return Object.freeze({
+    state,
+    objectId,
+    dev: objectEvidence?.dev ?? null,
+    ino: objectEvidence?.ino ?? null,
+    mode: objectEvidence?.mode ?? null,
+    evidence: objectEvidence,
+    evidenceDigest: HASH,
+  });
+}
+
 function reserveDraft(): AtomicEffectRequestDraftV1 {
   return {
     kind: "reserve_budget",
@@ -68,6 +90,43 @@ function reserveDraft(): AtomicEffectRequestDraftV1 {
     count: 1,
     byteSize: 0,
   };
+}
+
+function emittedEffect(
+  step: AtomicReducerStepV1,
+): Extract<AtomicReducerStepV1, { kind: "effect" }> {
+  if (step.kind !== "effect") {
+    throw new Error(`effect was not emitted: ${JSON.stringify(step.result)}`);
+  }
+  return step;
+}
+
+function plannedCanaryProof(
+  wrapperEvidence: AtomicObjectEvidenceV1,
+  targetParentEvidence: AtomicObjectEvidenceV1,
+  privateSourceEvidence: AtomicObjectEvidenceV1,
+): AtomicCanaryProofV1 {
+  return Object.freeze({
+    version: 1,
+    operationId: OPERATION_ID,
+    targetParentLocatorDigest: HASH,
+    targetParentEvidence,
+    wrapperEvidence,
+    attempt: 0,
+    sourceLeaf: `proof-${OPERATION_ID}-0`,
+    targetLeaf: `canary-${OPERATION_ID}-0`,
+    deletionLeaf: `deletion-${OPERATION_ID}-0`,
+    phase: "planned",
+    privateSourceEvidence,
+    publishedEvidence: null,
+    privateDeletionEvidence: null,
+    classification: null,
+    manifestSha256: null,
+    cleanupNextIndex: 0,
+    cleanupEntryCount: 0,
+    sourceParentSynced: false,
+    targetParentSynced: false,
+  });
 }
 
 describe("atomic publication effect protocol", () => {
@@ -794,6 +853,1344 @@ describe("atomic publication effect protocol", () => {
       result: { kind: "fail_stop", code: "unexpected_observation" },
     });
   });
+
+  test("separates native resolution from canonical location classification", () => {
+    const sourceParentId = semanticId();
+    const sourceId = semanticId();
+    const targetParentId = semanticId();
+    const targetId = semanticId();
+    const state = createAtomicReducerState({
+      flightNonce: "flight-canary-success",
+      request: {
+        kind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceParentId,
+        sourceId,
+        sourceLeaf: `proof-${OPERATION_ID}-0`,
+        targetParentId,
+        targetLeaf: `canary-${OPERATION_ID}-0`,
+        expectedSource: EVIDENCE,
+        expectedTarget: { absent: true },
+        evidenceDigest: HASH,
+      },
+      semanticIds: [sourceParentId, sourceId, targetParentId],
+    });
+    const native = reduceAtomicPublication(state, null);
+    if (native.kind !== "effect") throw new Error("native effect missing");
+    const observe = reduceAtomicPublication(state, {
+      kind: "native_resolved",
+      effectId: native.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "canary_publish",
+      sourceObjectId: sourceId,
+      sourceEvidence: EVIDENCE,
+      rawCode: "success",
+      nativePrecheckEvidenceDigest: HASH,
+      evidenceDigest: HASH,
+    });
+    expect(observe).toMatchObject({
+      kind: "effect",
+      request: {
+        kind: "observe_locations",
+        requestKind: "native_no_replace",
+        sourceId,
+      },
+    });
+    if (observe.kind !== "effect") throw new Error("observe effect missing");
+    const completed = reduceAtomicPublication(observe.state, {
+      kind: "locations_observed",
+      effectId: observe.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "canary_publish",
+      sourceParentId,
+      sourceLeaf: `proof-${OPERATION_ID}-0`,
+      targetParentId,
+      targetLeaf: `canary-${OPERATION_ID}-0`,
+      requestedSourceObjectId: sourceId,
+      sourceObjectId: null,
+      targetObjectId: targetId,
+      source: location("absent", null, null),
+      target: location("match", targetId, EVIDENCE),
+      evidenceDigest: HASH,
+    });
+    expect(completed).toMatchObject({
+      kind: "terminal",
+      result: { kind: "protocol_complete" },
+      state: {
+        admission: "open",
+        nativeClassification: {
+          outcome: "published",
+          nativeCode: "success",
+        },
+      },
+    });
+  });
+
+  test("recovers canary publication and private manifest cleanup", () => {
+    const wrapperId = semanticId();
+    const privateSourceId = semanticId();
+    const publicParentId = semanticId();
+    const publishedId = semanticId();
+    const deletionId = semanticId();
+    const wrapperEvidence = evidence({ ino: "10" });
+    const publicParentEvidence = evidence({ ino: "11" });
+    const sourceEvidence = evidence({ ino: "12" });
+    const planned = plannedCanaryProof(
+      wrapperEvidence,
+      publicParentEvidence,
+      sourceEvidence,
+    );
+    expect(() =>
+      createAtomicCanaryReducerState({
+        flightNonce: "flight-canary-duplicate",
+        action: "prove_mount",
+        proof: planned,
+        unresolvedForTargetParent: [planned, planned],
+        sourceParentId: wrapperId,
+        sourceParentRole: "wrapper",
+        sourceParentEvidence: wrapperEvidence,
+        sourceId: privateSourceId,
+        targetParentId: publicParentId,
+        targetParentRole: "profiles_parent",
+        targetParentEvidence: publicParentEvidence,
+        cleanupManifest: null,
+      }),
+    ).toThrow(/invalid atomic canary recovery input/u);
+
+    let current = emittedEffect(
+      reduceAtomicPublication(
+        createAtomicCanaryReducerState({
+          flightNonce: "flight-canary-mount",
+          action: "prove_mount",
+          proof: planned,
+          unresolvedForTargetParent: [],
+          sourceParentId: wrapperId,
+          sourceParentRole: "wrapper",
+          sourceParentEvidence: wrapperEvidence,
+          sourceId: privateSourceId,
+          targetParentId: publicParentId,
+          targetParentRole: "profiles_parent",
+          targetParentEvidence: publicParentEvidence,
+          cleanupManifest: null,
+        }),
+        null,
+      ),
+    );
+    expect(current.request).toMatchObject({
+      kind: "persist_canary_phase",
+      previousPhase: null,
+      proof: { phase: "planned" },
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "effect_completed",
+        effectId: current.request.effectId,
+        requestKind: "persist_canary_phase",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "revalidate_handle",
+      objectId: wrapperId,
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "effect_completed",
+        effectId: current.request.effectId,
+        requestKind: "revalidate_handle",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "revalidate_handle",
+      objectId: publicParentId,
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "effect_completed",
+        effectId: current.request.effectId,
+        requestKind: "revalidate_handle",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "statfs_parent",
+      objectId: wrapperId,
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "statfs_observed",
+        effectId: current.request.effectId,
+        objectId: wrapperId,
+        filesystem: "overlay",
+        magic: "0x794c7630",
+        device: "1",
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "statfs_parent",
+      objectId: publicParentId,
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "statfs_observed",
+        effectId: current.request.effectId,
+        objectId: publicParentId,
+        filesystem: "overlay",
+        magic: "0x794c7630",
+        device: "1",
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "native_no_replace",
+      move: "canary_publish",
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "native_resolved",
+        effectId: current.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceObjectId: privateSourceId,
+        sourceEvidence,
+        rawCode: "success",
+        nativePrecheckEvidenceDigest: HASH,
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(current.request).toMatchObject({ kind: "observe_locations" });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "locations_observed",
+        effectId: current.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceParentId: wrapperId,
+        sourceLeaf: planned.sourceLeaf,
+        targetParentId: publicParentId,
+        targetLeaf: planned.targetLeaf,
+        requestedSourceObjectId: privateSourceId,
+        sourceObjectId: null,
+        targetObjectId: publishedId,
+        source: location("absent", null, null),
+        target: location("match", publishedId, sourceEvidence),
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "fsync_directory",
+      objectId: wrapperId,
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "effect_completed",
+        effectId: current.request.effectId,
+        requestKind: "fsync_directory",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    );
+    expect(current.request).toMatchObject({
+      kind: "fsync_directory",
+      objectId: publicParentId,
+    });
+    const mounted = reduceAtomicPublication(current.state, {
+      kind: "effect_completed",
+      effectId: current.request.effectId,
+      requestKind: "fsync_directory",
+      evidenceDigest: HASH,
+      count: 1,
+      byteSize: 0,
+    });
+    if (mounted.kind !== "effect") {
+      throw new Error("published canary persistence was not requested");
+    }
+    expect(mounted.request).toMatchObject({
+      kind: "persist_canary_phase",
+      previousPhase: "planned",
+      proof: { phase: "published" },
+    });
+    const persistedMount = reduceAtomicPublication(mounted.state, {
+      kind: "effect_completed",
+      effectId: mounted.request.effectId,
+      requestKind: "persist_canary_phase",
+      evidenceDigest: HASH,
+      count: 1,
+      byteSize: 0,
+    });
+    expect(persistedMount).toMatchObject({
+      kind: "terminal",
+      result: {
+        kind: "mount_proved",
+        proof: {
+          phase: "published",
+          publishedEvidence: sourceEvidence,
+          sourceParentSynced: true,
+          targetParentSynced: true,
+        },
+      },
+    });
+    if (
+      persistedMount.kind !== "terminal" ||
+      persistedMount.result.kind !== "mount_proved"
+    ) {
+      throw new Error("mount proof was not completed");
+    }
+    const published = persistedMount.result.proof;
+
+    current = emittedEffect(
+      reduceAtomicPublication(
+        createAtomicCanaryReducerState({
+          flightNonce: "flight-canary-published-replay",
+          action: "prove_mount",
+          proof: published,
+          unresolvedForTargetParent: [published],
+          sourceParentId: wrapperId,
+          sourceParentRole: "wrapper",
+          sourceParentEvidence: wrapperEvidence,
+          sourceId: privateSourceId,
+          targetParentId: publicParentId,
+          targetParentRole: "profiles_parent",
+          targetParentEvidence: publicParentEvidence,
+          cleanupManifest: null,
+        }),
+        null,
+      ),
+    );
+    for (const requestKind of [
+      "revalidate_handle",
+      "revalidate_handle",
+    ] as const) {
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "effect_completed",
+          effectId: current.request.effectId,
+          requestKind,
+          evidenceDigest: HASH,
+          count: 1,
+          byteSize: 0,
+        }),
+      );
+    }
+    for (const objectId of [wrapperId, publicParentId] as const) {
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "statfs_observed",
+          effectId: current.request.effectId,
+          objectId,
+          filesystem: "overlay",
+          magic: "0x794c7630",
+          device: "1",
+          evidenceDigest: HASH,
+        }),
+      );
+    }
+    expect(current.request).toMatchObject({
+      kind: "observe_locations",
+      move: "canary_publish",
+    });
+    const replayedMount = reduceAtomicPublication(current.state, {
+      kind: "locations_observed",
+      effectId: current.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "canary_publish",
+      sourceParentId: wrapperId,
+      sourceLeaf: planned.sourceLeaf,
+      targetParentId: publicParentId,
+      targetLeaf: planned.targetLeaf,
+      requestedSourceObjectId: privateSourceId,
+      sourceObjectId: null,
+      targetObjectId: publishedId,
+      source: location("absent", null, null),
+      target: location("match", publishedId, sourceEvidence),
+      evidenceDigest: HASH,
+    });
+    expect(replayedMount).toMatchObject({
+      kind: "terminal",
+      result: {
+        kind: "mount_proved",
+        proof: {
+          classification: {
+            nativeCode: "success",
+          },
+        },
+      },
+      state: {
+        nativeClassification: {
+          nativeCode: "atomic_publish_replay_completed",
+        },
+      },
+    });
+    if (
+      replayedMount.kind !== "terminal" ||
+      replayedMount.result.kind !== "mount_proved"
+    ) {
+      throw new Error("published replay was not completed");
+    }
+    expect(replayedMount.result.proof).toBe(published);
+
+    current = emittedEffect(
+      reduceAtomicPublication(
+        createAtomicCanaryReducerState({
+          flightNonce: "flight-canary-published-regression",
+          action: "prove_mount",
+          proof: published,
+          unresolvedForTargetParent: [published],
+          sourceParentId: wrapperId,
+          sourceParentRole: "wrapper",
+          sourceParentEvidence: wrapperEvidence,
+          sourceId: privateSourceId,
+          targetParentId: publicParentId,
+          targetParentRole: "profiles_parent",
+          targetParentEvidence: publicParentEvidence,
+          cleanupManifest: null,
+        }),
+        null,
+      ),
+    );
+    for (const requestKind of [
+      "revalidate_handle",
+      "revalidate_handle",
+    ] as const) {
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "effect_completed",
+          effectId: current.request.effectId,
+          requestKind,
+          evidenceDigest: HASH,
+          count: 1,
+          byteSize: 0,
+        }),
+      );
+    }
+    for (const objectId of [wrapperId, publicParentId] as const) {
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "statfs_observed",
+          effectId: current.request.effectId,
+          objectId,
+          filesystem: "overlay",
+          magic: "0x794c7630",
+          device: "1",
+          evidenceDigest: HASH,
+        }),
+      );
+    }
+    const regressionClose = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "locations_observed",
+        effectId: current.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceParentId: wrapperId,
+        sourceLeaf: planned.sourceLeaf,
+        targetParentId: publicParentId,
+        targetLeaf: planned.targetLeaf,
+        requestedSourceObjectId: privateSourceId,
+        sourceObjectId: privateSourceId,
+        targetObjectId: null,
+        source: location("match", privateSourceId, sourceEvidence),
+        target: location("absent", null, null),
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(regressionClose.request).toMatchObject({
+      kind: "close_admission",
+      reason: "binding_invalid",
+    });
+    expect(
+      reduceAtomicPublication(regressionClose.state, {
+        kind: "effect_completed",
+        effectId: regressionClose.request.effectId,
+        requestKind: "close_admission",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    ).toMatchObject({
+      kind: "terminal",
+      result: { kind: "fail_stop", code: "native_binding_invalid" },
+      state: { admission: "closed" },
+    });
+
+    current = emittedEffect(
+      reduceAtomicPublication(
+        createAtomicCanaryReducerState({
+          flightNonce: "flight-canary-cleanup",
+          action: "cleanup",
+          proof: published,
+          unresolvedForTargetParent: [published],
+          sourceParentId: publicParentId,
+          sourceParentRole: "profiles_parent",
+          sourceParentEvidence: publicParentEvidence,
+          sourceId: publishedId,
+          targetParentId: wrapperId,
+          targetParentRole: "wrapper",
+          targetParentEvidence: wrapperEvidence,
+          cleanupManifest: {
+            sha256: HASH,
+            entryCount: 1,
+            nextIndex: 0,
+          },
+        }),
+        null,
+      ),
+    );
+    expect(current.request).toMatchObject({
+      kind: "persist_canary_phase",
+      previousPhase: "published",
+      proof: { phase: "deleting" },
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "effect_completed",
+        effectId: current.request.effectId,
+        requestKind: "persist_canary_phase",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    );
+    for (const [objectId, requestKind] of [
+      [publicParentId, "revalidate_handle"],
+      [wrapperId, "revalidate_handle"],
+    ] as const) {
+      expect(current.request).toMatchObject({ kind: requestKind, objectId });
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "effect_completed",
+          effectId: current.request.effectId,
+          requestKind,
+          evidenceDigest: HASH,
+          count: 1,
+          byteSize: 0,
+        }),
+      );
+    }
+    for (const objectId of [publicParentId, wrapperId] as const) {
+      expect(current.request).toMatchObject({
+        kind: "statfs_parent",
+        objectId,
+      });
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "statfs_observed",
+          effectId: current.request.effectId,
+          objectId,
+          filesystem: "overlay",
+          magic: "0x794c7630",
+          device: "1",
+          evidenceDigest: HASH,
+        }),
+      );
+    }
+    expect(current.request).toMatchObject({
+      kind: "native_no_replace",
+      move: "canary_source_to_private",
+    });
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "native_resolved",
+        effectId: current.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_source_to_private",
+        sourceObjectId: publishedId,
+        sourceEvidence,
+        rawCode: "success",
+        nativePrecheckEvidenceDigest: HASH,
+        evidenceDigest: HASH,
+      }),
+    );
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "locations_observed",
+        effectId: current.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_source_to_private",
+        sourceParentId: publicParentId,
+        sourceLeaf: planned.targetLeaf,
+        targetParentId: wrapperId,
+        targetLeaf: planned.deletionLeaf,
+        requestedSourceObjectId: publishedId,
+        sourceObjectId: null,
+        targetObjectId: deletionId,
+        source: location("absent", null, null),
+        target: location("match", deletionId, sourceEvidence),
+        evidenceDigest: HASH,
+      }),
+    );
+    for (const objectId of [publicParentId, wrapperId] as const) {
+      expect(current.request).toMatchObject({
+        kind: "fsync_directory",
+        objectId,
+      });
+      const next = reduceAtomicPublication(current.state, {
+        kind: "effect_completed",
+        effectId: current.request.effectId,
+        requestKind: "fsync_directory",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      });
+      if (objectId === publicParentId) current = emittedEffect(next);
+      else {
+        const persisted = emittedEffect(next);
+        expect(persisted.request).toMatchObject({
+          kind: "persist_canary_phase",
+          previousPhase: "deleting",
+          proof: { phase: "deleting" },
+        });
+        const completedCleanup = reduceAtomicPublication(persisted.state, {
+          kind: "effect_completed",
+          effectId: persisted.request.effectId,
+          requestKind: "persist_canary_phase",
+          evidenceDigest: HASH,
+          count: 1,
+          byteSize: 0,
+        });
+        expect(completedCleanup).toMatchObject({
+          kind: "terminal",
+          result: {
+            kind: "cleanup_pending",
+            proof: {
+              phase: "deleting",
+              manifestSha256: HASH,
+              cleanupNextIndex: 0,
+              cleanupEntryCount: 1,
+              privateDeletionEvidence: sourceEvidence,
+            },
+          },
+        });
+        if (
+          completedCleanup.kind !== "terminal" ||
+          completedCleanup.result.kind !== "cleanup_pending"
+        ) {
+          throw new Error("canary cleanup was not authorized");
+        }
+        expect(() =>
+          advanceAtomicCanaryCleanup(completedCleanup.result.proof, {
+            operationId: OPERATION_ID,
+            manifestSha256: HASH,
+            completedIndex: 0,
+            nextIndex: 2,
+            privateDeletionAbsent: true,
+            sourceParentSynced: true,
+            targetParentSynced: true,
+            evidenceDigest: HASH,
+          }),
+        ).toThrow(/invalid atomic canary cleanup progress/u);
+        const cleaned = advanceAtomicCanaryCleanup(
+          completedCleanup.result.proof,
+          {
+          operationId: OPERATION_ID,
+          manifestSha256: HASH,
+          completedIndex: 0,
+          nextIndex: 1,
+          privateDeletionAbsent: true,
+          sourceParentSynced: true,
+          targetParentSynced: true,
+          evidenceDigest: HASH,
+          },
+        );
+        expect(cleaned).toMatchObject({
+          phase: "cleaned",
+          cleanupNextIndex: 1,
+        });
+        expect(() =>
+          createAtomicCanaryReducerState({
+            flightNonce: "flight-canary-cleaned-reuse",
+            action: "prove_mount",
+            proof: cleaned,
+            unresolvedForTargetParent: [],
+            sourceParentId: wrapperId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: wrapperEvidence,
+            sourceId: privateSourceId,
+            targetParentId: publicParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence: publicParentEvidence,
+            cleanupManifest: null,
+          }),
+        ).toThrow(/invalid atomic canary recovery input/u);
+      }
+    }
+  });
+
+  test("closes admission when canary parent devices differ", () => {
+    const wrapperId = semanticId();
+    const sourceId = semanticId();
+    const targetParentId = semanticId();
+    const wrapperEvidence = evidence({ ino: "20" });
+    const targetParentEvidence = evidence({ dev: "2", ino: "21" });
+    const sourceEvidence = evidence({ ino: "22" });
+    const proof = plannedCanaryProof(
+      wrapperEvidence,
+      targetParentEvidence,
+      sourceEvidence,
+    );
+    let current = emittedEffect(
+      reduceAtomicPublication(
+        createAtomicCanaryReducerState({
+          flightNonce: "flight-canary-cross-device",
+          action: "prove_mount",
+          proof,
+          unresolvedForTargetParent: [proof],
+          sourceParentId: wrapperId,
+          sourceParentRole: "wrapper",
+          sourceParentEvidence: wrapperEvidence,
+          sourceId,
+          targetParentId,
+          targetParentRole: "profiles_parent",
+          targetParentEvidence,
+          cleanupManifest: null,
+        }),
+        null,
+      ),
+    );
+    for (const requestKind of [
+      "revalidate_handle",
+      "revalidate_handle",
+    ] as const) {
+      current = emittedEffect(
+        reduceAtomicPublication(current.state, {
+          kind: "effect_completed",
+          effectId: current.request.effectId,
+          requestKind,
+          evidenceDigest: HASH,
+          count: 1,
+          byteSize: 0,
+        }),
+      );
+    }
+    current = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "statfs_observed",
+        effectId: current.request.effectId,
+        objectId: wrapperId,
+        filesystem: "overlay",
+        magic: "0x794c7630",
+        device: "1",
+        evidenceDigest: HASH,
+      }),
+    );
+    const close = emittedEffect(
+      reduceAtomicPublication(current.state, {
+        kind: "statfs_observed",
+        effectId: current.request.effectId,
+        objectId: targetParentId,
+        filesystem: "overlay",
+        magic: "0x794c7630",
+        device: "2",
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(close.request).toMatchObject({
+      kind: "close_admission",
+      reason: "cross_device",
+    });
+    expect(
+      reduceAtomicPublication(close.state, {
+        kind: "effect_completed",
+        effectId: close.request.effectId,
+        requestKind: "close_admission",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    ).toMatchObject({
+      kind: "terminal",
+      result: { kind: "fail_stop", code: "native_cross_device" },
+      state: { admission: "closed" },
+    });
+  });
+
+  test("rejects invalid durable canary phase, identity, and cursor tuples", () => {
+    const wrapperId = semanticId();
+    const sourceId = semanticId();
+    const targetParentId = semanticId();
+    const wrapperEvidence = evidence({ ino: "30" });
+    const targetParentEvidence = evidence({ ino: "31" });
+    const sourceEvidence = evidence({ ino: "32" });
+    const planned = plannedCanaryProof(
+      wrapperEvidence,
+      targetParentEvidence,
+      sourceEvidence,
+    );
+    const baseInput = {
+      flightNonce: "flight-invalid-durable-canary",
+      action: "prove_mount" as const,
+      unresolvedForTargetParent: [] as ReadonlyArray<AtomicCanaryProofV1>,
+      sourceParentId: wrapperId,
+      sourceParentRole: "wrapper" as const,
+      sourceParentEvidence: wrapperEvidence,
+      sourceId,
+      targetParentId,
+      targetParentRole: "profiles_parent" as const,
+      targetParentEvidence,
+      cleanupManifest: null,
+    };
+    for (const proof of [
+      { ...planned, attempt: 1 },
+      { ...planned, sourceLeaf: `proof-${OPERATION_ID}-1` },
+      { ...planned, phase: "published" },
+    ] as unknown as AtomicCanaryProofV1[]) {
+      expect(() =>
+        createAtomicCanaryReducerState({ ...baseInput, proof }),
+      ).toThrow(/invalid atomic canary recovery input/u);
+    }
+    expect(() =>
+      createAtomicCanaryReducerState({
+        ...baseInput,
+        proof: planned,
+        sourceParentEvidence: evidence({ ino: "33" }),
+      }),
+    ).toThrow(/invalid atomic canary mount proof input/u);
+    expect(() =>
+      createAtomicCanaryReducerState({
+        ...baseInput,
+        proof: planned,
+        targetParentEvidence: evidence({ ino: "34" }),
+      }),
+    ).toThrow(/invalid atomic canary mount proof input/u);
+
+    const classification = Object.freeze({
+      outcome: "published" as const,
+      nativeCode: "success" as const,
+      sourceMatches: false,
+      targetMatches: true,
+      targetOther: false,
+      nativePrecheckEvidenceDigest: HASH,
+      locationEvidenceDigest: HASH,
+    });
+    const deleting: AtomicCanaryProofV1 = Object.freeze({
+      ...planned,
+      phase: "deleting",
+      publishedEvidence: sourceEvidence,
+      privateDeletionEvidence: null,
+      classification,
+      manifestSha256: HASH,
+      cleanupNextIndex: 0,
+      cleanupEntryCount: 2,
+    });
+    for (const proof of [
+      {
+        ...deleting,
+        classification: {
+          ...classification,
+          sourceMatches: true,
+        },
+      },
+      {
+        ...deleting,
+        publishedEvidence: evidence({ ino: "36" }),
+      },
+      {
+        ...deleting,
+        privateDeletionEvidence: sourceEvidence,
+      },
+      {
+        ...deleting,
+        sourceParentSynced: true,
+        targetParentSynced: false,
+      },
+    ] as AtomicCanaryProofV1[]) {
+      expect(isAtomicCanaryProofV1(proof)).toBe(false);
+    }
+    expect(() =>
+      createAtomicCanaryReducerState({
+        flightNonce: "flight-invalid-cleanup-cursor",
+        action: "cleanup",
+        proof: deleting,
+        unresolvedForTargetParent: [deleting],
+        sourceParentId: targetParentId,
+        sourceParentRole: "profiles_parent",
+        sourceParentEvidence: targetParentEvidence,
+        sourceId,
+        targetParentId: wrapperId,
+        targetParentRole: "wrapper",
+        targetParentEvidence: wrapperEvidence,
+        cleanupManifest: {
+          sha256: HASH,
+          entryCount: 2,
+          nextIndex: 1,
+        },
+      }),
+    ).toThrow(/atomic canary cleanup cursor changed/u);
+    expect(() =>
+      createAtomicCanaryReducerState({
+        flightNonce: "flight-invalid-deletion-identity",
+        action: "cleanup",
+        proof: {
+          ...deleting,
+          privateDeletionEvidence: evidence({ ino: "35" }),
+          sourceParentSynced: true,
+          targetParentSynced: true,
+        },
+        unresolvedForTargetParent: [],
+        sourceParentId: targetParentId,
+        sourceParentRole: "profiles_parent",
+        sourceParentEvidence: targetParentEvidence,
+        sourceId,
+        targetParentId: wrapperId,
+        targetParentRole: "wrapper",
+        targetParentEvidence: wrapperEvidence,
+        cleanupManifest: {
+          sha256: HASH,
+          entryCount: 2,
+          nextIndex: 0,
+        },
+      }),
+    ).toThrow(/invalid atomic canary/u);
+  });
+
+  test("normalizes only exact attempt-zero canary source-missing replay", () => {
+    const sourceParentId = semanticId();
+    const sourceId = semanticId();
+    const targetParentId = semanticId();
+    const targetId = semanticId();
+    const request: AtomicEffectRequestDraftV1 = {
+      kind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "canary_publish",
+      sourceParentId,
+      sourceId,
+      sourceLeaf: `proof-${OPERATION_ID}-0`,
+      targetParentId,
+      targetLeaf: `canary-${OPERATION_ID}-0`,
+      expectedSource: EVIDENCE,
+      expectedTarget: { absent: true },
+      evidenceDigest: HASH,
+    };
+    const state = createAtomicReducerState({
+      flightNonce: "flight-canary-replay",
+      request,
+      semanticIds: [sourceParentId, sourceId, targetParentId],
+      canaryReplayAuthority: {
+        operationId: OPERATION_ID,
+        attempt: 0,
+        phase: "planned",
+        sourceLeaf: `proof-${OPERATION_ID}-0`,
+        targetLeaf: `canary-${OPERATION_ID}-0`,
+        deletionLeaf: `deletion-${OPERATION_ID}-0`,
+        privateSourceEvidence: EVIDENCE,
+        publishedEvidence: null,
+        privateDeletionEvidence: null,
+        manifestSha256: null,
+        cleanupNextIndex: 0,
+        cleanupEntryCount: 0,
+      },
+    });
+    const native = reduceAtomicPublication(state, null);
+    if (native.kind !== "effect") throw new Error("native effect missing");
+    const observe = reduceAtomicPublication(state, {
+      kind: "native_resolved",
+      effectId: native.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "canary_publish",
+      sourceObjectId: sourceId,
+      sourceEvidence: EVIDENCE,
+      rawCode: "atomic_publish_source_missing",
+      nativePrecheckEvidenceDigest: HASH,
+      evidenceDigest: HASH,
+    });
+    if (observe.kind !== "effect") throw new Error("observe effect missing");
+    const completed = reduceAtomicPublication(observe.state, {
+      kind: "locations_observed",
+      effectId: observe.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "canary_publish",
+      sourceParentId,
+      sourceLeaf: `proof-${OPERATION_ID}-0`,
+      targetParentId,
+      targetLeaf: `canary-${OPERATION_ID}-0`,
+      requestedSourceObjectId: sourceId,
+      sourceObjectId: null,
+      targetObjectId: targetId,
+      source: location("absent", null, null),
+      target: location("match", targetId, EVIDENCE),
+      evidenceDigest: HASH,
+    });
+    expect(completed).toMatchObject({
+      kind: "terminal",
+      result: { kind: "protocol_complete" },
+      state: {
+        admission: "open",
+        nativeClassification: {
+          nativeCode: "atomic_publish_replay_completed",
+        },
+      },
+    });
+    expect(() =>
+      createAtomicReducerState({
+        flightNonce: "flight-canary-wrong-attempt",
+        request: { ...request, sourceLeaf: `proof-${OPERATION_ID}-1` },
+        semanticIds: [sourceParentId, sourceId, targetParentId],
+      }),
+    ).toThrow(/invalid atomic effect request/u);
+  });
+
+  test("closes admission for an exact no-replace canary conflict", () => {
+    const sourceParentId = semanticId();
+    const sourceId = semanticId();
+    const targetParentId = semanticId();
+    const targetId = semanticId();
+    const state = createAtomicReducerState({
+      flightNonce: "flight-canary-conflict",
+      request: {
+        kind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceParentId,
+        sourceId,
+        sourceLeaf: `proof-${OPERATION_ID}-0`,
+        targetParentId,
+        targetLeaf: `canary-${OPERATION_ID}-0`,
+        expectedSource: EVIDENCE,
+        expectedTarget: { absent: true },
+        evidenceDigest: HASH,
+      },
+      semanticIds: [sourceParentId, sourceId, targetParentId],
+    });
+    const native = emittedEffect(reduceAtomicPublication(state, null));
+    const observe = emittedEffect(
+      reduceAtomicPublication(native.state, {
+        kind: "native_resolved",
+        effectId: native.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceObjectId: sourceId,
+        sourceEvidence: EVIDENCE,
+        rawCode: "atomic_publish_exists",
+        nativePrecheckEvidenceDigest: HASH,
+        evidenceDigest: HASH,
+      }),
+    );
+    const close = emittedEffect(
+      reduceAtomicPublication(observe.state, {
+        kind: "locations_observed",
+        effectId: observe.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceParentId,
+        sourceLeaf: `proof-${OPERATION_ID}-0`,
+        targetParentId,
+        targetLeaf: `canary-${OPERATION_ID}-0`,
+        requestedSourceObjectId: sourceId,
+        sourceObjectId: sourceId,
+        targetObjectId: targetId,
+        source: location("match", sourceId, EVIDENCE),
+        target: location("other", targetId, evidence({ ino: "99" })),
+        evidenceDigest: HASH,
+      }),
+    );
+    expect(close.request).toMatchObject({
+      kind: "close_admission",
+      reason: "binding_invalid",
+    });
+    expect(
+      reduceAtomicPublication(close.state, {
+        kind: "effect_completed",
+        effectId: close.request.effectId,
+        requestKind: "close_admission",
+        evidenceDigest: HASH,
+        count: 1,
+        byteSize: 0,
+      }),
+    ).toMatchObject({
+      kind: "terminal",
+      result: { kind: "fail_stop", code: "native_binding_invalid" },
+      state: { admission: "closed" },
+    });
+  });
+
+  test.each(["planned", "published"] as const)(
+    "closes cleanup source-missing replay in %s phase",
+    phase => {
+      const sourceParentId = semanticId();
+      const sourceId = semanticId();
+      const targetParentId = semanticId();
+      const targetId = semanticId();
+      const state = createAtomicReducerState({
+        flightNonce: `flight-cleanup-replay-${phase}`,
+        request: {
+          kind: "native_no_replace",
+          operationId: OPERATION_ID,
+          move: "canary_source_to_private",
+          sourceParentId,
+          sourceId,
+          sourceLeaf: `canary-${OPERATION_ID}-0`,
+          targetParentId,
+          targetLeaf: `deletion-${OPERATION_ID}-0`,
+          expectedSource: EVIDENCE,
+          expectedTarget: { absent: true },
+          evidenceDigest: HASH,
+        },
+        semanticIds: [sourceParentId, sourceId, targetParentId],
+        canaryReplayAuthority: {
+          operationId: OPERATION_ID,
+          attempt: 0,
+          phase,
+          sourceLeaf: `proof-${OPERATION_ID}-0`,
+          targetLeaf: `canary-${OPERATION_ID}-0`,
+          deletionLeaf: `deletion-${OPERATION_ID}-0`,
+          privateSourceEvidence: EVIDENCE,
+          publishedEvidence: phase === "published" ? EVIDENCE : null,
+          privateDeletionEvidence: null,
+          manifestSha256: null,
+          cleanupNextIndex: 0,
+          cleanupEntryCount: 0,
+        },
+      });
+      const native = emittedEffect(reduceAtomicPublication(state, null));
+      const observe = emittedEffect(
+        reduceAtomicPublication(native.state, {
+          kind: "native_resolved",
+          effectId: native.request.effectId,
+          requestKind: "native_no_replace",
+          operationId: OPERATION_ID,
+          move: "canary_source_to_private",
+          sourceObjectId: sourceId,
+          sourceEvidence: EVIDENCE,
+          rawCode: "atomic_publish_source_missing",
+          nativePrecheckEvidenceDigest: HASH,
+          evidenceDigest: HASH,
+        }),
+      );
+      const close = emittedEffect(
+        reduceAtomicPublication(observe.state, {
+          kind: "locations_observed",
+          effectId: observe.request.effectId,
+          requestKind: "native_no_replace",
+          operationId: OPERATION_ID,
+          move: "canary_source_to_private",
+          sourceParentId,
+          sourceLeaf: `canary-${OPERATION_ID}-0`,
+          targetParentId,
+          targetLeaf: `deletion-${OPERATION_ID}-0`,
+          requestedSourceObjectId: sourceId,
+          sourceObjectId: null,
+          targetObjectId: targetId,
+          source: location("absent", null, null),
+          target: location("match", targetId, EVIDENCE),
+          evidenceDigest: HASH,
+        }),
+      );
+      expect(close.request).toMatchObject({
+        kind: "close_admission",
+        reason: "binding_invalid",
+      });
+      expect(
+        reduceAtomicPublication(close.state, {
+          kind: "effect_completed",
+          effectId: close.request.effectId,
+          requestKind: "close_admission",
+          evidenceDigest: HASH,
+          count: 1,
+          byteSize: 0,
+        }),
+      ).toMatchObject({
+        kind: "terminal",
+        result: { kind: "fail_stop", code: "native_binding_invalid" },
+        state: { admission: "closed" },
+      });
+    },
+  );
+
+  test("observes noncanary source-missing before closing admission", () => {
+    const sourceParentId = semanticId();
+    const sourceId = semanticId();
+    const targetParentId = semanticId();
+    const state = createAtomicReducerState({
+      flightNonce: "flight-profile-source-missing",
+      request: {
+        kind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "profile_publish",
+        sourceParentId,
+        sourceId,
+        sourceLeaf: "payload",
+        targetParentId,
+        targetLeaf: OPERATION_ID,
+        expectedSource: EVIDENCE,
+        expectedTarget: { absent: true },
+        evidenceDigest: HASH,
+      },
+      semanticIds: [sourceParentId, sourceId, targetParentId],
+    });
+    const native = reduceAtomicPublication(state, null);
+    if (native.kind !== "effect") throw new Error("native effect missing");
+    const observe = reduceAtomicPublication(state, {
+      kind: "native_resolved",
+      effectId: native.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "profile_publish",
+      sourceObjectId: sourceId,
+      sourceEvidence: EVIDENCE,
+      rawCode: "atomic_publish_source_missing",
+      nativePrecheckEvidenceDigest: HASH,
+      evidenceDigest: HASH,
+    });
+    if (observe.kind !== "effect") throw new Error("observe effect missing");
+    const close = reduceAtomicPublication(observe.state, {
+      kind: "locations_observed",
+      effectId: observe.request.effectId,
+      requestKind: "native_no_replace",
+      operationId: OPERATION_ID,
+      move: "profile_publish",
+      sourceParentId,
+      sourceLeaf: "payload",
+      targetParentId,
+      targetLeaf: OPERATION_ID,
+      requestedSourceObjectId: sourceId,
+      sourceObjectId: null,
+      targetObjectId: null,
+      source: location("absent", null, null),
+      target: location("absent", null, null),
+      evidenceDigest: HASH,
+    });
+    expect(close).toMatchObject({
+      kind: "effect",
+      request: {
+        kind: "close_admission",
+        reason: "binding_invalid",
+      },
+    });
+    if (close.kind !== "effect") throw new Error("close effect missing");
+    const terminal = reduceAtomicPublication(close.state, {
+      kind: "effect_completed",
+      effectId: close.request.effectId,
+      requestKind: "close_admission",
+      evidenceDigest: HASH,
+      count: 1,
+      byteSize: 0,
+    });
+    expect(terminal).toMatchObject({
+      kind: "terminal",
+      result: { kind: "fail_stop", code: "native_binding_invalid" },
+      state: { admission: "closed" },
+    });
+  });
+
+  test.each(
+    (["absent", "match", "other"] as const).flatMap(sourceState =>
+      (["absent", "match", "other"] as const)
+        .filter(
+          targetState =>
+            !(sourceState === "absent" && targetState === "match"),
+        )
+        .map(targetState => [sourceState, targetState] as const),
+    ),
+  )(
+    "closes admission for success with %s source and %s target",
+    (sourceState, targetState) => {
+      const sourceParentId = semanticId();
+      const sourceId = semanticId();
+      const targetParentId = semanticId();
+      const sourceOtherId = semanticId();
+      const targetId = semanticId();
+      const otherEvidence = evidence({ ino: "3" });
+      const state = createAtomicReducerState({
+        flightNonce: `flight-invalid-locations-${sourceState}-${targetState}`,
+        request: {
+          kind: "native_no_replace",
+          operationId: OPERATION_ID,
+          move: "canary_publish",
+          sourceParentId,
+          sourceId,
+          sourceLeaf: `proof-${OPERATION_ID}-0`,
+          targetParentId,
+          targetLeaf: `canary-${OPERATION_ID}-0`,
+          expectedSource: EVIDENCE,
+          expectedTarget: { absent: true },
+          evidenceDigest: HASH,
+        },
+        semanticIds: [sourceParentId, sourceId, targetParentId],
+      });
+      const native = reduceAtomicPublication(state, null);
+      if (native.kind !== "effect") throw new Error("native effect missing");
+      const observe = reduceAtomicPublication(state, {
+        kind: "native_resolved",
+        effectId: native.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceObjectId: sourceId,
+        sourceEvidence: EVIDENCE,
+        rawCode: "success",
+        nativePrecheckEvidenceDigest: HASH,
+        evidenceDigest: HASH,
+      });
+      if (observe.kind !== "effect") throw new Error("observe effect missing");
+      const sourceObjectId =
+        sourceState === "absent"
+          ? null
+          : sourceState === "match"
+            ? sourceId
+            : sourceOtherId;
+      const targetObjectId =
+        targetState === "absent" ? null : targetId;
+      const close = reduceAtomicPublication(observe.state, {
+        kind: "locations_observed",
+        effectId: observe.request.effectId,
+        requestKind: "native_no_replace",
+        operationId: OPERATION_ID,
+        move: "canary_publish",
+        sourceParentId,
+        sourceLeaf: `proof-${OPERATION_ID}-0`,
+        targetParentId,
+        targetLeaf: `canary-${OPERATION_ID}-0`,
+        requestedSourceObjectId: sourceId,
+        sourceObjectId,
+        targetObjectId,
+        source: location(
+          sourceState,
+          sourceObjectId,
+          sourceState === "absent"
+            ? null
+            : sourceState === "match"
+              ? EVIDENCE
+              : otherEvidence,
+        ),
+        target: location(
+          targetState,
+          targetObjectId,
+          targetState === "absent"
+            ? null
+            : targetState === "match"
+              ? EVIDENCE
+              : otherEvidence,
+        ),
+        evidenceDigest: HASH,
+      });
+      expect(close).toMatchObject({
+        kind: "effect",
+        request: { kind: "close_admission", reason: "ambiguous" },
+      });
+    },
+  );
 
   test("accepts exact observation maxima and rejects maxima plus one", () => {
     const fileId = semanticId();

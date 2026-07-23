@@ -33,6 +33,7 @@ import type {
 } from "./contracts.js";
 import { BrowserServiceError } from "./errors.js";
 import type {
+  AtomicCanaryProofV1,
   AtomicObjectEvidenceV1,
   FlightEffectId,
   FlightSemanticId,
@@ -55,6 +56,7 @@ import {
   reconcileBrowserStateWithAuthority,
   releaseChromiumSessionAttachment,
   retryFailedReconciliationOutcomeCleanups,
+  runAtomicCanaryRecovery,
   runWithReconciliationFilesystemTestContext,
   syncAndCanonicalizeHeldProfileTree,
   writeHeldProfileFixtureFile,
@@ -103,6 +105,7 @@ async function atomicFileEvidence(
 async function openAtomicBundlesParent(
   lease: Awaited<ReturnType<typeof acquireAtomicPreReadyRecoveryAuthority>>,
   canonicalRoot: string,
+  operationId = CHECKPOINT_A,
 ) {
   for (const reservation of [
     {
@@ -119,7 +122,7 @@ async function openAtomicBundlesParent(
     const reserved = await applyAtomicEffect(lease.controller, {
       kind: "reserve_budget",
       effectId: atomicEffectId(),
-      operationId: CHECKPOINT_A,
+      operationId,
       ...reservation,
     });
     if (reserved.kind !== "effect_completed") {
@@ -137,7 +140,7 @@ async function openAtomicBundlesParent(
   const opened = await applyAtomicEffect(lease.controller, {
     kind: "open_pin_handle",
     effectId: atomicEffectId(),
-    operationId: CHECKPOINT_A,
+    operationId,
     role: "bundles_parent",
     parentId: lease.initialAuthority.stagingRootId,
     leaf: "bundles",
@@ -148,6 +151,65 @@ async function openAtomicBundlesParent(
     throw new Error("atomic bundles parent was not pinned");
   }
   return opened;
+}
+
+async function createAtomicCanaryFixture(
+  lease: Awaited<ReturnType<typeof acquireAtomicPreReadyRecoveryAuthority>>,
+  bundles: Awaited<ReturnType<typeof openAtomicBundlesParent>>,
+  operationId: typeof CHECKPOINT_A | typeof CHECKPOINT_B,
+  targetParentLocatorDigest = sha("profiles-parent-locator"),
+) {
+  const wrapper = await applyAtomicEffect(lease.controller, {
+    kind: "create_and_pin_wrapper",
+    effectId: atomicEffectId(),
+    operationId,
+    role: "wrapper",
+    parentId: bundles.handleId,
+    leaf: operationId,
+    parentEvidenceDigest: bundles.evidence.evidenceDigest,
+    mode: 448,
+    expectedAbsence: true,
+  });
+  if (wrapper.kind !== "create_and_pin_completed") {
+    throw new Error("canary wrapper was not created");
+  }
+  const sourceLeaf = `proof-${operationId}-0`;
+  const source = await applyAtomicEffect(lease.controller, {
+    kind: "create_and_pin_directory",
+    effectId: atomicEffectId(),
+    operationId,
+    role: "private_source",
+    parentId: wrapper.handleId,
+    leaf: sourceLeaf,
+    parentEvidenceDigest: wrapper.evidence.evidenceDigest,
+    mode: 448,
+    expectedAbsence: true,
+  });
+  if (source.kind !== "create_and_pin_completed") {
+    throw new Error("canary source was not created");
+  }
+  const proof: AtomicCanaryProofV1 = Object.freeze({
+    version: 1,
+    operationId,
+    targetParentLocatorDigest,
+    targetParentEvidence: lease.initialAuthority.evidence.profilesParent,
+    wrapperEvidence: wrapper.evidence,
+    attempt: 0,
+    sourceLeaf,
+    targetLeaf: `canary-${operationId}-0`,
+    deletionLeaf: `deletion-${operationId}-0`,
+    phase: "planned",
+    privateSourceEvidence: source.evidence,
+    publishedEvidence: null,
+    privateDeletionEvidence: null,
+    classification: null,
+    manifestSha256: null,
+    cleanupNextIndex: 0,
+    cleanupEntryCount: 0,
+    sourceParentSynced: false,
+    targetParentSynced: false,
+  });
+  return Object.freeze({ wrapper, source, proof });
 }
 
 async function provisionAtomicNamespaces(canonicalRoot: string): Promise<void> {
@@ -6669,6 +6731,778 @@ describe("atomic publication reconciliation ownership", () => {
       });
       await expect(attempt).rejects.not.toHaveProperty("cause");
     } finally {
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("rejects disallowed filesystems before minting atomic authority", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          { atomicStatfsScenario: "disallowed" },
+          () =>
+            acquireAtomicPreReadyRecoveryAuthority(
+              installed.root,
+              CHECKPOINT_A,
+            ),
+        ),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic publication filesystem is unsupported",
+      });
+    } finally {
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("publishes a canary through raw native and separate location effects", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const sourceLeaf = `proof-${CHECKPOINT_A}-0`;
+    const targetLeaf = `canary-${CHECKPOINT_A}-0`;
+    let wrapper:
+      | Extract<
+          Awaited<ReturnType<typeof applyAtomicEffect>>,
+          { kind: "create_and_pin_completed" }
+        >
+      | undefined;
+    try {
+      const createdWrapper = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_wrapper",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "wrapper",
+        parentId: bundles.handleId,
+        leaf: CHECKPOINT_A,
+        parentEvidenceDigest: bundles.evidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      });
+      if (createdWrapper.kind !== "create_and_pin_completed") {
+        throw new Error("canary wrapper was not created");
+      }
+      wrapper = createdWrapper;
+      const source = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_directory",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "private_source",
+        parentId: wrapper.handleId,
+        leaf: sourceLeaf,
+        parentEvidenceDigest: wrapper.evidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      });
+      if (source.kind !== "create_and_pin_completed") {
+        throw new Error("canary source was not created");
+      }
+      for (const [role, objectId, expected] of [
+        ["wrapper", wrapper.handleId, wrapper.evidence],
+        [
+          "profiles_parent",
+          lease.initialAuthority.profilesParentId,
+          lease.initialAuthority.evidence.profilesParent,
+        ],
+      ] as const) {
+        const revalidated = await applyAtomicEffect(lease.controller, {
+          kind: "revalidate_handle",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role,
+          objectId,
+          cursor: 0,
+          byteLength: 0,
+          expected,
+        });
+        expect(revalidated).toMatchObject({
+          kind: "effect_completed",
+          requestKind: "revalidate_handle",
+        });
+        await expect(
+          applyAtomicEffect(lease.controller, {
+            kind: "statfs_parent",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role,
+            objectId,
+            expected,
+          }),
+        ).resolves.toMatchObject({
+          kind: "statfs_observed",
+          objectId,
+          device: expected.dev,
+        });
+      }
+      const native = await applyAtomicEffect(lease.controller, {
+        kind: "native_no_replace",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        move: "canary_publish",
+        sourceParentId: wrapper.handleId,
+        sourceId: source.handleId,
+        sourceLeaf,
+        targetParentId: lease.initialAuthority.profilesParentId,
+        targetLeaf,
+        expectedSource: source.evidence,
+        expectedTarget: { absent: true },
+        evidenceDigest: sha("canary-native"),
+      });
+      expect(native).toMatchObject({
+        kind: "native_resolved",
+        requestKind: "native_no_replace",
+        move: "canary_publish",
+        rawCode: "success",
+      });
+      const observed = await applyAtomicEffect(lease.controller, {
+        kind: "observe_locations",
+        requestKind: "native_no_replace",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        move: "canary_publish",
+        sourceParentId: wrapper.handleId,
+        sourceId: source.handleId,
+        sourceLeaf,
+        targetParentId: lease.initialAuthority.profilesParentId,
+        targetLeaf,
+        expectedSource: source.evidence,
+        expectedTarget: { absent: true },
+        evidenceDigest: sha("canary-native"),
+      });
+      expect(observed).toMatchObject({
+        kind: "locations_observed",
+        source: { state: "absent" },
+        target: {
+          state: "match",
+          dev: source.evidence.dev,
+          ino: source.evidence.ino,
+        },
+      });
+      if (
+        observed.kind !== "locations_observed" ||
+        observed.targetObjectId === null ||
+        observed.target.evidence === null
+      ) {
+        throw new Error("published canary was not pinned");
+      }
+      await expect(
+        lstat(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            CHECKPOINT_A,
+            sourceLeaf,
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(
+        (
+          await lstat(path.join(canonicalRoot, "profiles", targetLeaf), {
+            bigint: true,
+          })
+        ).ino,
+      ).toBe(BigInt(source.evidence.ino));
+
+      for (const [role, objectId, expected] of [
+        ["wrapper", wrapper.handleId, wrapper.evidence],
+        [
+          "profiles_parent",
+          lease.initialAuthority.profilesParentId,
+          lease.initialAuthority.evidence.profilesParent,
+        ],
+      ] as const) {
+        await applyAtomicEffect(lease.controller, {
+          kind: "revalidate_handle",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role,
+          objectId,
+          cursor: 0,
+          byteLength: 0,
+          expected,
+        });
+        await applyAtomicEffect(lease.controller, {
+          kind: "statfs_parent",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role,
+          objectId,
+          expected,
+        });
+      }
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "native_no_replace",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          move: "canary_publish",
+          sourceParentId: wrapper.handleId,
+          sourceId: source.handleId,
+          sourceLeaf,
+          targetParentId: lease.initialAuthority.profilesParentId,
+          targetLeaf,
+          expectedSource: source.evidence,
+          expectedTarget: { absent: true },
+          evidenceDigest: sha("canary-native-replay"),
+        }),
+      ).resolves.toMatchObject({
+        kind: "native_resolved",
+        rawCode: "atomic_publish_source_missing",
+      });
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "observe_locations",
+          requestKind: "native_no_replace",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          move: "canary_publish",
+          sourceParentId: wrapper.handleId,
+          sourceId: source.handleId,
+          sourceLeaf,
+          targetParentId: lease.initialAuthority.profilesParentId,
+          targetLeaf,
+          expectedSource: source.evidence,
+          expectedTarget: { absent: true },
+          evidenceDigest: sha("canary-native-replay"),
+        }),
+      ).resolves.toMatchObject({
+        kind: "locations_observed",
+        source: { state: "absent" },
+        target: { state: "match" },
+      });
+      const plannedProof: AtomicCanaryProofV1 = Object.freeze({
+        version: 1,
+        operationId: CHECKPOINT_A,
+        targetParentLocatorDigest: sha("profiles-parent-locator"),
+        targetParentEvidence:
+          lease.initialAuthority.evidence.profilesParent,
+        wrapperEvidence: wrapper.evidence,
+        attempt: 0,
+        sourceLeaf,
+        targetLeaf,
+        deletionLeaf: `deletion-${CHECKPOINT_A}-0`,
+        phase: "planned",
+        privateSourceEvidence: source.evidence,
+        publishedEvidence: null,
+        privateDeletionEvidence: null,
+        classification: null,
+        manifestSha256: null,
+        cleanupNextIndex: 0,
+        cleanupEntryCount: 0,
+        sourceParentSynced: false,
+        targetParentSynced: false,
+      });
+      const persistedPhases: string[] = [];
+      await expect(
+        runAtomicCanaryRecovery(
+          lease.controller,
+          {
+            flightNonce: "duplicate-canary-runner",
+            action: "prove_mount",
+            proof: plannedProof,
+            durableCanaryInventory: [plannedProof, plannedProof],
+            expectedTargetParentLocatorDigest:
+              plannedProof.targetParentLocatorDigest,
+            sourceParentId: wrapper.handleId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: wrapper.evidence,
+            sourceId: source.handleId,
+            targetParentId: lease.initialAuthority.profilesParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence:
+              lease.initialAuthority.evidence.profilesParent,
+            cleanupManifest: null,
+          },
+          async () => undefined,
+        ),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic canary inventory conflicts",
+      });
+      await expect(
+        runAtomicCanaryRecovery(
+          lease.controller,
+          {
+            flightNonce: "wrong-locator-canary-runner",
+            action: "prove_mount",
+            proof: plannedProof,
+            durableCanaryInventory: [],
+            expectedTargetParentLocatorDigest: sha("wrong-parent-locator"),
+            sourceParentId: wrapper.handleId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: wrapper.evidence,
+            sourceId: source.handleId,
+            targetParentId: lease.initialAuthority.profilesParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence:
+              lease.initialAuthority.evidence.profilesParent,
+            cleanupManifest: null,
+          },
+          async () => undefined,
+        ),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic canary inventory conflicts",
+      });
+      const recoveredMount = await runAtomicCanaryRecovery(
+          lease.controller,
+          {
+            flightNonce: "fresh-canary-runner",
+            action: "prove_mount",
+            proof: plannedProof,
+            durableCanaryInventory: [],
+            expectedTargetParentLocatorDigest:
+              plannedProof.targetParentLocatorDigest,
+            sourceParentId: wrapper.handleId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: wrapper.evidence,
+            sourceId: source.handleId,
+            targetParentId: lease.initialAuthority.profilesParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence:
+              lease.initialAuthority.evidence.profilesParent,
+            cleanupManifest: null,
+          },
+          async request => {
+            persistedPhases.push(request.proof.phase);
+          },
+        );
+      expect(recoveredMount).toMatchObject({
+        kind: "mount_proved",
+        proof: {
+          phase: "published",
+          publishedEvidence: source.evidence,
+        },
+      });
+      expect(persistedPhases).toEqual(["planned", "published"]);
+      const replayPersistence = vi.fn(async () => undefined);
+      const concurrentReplay = (flightNonce: string) =>
+        runAtomicCanaryRecovery(
+          lease.controller,
+          {
+            flightNonce,
+            action: "prove_mount",
+            proof: recoveredMount.proof,
+            durableCanaryInventory: [recoveredMount.proof],
+            expectedTargetParentLocatorDigest:
+              recoveredMount.proof.targetParentLocatorDigest,
+            sourceParentId: wrapper.handleId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: wrapper.evidence,
+            sourceId: source.handleId,
+            targetParentId: lease.initialAuthority.profilesParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence:
+              lease.initialAuthority.evidence.profilesParent,
+            cleanupManifest: null,
+          },
+          replayPersistence,
+        );
+      const sameParentResults = await Promise.all([
+        concurrentReplay("same-parent-canary-a"),
+        concurrentReplay("same-parent-canary-b"),
+      ]);
+      expect(sameParentResults).toMatchObject([
+        { kind: "mount_proved", proof: { phase: "published" } },
+        { kind: "mount_proved", proof: { phase: "published" } },
+      ]);
+      expect(replayPersistence).not.toHaveBeenCalled();
+      expect(sameParentResults[0]!.proof).toEqual(recoveredMount.proof);
+      expect(sameParentResults[1]!.proof).toEqual(recoveredMount.proof);
+
+      const deletionLeaf = `deletion-${CHECKPOINT_A}-0`;
+      const cleanupPhases: string[] = [];
+      const deleting = await runAtomicCanaryRecovery(
+        lease.controller,
+        {
+          flightNonce: "canary-cleanup-runner",
+          action: "cleanup",
+          proof: recoveredMount.proof,
+          durableCanaryInventory: [recoveredMount.proof],
+          expectedTargetParentLocatorDigest:
+            recoveredMount.proof.targetParentLocatorDigest,
+          sourceParentId: lease.initialAuthority.profilesParentId,
+          sourceParentRole: "profiles_parent",
+          sourceParentEvidence:
+            lease.initialAuthority.evidence.profilesParent,
+          sourceId: observed.targetObjectId,
+          targetParentId: wrapper.handleId,
+          targetParentRole: "wrapper",
+          targetParentEvidence: wrapper.evidence,
+          cleanupManifest: {
+            sha256: sha("canary-manifest"),
+            entryCount: 1,
+            nextIndex: 0,
+          },
+        },
+        async request => {
+          cleanupPhases.push(request.proof.phase);
+        },
+      );
+      expect(cleanupPhases).toEqual(["deleting", "deleting"]);
+      expect(deleting).toMatchObject({
+        kind: "cleanup_pending",
+        proof: {
+          phase: "deleting",
+          privateDeletionEvidence: source.evidence,
+        },
+      });
+      const replayedCleanup = await runAtomicCanaryRecovery(
+        lease.controller,
+        {
+          flightNonce: "fresh-cleanup-replay-runner",
+          action: "cleanup",
+          proof: deleting.proof,
+          durableCanaryInventory: [deleting.proof],
+          expectedTargetParentLocatorDigest:
+            deleting.proof.targetParentLocatorDigest,
+          sourceParentId: lease.initialAuthority.profilesParentId,
+          sourceParentRole: "profiles_parent",
+          sourceParentEvidence:
+            lease.initialAuthority.evidence.profilesParent,
+          sourceId: observed.targetObjectId,
+          targetParentId: wrapper.handleId,
+          targetParentRole: "wrapper",
+          targetParentEvidence: wrapper.evidence,
+          cleanupManifest: {
+            sha256: sha("canary-manifest"),
+            entryCount: 1,
+            nextIndex: 0,
+          },
+        },
+        async () => undefined,
+      );
+      expect(replayedCleanup).toMatchObject({
+        kind: "cleanup_pending",
+        proof: {
+          phase: "deleting",
+          privateDeletionEvidence: source.evidence,
+        },
+      });
+      expect(
+        await lstat(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            CHECKPOINT_A,
+            deletionLeaf,
+          ),
+        ),
+      ).toMatchObject({ ino: Number(source.evidence.ino) });
+    } finally {
+      await closeAtomicEffectController(lease.controller).catch(() => undefined);
+      await rm(path.join(canonicalRoot, "profiles", targetLeaf), {
+        recursive: true,
+        force: true,
+      });
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("reserves one fresh canary across controllers sharing a root", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const leaseA = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const leaseB = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_B,
+    );
+    const locator = sha("shared-parent-race-locator");
+    const bundlesA = await openAtomicBundlesParent(
+      leaseA,
+      canonicalRoot,
+      CHECKPOINT_A,
+    );
+    const bundlesB = await openAtomicBundlesParent(
+      leaseB,
+      canonicalRoot,
+      CHECKPOINT_B,
+    );
+    const fixtureA = await createAtomicCanaryFixture(
+      leaseA,
+      bundlesA,
+      CHECKPOINT_A,
+      locator,
+    );
+    const fixtureB = await createAtomicCanaryFixture(
+      leaseB,
+      bundlesB,
+      CHECKPOINT_B,
+      locator,
+    );
+    let entered!: () => void;
+    const persistenceEntered = new Promise<void>(resolve => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const persistenceRelease = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const input = (
+      lease: typeof leaseA,
+      fixture: typeof fixtureA,
+      flightNonce: string,
+    ) => ({
+      flightNonce,
+      action: "prove_mount" as const,
+      proof: fixture.proof,
+      durableCanaryInventory: [],
+      expectedTargetParentLocatorDigest: locator,
+      sourceParentId: fixture.wrapper.handleId,
+      sourceParentRole: "wrapper" as const,
+      sourceParentEvidence: fixture.wrapper.evidence,
+      sourceId: fixture.source.handleId,
+      targetParentId: lease.initialAuthority.profilesParentId,
+      targetParentRole: "profiles_parent" as const,
+      targetParentEvidence: lease.initialAuthority.evidence.profilesParent,
+      cleanupManifest: null,
+    });
+    const first = runAtomicCanaryRecovery(
+      leaseA.controller,
+      input(leaseA, fixtureA, "fresh-claim-a"),
+      async () => {
+        entered();
+        await persistenceRelease;
+        throw new Error("injected uncertain persistence");
+      },
+    );
+    await persistenceEntered;
+    const secondPersistence = vi.fn(async () => undefined);
+    const second = runAtomicCanaryRecovery(
+      leaseB.controller,
+      input(leaseB, fixtureB, "fresh-claim-b"),
+      secondPersistence,
+    );
+    let secondSettled = false;
+    void second.finally(() => {
+      secondSettled = true;
+    }).catch(() => undefined);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(secondSettled).toBe(false);
+    release();
+    try {
+      await expect(first).rejects.toThrow("injected uncertain persistence");
+      await expect(second).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic canary inventory conflicts",
+      });
+      expect(secondPersistence).not.toHaveBeenCalled();
+    } finally {
+      await closeAtomicEffectController(leaseA.controller).catch(
+        () => undefined,
+      );
+      await closeAtomicEffectController(leaseB.controller).catch(
+        () => undefined,
+      );
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_B,
+        ),
+        { recursive: true, force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("runner closes admission for a real canary target conflict", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const locator = sha("conflict-parent-locator");
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const fixture = await createAtomicCanaryFixture(
+      lease,
+      bundles,
+      CHECKPOINT_A,
+      locator,
+    );
+    const target = path.join(
+      canonicalRoot,
+      "profiles",
+      fixture.proof.targetLeaf,
+    );
+    await mkdir(target, { mode: 0o700 });
+    const persisted: string[] = [];
+    try {
+      await expect(
+        runAtomicCanaryRecovery(
+          lease.controller,
+          {
+            flightNonce: "real-canary-conflict",
+            action: "prove_mount",
+            proof: fixture.proof,
+            durableCanaryInventory: [],
+            expectedTargetParentLocatorDigest: locator,
+            sourceParentId: fixture.wrapper.handleId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: fixture.wrapper.evidence,
+            sourceId: fixture.source.handleId,
+            targetParentId: lease.initialAuthority.profilesParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence:
+              lease.initialAuthority.evidence.profilesParent,
+            cleanupManifest: null,
+          },
+          async request => {
+            persisted.push(request.proof.phase);
+          },
+        ),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message:
+          "atomic canary recovery failed: native_binding_invalid",
+      });
+      expect(persisted).toEqual(["planned"]);
+      await expect(lstat(target)).resolves.toMatchObject({
+        ino: expect.any(Number),
+      });
+    } finally {
+      await closeAtomicEffectController(lease.controller).catch(
+        () => undefined,
+      );
+      await rm(target, { recursive: true, force: true });
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("published replay never renames a regressed private source", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const locator = sha("published-regression-locator");
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const fixture = await createAtomicCanaryFixture(
+      lease,
+      bundles,
+      CHECKPOINT_A,
+      locator,
+    );
+    const published: AtomicCanaryProofV1 = Object.freeze({
+      ...fixture.proof,
+      phase: "published",
+      publishedEvidence: fixture.source.evidence,
+      classification: Object.freeze({
+        outcome: "published",
+        nativeCode: "success",
+        sourceMatches: false,
+        targetMatches: true,
+        targetOther: false,
+        nativePrecheckEvidenceDigest: sha("published-precheck"),
+        locationEvidenceDigest: sha("published-locations"),
+      }),
+      sourceParentSynced: true,
+      targetParentSynced: true,
+    });
+    const source = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+      fixture.proof.sourceLeaf,
+    );
+    const target = path.join(
+      canonicalRoot,
+      "profiles",
+      fixture.proof.targetLeaf,
+    );
+    const persistence = vi.fn(async () => undefined);
+    try {
+      await expect(
+        runAtomicCanaryRecovery(
+          lease.controller,
+          {
+            flightNonce: "published-regressed-source",
+            action: "prove_mount",
+            proof: published,
+            durableCanaryInventory: [published],
+            expectedTargetParentLocatorDigest: locator,
+            sourceParentId: fixture.wrapper.handleId,
+            sourceParentRole: "wrapper",
+            sourceParentEvidence: fixture.wrapper.evidence,
+            sourceId: fixture.source.handleId,
+            targetParentId: lease.initialAuthority.profilesParentId,
+            targetParentRole: "profiles_parent",
+            targetParentEvidence:
+              lease.initialAuthority.evidence.profilesParent,
+            cleanupManifest: null,
+          },
+          persistence,
+        ),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message:
+          "atomic canary recovery failed: native_binding_invalid",
+      });
+      expect(persistence).not.toHaveBeenCalled();
+      await expect(lstat(source)).resolves.toMatchObject({
+        ino: Number(fixture.source.evidence.ino),
+      });
+      await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await closeAtomicEffectController(lease.controller).catch(
+        () => undefined,
+      );
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
       await closeAnchoredProfileRoot(installed.root);
     }
   });

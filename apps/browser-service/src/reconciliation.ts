@@ -17,6 +17,10 @@ import { chromium, type Browser, type BrowserContext } from "playwright";
 import type {
   AtomicEffectObservationV1,
   AtomicEffectRequestV1,
+  AtomicCanaryProofV1,
+  AtomicCanaryRecoveryInputV1,
+  AtomicTerminalResultV1,
+  AtomicLocationMoveV1,
   AtomicObjectEvidenceV1,
   AtomicObjectRoleV1,
   FlightEffectId,
@@ -24,9 +28,13 @@ import type {
   FlightSemanticId,
 } from "./atomic-directory-publication.js";
 import {
+  createAtomicCanaryReducerState,
   isAtomicControlLeafV1,
+  isAtomicCanaryProofV1,
   isAtomicPayloadLeafV1,
+  reduceAtomicPublication,
 } from "./atomic-directory-publication.js";
+import { loadAtomicDirectoryPublicationNative } from "./atomic-directory-publication-native.js";
 import {
   MAX_RECONCILIATION_REFERENCES,
   canonicalJson,
@@ -61,6 +69,14 @@ const PLAN_FILES = new Set([
   "complete",
 ]);
 const ATOMIC_PROCFS_MAGIC = 0x9fa0n;
+const ATOMIC_O_PATH = 0o10000000;
+const ATOMIC_ALLOWED_FILESYSTEM_TYPES = new Set([
+  0xef53n,
+  0x58465342n,
+  0x9123683en,
+  0x01021994n,
+  0x794c7630n,
+]);
 const ATOMIC_SEMANTIC_ID_LIMIT = 4_096;
 const ATOMIC_PARTIAL_ID_LIMIT = 1_024;
 const ATOMIC_DIRECTORY_PAGE_LIMIT = 256;
@@ -107,6 +123,14 @@ export type ReconciliationFilesystemTestContext = {
     | "wrong_type"
     | "identity_mismatch"
     | "unsupported_operation";
+  atomicStatfsScenario?: "disallowed" | "device_mismatch";
+  atomicNativeBarrier?: (
+    phase: "before" | "after",
+    move: Extract<
+      AtomicEffectRequestV1,
+      { kind: "native_no_replace" }
+    >["move"],
+  ) => void;
   atomicOpenFlags?: (point: string, flags: number, mode?: number) => void;
   atomicOperationCompleted?: (point: string) => void;
 };
@@ -8416,6 +8440,17 @@ type AtomicEffectFlightRecord = {
     point: string;
   }>;
   seenEffects: WeakSet<object>;
+  revalidatedHandles: WeakSet<object>;
+  statfsHandles: WeakMap<
+    object,
+    Readonly<{
+      device: string;
+      filesystem: Extract<
+        AtomicEffectObservationV1,
+        { kind: "statfs_observed" }
+      >["filesystem"];
+    }>
+  >;
   semanticCount: number;
   partialCount: number;
   effectCount: number;
@@ -8947,6 +8982,67 @@ function assertAtomicProcfs(root: FileHandle): void {
   }
 }
 
+function atomicStatfsType(handle: FileHandle): bigint {
+  const scenario =
+    process.env.VITEST === "true"
+      ? filesystemTestContext.getStore()?.atomicStatfsScenario
+      : undefined;
+  if (scenario === "disallowed") return 0x6969n;
+  try {
+    return statfsSync(`/proc/self/fd/${handle.fd}`, {
+      bigint: true,
+    }).type;
+  } catch {
+    throw atomicFailure("atomic publication filesystem is unsupported");
+  }
+}
+
+function assertAtomicAllowedFilesystem(handle: FileHandle): void {
+  if (!ATOMIC_ALLOWED_FILESYSTEM_TYPES.has(atomicStatfsType(handle))) {
+    throw atomicFailure("atomic publication filesystem is unsupported");
+  }
+}
+
+function assertAtomicMountPair(
+  source: AtomicHeldRecord,
+  target: AtomicHeldRecord,
+): void {
+  assertAtomicAllowedFilesystem(source.handle);
+  assertAtomicAllowedFilesystem(target.handle);
+  const scenario =
+    process.env.VITEST === "true"
+      ? filesystemTestContext.getStore()?.atomicStatfsScenario
+      : undefined;
+  if (
+    source.stat.dev !== target.stat.dev ||
+    scenario === "device_mismatch"
+  ) {
+    throw atomicFailure("atomic publication filesystem crosses devices");
+  }
+}
+
+function atomicFilesystemName(
+  magic: bigint,
+): Extract<
+  AtomicEffectObservationV1,
+  { kind: "statfs_observed" }
+>["filesystem"] | null {
+  switch (magic) {
+    case 0xef53n:
+      return "ext";
+    case 0x58465342n:
+      return "xfs";
+    case 0x9123683en:
+      return "btrfs";
+    case 0x01021994n:
+      return "tmpfs";
+    case 0x794c7630n:
+      return "overlay";
+    default:
+      return null;
+  }
+}
+
 async function acquireAtomicFixedDirectory(
   root: RootCapabilityRecord,
   parent: FileHandle,
@@ -9021,6 +9117,7 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
     ) {
       throw atomicFailure("atomic publication state root is invalid");
     }
+    assertAtomicAllowedFilesystem(rootRecord.anchored.handle);
     const profiles = await acquireAtomicFixedDirectory(
       rootRecord,
       rootRecord.anchored.handle,
@@ -9039,6 +9136,8 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
     ) {
       throw atomicFailure("atomic publication authority device is invalid");
     }
+    assertAtomicAllowedFilesystem(profiles.handle);
+    assertAtomicAllowedFilesystem(staging.handle);
     const controller = Object.freeze({}) as AtomicEffectControllerV1;
     const flight: AtomicEffectFlightRecord = {
       state: "live",
@@ -9054,6 +9153,8 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
       livePartials: new Set(),
       transientHandles: new Set(),
       seenEffects: new WeakSet(),
+      revalidatedHandles: new WeakSet(),
+      statfsHandles: new WeakMap(),
       semanticCount: 0,
       partialCount: 0,
       effectCount: 0,
@@ -9147,6 +9248,62 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
       throw new AggregateError(
         failures,
         "atomic publication authority cleanup failed",
+      );
+    }
+    throw error;
+  }
+}
+
+export type AtomicCanonicalRootRecoveryLeaseV1 =
+  AtomicPreReadyRecoveryLeaseV1 &
+    Readonly<{
+      closeRoot: () => Promise<void>;
+    }>;
+
+export async function acquireAtomicPreReadyRecoveryAuthorityFromCanonicalRoot(
+  canonicalRoot: string,
+  binding: ReadyProfileRootBinding,
+  admission: ReconciliationExecutionAdmission,
+  operationId: string,
+): Promise<AtomicCanonicalRootRecoveryLeaseV1> {
+  if (
+    !tokenSchema.safeParse(binding.processNonce).success ||
+    !tokenSchema.safeParse(binding.controlGenerationNonce).success ||
+    !/^[a-f0-9]{64}$/u.test(binding.snapshotDigest)
+  ) {
+    throw atomicFailure("atomic publication root binding is invalid");
+  }
+  const anchored = await openAnchoredRoot(canonicalRoot, admission);
+  const rootRecord: RootCapabilityRecord = {
+    state: "live",
+    anchored,
+    binding: Object.freeze({ ...binding }),
+    children: new Set(),
+    acceptingOperations: true,
+    activeOperations: 0,
+    drainWaiters: new Set(),
+    childDrainWaiters: new Set(),
+    authorities: new Set(),
+    partialCreateCleanups: new Set(),
+  };
+  const root = Object.freeze({}) as AnchoredProfileRoot;
+  rootCapabilityRecords.set(root as object, rootRecord);
+  try {
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      root,
+      operationId,
+    );
+    return Object.freeze({
+      ...lease,
+      closeRoot: () => closeAnchoredProfileRoot(root),
+    });
+  } catch (error) {
+    try {
+      await closeAnchoredProfileRoot(root);
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        "atomic publication root cleanup failed",
       );
     }
     throw error;
@@ -9906,7 +10063,11 @@ async function applyAtomicRevalidateOrSync(
   try {
     if (request.kind === "revalidate_handle") {
       atomicGate(flight, [record], "before", "atomic-revalidate");
+      if (record.stat.isDirectory()) {
+        assertAtomicAllowedFilesystem(record.handle);
+      }
       atomicGate(flight, [record], "after", "atomic-revalidate");
+      flight.revalidatedHandles.add(request.objectId as object);
     } else {
       await atomicAwait(flight, [record], "atomic-fsync", () =>
         record.handle.sync(),
@@ -9923,6 +10084,52 @@ async function applyAtomicRevalidateOrSync(
       ),
       count: 1,
       byteSize: 0,
+    });
+  } catch (error) {
+    return rejectAtomicFilesystemError(flight, request, error);
+  }
+}
+
+function applyAtomicStatfs(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<AtomicEffectRequestV1, { kind: "statfs_parent" }>,
+): AtomicEffectObservationV1 {
+  let record: AtomicHeldRecord;
+  try {
+    record = resolveAtomicRecord(flight, request.objectId);
+    if (
+      record.role !== request.role ||
+      !record.stat.isDirectory() ||
+      !sameAtomicEvidence(record.evidence, request.expected)
+    ) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    atomicGate(flight, [record], "before", "atomic-statfs");
+    const magic = atomicStatfsType(record.handle);
+    const filesystem = atomicFilesystemName(magic);
+    atomicGate(flight, [record], "after", "atomic-statfs");
+    if (filesystem === null) {
+      return atomicRejected(flight, request, "unsupported");
+    }
+    flight.statfsHandles.set(
+      request.objectId as object,
+      Object.freeze({
+        device: String(record.stat.dev),
+        filesystem,
+      }),
+    );
+    return Object.freeze({
+      kind: "statfs_observed",
+      effectId: request.effectId,
+      objectId: request.objectId,
+      filesystem,
+      magic: `0x${magic.toString(16)}`,
+      device: String(record.stat.dev),
+      evidenceDigest: atomicObservationDigest(
+        flight,
+        request,
+        `${filesystem}:${magic.toString(16)}:${record.stat.dev}`,
+      ),
     });
   } catch (error) {
     return rejectAtomicFilesystemError(flight, request, error);
@@ -10761,6 +10968,474 @@ async function applyAtomicRemove(
   }
 }
 
+function atomicNativeCode(error: unknown): Extract<
+  AtomicEffectObservationV1,
+  { kind: "native_resolved" }
+>["rawCode"] {
+  if (isNodeError(error) && typeof error.code === "string") {
+    switch (error.code) {
+      case "atomic_publish_exists":
+      case "atomic_publish_source_missing":
+      case "atomic_publish_unsupported":
+      case "atomic_publish_cross_device":
+      case "atomic_publish_binding_invalid":
+      case "atomic_publish_denied":
+      case "atomic_publish_invalid_argument":
+      case "atomic_publish_io":
+        return error.code;
+    }
+  }
+  return "atomic_publish_io";
+}
+
+function atomicNativeMoveValid(
+  request: Extract<AtomicEffectRequestV1, { kind: "native_no_replace" }>,
+  source: AtomicHeldRecord,
+  targetParent: AtomicHeldRecord,
+): boolean {
+  if (
+    source.parentId !== request.sourceParentId ||
+    source.leaf !== request.sourceLeaf ||
+    !sameAtomicEvidence(source.evidence, request.expectedSource) ||
+    !("absent" in request.expectedTarget)
+  ) {
+    return false;
+  }
+  switch (request.move) {
+    case "profile_publish":
+      return (
+        source.role === "private_source" &&
+        request.sourceLeaf === "payload" &&
+        (targetParent.role === "profiles_parent" ||
+          targetParent.role === "public_target")
+      );
+    case "canary_publish":
+      return (
+        source.role === "private_source" &&
+        request.sourceLeaf === `proof-${request.operationId}-0` &&
+        request.targetLeaf === `canary-${request.operationId}-0` &&
+        (targetParent.role === "profiles_parent" ||
+          targetParent.role === "public_target")
+      );
+    case "profile_source_to_private":
+      return (
+        (source.role === "public_source" ||
+          source.role === "public_target") &&
+        targetParent.role === "wrapper" &&
+        request.targetLeaf === `delete-${request.operationId}`
+      );
+    case "canary_source_to_private":
+      return (
+        (source.role === "public_source" ||
+          source.role === "public_target") &&
+        targetParent.role === "wrapper" &&
+        request.sourceLeaf === `canary-${request.operationId}-0` &&
+        request.targetLeaf === `deletion-${request.operationId}-0`
+      );
+  }
+}
+
+function atomicMissingCanaryReplayMoveValid(
+  request: Extract<AtomicEffectRequestV1, { kind: "native_no_replace" }>,
+  sourceParent: AtomicHeldRecord,
+  targetParent: AtomicHeldRecord,
+): boolean {
+  if (!("absent" in request.expectedTarget)) return false;
+  if (request.move === "canary_publish") {
+    return (
+      sourceParent.role === "wrapper" &&
+      request.sourceLeaf === `proof-${request.operationId}-0` &&
+      request.targetLeaf === `canary-${request.operationId}-0` &&
+      (targetParent.role === "profiles_parent" ||
+        targetParent.role === "public_target")
+    );
+  }
+  return (
+    request.move === "canary_source_to_private" &&
+    (sourceParent.role === "profiles_parent" ||
+      sourceParent.role === "public_target") &&
+    targetParent.role === "wrapper" &&
+    request.sourceLeaf === `canary-${request.operationId}-0` &&
+    request.targetLeaf === `deletion-${request.operationId}-0`
+  );
+}
+
+async function applyAtomicNativeNoReplace(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<AtomicEffectRequestV1, { kind: "native_no_replace" }>,
+): Promise<AtomicEffectObservationV1> {
+  let sourceParent: AtomicHeldRecord;
+  let source: AtomicHeldRecord | null = null;
+  let targetParent: AtomicHeldRecord;
+  try {
+    sourceParent = resolveAtomicRecord(flight, request.sourceParentId);
+    targetParent = resolveAtomicRecord(flight, request.targetParentId);
+  } catch {
+    flight.state = "fail_stopped";
+    flight.root.acceptingOperations = false;
+    return atomicRejected(flight, request, "binding_invalid");
+  }
+  try {
+    source = resolveAtomicRecord(flight, request.sourceId);
+  } catch {
+    source = null;
+  }
+  if (source === null) {
+    try {
+      await atomicAwait(
+        flight,
+        [sourceParent],
+        "atomic-native-replay-source-absence",
+        () => fs.lstat(procPath(sourceParent.handle, request.sourceLeaf)),
+      );
+      flight.state = "fail_stopped";
+      flight.root.acceptingOperations = false;
+      return atomicRejected(flight, request, "binding_invalid");
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") {
+        flight.state = "fail_stopped";
+        flight.root.acceptingOperations = false;
+        return atomicRejected(flight, request, "binding_invalid");
+      }
+    }
+  }
+  const sourceStatfs = flight.statfsHandles.get(
+    request.sourceParentId as object,
+  );
+  const targetStatfs = flight.statfsHandles.get(
+    request.targetParentId as object,
+  );
+  if (
+    !flight.revalidatedHandles.has(request.sourceParentId as object) ||
+    !flight.revalidatedHandles.has(request.targetParentId as object) ||
+    sourceStatfs === undefined ||
+    targetStatfs === undefined ||
+    sourceStatfs.device !== targetStatfs.device ||
+    (source === null
+      ? !atomicMissingCanaryReplayMoveValid(
+          request,
+          sourceParent,
+          targetParent,
+        )
+      : !atomicNativeMoveValid(request, source, targetParent))
+  ) {
+    flight.state = "fail_stopped";
+    flight.root.acceptingOperations = false;
+    return atomicRejected(flight, request, "binding_invalid");
+  }
+  flight.revalidatedHandles.delete(request.sourceParentId as object);
+  flight.revalidatedHandles.delete(request.targetParentId as object);
+  flight.statfsHandles.delete(request.sourceParentId as object);
+  flight.statfsHandles.delete(request.targetParentId as object);
+
+  let rawCode: Extract<
+    AtomicEffectObservationV1,
+    { kind: "native_resolved" }
+  >["rawCode"] = "success";
+  let renamed = false;
+  let gated = false;
+  const precheckValue = {
+    sourceParent: sourceParent.evidence.evidenceDigest,
+    source:
+      source === null
+        ? request.expectedSource.evidenceDigest
+        : source.evidence.evidenceDigest,
+    targetParent: targetParent.evidence.evidenceDigest,
+  };
+  const nativePrecheckEvidenceDigest = sha256(
+    JSON.stringify(precheckValue),
+  );
+  try {
+    atomicGate(
+      flight,
+      source === null
+        ? [sourceParent, targetParent]
+        : [sourceParent, source, targetParent],
+      "before",
+      "atomic-native-no-replace",
+    );
+    gated = true;
+    assertAtomicMountPair(sourceParent, targetParent);
+    filesystemTestContext
+      .getStore()
+      ?.atomicNativeBarrier?.("before", request.move);
+    loadAtomicDirectoryPublicationNative().renameNoReplace(
+      sourceParent.handle.fd,
+      request.sourceLeaf,
+      targetParent.handle.fd,
+      request.targetLeaf,
+    );
+    renamed = true;
+    if (source !== null) flight.removedRecords.add(source);
+    filesystemTestContext
+      .getStore()
+      ?.atomicNativeBarrier?.("after", request.move);
+  } catch (error) {
+    if (renamed && source !== null) flight.removedRecords.add(source);
+    if (
+      error instanceof BrowserServiceError &&
+      error.message === "atomic publication filesystem is unsupported"
+    ) {
+      rawCode = "atomic_publish_unsupported";
+    } else if (
+      error instanceof BrowserServiceError &&
+      error.message === "atomic publication filesystem crosses devices"
+    ) {
+      rawCode = "atomic_publish_cross_device";
+    } else {
+      rawCode = atomicNativeCode(error);
+    }
+  } finally {
+    if (gated) {
+      try {
+        atomicGate(
+          flight,
+          source === null
+            ? [sourceParent, targetParent]
+            : [sourceParent, source, targetParent],
+          "after",
+          "atomic-native-no-replace",
+        );
+      } catch {
+        rawCode = "atomic_publish_binding_invalid";
+      }
+    }
+  }
+  return Object.freeze({
+    kind: "native_resolved",
+    effectId: request.effectId,
+    requestKind: "native_no_replace",
+    operationId: request.operationId,
+    move: request.move,
+    sourceObjectId: request.sourceId,
+    sourceEvidence: request.expectedSource,
+    rawCode,
+    nativePrecheckEvidenceDigest,
+    evidenceDigest: atomicObservationDigest(
+      flight,
+      request,
+      `${rawCode}:${nativePrecheckEvidenceDigest}`,
+    ),
+  });
+}
+
+type AtomicObservedLocation = Readonly<{
+  location: Extract<
+    AtomicEffectObservationV1,
+    { kind: "locations_observed" }
+  >["source"];
+  objectId: FlightSemanticId | null;
+}>;
+
+async function observeAtomicChild(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "observe_locations"; requestKind: "native_no_replace" }
+  >,
+  parent: AtomicHeldRecord,
+  parentId: FlightSemanticId,
+  leaf: string,
+  expected: AtomicObjectEvidenceV1,
+  sourceSide: boolean,
+): Promise<AtomicObservedLocation> {
+  let before: BigIntStats;
+  try {
+    before = await atomicAwait(
+      flight,
+      [parent],
+      `atomic-observe-${sourceSide ? "source" : "target"}-lstat`,
+      () => fs.lstat(procPath(parent.handle, leaf), { bigint: true }),
+    );
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      const value = {
+        state: "absent" as const,
+        objectId: null,
+        dev: null,
+        ino: null,
+        mode: null,
+        evidence: null,
+      };
+      return Object.freeze({
+        objectId: null,
+        location: Object.freeze({
+          ...value,
+          evidenceDigest: sha256(JSON.stringify(value)),
+        }),
+      });
+    }
+    throw error;
+  }
+  const flags = before.isDirectory()
+    ? constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    : ATOMIC_O_PATH | constants.O_NOFOLLOW;
+  let handle: FileHandle | null = await atomicAwait(
+    flight,
+    [parent],
+    `atomic-observe-${sourceSide ? "source" : "target"}-open`,
+    () => fs.open(procPath(parent.handle, leaf), flags),
+  );
+  try {
+    const stat = await atomicAwait(
+      flight,
+      [parent],
+      `atomic-observe-${sourceSide ? "source" : "target"}-fstat`,
+      () => handle!.stat({ bigint: true }),
+    );
+    assertAtomicStat(
+      before,
+      stat,
+      "atomic publication observed location changed",
+    );
+    const evidence = atomicEvidenceFromStat(stat);
+    const matches = sameAtomicEvidence(evidence, expected);
+    if (sourceSide && matches && request.sourceId !== null) {
+      const observed = handle;
+      await atomicVerifiedClose(
+        flight,
+        [parent],
+        "atomic-observe-source-close",
+        () => observed.close(),
+        () => {
+          handle = null;
+        },
+      );
+      const value = {
+        state: "match" as const,
+        objectId: request.sourceId,
+        dev: evidence.dev,
+        ino: evidence.ino,
+        mode: evidence.mode,
+        evidence,
+      };
+      return Object.freeze({
+        objectId: request.sourceId,
+        location: Object.freeze({
+          ...value,
+          evidenceDigest: sha256(
+            JSON.stringify({
+              ...value,
+              objectId: "requested-source",
+            }),
+          ),
+        }),
+      });
+    }
+    const held: AtomicHeldRecord = Object.freeze({
+      role: sourceSide
+        ? "public_source"
+        : request.move === "profile_source_to_private" ||
+            request.move === "canary_source_to_private"
+          ? "private_deletion"
+          : "public_target",
+      operationId: request.operationId,
+      parentId,
+      leaf,
+      handle,
+      binding: parent.binding,
+      evidence,
+      stat,
+      owned: true,
+    });
+    const objectId = mintAtomicSemanticId(flight, held);
+    handle = null;
+    const value = {
+      state: matches ? ("match" as const) : ("other" as const),
+      objectId,
+      dev: evidence.dev,
+      ino: evidence.ino,
+      mode: evidence.mode,
+      evidence,
+    };
+    return Object.freeze({
+      objectId,
+      location: Object.freeze({
+        ...value,
+        evidenceDigest: sha256(
+          JSON.stringify({
+            ...value,
+            objectId: matches ? "observed-match" : "observed-other",
+          }),
+        ),
+      }),
+    });
+  } finally {
+    if (handle !== null) {
+      const retained = handle;
+      await atomicVerifiedClose(
+        flight,
+        [parent],
+        "atomic-observe-failed-close",
+        () => retained.close(),
+        () => {
+          handle = null;
+        },
+      );
+    }
+  }
+}
+
+async function applyAtomicObserveLocations(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "observe_locations"; requestKind: "native_no_replace" }
+  >,
+): Promise<AtomicEffectObservationV1> {
+  let sourceParent: AtomicHeldRecord;
+  let targetParent: AtomicHeldRecord;
+  try {
+    sourceParent = resolveAtomicRecord(flight, request.sourceParentId);
+    targetParent = resolveAtomicRecord(flight, request.targetParentId);
+    assertAtomicMountPair(sourceParent, targetParent);
+    const source = await observeAtomicChild(
+      flight,
+      request,
+      sourceParent,
+      request.sourceParentId,
+      request.sourceLeaf,
+      request.expectedSource,
+      true,
+    );
+    const target = await observeAtomicChild(
+      flight,
+      request,
+      targetParent,
+      request.targetParentId,
+      request.targetLeaf,
+      request.expectedSource,
+      false,
+    );
+    const evidenceDigest = sha256(
+      JSON.stringify({
+        move: request.move,
+        source: source.location.evidenceDigest,
+        target: target.location.evidenceDigest,
+      }),
+    );
+    return Object.freeze({
+      kind: "locations_observed",
+      effectId: request.effectId,
+      requestKind: "native_no_replace",
+      operationId: request.operationId,
+      move: request.move,
+      sourceParentId: request.sourceParentId,
+      sourceLeaf: request.sourceLeaf,
+      targetParentId: request.targetParentId,
+      targetLeaf: request.targetLeaf,
+      requestedSourceObjectId: request.sourceId,
+      sourceObjectId: source.objectId,
+      targetObjectId: target.objectId,
+      source: source.location,
+      target: target.location,
+      evidenceDigest,
+    });
+  } catch (error) {
+    return rejectAtomicFilesystemError(flight, request, error);
+  }
+}
+
 export async function applyAtomicEffect(
   controller: AtomicEffectControllerV1,
   request: AtomicEffectRequestV1,
@@ -10771,6 +11446,8 @@ export async function applyAtomicEffect(
   );
   assertAtomicRequest(flight, request);
   switch (request.kind) {
+    case "persist_canary_phase":
+      return atomicRejected(flight, request, "unsupported");
     case "reserve_budget":
     case "release_budget":
       return applyAtomicReservation(flight, request);
@@ -10797,6 +11474,8 @@ export async function applyAtomicEffect(
             | "fsync_parent";
         },
       );
+    case "statfs_parent":
+      return applyAtomicStatfs(flight, request);
     case "close_handle":
       return applyAtomicClose(
         flight,
@@ -10849,12 +11528,216 @@ export async function applyAtomicEffect(
     case "persist_intent":
     case "replace_intent":
     case "persist_manifest":
+      return atomicRejected(flight, request, "unsupported");
     case "native_no_replace":
+      return applyAtomicNativeNoReplace(flight, request);
     case "observe_locations":
+      return request.requestKind === "native_no_replace"
+        ? applyAtomicObserveLocations(flight, request)
+        : atomicRejected(flight, request, "unsupported");
     case "resolve_adoption":
     case "adopt_generation":
     case "release_publication":
       return atomicRejected(flight, request, "unsupported");
+  }
+}
+
+export type AtomicCanaryRecoveryRunnerInputV1 = Omit<
+  AtomicCanaryRecoveryInputV1,
+  "unresolvedForTargetParent"
+> &
+  Readonly<{
+    durableCanaryInventory: ReadonlyArray<AtomicCanaryProofV1>;
+    expectedTargetParentLocatorDigest: string;
+  }>;
+
+export type PersistAtomicCanaryPhaseV1 = (
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "persist_canary_phase" }
+  >,
+) => Promise<void>;
+
+async function runAtomicCanaryRecoveryCore(
+  controller: AtomicEffectControllerV1,
+  input: AtomicCanaryRecoveryRunnerInputV1,
+  persistCanaryPhase: PersistAtomicCanaryPhaseV1,
+): Promise<
+  Extract<
+    AtomicTerminalResultV1,
+    { kind: "mount_proved" | "cleanup_pending" }
+  >
+> {
+  if (
+    input.durableCanaryInventory.some(
+      proof => !isAtomicCanaryProofV1(proof),
+    )
+  ) {
+    throw atomicFailure("atomic canary inventory is invalid");
+  }
+  const unresolved = input.durableCanaryInventory.filter(
+    proof =>
+      proof.phase !== "cleaned" &&
+      proof.targetParentLocatorDigest ===
+        input.proof.targetParentLocatorDigest,
+  );
+  if (
+    input.proof.targetParentLocatorDigest !==
+      input.expectedTargetParentLocatorDigest ||
+    unresolved.length > 1 ||
+    (unresolved.length === 1 &&
+      !sameAtomicCanaryProof(unresolved[0]!, input.proof)) ||
+    (unresolved.length === 0 && input.proof.phase !== "planned")
+  ) {
+    throw atomicFailure("atomic canary inventory conflicts");
+  }
+  let step = reduceAtomicPublication(
+    createAtomicCanaryReducerState({
+      ...input,
+      unresolvedForTargetParent: unresolved,
+    }),
+    null,
+  );
+  for (let count = 0; count < 64; count += 1) {
+    if (step.kind === "terminal") {
+      if (
+        step.result.kind === "mount_proved" ||
+        step.result.kind === "cleanup_pending"
+      ) {
+        return step.result;
+      }
+      throw atomicFailure(
+        `atomic canary recovery failed: ${step.result.kind === "fail_stop" ? step.result.code : step.result.kind}`,
+      );
+    }
+    let observation: AtomicEffectObservationV1;
+    if (step.request.kind === "persist_canary_phase") {
+      await persistCanaryPhase(step.request);
+      observation = Object.freeze({
+        kind: "effect_completed",
+        effectId: step.request.effectId,
+        requestKind: "persist_canary_phase",
+        evidenceDigest: step.request.evidenceDigest,
+        count: 1,
+        byteSize: 0,
+      });
+    } else {
+      observation = await applyAtomicEffect(controller, step.request);
+    }
+    step = reduceAtomicPublication(step.state, observation);
+  }
+  throw atomicFailure("atomic canary recovery exceeded effect bound");
+}
+
+type AtomicCanaryRecoveryClaim = {
+  proof: AtomicCanaryProofV1;
+  persistence: "reserved" | "durable" | "uncertain";
+  tail: Promise<void>;
+};
+
+const atomicCanaryRecoveryClaims = new WeakMap<
+  RootCapabilityRecord,
+  Map<string, AtomicCanaryRecoveryClaim>
+>();
+
+function sameAtomicCanaryProof(
+  left: AtomicCanaryProofV1,
+  right: AtomicCanaryProofV1,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export async function runAtomicCanaryRecovery(
+  controller: AtomicEffectControllerV1,
+  input: AtomicCanaryRecoveryRunnerInputV1,
+  persistCanaryPhase: PersistAtomicCanaryPhaseV1,
+): Promise<
+  Extract<
+    AtomicTerminalResultV1,
+    { kind: "mount_proved" | "cleanup_pending" }
+  >
+> {
+  const flight = requireAtomicFlight(controller);
+  if (
+    !isAtomicCanaryProofV1(input.proof) ||
+    input.durableCanaryInventory.some(
+      proof => !isAtomicCanaryProofV1(proof),
+    )
+  ) {
+    throw atomicFailure("atomic canary inventory is invalid");
+  }
+  const supplied = input.durableCanaryInventory.filter(
+    proof =>
+      proof.phase !== "cleaned" &&
+      proof.targetParentLocatorDigest ===
+        input.proof.targetParentLocatorDigest,
+  );
+  if (
+    input.proof.targetParentLocatorDigest !==
+      input.expectedTargetParentLocatorDigest ||
+    supplied.length > 1 ||
+    (supplied.length === 1 &&
+      !sameAtomicCanaryProof(supplied[0]!, input.proof)) ||
+    (supplied.length === 0 && input.proof.phase !== "planned")
+  ) {
+    throw atomicFailure("atomic canary inventory conflicts");
+  }
+  let claims = atomicCanaryRecoveryClaims.get(flight.root);
+  if (claims === undefined) {
+    claims = new Map();
+    atomicCanaryRecoveryClaims.set(flight.root, claims);
+  }
+  const key = input.expectedTargetParentLocatorDigest;
+  const existing = claims.get(key);
+  const previous = existing?.tail ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const tail = previous.then(() => gate);
+  const claim: AtomicCanaryRecoveryClaim =
+    existing ?? {
+      proof: input.proof,
+      persistence: supplied.length === 0 ? "reserved" : "durable",
+      tail,
+    };
+  claim.tail = tail;
+  claims.set(key, claim);
+  await previous;
+  try {
+    if (
+      existing !== undefined &&
+      (!sameAtomicCanaryProof(claim.proof, input.proof) ||
+        claim.persistence === "uncertain")
+    ) {
+      throw atomicFailure("atomic canary inventory conflicts");
+    } else if (
+      existing !== undefined &&
+      supplied.length === 1 &&
+      !sameAtomicCanaryProof(supplied[0]!, claim.proof)
+    ) {
+      throw atomicFailure("atomic canary inventory conflicts");
+    }
+    return await runAtomicCanaryRecoveryCore(
+      controller,
+      {
+        ...input,
+        durableCanaryInventory:
+          claim.persistence === "durable" ? [claim.proof] : [],
+      },
+      async request => {
+        try {
+          await persistCanaryPhase(request);
+        } catch (error) {
+          claim.persistence = "uncertain";
+          throw error;
+        }
+        claim.proof = request.proof;
+        claim.persistence = "durable";
+      },
+    );
+  } finally {
+    release();
   }
 }
 

@@ -70,6 +70,7 @@ export type AtomicEffectKindV1 =
   | "cleanup_partial_create"
   | "open_pin_handle"
   | "revalidate_handle"
+  | "statfs_parent"
   | "close_handle"
   | "enumerate_directory"
   | "read_file_chunk"
@@ -81,6 +82,7 @@ export type AtomicEffectKindV1 =
   | "fsync_file"
   | "fsync_directory"
   | "fsync_parent"
+  | "persist_canary_phase"
   | "persist_intent"
   | "replace_intent"
   | "remove_intent"
@@ -183,6 +185,14 @@ export type AtomicEffectRequestV1 =
       expected: AtomicObjectEvidenceV1;
     }>
   | Readonly<{
+      kind: "statfs_parent";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      role: AtomicObjectRoleV1;
+      objectId: FlightSemanticId;
+      expected: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
       kind:
         | "revalidate_handle"
         | "close_handle"
@@ -195,6 +205,14 @@ export type AtomicEffectRequestV1 =
       cursor: number;
       byteLength: number;
       expected: AtomicObjectEvidenceV1;
+    }>
+  | Readonly<{
+      kind: "persist_canary_phase";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      previousPhase: "planned" | "published" | "deleting" | null;
+      proof: AtomicCanaryProofV1;
+      evidenceDigest: Sha256;
     }>
   | Readonly<{
       kind: "populate_payload_entry" | "canonicalize_tree_step";
@@ -438,6 +456,15 @@ export type AtomicEffectObservationV1 =
       evidence: AtomicObjectEvidenceV1;
     }>
   | Readonly<{
+      kind: "statfs_observed";
+      effectId: FlightEffectId;
+      objectId: FlightSemanticId;
+      filesystem: "ext" | "xfs" | "btrfs" | "tmpfs" | "overlay";
+      magic: string;
+      device: string;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
       kind: "create_and_pin_partial";
       effectId: FlightEffectId;
       requestKind:
@@ -665,10 +692,137 @@ export type AtomicProtocolFailureV1 =
   | "id_cap_exceeded"
   | "effect_rejected"
   | "partial_cleanup_failed"
+  | "native_binding_invalid"
+  | "native_ambiguous"
+  | "native_unsupported"
+  | "native_cross_device"
+  | "native_denied"
+  | "native_io"
   | "terminal_replay";
+
+export type AtomicNativeClassificationV1 = Readonly<{
+  outcome: "unpublished" | "conflict" | "published";
+  nativeCode:
+    | Exclude<AtomicRawNativeCodeV1, "atomic_publish_source_missing">
+    | "atomic_publish_replay_completed";
+  sourceMatches: boolean;
+  targetMatches: boolean;
+  targetOther: boolean;
+  nativePrecheckEvidenceDigest: Sha256;
+  locationEvidenceDigest: Sha256;
+}>;
+
+export type AtomicCanaryReplayAuthorityV1 = Readonly<{
+  operationId: CanonicalUuid;
+  attempt: 0;
+  phase: "planned" | "published" | "deleting";
+  sourceLeaf: string;
+  targetLeaf: string;
+  deletionLeaf: string;
+  privateSourceEvidence: AtomicObjectEvidenceV1;
+  publishedEvidence: AtomicObjectEvidenceV1 | null;
+  privateDeletionEvidence: AtomicObjectEvidenceV1 | null;
+  manifestSha256: Sha256 | null;
+  cleanupNextIndex: number;
+  cleanupEntryCount: number;
+}>;
+
+export type AtomicCanaryProofV1 = Readonly<{
+  version: 1;
+  operationId: CanonicalUuid;
+  targetParentLocatorDigest: Sha256;
+  targetParentEvidence: AtomicObjectEvidenceV1;
+  wrapperEvidence: AtomicObjectEvidenceV1;
+  attempt: 0;
+  sourceLeaf: string;
+  targetLeaf: string;
+  deletionLeaf: string;
+  phase: "planned" | "published" | "deleting" | "cleaned";
+  privateSourceEvidence: AtomicObjectEvidenceV1;
+  publishedEvidence: AtomicObjectEvidenceV1 | null;
+  privateDeletionEvidence: AtomicObjectEvidenceV1 | null;
+  classification: AtomicNativeClassificationV1 | null;
+  manifestSha256: Sha256 | null;
+  cleanupNextIndex: number;
+  cleanupEntryCount: number;
+  sourceParentSynced: boolean;
+  targetParentSynced: boolean;
+}>;
+
+export type AtomicCanaryRecoveryInputV1 = Readonly<{
+  flightNonce: string;
+  action: "prove_mount" | "cleanup";
+  proof: AtomicCanaryProofV1;
+  unresolvedForTargetParent: ReadonlyArray<AtomicCanaryProofV1>;
+  sourceParentId: FlightSemanticId;
+  sourceParentRole: AtomicObjectRoleV1;
+  sourceParentEvidence: AtomicObjectEvidenceV1;
+  sourceId: FlightSemanticId;
+  targetParentId: FlightSemanticId;
+  targetParentRole: AtomicObjectRoleV1;
+  targetParentEvidence: AtomicObjectEvidenceV1;
+  cleanupManifest:
+    | Readonly<{
+        sha256: Sha256;
+        entryCount: number;
+        nextIndex: number;
+      }>
+    | null;
+}>;
+
+type AtomicCanaryWorkflowStageV1 =
+  | "revalidate_source"
+  | "revalidate_target"
+  | "statfs_source"
+  | "statfs_target"
+  | "native"
+  | "observe"
+  | "sync_source"
+  | "sync_target"
+  | "persist_planned"
+  | "persist_deleting"
+  | "persist_published"
+  | "persist_deleting_evidence"
+  | "verify_published_locations";
+
+type AtomicCanaryWorkflowV1 = Readonly<{
+  action: AtomicCanaryRecoveryInputV1["action"];
+  stage: AtomicCanaryWorkflowStageV1;
+  durablePhase: "planned" | "published" | "deleting";
+  proof: AtomicCanaryProofV1;
+  sourceParentId: FlightSemanticId;
+  sourceParentRole: AtomicObjectRoleV1;
+  sourceParentEvidence: AtomicObjectEvidenceV1;
+  sourceId: FlightSemanticId;
+  targetParentId: FlightSemanticId;
+  targetParentRole: AtomicObjectRoleV1;
+  targetParentEvidence: AtomicObjectEvidenceV1;
+  sourceFilesystem: string | null;
+  sourceDevice: string | null;
+  targetFilesystem: string | null;
+  targetDevice: string | null;
+}>;
+
+type PendingAtomicNativeResolutionV1 = Readonly<{
+  request: Extract<AtomicEffectRequestV1, { kind: "native_no_replace" }>;
+  rawCode: AtomicRawNativeCodeV1;
+  nativePrecheckEvidenceDigest: Sha256;
+}>;
 
 export type AtomicTerminalResultV1 =
   | Readonly<{ kind: "protocol_complete" }>
+  | Readonly<{
+      kind: "mount_proved";
+      proof: AtomicCanaryProofV1;
+    }>
+  | Readonly<{
+      kind: "cleanup_pending";
+      proof: AtomicCanaryProofV1;
+    }>
+  | Readonly<{
+      kind: "canary_cleaned";
+      proof: AtomicCanaryProofV1;
+    }>
   | Readonly<{
       kind: "fail_stop";
       code: AtomicProtocolFailureV1;
@@ -691,6 +845,11 @@ export type AtomicReducerStateV1 = Readonly<{
   reservations: AtomicReadReservationsV1;
   cursors: AtomicReducerCursorsV1;
   admission: "open" | "closed";
+  canaryWorkflow: AtomicCanaryWorkflowV1 | null;
+  canaryReplayAuthority: AtomicCanaryReplayAuthorityV1 | null;
+  pendingNativeResolution: PendingAtomicNativeResolutionV1 | null;
+  nativeClassification: AtomicNativeClassificationV1 | null;
+  pendingNativeFailure: AtomicProtocolFailureV1 | null;
   terminalResult: AtomicTerminalResultV1 | null;
 }>;
 
@@ -715,6 +874,7 @@ export type CreateAtomicReducerStateV1 = Readonly<{
   partialCreateIdCount?: number;
   reservations?: Partial<AtomicReadReservationsV1>;
   cursors?: Partial<AtomicReducerCursorsV1>;
+  canaryReplayAuthority?: AtomicCanaryReplayAuthorityV1;
 }>;
 
 function isNonNegativeInteger(value: number): boolean {
@@ -776,9 +936,35 @@ function cloneExpectedTarget(
     : cloneEvidence(expected);
 }
 
+function cloneCanaryProof(
+  proof: AtomicCanaryProofV1,
+): AtomicCanaryProofV1 {
+  return Object.freeze({
+    ...proof,
+    targetParentEvidence: cloneEvidence(proof.targetParentEvidence),
+    wrapperEvidence: cloneEvidence(proof.wrapperEvidence),
+    privateSourceEvidence: cloneEvidence(proof.privateSourceEvidence),
+    publishedEvidence:
+      proof.publishedEvidence === null
+        ? null
+        : cloneEvidence(proof.publishedEvidence),
+    privateDeletionEvidence:
+      proof.privateDeletionEvidence === null
+        ? null
+        : cloneEvidence(proof.privateDeletionEvidence),
+    classification:
+      proof.classification === null
+        ? null
+        : Object.freeze({ ...proof.classification }),
+  });
+}
+
 function cloneRequest(
   request: AtomicEffectRequestDraftV1,
 ): AtomicEffectRequestDraftV1 {
+  if (request.kind === "persist_canary_phase") {
+    return { ...request, proof: cloneCanaryProof(request.proof) };
+  }
   if (
     request.kind === "copy_payload_chunk" ||
     request.kind === "write_file_chunk"
@@ -813,6 +999,7 @@ function cloneRequest(
   if (
     request.kind === "open_pin_handle" ||
     request.kind === "revalidate_handle" ||
+    request.kind === "statfs_parent" ||
     request.kind === "close_handle" ||
     request.kind === "enumerate_directory" ||
     request.kind === "read_file_chunk" ||
@@ -1000,6 +1187,7 @@ const ATOMIC_EFFECT_KINDS = [
   "cleanup_partial_create",
   "open_pin_handle",
   "revalidate_handle",
+  "statfs_parent",
   "close_handle",
   "enumerate_directory",
   "read_file_chunk",
@@ -1011,6 +1199,7 @@ const ATOMIC_EFFECT_KINDS = [
   "fsync_file",
   "fsync_directory",
   "fsync_parent",
+  "persist_canary_phase",
   "persist_intent",
   "replace_intent",
   "remove_intent",
@@ -1038,6 +1227,7 @@ const EFFECT_COMPLETED_KINDS = [
   "fsync_file",
   "fsync_directory",
   "fsync_parent",
+  "persist_canary_phase",
   "replace_intent",
   "close_admission",
 ] as const;
@@ -1110,6 +1300,30 @@ function evidenceEquals(
   );
 }
 
+function nativeMoveLeavesValid(
+  move: AtomicNativeMoveV1,
+  operationId: CanonicalUuid,
+  sourceLeaf: string,
+  targetLeaf: string,
+): boolean {
+  switch (move) {
+    case "profile_publish":
+      return sourceLeaf === "payload";
+    case "canary_publish":
+      return (
+        sourceLeaf === `proof-${operationId}-0` &&
+        targetLeaf === `canary-${operationId}-0`
+      );
+    case "profile_source_to_private":
+      return targetLeaf === `delete-${operationId}`;
+    case "canary_source_to_private":
+      return (
+        sourceLeaf === `canary-${operationId}-0` &&
+        targetLeaf === `deletion-${operationId}-0`
+      );
+  }
+}
+
 function validRequest(value: unknown): value is AtomicEffectRequestV1 {
   if (
     !isRecord(value) ||
@@ -1147,6 +1361,35 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
         ]) &&
         isNonNegativeInteger(request.count) &&
         isNonNegativeInteger(request.byteSize)
+      );
+    case "persist_canary_phase":
+      return (
+        hasExactKeys(value, [
+          "kind",
+          "effectId",
+          "operationId",
+          "previousPhase",
+          "proof",
+          "evidenceDigest",
+        ]) &&
+        (request.previousPhase === null ||
+          isOneOf(request.previousPhase, [
+            "planned",
+            "published",
+            "deleting",
+          ])) &&
+        validCanaryProof(request.proof) &&
+        request.proof.operationId === request.operationId &&
+        ((request.previousPhase === null &&
+          request.proof.phase === "planned") ||
+          (request.previousPhase === "planned" &&
+            request.proof.phase === "published") ||
+          (request.previousPhase === "published" &&
+            request.proof.phase === "deleting") ||
+          (request.previousPhase === "deleting" &&
+            (request.proof.phase === "deleting" ||
+              request.proof.phase === "cleaned"))) &&
+        isSha256(request.evidenceDigest)
       );
     case "create_and_pin_wrapper":
     case "create_and_pin_directory":
@@ -1223,6 +1466,20 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
         isFlightId(request.objectId) &&
         isNonNegativeInteger(request.cursor) &&
         isNonNegativeInteger(request.byteLength) &&
+        isEvidence(request.expected)
+      );
+    case "statfs_parent":
+      return (
+        hasExactKeys(value, [
+          "kind",
+          "effectId",
+          "operationId",
+          "role",
+          "objectId",
+          "expected",
+        ]) &&
+        isOneOf(request.role, ATOMIC_OBJECT_ROLES) &&
+        isFlightId(request.objectId) &&
         isEvidence(request.expected)
       );
     case "enumerate_directory":
@@ -1400,6 +1657,12 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
         isFlightId(request.targetParentId) &&
         isAtomicControlLeafV1(request.sourceLeaf) &&
         isAtomicControlLeafV1(request.targetLeaf) &&
+        nativeMoveLeavesValid(
+          request.move,
+          request.operationId,
+          request.sourceLeaf,
+          request.targetLeaf,
+        ) &&
         isEvidence(request.expectedSource) &&
         (isEvidence(request.expectedTarget) ||
           isExpectedAbsent(request.expectedTarget)) &&
@@ -1429,6 +1692,12 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
             isFlightId(request.targetParentId) &&
             isAtomicControlLeafV1(request.sourceLeaf) &&
             isAtomicControlLeafV1(request.targetLeaf) &&
+            nativeMoveLeavesValid(
+              request.move,
+              request.operationId,
+              request.sourceLeaf,
+              request.targetLeaf,
+            ) &&
             isEvidence(request.expectedSource) &&
             (isEvidence(request.expectedTarget) ||
               isExpectedAbsent(request.expectedTarget)) &&
@@ -1574,6 +1843,12 @@ export function createAtomicReducerState(
   ) {
     throw new TypeError("invalid atomic reducer bounds");
   }
+  if (
+    input.canaryReplayAuthority !== undefined &&
+    !validCanaryReplayAuthority(input.canaryReplayAuthority)
+  ) {
+    throw new TypeError("invalid atomic canary replay authority");
+  }
   const effectId = makeEffectId(input.flightNonce, 0);
   const outstandingRequest = attachEffectId(input.request, effectId);
   if (!validRequest(outstandingRequest)) {
@@ -1594,7 +1869,237 @@ export function createAtomicReducerState(
     reservations,
     cursors,
     admission: "open" as const,
+    canaryWorkflow: null,
+    canaryReplayAuthority:
+      input.canaryReplayAuthority === undefined
+        ? null
+        : Object.freeze({
+            ...input.canaryReplayAuthority,
+            privateSourceEvidence: cloneEvidence(
+              input.canaryReplayAuthority.privateSourceEvidence,
+            ),
+            publishedEvidence:
+              input.canaryReplayAuthority.publishedEvidence === null
+                ? null
+                : cloneEvidence(
+                    input.canaryReplayAuthority.publishedEvidence,
+                  ),
+            privateDeletionEvidence:
+              input.canaryReplayAuthority.privateDeletionEvidence === null
+                ? null
+                : cloneEvidence(
+                    input.canaryReplayAuthority.privateDeletionEvidence,
+                  ),
+          }),
+    pendingNativeResolution: null,
+    nativeClassification: null,
+    pendingNativeFailure: null,
     terminalResult: null,
+  });
+}
+
+function canaryReplayAuthorityFromProof(
+  proof: AtomicCanaryProofV1,
+): AtomicCanaryReplayAuthorityV1 | null {
+  if (proof.phase === "cleaned") return null;
+  return Object.freeze({
+    operationId: proof.operationId,
+    attempt: 0 as const,
+    phase: proof.phase,
+    sourceLeaf: proof.sourceLeaf,
+    targetLeaf: proof.targetLeaf,
+    deletionLeaf: proof.deletionLeaf,
+    privateSourceEvidence: proof.privateSourceEvidence,
+    publishedEvidence: proof.publishedEvidence,
+    privateDeletionEvidence: proof.privateDeletionEvidence,
+    manifestSha256: proof.manifestSha256,
+    cleanupNextIndex: proof.cleanupNextIndex,
+    cleanupEntryCount: proof.cleanupEntryCount,
+  });
+}
+
+export function createAtomicCanaryReducerState(
+  input: AtomicCanaryRecoveryInputV1,
+): AtomicReducerStateV1 {
+  if (
+    !validCanaryProof(input.proof) ||
+    input.proof.phase === "cleaned" ||
+    input.unresolvedForTargetParent.length > 1 ||
+    (input.unresolvedForTargetParent.length === 1 &&
+      (!validCanaryProof(input.unresolvedForTargetParent[0]!) ||
+        JSON.stringify(input.unresolvedForTargetParent[0]) !==
+          JSON.stringify(input.proof))) ||
+    !isFlightId(input.sourceParentId) ||
+    !isOneOf(input.sourceParentRole, ATOMIC_OBJECT_ROLES) ||
+    !isEvidence(input.sourceParentEvidence) ||
+    !isFlightId(input.sourceId) ||
+    !isFlightId(input.targetParentId) ||
+    !isOneOf(input.targetParentRole, ATOMIC_OBJECT_ROLES) ||
+    !isEvidence(input.targetParentEvidence)
+  ) {
+    throw new TypeError("invalid atomic canary recovery input");
+  }
+  let proof = input.proof;
+  const durablePhase = proof.phase as
+    | "planned"
+    | "published"
+    | "deleting";
+  let persistDeleting = false;
+  const persistPlanned =
+    input.action === "prove_mount" &&
+    proof.phase === "planned" &&
+    input.unresolvedForTargetParent.length === 0;
+  if (input.action === "prove_mount") {
+    if (
+      (proof.phase !== "planned" && proof.phase !== "published") ||
+      input.sourceParentRole !== "wrapper" ||
+      !evidenceEquals(input.sourceParentEvidence, proof.wrapperEvidence) ||
+      !evidenceEquals(
+        input.targetParentEvidence,
+        proof.targetParentEvidence,
+      ) ||
+      (input.unresolvedForTargetParent.length === 0 &&
+        proof.phase !== "planned")
+    ) {
+      throw new TypeError("invalid atomic canary mount proof input");
+    }
+  } else {
+    if (
+      (proof.phase !== "published" && proof.phase !== "deleting") ||
+      proof.publishedEvidence === null ||
+      !evidenceEquals(
+        input.sourceParentEvidence,
+        proof.targetParentEvidence,
+      ) ||
+      input.targetParentRole !== "wrapper" ||
+      !evidenceEquals(input.targetParentEvidence, proof.wrapperEvidence) ||
+      input.cleanupManifest === null ||
+      !isSha256(input.cleanupManifest.sha256) ||
+      !isNonNegativeInteger(input.cleanupManifest.entryCount) ||
+      input.cleanupManifest.entryCount < 1 ||
+      !isNonNegativeInteger(input.cleanupManifest.nextIndex) ||
+      input.cleanupManifest.nextIndex >=
+        input.cleanupManifest.entryCount
+    ) {
+      throw new TypeError("invalid atomic canary cleanup input");
+    }
+    if (proof.phase === "published") {
+      persistDeleting = true;
+      proof = Object.freeze({
+        ...proof,
+        phase: "deleting" as const,
+        manifestSha256: input.cleanupManifest.sha256,
+        cleanupNextIndex: input.cleanupManifest.nextIndex,
+        cleanupEntryCount: input.cleanupManifest.entryCount,
+        sourceParentSynced: false,
+        targetParentSynced: false,
+      });
+    } else if (
+      proof.manifestSha256 !== input.cleanupManifest.sha256 ||
+      proof.cleanupNextIndex !== input.cleanupManifest.nextIndex ||
+      proof.cleanupEntryCount !== input.cleanupManifest.entryCount
+    ) {
+      throw new TypeError("atomic canary cleanup cursor changed");
+    }
+  }
+
+  const replayAuthority = canaryReplayAuthorityFromProof(proof);
+  const base = createAtomicReducerState({
+    flightNonce: input.flightNonce,
+    request: persistDeleting || persistPlanned
+      ? {
+          kind: "persist_canary_phase",
+          operationId: proof.operationId,
+          previousPhase: persistDeleting ? "published" : null,
+          proof,
+          evidenceDigest: sha256(
+            new TextEncoder().encode(JSON.stringify(proof)),
+          ),
+        }
+      : {
+          kind: "revalidate_handle",
+          operationId: proof.operationId,
+          role: input.sourceParentRole,
+          objectId: input.sourceParentId,
+          cursor: 0,
+          byteLength: 0,
+          expected: input.sourceParentEvidence,
+        },
+    semanticIds: [
+      input.sourceParentId,
+      input.sourceId,
+      input.targetParentId,
+    ],
+    ...(replayAuthority === null
+      ? {}
+      : { canaryReplayAuthority: replayAuthority }),
+  });
+  const workflow: AtomicCanaryWorkflowV1 = Object.freeze({
+    action: input.action,
+    stage: persistDeleting
+      ? ("persist_deleting" as const)
+      : persistPlanned
+        ? ("persist_planned" as const)
+        : ("revalidate_source" as const),
+    durablePhase,
+    proof,
+    sourceParentId: input.sourceParentId,
+    sourceParentRole: input.sourceParentRole,
+    sourceParentEvidence: input.sourceParentEvidence,
+    sourceId: input.sourceId,
+    targetParentId: input.targetParentId,
+    targetParentRole: input.targetParentRole,
+    targetParentEvidence: input.targetParentEvidence,
+    sourceFilesystem: null,
+    sourceDevice: null,
+    targetFilesystem: null,
+    targetDevice: null,
+  });
+  return Object.freeze({ ...base, canaryWorkflow: workflow });
+}
+
+export type AtomicCanaryCleanupProgressV1 = Readonly<{
+  operationId: CanonicalUuid;
+  manifestSha256: Sha256;
+  completedIndex: number;
+  nextIndex: number;
+  privateDeletionAbsent: boolean;
+  sourceParentSynced: boolean;
+  targetParentSynced: boolean;
+  evidenceDigest: Sha256;
+}>;
+
+export function advanceAtomicCanaryCleanup(
+  proof: AtomicCanaryProofV1,
+  progress: AtomicCanaryCleanupProgressV1,
+): AtomicCanaryProofV1 {
+  if (
+    !validCanaryProof(proof) ||
+    proof.phase !== "deleting" ||
+    proof.privateDeletionEvidence === null ||
+    progress.operationId !== proof.operationId ||
+    progress.manifestSha256 !== proof.manifestSha256 ||
+    progress.completedIndex !== proof.cleanupNextIndex ||
+    progress.nextIndex !== progress.completedIndex + 1 ||
+    progress.nextIndex > proof.cleanupEntryCount ||
+    typeof progress.privateDeletionAbsent !== "boolean" ||
+    progress.sourceParentSynced !== true ||
+    progress.targetParentSynced !== true ||
+    !isSha256(progress.evidenceDigest) ||
+    (progress.nextIndex === proof.cleanupEntryCount) !==
+      progress.privateDeletionAbsent
+  ) {
+    throw new TypeError("invalid atomic canary cleanup progress");
+  }
+  return Object.freeze({
+    ...proof,
+    phase:
+      progress.nextIndex === proof.cleanupEntryCount
+        ? ("cleaned" as const)
+        : ("deleting" as const),
+    cleanupNextIndex: progress.nextIndex,
+    sourceParentSynced: true,
+    targetParentSynced: true,
   });
 }
 
@@ -1613,6 +2118,8 @@ function requestKindForObservation(
       return observation.requestKind;
     case "existing_handle_pinned":
       return "open_pin_handle";
+    case "statfs_observed":
+      return "statfs_parent";
     case "partial_create_cleanup_observed":
     case "partial_create_cleanup_failed":
       return "cleanup_partial_create";
@@ -1755,6 +2262,36 @@ function validObservation(value: unknown): value is AtomicEffectObservationV1 {
         ]) &&
         isFlightId(value.handleId) &&
         isEvidence(value.evidence)
+      );
+    case "statfs_observed":
+      return (
+        hasExactKeys(value, [
+          "kind",
+          "effectId",
+          "objectId",
+          "filesystem",
+          "magic",
+          "device",
+          "evidenceDigest",
+        ]) &&
+        isFlightId(value.effectId) &&
+        isFlightId(value.objectId) &&
+        isOneOf(value.filesystem, [
+          "ext",
+          "xfs",
+          "btrfs",
+          "tmpfs",
+          "overlay",
+        ]) &&
+        isOneOf(value.magic, [
+          "0xef53",
+          "0x58465342",
+          "0x9123683e",
+          "0x1021994",
+          "0x794c7630",
+        ]) &&
+        /^(?:0|[1-9][0-9]*)$/u.test(value.device as string) &&
+        isSha256(value.evidenceDigest)
       );
     case "existing_handle_pinned":
       return (
@@ -2320,6 +2857,13 @@ function observationSpecificMismatch(
       return isSha256(observation.evidenceDigest)
         ? null
         : "observation_mismatch";
+    case "statfs_observed":
+      return request.kind === "statfs_parent" &&
+        observation.objectId === request.objectId &&
+        observation.device === request.expected.dev &&
+        isSha256(observation.evidenceDigest)
+        ? null
+        : "observation_mismatch";
     case "effect_completed":
       return isNonNegativeInteger(observation.count) &&
         isNonNegativeInteger(observation.byteSize) &&
@@ -2412,7 +2956,8 @@ function observationSpecificMismatch(
         request.kind === "native_no_replace" &&
         (observation.move !== request.move ||
           observation.sourceObjectId !== request.sourceId ||
-          !evidenceEquals(observation.sourceEvidence, request.expectedSource))
+          !evidenceEquals(observation.sourceEvidence, request.expectedSource) ||
+          state.pendingNativeResolution !== null)
       ) {
         return "observation_mismatch";
       }
@@ -2444,7 +2989,38 @@ function observationSpecificMismatch(
         request.requestKind === "native_no_replace" &&
         observation.requestKind === "native_no_replace"
       ) {
-        return observation.sourceParentId === request.sourceParentId &&
+        const pending = state.pendingNativeResolution;
+        const verification = state.canaryWorkflow;
+        const authorizedRequest =
+          (pending !== null &&
+            pending.request.operationId === request.operationId &&
+            pending.request.move === request.move &&
+            pending.request.sourceParentId === request.sourceParentId &&
+            pending.request.sourceId === request.sourceId &&
+            pending.request.sourceLeaf === request.sourceLeaf &&
+            pending.request.targetParentId === request.targetParentId &&
+            pending.request.targetLeaf === request.targetLeaf &&
+            evidenceEquals(
+              pending.request.expectedSource,
+              request.expectedSource,
+            )) ||
+          (verification !== null &&
+            verification.stage === "verify_published_locations" &&
+            verification.action === "prove_mount" &&
+            verification.durablePhase === "published" &&
+            request.operationId === verification.proof.operationId &&
+            request.move === "canary_publish" &&
+            request.sourceParentId === verification.sourceParentId &&
+            request.sourceId === verification.sourceId &&
+            request.sourceLeaf === verification.proof.sourceLeaf &&
+            request.targetParentId === verification.targetParentId &&
+            request.targetLeaf === verification.proof.targetLeaf &&
+            evidenceEquals(
+              request.expectedSource,
+              verification.proof.privateSourceEvidence,
+            ));
+        return authorizedRequest &&
+          observation.sourceParentId === request.sourceParentId &&
           observation.sourceLeaf === request.sourceLeaf &&
           observation.targetParentId === request.targetParentId &&
           observation.targetLeaf === request.targetLeaf &&
@@ -2580,6 +3156,7 @@ function requestSemanticIds(
     case "open_pin_handle":
       return [request.parentId];
     case "revalidate_handle":
+    case "statfs_parent":
     case "close_handle":
     case "enumerate_directory":
     case "read_file_chunk":
@@ -2629,6 +3206,7 @@ function requestSemanticIds(
       return [request.parentId, request.objectId];
     case "reserve_budget":
     case "release_budget":
+    case "persist_canary_phase":
     case "cleanup_partial_create":
     case "resolve_adoption":
     case "adopt_generation":
@@ -2636,6 +3214,387 @@ function requestSemanticIds(
     case "close_admission":
       return [];
   }
+}
+
+function validNativeClassification(
+  value: AtomicNativeClassificationV1 | null,
+): boolean {
+  if (value === null) return true;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "outcome",
+      "nativeCode",
+      "sourceMatches",
+      "targetMatches",
+      "targetOther",
+      "nativePrecheckEvidenceDigest",
+      "locationEvidenceDigest",
+    ]) ||
+    !isOneOf(value.outcome, ["unpublished", "conflict", "published"]) ||
+    !isOneOf(value.nativeCode, [
+      "success",
+      "atomic_publish_replay_completed",
+      "atomic_publish_exists",
+      "atomic_publish_unsupported",
+      "atomic_publish_cross_device",
+      "atomic_publish_binding_invalid",
+      "atomic_publish_denied",
+      "atomic_publish_invalid_argument",
+      "atomic_publish_io",
+    ]) ||
+    typeof value.sourceMatches !== "boolean" ||
+    typeof value.targetMatches !== "boolean" ||
+    typeof value.targetOther !== "boolean" ||
+    !isSha256(value.nativePrecheckEvidenceDigest) ||
+    !isSha256(value.locationEvidenceDigest)
+  ) {
+    return false;
+  }
+  if (value.outcome === "published") {
+    return (
+      (value.nativeCode === "success" ||
+        value.nativeCode === "atomic_publish_replay_completed") &&
+      !value.sourceMatches &&
+      value.targetMatches &&
+      !value.targetOther
+    );
+  }
+  if (value.outcome === "conflict") {
+    return (
+      value.nativeCode === "atomic_publish_exists" &&
+      value.sourceMatches &&
+      !value.targetMatches &&
+      value.targetOther
+    );
+  }
+  return (
+    value.nativeCode !== "success" &&
+    value.nativeCode !== "atomic_publish_replay_completed" &&
+    value.nativeCode !== "atomic_publish_exists" &&
+    value.sourceMatches &&
+    !value.targetMatches &&
+    !value.targetOther
+  );
+}
+
+function validCanaryReplayAuthority(
+  value: AtomicCanaryReplayAuthorityV1 | null,
+): boolean {
+  if (value === null) return true;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "operationId",
+      "attempt",
+      "phase",
+      "sourceLeaf",
+      "targetLeaf",
+      "deletionLeaf",
+      "privateSourceEvidence",
+      "publishedEvidence",
+      "privateDeletionEvidence",
+      "manifestSha256",
+      "cleanupNextIndex",
+      "cleanupEntryCount",
+    ]) ||
+    !isCanonicalUuid(value.operationId) ||
+    value.attempt !== 0 ||
+    !isOneOf(value.phase, ["planned", "published", "deleting"]) ||
+    value.sourceLeaf !== `proof-${value.operationId}-0` ||
+    value.targetLeaf !== `canary-${value.operationId}-0` ||
+    value.deletionLeaf !== `deletion-${value.operationId}-0` ||
+    !isEvidence(value.privateSourceEvidence) ||
+    (value.publishedEvidence !== null &&
+      (!isEvidence(value.publishedEvidence) ||
+        !evidenceEquals(
+          value.publishedEvidence,
+          value.privateSourceEvidence,
+        ))) ||
+    (value.privateDeletionEvidence !== null &&
+      (!isEvidence(value.privateDeletionEvidence) ||
+        value.publishedEvidence === null ||
+        !evidenceEquals(
+          value.privateDeletionEvidence,
+          value.publishedEvidence,
+        ))) ||
+    (value.manifestSha256 !== null && !isSha256(value.manifestSha256)) ||
+    !isNonNegativeInteger(value.cleanupNextIndex) ||
+    !isNonNegativeInteger(value.cleanupEntryCount) ||
+    value.cleanupNextIndex > value.cleanupEntryCount
+  ) {
+    return false;
+  }
+  if (value.phase === "planned") {
+    return (
+      value.publishedEvidence === null &&
+      value.privateDeletionEvidence === null &&
+      value.manifestSha256 === null &&
+      value.cleanupNextIndex === 0 &&
+      value.cleanupEntryCount === 0
+    );
+  }
+  if (value.phase === "published") {
+    return (
+      value.publishedEvidence !== null &&
+      value.privateDeletionEvidence === null &&
+      value.manifestSha256 === null &&
+      value.cleanupNextIndex === 0 &&
+      value.cleanupEntryCount === 0
+    );
+  }
+  return (
+    value.publishedEvidence !== null &&
+    value.manifestSha256 !== null &&
+    value.cleanupEntryCount > 0
+  );
+}
+
+function validCanaryProof(value: AtomicCanaryProofV1): boolean {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operationId",
+      "targetParentLocatorDigest",
+      "targetParentEvidence",
+      "wrapperEvidence",
+      "attempt",
+      "sourceLeaf",
+      "targetLeaf",
+      "deletionLeaf",
+      "phase",
+      "privateSourceEvidence",
+      "publishedEvidence",
+      "privateDeletionEvidence",
+      "classification",
+      "manifestSha256",
+      "cleanupNextIndex",
+      "cleanupEntryCount",
+      "sourceParentSynced",
+      "targetParentSynced",
+    ]) ||
+    value.version !== 1 ||
+    !isCanonicalUuid(value.operationId) ||
+    !isSha256(value.targetParentLocatorDigest) ||
+    !isEvidence(value.targetParentEvidence) ||
+    value.targetParentEvidence.mode !== 448 ||
+    !isEvidence(value.wrapperEvidence) ||
+    value.wrapperEvidence.mode !== 448 ||
+    value.attempt !== 0 ||
+    value.sourceLeaf !== `proof-${value.operationId}-0` ||
+    value.targetLeaf !== `canary-${value.operationId}-0` ||
+    value.deletionLeaf !== `deletion-${value.operationId}-0` ||
+    !isOneOf(value.phase, [
+      "planned",
+      "published",
+      "deleting",
+      "cleaned",
+    ]) ||
+    !isEvidence(value.privateSourceEvidence) ||
+    value.privateSourceEvidence.mode !== 448 ||
+    (value.publishedEvidence !== null &&
+      (!isEvidence(value.publishedEvidence) ||
+        !evidenceEquals(
+          value.publishedEvidence,
+          value.privateSourceEvidence,
+        ))) ||
+    (value.privateDeletionEvidence !== null &&
+      (!isEvidence(value.privateDeletionEvidence) ||
+        value.publishedEvidence === null ||
+        !evidenceEquals(
+          value.privateDeletionEvidence,
+          value.publishedEvidence,
+        ))) ||
+    !validNativeClassification(value.classification) ||
+    (value.manifestSha256 !== null && !isSha256(value.manifestSha256)) ||
+    !isNonNegativeInteger(value.cleanupNextIndex) ||
+    !isNonNegativeInteger(value.cleanupEntryCount) ||
+    value.cleanupNextIndex > value.cleanupEntryCount ||
+    typeof value.sourceParentSynced !== "boolean" ||
+    typeof value.targetParentSynced !== "boolean"
+  ) {
+    return false;
+  }
+  if (value.phase === "planned") {
+    return (
+      value.publishedEvidence === null &&
+      value.privateDeletionEvidence === null &&
+      value.classification === null &&
+      value.manifestSha256 === null &&
+      value.cleanupNextIndex === 0 &&
+      value.cleanupEntryCount === 0 &&
+      !value.sourceParentSynced &&
+      !value.targetParentSynced
+    );
+  }
+  if (
+    value.publishedEvidence === null ||
+    value.classification === null ||
+    value.classification.outcome !== "published"
+  ) {
+    return false;
+  }
+  if (value.phase === "published") {
+    return (
+      value.privateDeletionEvidence === null &&
+      value.manifestSha256 === null &&
+      value.cleanupNextIndex === 0 &&
+      value.cleanupEntryCount === 0 &&
+      value.sourceParentSynced &&
+      value.targetParentSynced
+    );
+  }
+  if (
+    value.manifestSha256 === null ||
+    value.cleanupEntryCount < 1
+  ) {
+    return false;
+  }
+  if (value.phase === "deleting") {
+    return (
+      value.cleanupNextIndex < value.cleanupEntryCount &&
+      (value.privateDeletionEvidence === null
+        ? !value.sourceParentSynced && !value.targetParentSynced
+        : value.sourceParentSynced && value.targetParentSynced)
+    );
+  }
+  return (
+    value.privateDeletionEvidence !== null &&
+    value.cleanupNextIndex === value.cleanupEntryCount &&
+    value.sourceParentSynced &&
+    value.targetParentSynced
+  );
+}
+
+export function isAtomicCanaryProofV1(
+  value: unknown,
+): value is AtomicCanaryProofV1 {
+  return validCanaryProof(value as AtomicCanaryProofV1);
+}
+
+function validCanaryWorkflow(value: AtomicCanaryWorkflowV1 | null): boolean {
+  return (
+    value === null ||
+    (isRecord(value) &&
+      hasExactKeys(value, [
+        "action",
+        "stage",
+        "durablePhase",
+        "proof",
+        "sourceParentId",
+        "sourceParentRole",
+        "sourceParentEvidence",
+        "sourceId",
+        "targetParentId",
+        "targetParentRole",
+        "targetParentEvidence",
+        "sourceFilesystem",
+        "sourceDevice",
+        "targetFilesystem",
+        "targetDevice",
+      ]) &&
+      isOneOf(value.action, ["prove_mount", "cleanup"]) &&
+      isOneOf(value.durablePhase, [
+        "planned",
+        "published",
+        "deleting",
+      ]) &&
+      isOneOf(value.stage, [
+        "revalidate_source",
+        "revalidate_target",
+        "statfs_source",
+        "statfs_target",
+        "native",
+        "observe",
+        "sync_source",
+        "sync_target",
+        "persist_planned",
+        "persist_deleting",
+        "persist_published",
+        "persist_deleting_evidence",
+        "verify_published_locations",
+      ]) &&
+      (validCanaryProof(value.proof) ||
+        ((value.stage === "sync_source" ||
+          value.stage === "sync_target" ||
+          value.stage === "persist_published" ||
+          value.stage === "persist_deleting_evidence") &&
+          validCanaryProof({
+            ...value.proof,
+            sourceParentSynced: true,
+            targetParentSynced: true,
+          }))) &&
+      isFlightId(value.sourceParentId) &&
+      isOneOf(value.sourceParentRole, ATOMIC_OBJECT_ROLES) &&
+      isEvidence(value.sourceParentEvidence) &&
+      isFlightId(value.sourceId) &&
+      isFlightId(value.targetParentId) &&
+      isOneOf(value.targetParentRole, ATOMIC_OBJECT_ROLES) &&
+      isEvidence(value.targetParentEvidence) &&
+      (value.sourceFilesystem === null ||
+        isOneOf(value.sourceFilesystem, [
+          "ext",
+          "xfs",
+          "btrfs",
+          "tmpfs",
+          "overlay",
+        ])) &&
+      (value.targetFilesystem === null ||
+        isOneOf(value.targetFilesystem, [
+          "ext",
+          "xfs",
+          "btrfs",
+          "tmpfs",
+          "overlay",
+        ])) &&
+      (value.sourceDevice === null ||
+        /^(?:0|[1-9][0-9]*)$/u.test(value.sourceDevice)) &&
+      (value.targetDevice === null ||
+        /^(?:0|[1-9][0-9]*)$/u.test(value.targetDevice)))
+  );
+}
+
+function validPendingNativeResolution(
+  value: PendingAtomicNativeResolutionV1 | null,
+): boolean {
+  return (
+    value === null ||
+    (isRecord(value) &&
+      hasExactKeys(value, [
+        "request",
+        "rawCode",
+        "nativePrecheckEvidenceDigest",
+      ]) &&
+      validRequest(value.request) &&
+      value.request.kind === "native_no_replace" &&
+      isOneOf(value.rawCode, [
+        "success",
+        "atomic_publish_exists",
+        "atomic_publish_source_missing",
+        "atomic_publish_unsupported",
+        "atomic_publish_cross_device",
+        "atomic_publish_binding_invalid",
+        "atomic_publish_denied",
+        "atomic_publish_invalid_argument",
+        "atomic_publish_io",
+      ]) &&
+      isSha256(value.nativePrecheckEvidenceDigest))
+  );
+}
+
+function validNativeFailure(value: AtomicProtocolFailureV1 | null): boolean {
+  return (
+    value === null ||
+    isOneOf(value, [
+      "native_binding_invalid",
+      "native_ambiguous",
+      "native_unsupported",
+      "native_cross_device",
+      "native_denied",
+      "native_io",
+    ])
+  );
 }
 
 function validateState(state: AtomicReducerStateV1): boolean {
@@ -2656,6 +3615,11 @@ function validateState(state: AtomicReducerStateV1): boolean {
       "reservations",
       "cursors",
       "admission",
+      "canaryWorkflow",
+      "canaryReplayAuthority",
+      "pendingNativeResolution",
+      "nativeClassification",
+      "pendingNativeFailure",
       "terminalResult",
     ]) &&
     state.version === 1 &&
@@ -2695,10 +3659,21 @@ function validateState(state: AtomicReducerStateV1): boolean {
     isNonNegativeInteger(state.cursors.file) &&
     isNonNegativeInteger(state.cursors.content) &&
     (state.admission === "open" || state.admission === "closed") &&
+    validCanaryWorkflow(state.canaryWorkflow) &&
+    validCanaryReplayAuthority(state.canaryReplayAuthority) &&
+    validPendingNativeResolution(state.pendingNativeResolution) &&
+    validNativeClassification(state.nativeClassification) &&
+    validNativeFailure(state.pendingNativeFailure) &&
     (state.terminalResult === null ||
       (state.terminalResult.kind === "protocol_complete"
         ? isRecord(state.terminalResult) &&
           hasExactKeys(state.terminalResult, ["kind"])
+        : state.terminalResult.kind === "mount_proved" ||
+            state.terminalResult.kind === "cleanup_pending" ||
+            state.terminalResult.kind === "canary_cleaned"
+          ? isRecord(state.terminalResult) &&
+            hasExactKeys(state.terminalResult, ["kind", "proof"]) &&
+            validCanaryProof(state.terminalResult.proof)
         : state.terminalResult.kind === "fail_stop" &&
           isRecord(state.terminalResult) &&
           hasExactKeys(state.terminalResult, [
@@ -2765,6 +3740,181 @@ function initialRequestFailure(
   return null;
 }
 
+function scheduleAtomicEffect(
+  state: AtomicReducerStateV1,
+  draft: AtomicEffectRequestDraftV1,
+  additions: Partial<AtomicReducerStateV1> = {},
+): AtomicReducerStepV1 {
+  const request = attachEffectId(
+    draft,
+    makeEffectId(state.flightNonce, state.stepCounter),
+  );
+  if (!validRequest(request)) return fail(state, "invalid_request");
+  const nextState: AtomicReducerStateV1 = Object.freeze({
+    ...state,
+    ...additions,
+    stepCounter: state.stepCounter + 1,
+    outstandingRequest: request,
+  });
+  return Object.freeze({ kind: "effect" as const, state: nextState, request });
+}
+
+function exactLocationMatch(
+  location: CanonicalLocationEvidenceV1,
+  expected: AtomicObjectEvidenceV1,
+): boolean {
+  return (
+    location.state === "match" &&
+    location.evidence !== null &&
+    evidenceEquals(location.evidence, expected) &&
+    location.dev === expected.dev &&
+    location.ino === expected.ino &&
+    location.mode === expected.mode
+  );
+}
+
+function nativeClassificationFromLocations(
+  pending: PendingAtomicNativeResolutionV1,
+  authority: AtomicCanaryReplayAuthorityV1 | null,
+  observation: Extract<
+    AtomicEffectObservationV1,
+    { kind: "locations_observed"; requestKind: "native_no_replace" }
+  >,
+): AtomicNativeClassificationV1 | null {
+  const sourceMatches =
+    exactLocationMatch(observation.source, pending.request.expectedSource) &&
+    observation.sourceObjectId === pending.request.sourceId;
+  const targetMatches = exactLocationMatch(
+    observation.target,
+    pending.request.expectedSource,
+  );
+  const sourceAbsent =
+    observation.source.state === "absent" &&
+    observation.sourceObjectId === null;
+  const targetAbsent =
+    observation.target.state === "absent" &&
+    observation.targetObjectId === null;
+  const targetOther =
+    observation.target.state === "other" &&
+    observation.targetObjectId !== null;
+  const unpublished = sourceMatches && targetAbsent;
+  const conflict = sourceMatches && targetOther;
+  const published = sourceAbsent && targetMatches;
+  if (
+    Number(unpublished) + Number(conflict) + Number(published) !==
+    1
+  ) {
+    return null;
+  }
+
+  let outcome: AtomicNativeClassificationV1["outcome"];
+  let nativeCode: AtomicNativeClassificationV1["nativeCode"];
+  if (pending.rawCode === "success" && published) {
+    outcome = "published";
+    nativeCode = "success";
+  } else if (pending.rawCode === "atomic_publish_exists" && conflict) {
+    outcome = "conflict";
+    nativeCode = "atomic_publish_exists";
+  } else if (
+    pending.rawCode === "atomic_publish_source_missing" &&
+    published &&
+    authority !== null &&
+    authority.operationId === pending.request.operationId &&
+    authority.attempt === 0 &&
+    authority.sourceLeaf ===
+      `proof-${pending.request.operationId}-0` &&
+    authority.targetLeaf ===
+      `canary-${pending.request.operationId}-0` &&
+    authority.deletionLeaf ===
+      `deletion-${pending.request.operationId}-0` &&
+    evidenceEquals(
+      authority.privateSourceEvidence,
+      pending.request.expectedSource,
+    ) &&
+    ((pending.request.move === "canary_publish" &&
+      (authority.phase === "planned" ||
+        (authority.phase === "published" &&
+          authority.publishedEvidence !== null &&
+          evidenceEquals(
+            authority.publishedEvidence,
+            pending.request.expectedSource,
+          )))) ||
+      (pending.request.move === "canary_source_to_private" &&
+        authority.phase === "deleting" &&
+        authority.publishedEvidence !== null &&
+        evidenceEquals(
+          authority.publishedEvidence,
+          pending.request.expectedSource,
+        ) &&
+        authority.manifestSha256 !== null &&
+        authority.cleanupEntryCount > 0 &&
+        authority.cleanupNextIndex <= authority.cleanupEntryCount))
+  ) {
+    outcome = "published";
+    nativeCode = "atomic_publish_replay_completed";
+  } else if (
+    unpublished &&
+    pending.rawCode !== "success" &&
+    pending.rawCode !== "atomic_publish_exists" &&
+    pending.rawCode !== "atomic_publish_source_missing"
+  ) {
+    outcome = "unpublished";
+    nativeCode = pending.rawCode;
+  } else {
+    return null;
+  }
+
+  return Object.freeze({
+    outcome,
+    nativeCode,
+    sourceMatches,
+    targetMatches,
+    targetOther,
+    nativePrecheckEvidenceDigest: pending.nativePrecheckEvidenceDigest,
+    locationEvidenceDigest: observation.evidenceDigest,
+  });
+}
+
+function nativeFailureAction(
+  rawCode: AtomicRawNativeCodeV1,
+  ambiguous: boolean,
+): Readonly<{
+  reason: Extract<
+    AtomicEffectRequestV1,
+    { kind: "close_admission" }
+  >["reason"];
+  failure: AtomicProtocolFailureV1;
+}> | null {
+  if (rawCode === "atomic_publish_source_missing") {
+    return {
+      reason: "binding_invalid",
+      failure: "native_binding_invalid",
+    };
+  }
+  if (ambiguous) {
+    return { reason: "ambiguous", failure: "native_ambiguous" };
+  }
+  switch (rawCode) {
+    case "success":
+    case "atomic_publish_exists":
+      return null;
+    case "atomic_publish_binding_invalid":
+    case "atomic_publish_invalid_argument":
+      return {
+        reason: "binding_invalid",
+        failure: "native_binding_invalid",
+      };
+    case "atomic_publish_unsupported":
+      return { reason: "unsupported", failure: "native_unsupported" };
+    case "atomic_publish_cross_device":
+      return { reason: "cross_device", failure: "native_cross_device" };
+    case "atomic_publish_denied":
+      return { reason: "denied", failure: "native_denied" };
+    case "atomic_publish_io":
+      return { reason: "io", failure: "native_io" };
+  }
+}
+
 export function reduceAtomicPublication(
   state: AtomicReducerStateV1,
   observation: AtomicEffectObservationV1 | null,
@@ -2805,6 +3955,43 @@ export function reduceAtomicPublication(
   }
   const mismatch = observationSpecificMismatch(request, observation, state);
   if (mismatch !== null) {
+    if (
+      request.kind === "observe_locations" &&
+      request.requestKind === "native_no_replace" &&
+      state.pendingNativeResolution !== null
+    ) {
+      const consumed: AtomicReducerStateV1 = Object.freeze({
+        ...state,
+        outstandingRequest: null,
+        consumedEffectIds: Object.freeze([
+          ...state.consumedEffectIds,
+          request.effectId,
+        ]),
+      });
+      return scheduleAtomicEffect(
+        consumed,
+        {
+          kind: "close_admission",
+          operationId: request.operationId,
+          reason: "binding_invalid",
+          evidenceDigest: sha256(
+            new TextEncoder().encode(
+              JSON.stringify({
+                precheck:
+                  state.pendingNativeResolution
+                    .nativePrecheckEvidenceDigest,
+                request: request.evidenceDigest,
+                mismatch,
+              }),
+            ),
+          ),
+        },
+        {
+          pendingNativeResolution: null,
+          pendingNativeFailure: "native_binding_invalid",
+        },
+      );
+    }
     return fail(state, mismatch);
   }
   const accepted = withAcceptedObservation(state, request, observation);
@@ -2859,6 +4046,544 @@ export function reduceAtomicPublication(
         ...accepted,
         activePartialId: null,
       }),
+    );
+  }
+  const workflow = accepted.canaryWorkflow;
+  if (
+    workflow !== null &&
+    observation.kind === "effect_completed" &&
+    observation.requestKind === "persist_canary_phase"
+  ) {
+    if (
+      workflow.stage === "persist_planned" ||
+      workflow.stage === "persist_deleting"
+    ) {
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "revalidate_handle",
+          operationId: workflow.proof.operationId,
+          role: workflow.sourceParentRole,
+          objectId: workflow.sourceParentId,
+          cursor: 0,
+          byteLength: 0,
+          expected: workflow.sourceParentEvidence,
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            durablePhase:
+              workflow.stage === "persist_planned"
+                ? ("planned" as const)
+                : ("deleting" as const),
+            stage: "revalidate_source" as const,
+          }),
+        },
+      );
+    }
+    if (
+      workflow.stage === "persist_published" ||
+      workflow.stage === "persist_deleting_evidence"
+    ) {
+      const result: AtomicTerminalResultV1 =
+        workflow.stage === "persist_published"
+          ? Object.freeze({
+              kind: "mount_proved" as const,
+              proof: workflow.proof,
+            })
+          : Object.freeze({
+              kind: "cleanup_pending" as const,
+              proof: workflow.proof,
+            });
+      return terminal(
+        Object.freeze({
+          ...accepted,
+          canaryWorkflow: null,
+          canaryReplayAuthority:
+            canaryReplayAuthorityFromProof(workflow.proof),
+        }),
+        result,
+      );
+    }
+  }
+  if (
+    workflow !== null &&
+    observation.kind === "effect_completed" &&
+    observation.requestKind === "revalidate_handle"
+  ) {
+    if (workflow.stage === "revalidate_source") {
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "revalidate_handle",
+          operationId: workflow.proof.operationId,
+          role: workflow.targetParentRole,
+          objectId: workflow.targetParentId,
+          cursor: 0,
+          byteLength: 0,
+          expected: workflow.targetParentEvidence,
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            stage: "revalidate_target" as const,
+          }),
+        },
+      );
+    }
+    if (workflow.stage === "revalidate_target") {
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "statfs_parent",
+          operationId: workflow.proof.operationId,
+          role: workflow.sourceParentRole,
+          objectId: workflow.sourceParentId,
+          expected: workflow.sourceParentEvidence,
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            stage: "statfs_source" as const,
+          }),
+        },
+      );
+    }
+  }
+  if (
+    workflow !== null &&
+    observation.kind === "statfs_observed" &&
+    request.kind === "statfs_parent"
+  ) {
+    if (workflow.stage === "statfs_source") {
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "statfs_parent",
+          operationId: workflow.proof.operationId,
+          role: workflow.targetParentRole,
+          objectId: workflow.targetParentId,
+          expected: workflow.targetParentEvidence,
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            stage: "statfs_target" as const,
+            sourceFilesystem: observation.filesystem,
+            sourceDevice: observation.device,
+          }),
+        },
+      );
+    }
+    if (workflow.stage === "statfs_target") {
+      if (
+        workflow.sourceDevice !== observation.device ||
+        workflow.sourceFilesystem === null
+      ) {
+        return scheduleAtomicEffect(
+          accepted,
+          {
+            kind: "close_admission",
+            operationId: workflow.proof.operationId,
+            reason: "cross_device",
+            evidenceDigest: sha256(
+              new TextEncoder().encode(
+                JSON.stringify({
+                  sourceDevice: workflow.sourceDevice,
+                  targetDevice: observation.device,
+                }),
+              ),
+            ),
+          },
+          {
+            pendingNativeFailure: "native_cross_device",
+            canaryWorkflow: null,
+          },
+        );
+      }
+      if (
+        workflow.action === "prove_mount" &&
+        workflow.durablePhase === "published"
+      ) {
+        return scheduleAtomicEffect(
+          accepted,
+          {
+            kind: "observe_locations",
+            requestKind: "native_no_replace",
+            operationId: workflow.proof.operationId,
+            move: "canary_publish",
+            sourceParentId: workflow.sourceParentId,
+            sourceId: workflow.sourceId,
+            sourceLeaf: workflow.proof.sourceLeaf,
+            targetParentId: workflow.targetParentId,
+            targetLeaf: workflow.proof.targetLeaf,
+            expectedSource: workflow.proof.privateSourceEvidence,
+            expectedTarget: { absent: true },
+            evidenceDigest: sha256(
+              new TextEncoder().encode(
+                JSON.stringify({
+                  proof: workflow.proof,
+                  sourceFilesystem: workflow.sourceFilesystem,
+                  sourceDevice: workflow.sourceDevice,
+                  targetFilesystem: observation.filesystem,
+                  targetDevice: observation.device,
+                  verification: "published_locations",
+                }),
+              ),
+            ),
+          },
+          {
+            canaryWorkflow: Object.freeze({
+              ...workflow,
+              stage: "verify_published_locations" as const,
+              targetFilesystem: observation.filesystem,
+              targetDevice: observation.device,
+            }),
+          },
+        );
+      }
+      const cleanup = workflow.action === "cleanup";
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "native_no_replace",
+          operationId: workflow.proof.operationId,
+          move: cleanup
+            ? "canary_source_to_private"
+            : "canary_publish",
+          sourceParentId: workflow.sourceParentId,
+          sourceId: workflow.sourceId,
+          sourceLeaf: cleanup
+            ? workflow.proof.targetLeaf
+            : workflow.proof.sourceLeaf,
+          targetParentId: workflow.targetParentId,
+          targetLeaf: cleanup
+            ? workflow.proof.deletionLeaf
+            : workflow.proof.targetLeaf,
+          expectedSource: cleanup
+            ? workflow.proof.publishedEvidence!
+            : workflow.proof.privateSourceEvidence,
+          expectedTarget: { absent: true },
+          evidenceDigest: sha256(
+            new TextEncoder().encode(
+              JSON.stringify({
+                proof: workflow.proof,
+                sourceFilesystem: workflow.sourceFilesystem,
+                sourceDevice: workflow.sourceDevice,
+                targetFilesystem: observation.filesystem,
+                targetDevice: observation.device,
+              }),
+            ),
+          ),
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            stage: "native" as const,
+            targetFilesystem: observation.filesystem,
+            targetDevice: observation.device,
+          }),
+        },
+      );
+    }
+  }
+  if (
+    workflow !== null &&
+    observation.kind === "effect_completed" &&
+    observation.requestKind === "fsync_directory"
+  ) {
+    if (workflow.stage === "sync_source") {
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "fsync_directory",
+          operationId: workflow.proof.operationId,
+          role: workflow.targetParentRole,
+          objectId: workflow.targetParentId,
+          expected: workflow.targetParentEvidence,
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            stage: "sync_target" as const,
+          }),
+        },
+      );
+    }
+    if (workflow.stage === "sync_target") {
+      const proof = Object.freeze({
+        ...workflow.proof,
+        sourceParentSynced: true,
+        targetParentSynced: true,
+      });
+      const publishing = workflow.action === "prove_mount";
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "persist_canary_phase",
+          operationId: workflow.proof.operationId,
+          previousPhase: workflow.durablePhase,
+          proof,
+          evidenceDigest: sha256(
+            new TextEncoder().encode(JSON.stringify(proof)),
+          ),
+        },
+        {
+          canaryWorkflow: Object.freeze({
+            ...workflow,
+            durablePhase: publishing
+              ? ("published" as const)
+              : ("deleting" as const),
+            stage: publishing
+              ? ("persist_published" as const)
+              : ("persist_deleting_evidence" as const),
+            proof,
+          }),
+          canaryReplayAuthority:
+            canaryReplayAuthorityFromProof(proof),
+        },
+      );
+    }
+  }
+  if (
+    observation.kind === "native_resolved" &&
+    request.kind === "native_no_replace"
+  ) {
+    return scheduleAtomicEffect(
+      accepted,
+      {
+        kind: "observe_locations",
+        requestKind: "native_no_replace",
+        operationId: request.operationId,
+        move: request.move,
+        sourceParentId: request.sourceParentId,
+        sourceId: request.sourceId,
+        sourceLeaf: request.sourceLeaf,
+        targetParentId: request.targetParentId,
+        targetLeaf: request.targetLeaf,
+        expectedSource: request.expectedSource,
+        expectedTarget: request.expectedTarget,
+        evidenceDigest: request.evidenceDigest,
+      },
+      {
+        pendingNativeResolution: Object.freeze({
+          request,
+          rawCode: observation.rawCode,
+          nativePrecheckEvidenceDigest:
+            observation.nativePrecheckEvidenceDigest,
+        }),
+        canaryWorkflow:
+          workflow === null
+            ? null
+            : Object.freeze({
+                ...workflow,
+                stage: "observe" as const,
+              }),
+      },
+    );
+  }
+  if (
+    observation.kind === "locations_observed" &&
+    observation.requestKind === "native_no_replace" &&
+    request.kind === "observe_locations" &&
+    request.requestKind === "native_no_replace"
+  ) {
+    if (
+      workflow !== null &&
+      workflow.stage === "verify_published_locations"
+    ) {
+      const sourceAbsent =
+        observation.source.state === "absent" &&
+        observation.sourceObjectId === null;
+      const targetMatches =
+        exactLocationMatch(
+          observation.target,
+          workflow.proof.privateSourceEvidence,
+        ) && observation.targetObjectId !== null;
+      if (sourceAbsent && targetMatches) {
+        const classification: AtomicNativeClassificationV1 =
+          Object.freeze({
+            outcome: "published",
+            nativeCode: "atomic_publish_replay_completed",
+            sourceMatches: false,
+            targetMatches: true,
+            targetOther: false,
+            nativePrecheckEvidenceDigest: request.evidenceDigest,
+            locationEvidenceDigest: observation.evidenceDigest,
+          });
+        return terminal(
+          Object.freeze({
+            ...accepted,
+            nativeClassification: classification,
+            canaryWorkflow: null,
+          }),
+          Object.freeze({
+            kind: "mount_proved" as const,
+            proof: workflow.proof,
+          }),
+        );
+      }
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "close_admission",
+          operationId: request.operationId,
+          reason: "binding_invalid",
+          evidenceDigest: sha256(
+            new TextEncoder().encode(
+              JSON.stringify({
+                verification: request.evidenceDigest,
+                locations: observation.evidenceDigest,
+                sourceState: observation.source.state,
+                targetState: observation.target.state,
+              }),
+            ),
+          ),
+        },
+        {
+          pendingNativeFailure: "native_binding_invalid",
+          canaryWorkflow: null,
+        },
+      );
+    }
+    const pending = accepted.pendingNativeResolution;
+    if (pending === null) return fail(accepted, "observation_mismatch");
+    const classification = nativeClassificationFromLocations(
+      pending,
+      accepted.canaryReplayAuthority,
+      observation,
+    );
+    const action =
+      classification?.nativeCode === "atomic_publish_replay_completed"
+        ? null
+        : nativeFailureAction(
+            pending.rawCode,
+            classification === null,
+          );
+    if (
+      classification !== null &&
+      classification.outcome === "conflict"
+    ) {
+      const evidenceDigest = sha256(
+        new TextEncoder().encode(
+          JSON.stringify({
+            rawCode: pending.rawCode,
+            precheck: pending.nativePrecheckEvidenceDigest,
+            locations: observation.evidenceDigest,
+            reason: "binding_invalid",
+          }),
+        ),
+      );
+      return scheduleAtomicEffect(
+        accepted,
+        {
+          kind: "close_admission",
+          operationId: request.operationId,
+          reason: "binding_invalid",
+          evidenceDigest,
+        },
+        {
+          pendingNativeResolution: null,
+          nativeClassification: classification,
+          pendingNativeFailure: "native_binding_invalid",
+          canaryWorkflow: null,
+        },
+      );
+    }
+    if (classification !== null && action === null) {
+      if (
+        workflow !== null &&
+        workflow.stage === "observe" &&
+        classification.outcome === "published" &&
+        observation.target.evidence !== null
+      ) {
+        const proof: AtomicCanaryProofV1 =
+          workflow.action === "prove_mount"
+            ? Object.freeze({
+                ...workflow.proof,
+                phase: "published" as const,
+                publishedEvidence: observation.target.evidence,
+                classification,
+                sourceParentSynced: false,
+                targetParentSynced: false,
+              })
+            : Object.freeze({
+                ...workflow.proof,
+                phase: "deleting" as const,
+                privateDeletionEvidence: observation.target.evidence,
+                sourceParentSynced: false,
+                targetParentSynced: false,
+              });
+        return scheduleAtomicEffect(
+          accepted,
+          {
+            kind: "fsync_directory",
+            operationId: workflow.proof.operationId,
+            role: workflow.sourceParentRole,
+            objectId: workflow.sourceParentId,
+            expected: workflow.sourceParentEvidence,
+          },
+          {
+            pendingNativeResolution: null,
+            nativeClassification: classification,
+            canaryWorkflow: Object.freeze({
+              ...workflow,
+              stage: "sync_source" as const,
+              proof,
+            }),
+            canaryReplayAuthority:
+              canaryReplayAuthorityFromProof(proof),
+          },
+        );
+      }
+      return completed(
+        Object.freeze({
+          ...accepted,
+          pendingNativeResolution: null,
+          nativeClassification: classification,
+        }),
+      );
+    }
+    if (action === null) {
+      return fail(accepted, "native_ambiguous");
+    }
+    const evidenceDigest = sha256(
+      new TextEncoder().encode(
+        JSON.stringify({
+          rawCode: pending.rawCode,
+          precheck: pending.nativePrecheckEvidenceDigest,
+          locations: observation.evidenceDigest,
+          reason: action.reason,
+        }),
+      ),
+    );
+    return scheduleAtomicEffect(
+      accepted,
+      {
+        kind: "close_admission",
+        operationId: request.operationId,
+        reason: action.reason,
+        evidenceDigest,
+      },
+      {
+        pendingNativeResolution: null,
+        nativeClassification: classification,
+        pendingNativeFailure: action.failure,
+      },
+    );
+  }
+  if (
+    observation.kind === "effect_completed" &&
+    request.kind === "close_admission" &&
+    accepted.pendingNativeFailure !== null
+  ) {
+    return fail(
+      Object.freeze({
+        ...accepted,
+        admission: "closed" as const,
+        pendingNativeFailure: null,
+      }),
+      accepted.pendingNativeFailure,
     );
   }
   return completed(accepted);
