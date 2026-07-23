@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -621,8 +622,207 @@ static int authenticate_fixture_control(void) {
          memcmp(actual, expected, (size_t)expected_length) == 0;
 }
 
-void atomic_publish_test_hook_before(void) {}
-void atomic_publish_test_hook_after(void) {}
+enum {
+  ATOMIC_SYSCALL_BARRIER_NONE = 0,
+  ATOMIC_SYSCALL_BARRIER_BEFORE = 1,
+  ATOMIC_SYSCALL_BARRIER_AFTER = 2,
+};
+
+static _Thread_local int atomic_syscall_barrier_phase;
+
+typedef struct atomic_test_addon_identity {
+  dev_t device;
+  ino_t inode;
+  int captured;
+} atomic_test_addon_identity;
+
+static atomic_test_addon_identity test_addon_identity;
+static const unsigned char test_addon_identity_anchor = 0xa7;
+
+static int mapped_identity_for_address(const void *address, dev_t *device,
+                                       ino_t *inode) {
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (maps == NULL) {
+    return 0;
+  }
+  char *line = NULL;
+  size_t capacity = 0;
+  uintptr_t target = (uintptr_t)address;
+  int found = 0;
+  while (getline(&line, &capacity, maps) >= 0) {
+    unsigned long start;
+    unsigned long end;
+    unsigned long offset;
+    unsigned long device_major;
+    unsigned long device_minor;
+    unsigned long long mapped_inode;
+    char permissions[5];
+    int fields =
+        sscanf(line, "%lx-%lx %4s %lx %lx:%lx %llu", &start, &end,
+               permissions, &offset, &device_major, &device_minor,
+               &mapped_inode);
+    if (fields == 7 && target >= (uintptr_t)start &&
+        target < (uintptr_t)end && mapped_inode > 0) {
+      *device = makedev(device_major, device_minor);
+      *inode = (ino_t)mapped_inode;
+      found = 1;
+      break;
+    }
+  }
+  free(line);
+  if (fclose(maps) != 0) {
+    return 0;
+  }
+  return found;
+}
+
+int atomic_publish_test_hook_capture_addon_identity(void) {
+  dev_t device;
+  ino_t inode;
+  if (!mapped_identity_for_address(&test_addon_identity_anchor, &device,
+                                   &inode)) {
+    return 0;
+  }
+  if (test_addon_identity.captured) {
+    return test_addon_identity.device == device &&
+           test_addon_identity.inode == inode;
+  }
+  test_addon_identity.device = device;
+  test_addon_identity.inode = inode;
+  test_addon_identity.captured = 1;
+  return 1;
+}
+
+static int descriptor_access_mode(int descriptor, int expected_mode) {
+  int flags = fcntl(descriptor, F_GETFL);
+  return flags >= 0 && (flags & O_ACCMODE) == expected_mode;
+}
+
+static int authenticate_syscall_barrier_regular(int descriptor,
+                                                int require_unlinked,
+                                                int require_elf) {
+  struct stat status;
+  unsigned char elf[4];
+  if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) ||
+      status.st_uid != getuid() || (status.st_mode & 07777) != 0600 ||
+      (require_unlinked ? status.st_nlink != 0 : status.st_nlink > 1) ||
+      !descriptor_access_mode(descriptor, O_RDONLY)) {
+    return 0;
+  }
+  if (!require_elf) {
+    return 1;
+  }
+  ssize_t count;
+  do {
+    count = pread(descriptor, elf, sizeof(elf), 0);
+  } while (count < 0 && errno == EINTR);
+  return count == (ssize_t)sizeof(elf) && elf[0] == 0x7f &&
+         elf[1] == 'E' && elf[2] == 'L' && elf[3] == 'F';
+}
+
+static int authenticate_syscall_barrier_directory(int descriptor) {
+  struct stat status;
+  return fstat(descriptor, &status) == 0 && S_ISDIR(status.st_mode) &&
+         status.st_uid == getuid() &&
+         descriptor_access_mode(descriptor, O_RDONLY);
+}
+
+static int authenticate_syscall_barrier_fifo(int descriptor,
+                                             int expected_mode,
+                                             struct stat *status) {
+  int flags;
+  return fstat(descriptor, status) == 0 && S_ISFIFO(status->st_mode) &&
+         status->st_uid == getuid() && (status->st_mode & 07777) == 0600 &&
+         status->st_nlink == 0 &&
+         (flags = fcntl(descriptor, F_GETFL)) >= 0 &&
+         (flags & O_ACCMODE) == expected_mode &&
+         (flags & (O_NONBLOCK | O_APPEND)) == 0;
+}
+
+static int read_syscall_barrier_control(void) {
+  static const char before[] =
+      "atomic-publish-syscall-barrier-v1:before\n";
+  static const char after[] = "atomic-publish-syscall-barrier-v1:after\n";
+  struct stat status;
+  char actual[sizeof(before)];
+  if (!authenticate_syscall_barrier_regular(6, 1, 0) ||
+      fstat(6, &status) != 0 ||
+      (status.st_size != (off_t)(sizeof(before) - 1U) &&
+       status.st_size != (off_t)(sizeof(after) - 1U))) {
+    return ATOMIC_SYSCALL_BARRIER_NONE;
+  }
+  ssize_t count;
+  do {
+    count = pread(6, actual, sizeof(actual), 0);
+  } while (count < 0 && errno == EINTR);
+  if (count == (ssize_t)(sizeof(before) - 1U) &&
+      memcmp(actual, before, sizeof(before) - 1U) == 0) {
+    return ATOMIC_SYSCALL_BARRIER_BEFORE;
+  }
+  if (count == (ssize_t)(sizeof(after) - 1U) &&
+      memcmp(actual, after, sizeof(after) - 1U) == 0) {
+    return ATOMIC_SYSCALL_BARRIER_AFTER;
+  }
+  return ATOMIC_SYSCALL_BARRIER_NONE;
+}
+
+static int authenticate_syscall_barrier(void) {
+  struct stat addon;
+  struct stat ready;
+  struct stat release;
+  int phase;
+  if (!authenticate_syscall_barrier_regular(3, 1, 1) ||
+      !test_addon_identity.captured || fstat(3, &addon) != 0 ||
+      addon.st_dev != test_addon_identity.device ||
+      addon.st_ino != test_addon_identity.inode ||
+      !authenticate_syscall_barrier_directory(4) ||
+      !authenticate_syscall_barrier_directory(5) ||
+      !authenticate_syscall_barrier_fifo(7, O_WRONLY, &ready) ||
+      !authenticate_syscall_barrier_fifo(8, O_RDONLY, &release) ||
+      (ready.st_dev == release.st_dev && ready.st_ino == release.st_ino)) {
+    return ATOMIC_SYSCALL_BARRIER_NONE;
+  }
+  phase = read_syscall_barrier_control();
+  return phase;
+}
+
+static int run_syscall_barrier(void) {
+  static const unsigned char byte = 0x01;
+  ssize_t count;
+  do {
+    count = write(7, &byte, 1);
+  } while (count < 0 && errno == EINTR);
+  if (count != 1) {
+    return 0;
+  }
+  unsigned char release;
+  do {
+    count = read(8, &release, 1);
+  } while (count < 0 && errno == EINTR);
+  return count == 1 && release == byte;
+}
+
+int atomic_publish_test_hook_before(void) {
+  atomic_syscall_barrier_phase = authenticate_syscall_barrier();
+  if (atomic_syscall_barrier_phase == ATOMIC_SYSCALL_BARRIER_NONE) {
+    return 0;
+  }
+  if (atomic_syscall_barrier_phase == ATOMIC_SYSCALL_BARRIER_BEFORE &&
+      !run_syscall_barrier()) {
+    atomic_syscall_barrier_phase = ATOMIC_SYSCALL_BARRIER_NONE;
+    return 0;
+  }
+  return 1;
+}
+
+int atomic_publish_test_hook_after(void) {
+  int phase = atomic_syscall_barrier_phase;
+  atomic_syscall_barrier_phase = ATOMIC_SYSCALL_BARRIER_NONE;
+  if (phase == ATOMIC_SYSCALL_BARRIER_AFTER) {
+    return run_syscall_barrier();
+  }
+  return phase == ATOMIC_SYSCALL_BARRIER_BEFORE;
+}
 
 static napi_value throw_test(napi_env env, const char *message) {
   if (napi_throw_error(env, "atomic_publish_test_hook_invalid", message) !=

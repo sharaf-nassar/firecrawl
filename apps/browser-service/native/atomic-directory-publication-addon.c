@@ -169,7 +169,10 @@ static napi_value rename_no_replace(napi_env env, napi_callback_info info) {
   }
 
 #ifdef ATOMIC_PUBLISH_TEST_HOOKS
-  atomic_publish_test_hook_before();
+  if (source_fd != 4 || target_fd != 5 ||
+      !atomic_publish_test_hook_before()) {
+    return throw_code(env, "atomic_publish_test_hook_invalid");
+  }
 #endif
 #ifdef SYS_renameat2
   int result = (int)syscall(SYS_renameat2, source_fd, source_leaf, target_fd,
@@ -180,7 +183,9 @@ static napi_value rename_no_replace(napi_env env, napi_callback_info info) {
 #endif
   int syscall_error = errno;
 #ifdef ATOMIC_PUBLISH_TEST_HOOKS
-  atomic_publish_test_hook_after();
+  if (!atomic_publish_test_hook_after()) {
+    return throw_code(env, "atomic_publish_test_hook_invalid");
+  }
 #endif
   if (result != 0) {
     return throw_code(env, atomic_publish_map_errno(syscall_error));
@@ -212,7 +217,8 @@ static napi_value initialize(napi_env env, napi_value exports) {
     return throw_napi_failure(env);
   }
 #ifdef ATOMIC_PUBLISH_TEST_HOOKS
-  if (atomic_publish_export_test_hooks(env, exports) != napi_ok) {
+  if (!atomic_publish_test_hook_capture_addon_identity() ||
+      atomic_publish_export_test_hooks(env, exports) != napi_ok) {
     if (napi_throw_error(env, "atomic_publish_test_hook_init",
                          "failed to initialize test hooks") != napi_ok) {
       return NULL;
