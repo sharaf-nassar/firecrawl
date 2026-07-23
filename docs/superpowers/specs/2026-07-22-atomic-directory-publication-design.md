@@ -1803,6 +1803,24 @@ type AtomicDirectoryPublicationNativeTestV1 =
     Readonly<{
       testHooks: Readonly<{
         becomeChildSubreaperForTest(): void;
+        prepareInheritedLockFdForTest(
+          evidence: Readonly<{
+            role:
+              | "orphan_lock_driver_v1"
+              | "orphan_lock_descendant_v1";
+            nodeExecutableRealpath: string;
+            nodeExecutableSha256: string;
+            scriptRealpath: string;
+            scriptSha256: string;
+            expectedParentPid: number;
+            expectedParentStarttime: string;
+            fd9Device: string;
+            fd9Inode: string;
+            fd9Uid: number;
+            fd9Mode: 0o600;
+            fd9Nlink: 1;
+          }>,
+        ): void;
         claimAdoptedChildForTest(
           evidence: Readonly<{
             role: "orphan_lock_descendant_v1";
@@ -1833,10 +1851,33 @@ type AtomicDirectoryPublicationNativeTestV1 =
 }>;
 ```
 
-`testHooks` has exactly those three functions and accepts no raw fd, path
+`testHooks` has exactly those four functions and accepts no raw fd, path
 override, caller-selected token, executable choice, signal request, timeout,
 or generic pid. `becomeChildSubreaperForTest()` performs and verifies Linux
 `PR_SET_CHILD_SUBREAPER`/`PR_GET_CHILD_SUBREAPER`.
+
+`prepareInheritedLockFdForTest()` is callable only from the canonical orphan
+fixture's already-started Node process in exact driver/descendant roles. The
+fixture's module-private fixed wrapper constructs the exact evidence object;
+no CLI, environment-selected module-init path, test callback, or arbitrary
+caller fields reach the native function. It validates current process
+pid/starttime, canonical Node executable realpath/hash, canonical fixture
+script realpath/hash plus exact `/proc/self/cmdline`, fixed
+`/proc/self/environ` and role, current/expected parent pid/starttime, and
+hard-coded fd 9 only. It no-follow authenticates the private build-lock record
+and requires fd9 device/inode/current uid/mode `0600`/link count one to match.
+It captures `fstat(9)`, `/proc/self/fd/9`, `/proc/self/fdinfo/9`, and
+`fcntl(F_GETFD)` before mutation; clears only `FD_CLOEXEC` on its own fd 9
+through `fcntl(F_SETFD, oldFlags & ~FD_CLOEXEC)`; then repeats every check and
+requires CLOEXEC clear with all other identity/descriptor flags unchanged.
+It accepts no fd number and cannot touch another descriptor.
+
+This hook has no module-load, environment-triggered, subreaper, signal, wait,
+spawn, or publication side effect. Production addon never contains it.
+Driver calls the fixed wrapper after Node startup and before spawning/execing
+the descendant; descendant calls it independently after its Node startup and
+before its ready record. A missing, duplicate, late, wrong-role, or mismatched
+call fails the fixture before further spawn/ready action.
 
 The harness validates the live driver-parent relationship before killing the
 driver; native code does not attempt to prove that dead historical
@@ -1883,9 +1924,9 @@ them after reap. No `waitpid(-1)`, generic adoption, sleep, or Node
 `ChildProcess` pid is accepted. Node-created flock, driver, compiler, builder,
 and contender children remain owned and reaped only by their libuv handles.
 
-Production build/link/load rejects `testHooks` and all three hook symbols and
+Production build/link/load rejects `testHooks` and all four hook symbols and
 remains the exact three-property ABI. Test-addon shape tests require exact four
-top-level properties and exact three nested hook properties.
+top-level properties and exact four nested hook properties.
 
 Raw native object stays module-private to the service loader consumed only by
 the reconciliation controller. The isolated preflight script may load the
@@ -1982,6 +2023,24 @@ unchanged; reducer alone normalizes after a separately observed location tuple.
 Tests may fake pure effect scheduling/admission state, but never native
 rename results in integration or recovery tests. Production cannot select a
 module path.
+
+Every claimed cleanup, publication, and GCC/build transition is implemented in
+the real production module and exercised through that same implementation.
+Tests cannot satisfy acceptance with a test-only reducer, copied state machine,
+fake-only effect, mocked publication/cleanup result, or alternate GCC control
+path. Pure reducer unit tests may substitute closed observations only to test
+the reducer mapping; real controller/recovery, native publication, build-lock,
+and gcc/`cc1` acceptance still invokes production state and effects.
+
+If boundary coverage needs an internal matrix seam, it is a closed no-argument
+module-only test function enabled solely by direct `VITEST=true` import. It
+selects a checked-in fixed matrix internally, invokes the real production
+state machine/effect adapters, and returns only frozen canonical results. It
+exports no parameterized reducer, effect callback, fd/path/executable,
+filesystem adapter, result injection, or arbitrary matrix selector, and no
+production CLI/runtime path can call it. Fixture-only orphan control remains a
+test proof of the production lock lifecycle; it does not replace any
+production cleanup/publication/GCC implementation.
 
 ## Crash recovery and cleanup matrix
 
@@ -2254,22 +2313,34 @@ that production CLI path. They cannot name the fixture, role, or spawn seam.
 
 In fixture mode the locked child receives the normal exact
 `ATOMIC_BUILD_LOCK_FD=9`, plus only
-`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`; fd 3, fd 4, and fd 9 are inherited.
+`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`, canonical decimal
+`ATOMIC_BUILD_LOCK_FIXTURE_EXPECTED_PARENT_PID`, and
+`ATOMIC_BUILD_LOCK_FIXTURE_EXPECTED_PARENT_STARTTIME`; fd 3, fd 4, and fd 9
+are inherited.
 The driver environment is rebuilt rather than spread from `process.env` and
 contains exactly `PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
 `ATOMIC_BUILD_LOCK_FD=9`, and
-`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`.
+`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver` plus those two expected-parent keys.
+After Node startup, driver loads only the fixed test addon and its
+module-private wrapper calls `prepareInheritedLockFdForTest()` with canonical
+driver evidence. Only after native post-check proves its own fd9 CLOEXEC clear
+may driver spawn the descendant.
+
 The driver forks/execs the same canonical fixture with role `descendant`,
-mapping the same three descriptors and adding only canonical decimal
-`ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`; its environment is otherwise the same
-exact fixed set with role `descendant`. The descendant validates its role,
-driver pid, exact argv/environment, fd types, and lock fd identity, then writes
-one canonical UTF-8 ready record containing exact event `orphan-ready-v1`,
-role `orphan_lock_descendant_v1`, driver pid/starttime, descendant
-pid/starttime, canonical Node executable realpath/hash, canonical fixture
-script realpath/hash, and fd9 device/inode/CLOEXEC-false evidence. No other
-fields or whitespace are valid. It closes fd 3 and blocks on fd 4. After
-descendant spawn, driver closes its own fd 3/4 duplicates but retains fd 9 and
+mapping the same three descriptors. Descendant environment replaces role and
+expected-parent values with exact `descendant` and driver pid/starttime and
+adds canonical decimal `ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`; no inherited
+key is spread. After its own Node startup, descendant validates role, driver,
+exact argv/environment, and fd types, then its fixed wrapper independently
+calls `prepareInheritedLockFdForTest()` with canonical descendant evidence.
+Only after native post-check proves descendant fd9 identity and CLOEXEC clear
+does it write one canonical UTF-8 ready record containing exact event
+`orphan-ready-v1`, role `orphan_lock_descendant_v1`, driver pid/starttime,
+descendant pid/starttime, canonical Node executable realpath/hash, canonical
+fixture script realpath/hash, and fd9
+device/inode/uid/mode/link-count/CLOEXEC-false evidence. No other fields or
+whitespace are valid. It closes fd 3 and blocks on fd 4. After descendant
+spawn, driver closes its own fd 3/4 duplicates but retains prepared fd 9 and
 remains alive.
 
 Harness validates the complete ready record against live `/proc` evidence
@@ -2516,7 +2587,7 @@ Native inputs are split exactly:
   entrypoint;
 - `native/atomic-directory-publication-errors.c` and `.h`: shared errno map;
 - `native/atomic-directory-publication-test-hooks.c` and `.h`: test-only
-  pipe/eventfd barriers around the real syscall plus the three closed test
+  pipe/eventfd barriers around the real syscall plus the four closed test
   hooks specified above; and
 - `native/atomic-directory-publication-errors.test.c`: standalone errno-map
   test main.
@@ -2723,7 +2794,8 @@ It also contains no `run-native-build.test.mjs`,
 `native-build-lock-orphan.fixture.mjs`, other `*.test.*` or fixture sources,
 test FIFO/temp content, `testHooks`,
 `becomeChildSubreaperForTest`, or
-`claimAdoptedChildForTest`/`reapClaimedChildForTest`. Deferred
+`prepareInheritedLockFdForTest`/`claimAdoptedChildForTest`/
+`reapClaimedChildForTest`. Deferred
 `src/dockerfile.test.ts` asserts those path/name/symbol absences and proves the
 production addon still has exactly three own properties.
 The same Dockerfile defines a separate init target containing pinned util-linux
@@ -2813,6 +2885,19 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   verified close, zero builder or later-child spawn where applicable, and zero
   staging inspection/removal/mutation.
   Concurrent builders serialize and timeout has no compiler/staging effect.
+  Test-addon shape is exact production three properties plus `testHooks` with
+  exactly four functions. Real fixture driver and descendant processes each
+  prove fd9 CLOEXEC is clear only after their own post-startup
+  `prepareInheritedLockFdForTest()` call; driver preparation precedes
+  descendant spawn, descendant preparation precedes ready. Pre/post captures
+  require identical fd9 dev/inode/uid/mode/nlink and unchanged descriptor
+  flags except CLOEXEC. Negative child-process tests cover wrong/duplicate/
+  late role, wrong parent pid/starttime, Node/script/cmdline/hash/environment
+  drift, nonprivate or replaced lock identity, wrong uid/mode/nlink, fd9
+  absent/nonregular, and attempted arbitrary-fd evidence. Each rejects before
+  later spawn/ready and has zero subreaper/signal/wait/publication side effect;
+  module load and fixture environment alone never clear CLOEXEC.
+
   Harness becomes a verified subreaper, creates exact private named-FIFO
   endpoints, and runs the closed orphan seam. After validating the canonical
   ready record and live driver-parent relation, it kills the driver and awaits
@@ -2924,9 +3009,9 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   `atomic-directory-publication.node.sha256` are copied from native build
   outputs; input dep/hash sidecars, objects, maps, traces, and test outputs are
   absent. They also assert absence of the test addon, orphan fixture, test
-  scripts/FIFO state, and all three test-hook names/symbols, while production addon
-  shape remains exactly three properties. Two independent `--no-cache` Docker
-  builds per native supported
+  scripts/FIFO state, and all four test-hook names/symbols, while production
+  addon shape remains exactly three properties. Two independent `--no-cache`
+  Docker builds per native supported
   `TARGETARCH` extract those exact runtime paths and require byte/hash equality
   for both addon and canonical checksum plus embedded-addon-hash agreement.
   Prestart rejects independent tampering of addon or attestation before service
