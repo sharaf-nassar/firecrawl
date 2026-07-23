@@ -2268,31 +2268,100 @@ saved lock device/inode identity; a known saved descriptor, where available,
 must instead fail `fstat` with `EBADF`. This observation proves the
 runner/harness duplicate is gone.
 
-The harness then waits for the descendant's live parent to become the harness
-subreaper, revalidates the descendant's exact pid/starttime and still-open fd 9
-identity, and synchronously calls `claimAdoptedChildForTest()` with canonical
-evidence including the harness pid/starttime as adoptive parent. Only after the
-opaque claim handle is returned does a separately opened
+Harness owns one monotonic orphan-cleanup record. Its `claimState` is exactly
+`unclaimed | claimed_unconsumed | reap_pending | reaped`; its independent
+`releaseState` is exactly `not_attempted | written | closed | failed`.
+`unclaimed` also carries a one-way `claimAttempted` bit so a failed claim
+sequence is never retried. `claimed_unconsumed` stores the one opaque native
+handle, `reap_pending` stores the one Promise returned by consuming that
+handle, and `reaped` stores its canonical result. Release failure stores exact
+`write|close` stage and errno while remaining terminal `failed`; failed write
+is never retried. Independent `releaseWriterCloseAttempted` and
+`releaseWriterCloseResult: not_attempted | closed | failed` fields govern
+descriptor close regardless of `releaseState`. The close-attempt bit is set
+before the close syscall boundary, and only a true bit suppresses a later
+close. Separate one-way close-attempt bits for ready reader and release writer
+guarantee each harness FIFO endpoint is closed at most once. Anchors, unused
+duplicates, and the fixture's ready writer/release reader likewise have one
+owner and one close-attempt bit; every FIFO descriptor has one close attempt
+on its reachable terminal path and no process retries a close.
+
+The harness then waits at most fixed `2000ms`, using monotonic deadline and
+identity-checked `/proc` observations rather than sleeps, for the descendant's
+live parent to become the harness subreaper while the descendant remains
+blocked and its exact fd 9 remains open. It revalidates the descendant's exact
+pid/starttime and fd 9 identity, then synchronously calls
+`claimAdoptedChildForTest()` with canonical evidence including the harness
+pid/starttime as adoptive parent. Only after the opaque claim handle is
+returned does a separately opened
 `/usr/bin/flock --exclusive --nonblock 9` contender have to report contention.
 Thus the only observed live holder is the claimed descendant's fd 9. Harness
-then writes exact release byte `0x01` and closes the release writer.
-Descendant closes fd 4/fd 9 and exits zero;
-`reapClaimedChildForTest(handle, exactPolicy)` must exact-PID reap and return
+atomically records `claimed_unconsumed`, writes exact release byte `0x01`
+(`not_attempted -> written`), sets `releaseWriterCloseAttempted=true`, and
+closes the release writer (`written -> closed`,
+`releaseWriterCloseResult=closed`). Calling
+`reapClaimedChildForTest(handle, exactPolicy)` consumes the stored handle and
+records `reap_pending` before exposing/awaiting its one Promise. Descendant
+closes fd 4/fd 9 and exits zero; resolution records `reaped` with exact-PID
 exit zero. This test proves lock retention after the controlled post-ready
 parent kill.
 
 The guarantee is deliberately narrow. Unexpected driver failure before a
-valid ready record fails the test. On every post-ready assertion failure,
-cleanup closes the ready endpoint, writes the one release byte when the
-release endpoint remains valid, and closes it. If a claim handle exists,
-cleanup consumes it through the exact reap policy. If the canonical child has
-already been adopted but no handle exists, cleanup revalidates and claims it
-before the same reap; it never signals an unclaimed pid. Driver cleanup uses
-only its existing Node `ChildProcess` handle and awaits it through libuv. The
-final KILL-timeout case keeps the test process alive on native exact-PID
-cleanup and reports the still-live pidfd evidence. This does not claim
-crash-proof cleanup, adoption from malformed evidence, or zero residue after
-whole-harness `SIGKILL`.
+valid ready record fails the test. Success, assertion failure, cancellation,
+and repeated cleanup all dispatch only on the recorded phase:
+
+- `unclaimed`: if `claimAttempted` is false, set it true before I/O; close the
+  ready reader once, terminate the still-live canonical driver only through
+  its Node `ChildProcess` handle, await that handle through libuv, and await
+  runner settlement. Then, for at most fixed `2000ms`, require actual direct
+  adoption by the harness subreaper while the descendant remains blocked with
+  exact live fd9; revalidate full live evidence and synchronously call
+  `claimAdoptedChildForTest()` exactly once. Only its acknowledgement advances
+  to `claimed_unconsumed`. If `claimAttempted` was already true while state
+  remains `unclaimed`, return the recorded cleanup failure without repeating
+  driver wait, adoption, evidence, or claim.
+- `claimed_unconsumed`: never repeat driver handling, adoption, live evidence,
+  fd9 validation, or native claim. If release is `not_attempted`, attempt the
+  exact `0x01` write once, recording `written` or terminal `failed`. Write
+  failure never changes back from `failed` and never retries. Independently,
+  whenever `releaseWriterCloseAttempted=false`, the same invocation or any
+  reentry first sets it true, then issues the one close and records
+  `releaseWriterCloseResult=closed|failed`. Successful close advances
+  `written -> closed`; close failure advances `written -> failed`; after write
+  failure, close result is recorded separately and `releaseState` remains
+  `failed`. `releaseWriterCloseAttempted=true` is the only close no-op gate.
+  Thus a failure injected after write failure but before the close gate still
+  causes exactly one close attempt on reentry, while failure after the bit is
+  set never causes a second. Only after that close attempt, regardless of
+  release/write/close result, consume the existing claim handle exactly once
+  through `reapClaimedChildForTest(handle, exactPolicy)` and record
+  `reap_pending` before awaiting its fixed graceful/TERM/KILL escalation.
+- `reap_pending`: perform no driver, adoption, evidence, fd9, claim, release,
+  signal, or new reap operation. Await only the already stored Promise; on its
+  canonical result advance once to `reaped`.
+- `reaped`: perform only idempotent descriptor/temp cleanup. Each endpoint's
+  close-attempt bit permits at most one actual close; already-absent temp
+  leaves/directories are accepted only after their saved identity/absence
+  checks. Repeated cleanup is otherwise a no-op returning the stored result.
+
+After release begins, the descendant may have closed fd9, exited, or become a
+zombie; those are valid claimed states. Neither `claimed_unconsumed` after its
+release attempt nor `reap_pending|reaped` requires live `/proc` evidence or
+fd9. Release failure never returns control to `unclaimed` and never causes a
+second write, close, adoption, claim, or reap.
+
+If driver termination cannot be awaited, adoption does not occur within the
+bound, evidence cannot be revalidated, or native claim rejects, cleanup has no
+descendant authority: it neither writes/closes the release endpoint nor sends
+a raw signal nor performs a raw/generic wait. It reports an explicit cleanup
+failure with driver/adoption/evidence state and does not claim the descendant
+was released or reaped. Bounded claim-policy escalation is used only after a
+claim handle exists. Release write or close failure after claim still consumes
+that handle and uses its fixed escalation. The final KILL-timeout case keeps
+the test process alive on the one stored native exact-PID Promise and reports
+the still-live pidfd evidence. This does not claim crash-proof cleanup,
+adoption from malformed evidence, or zero residue after whole-harness
+`SIGKILL`.
 
 Real gcc/`cc1` inheritance is a separate happy-path test, not an orphan
 fixture. It runs first in a fresh dedicated
@@ -2715,7 +2784,28 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   pid/starttime, Node executable, script cmdline/hash, fixed environment, fd9
   identity, or CLOEXEC. They do not ask native code to validate the dead
   original parent. Early unexpected driver failure is a test failure with the
-  exact cleanup sequence, not a crash-recovery claim.
+  exact cleanup sequence, not a crash-recovery claim. Failure/cancellation
+  injections after every ready, driver-exit, adoption, evidence, claim,
+  contention, release-write, and release-close boundary assert the same order:
+  driver-handle termination/await, bounded live adoption, synchronous native
+  claim acknowledgement, then and only then release byte/EOF, followed by
+  async exact-PID reap. Pre-claim failure asserts zero release bytes/EOF, zero
+  raw signal/wait, and an honest cleanup-failure result; post-claim release
+  failure asserts escalation only through the claimed native handle. Further
+  injections bracket every monotonic transition in
+  `unclaimed -> claimed_unconsumed -> reap_pending -> reaped` and
+  `not_attempted -> written -> closed|failed`, including write failure, close
+  failure, Promise creation, pending Promise, and resolution. Reinvoking
+  cleanup from every captured phase proves no repeated driver await, adoption,
+  fd9 check, claim, write, close, reap creation, or signal; after release,
+  exited/zombie child and absent fd9 remain valid for awaiting the existing
+  reap Promise. Two cleanup calls after `reaped` produce identical stored
+  result and zero additional syscalls or filesystem mutation. Dedicated close
+  boundary injections prove: write-failed plus
+  `releaseWriterCloseAttempted=false` reentry performs one close; after setting
+  the bit but before the close syscall, reentry performs zero closes; after
+  either recorded close result, reentry also performs zero closes. All cases
+  keep terminal release write state `failed` and never rewrite `0x01`.
 
   The earlier separate non-subreaper happy-path process directly spawns the
   attested gcc Node `ChildProcess` with fd9, the exact sanitized production
