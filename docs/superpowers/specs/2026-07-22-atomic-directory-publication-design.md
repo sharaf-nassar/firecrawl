@@ -1484,11 +1484,16 @@ Ordering is fixed for every loop and expands every earlier protocol step:
    reducer first completes durable adopted intent replacement, then emits
    `adopt_generation`; release follows durable discard/cleaned transitions and
    exact `release_publication`. Reconciliation verifies its authority record,
-   durably
-   commits `adopted`, then mints/moves `BoundGeneration` into its own WeakMap and
-   Registry/ProfileStore ownership before releasing the operation lock. No
-   observer can see adopted state without the corresponding live capability;
-   crash after durable commit is recovered from the same authority evidence.
+   durably commits `adopted`, then mints/moves `BoundGeneration` into its own
+   WeakMap. During pre-ready recovery, that capability is retained only inside
+   reconciliation's non-exported sealed recovery outcome; Registry and
+   ProfileStore do not yet exist and receive nothing. The single startup
+   constructor/install consumes all sealed capabilities once. During an
+   ordinary runtime publication, reconciliation instead attaches the new
+   capability once to the already-installed generation store under the
+   operation lock. No observer can see adopted state without the corresponding
+   sealed-or-installed live capability; crash after durable commit is recovered
+   from the same authority evidence.
 7. Every exit emits required `close_handle` effects in reverse ownership order;
    only observed releases emit `release_budget`. Failure to close follows the
    existing close-unverified fail-stop and never licenses implicit cleanup.
@@ -1685,13 +1690,29 @@ Startup order is fixed:
    source/target. Run fresh statfs/statx canaries and resolve all intents.
 4. Adopt snapshot-authorized targets or durably enter `discarding`, finish
    source/private cleanup, then mark non-adopted public targets
-   `released_to_reconciliation` and remove their intents last.
+   `released_to_reconciliation` and remove their intents last. Each adopted
+   `BoundGeneration` remains solely in reconciliation's sealed outcome; no
+   Registry/ProfileStore attachment occurs in this step.
 5. Only after no unresolved intent owns a public locator may general Task 3
    enumeration, plan publication, quarantine, or mutation begin. Recapture and
    seal resulting root/snapshot/manifest evidence.
-6. Reconciliation consumes the internal outcome, constructs generation-scoped
-   ProfileStore from its own held recovered records, atomically installs
-   authority/store/result, and flips ready.
+6. Reconciliation consumes the sealed internal outcome, invokes the
+   generation-scoped ProfileStore constructor exactly once from its own held
+   recovered records and sealed `BoundGeneration` capabilities, forms one
+   immutable `{generation, authority, store, result}` install bundle, and
+   performs exactly one Registry compare-and-swap installation under the
+   reconciliation lock.
+   Only that successful atomic install flips ready.
+
+No provisional, discovery-time, per-profile, retry, or pre-recovery
+ProfileStore construction is legal. The single store cannot become visible
+before its authority/result, and authority/result cannot become visible without
+that same store. Constructor failure performs no install; compare-and-swap
+failure verified-closes the one uninstalled store and all transferred handles,
+leaves the prior generation unchanged and readiness false, and never retries by
+constructing another store in-process. Tests count one constructor call and one
+install call for each successful generation and inject failure on both sides of
+the atomic install to prove no partial Registry/ProfileStore state.
 
 Task 3 never quarantines or mutates an intent-owned source/target. Release is
 crash-safe without a third location: durable `discarding` records outcome
@@ -1708,10 +1729,14 @@ After successful publication, the engine returns only a semantic adoption
 effect. Under the operation lock, reconciliation uses the still-open target
 pin/evidence and retained root→`profiles`→profile→state leases, persists the
 authorized adopted transition, and constructs `BoundGeneration` directly in
-its sole-owner WeakMap without pathname reopen. It atomically moves that record
-from `publishing` to `live` and attaches Registry/ProfileStore ownership before
-releasing the lock; only then may wrapper cleanup begin. The engine never sees
-or mints `BoundGeneration`.
+its sole-owner WeakMap without pathname reopen. Pre-ready recovery moves that
+record from `publishing` to reconciliation's sealed outcome only; it cannot
+touch Registry/ProfileStore. Startup's one ProfileStore constructor consumes
+all sealed records and its one compare-and-swap installs capability/store/result
+together. Runtime publication may move a new record from `publishing` to the
+already-installed generation store exactly once under the operation lock.
+Only the applicable seal/install/installed-store attachment may precede wrapper
+cleanup. The engine never sees or mints `BoundGeneration`.
 
 The reconciliation-owned live record holds generation pin, every ancestor/
 parent lease, intent lease, startup binding, and adoption state. Registry/store
@@ -2003,17 +2028,71 @@ rejected.
 Build locking belongs to `scripts/run-native-build.mjs`, not the compiler
 script. Package scripts invoke the runner with closed target `production` or
 `all`. The runner sets umask `0077`, creates exact `build/` with Node filesystem
-APIs, verifies fixed `/usr/bin/flock`, then spawns exactly
-`/usr/bin/flock --exclusive --timeout 60
-build/.atomic-directory-publication-build.lock <real-node22>
-scripts/build-native.mjs <target>`. The lock parent holds across the entire
-compiler child and kernel-releases on exit/crash. `build-native.mjs` never calls
-flock or creates the build root; direct invocation is unsupported and package/
-Docker entrypoints use only the runner. Host tests verify
-path/version; Task 6 builder/test images additionally verify `/usr/bin/flock`
-comes from pinned util-linux and matches a checked-in version/binary-digest
-allowlist in `native/toolchain-allowlist.json`. Browser runtime does not contain
-or need flock; only the separate init image retains it at runtime.
+APIs, and no-follow opens exact
+`build/.atomic-directory-publication-build.lock` with numeric
+`O_RDWR | O_CREAT | O_NOFOLLOW`, mode `0600`; it requires regular file/current
+uid/mode `0600`/link count one. It verifies fixed `/usr/bin/flock` and
+`--no-fork` support, then spawns exact argv `/usr/bin/flock --no-fork
+--exclusive --timeout 60 9 <real-node22> scripts/build-native.mjs <target>`.
+The Node spawn `stdio` array is exactly stdin `ignore`, stdout/stderr `inherit`,
+indices 3..8 `ignore`, and index 9 the opened parent lock fd. Mapping a numeric
+parent fd to child fd 9 duplicates the same open file description with
+`FD_CLOEXEC` clear on child fd 9. Environment contains exact
+`ATOMIC_BUILD_LOCK_FD=9`; no other lock-fd value is accepted.
+
+`flock` locks fd 9 and `--no-fork` execs Node rather than retaining a wrapper
+that could explicitly unlock after only its direct child exits. Runner retains
+its duplicate until the exec child terminates, then verified-closes it. Locked
+`build-native.mjs` first requires the env value, `fstatSync(9)` equality with
+the runner's no-follow lock record, and `/proc/self/fd/9` presence before any
+staging inspection. Every child it spawns—compiler identity probe, compilation,
+link, test executable, or addon loader—uses an explicit Node `stdio` array with
+fd 9 mapped to child fd 9; compile/probe stdout and stderr use their specified
+bounded pipes, link stdout uses its O_EXCL trace fd, unused 3..8 are `ignore`.
+The inherited fd remains non-CLOEXEC across compiler-driver exec and its pinned
+`cc1`/assembler/collect2/linker descendants. Neither script closes fd 9.
+
+Consequently SIGKILL of runner, locked build script, or compiler driver cannot
+release the flock while any descendant still has fd 9. A new runner may open
+the lock leaf but its separate open file description blocks/times out in flock
+and cannot inspect/remove/create staging. Only after the last descendant exits
+and closes fd 9 can a new build acquire the lock, validate fd 9, and discard the
+old staging generation before creating another. `build-native.mjs` never calls
+flock or creates the build root; direct invocation without the inherited locked
+fd is unsupported and rejects before filesystem mutation. Package/Docker
+entrypoints use only the runner. Host tests verify path/version/flag support.
+Current Task 4 owns the complete immutable Docker-init allowlist described
+below; Task 6
+builder/test/init images only consume it to verify `/usr/bin/flock`. Browser
+runtime does not contain or need flock; only the separate init image retains it
+at runtime.
+
+`native/toolchain-allowlist.json` is fully owned and completed by current Task
+4, including Docker-init identities that Task 6 has not yet consumed. Its exact
+top-level keys are `schemaVersion` (integer `1`) and `dockerInit`. `dockerInit`
+has exactly `amd64` and `arm64`; no default/wildcard/fallback entry exists. Each
+architecture object has exactly these concrete string fields:
+`targetArch`, `nodeBaseRepository`, `nodeBaseIndexDigest`,
+`nodeBasePlatformDigest`, `osReleaseSha256`, `dpkgArchitecture`,
+`utilLinuxPackage`, `utilLinuxVersion`, `flockRealpath`, and `flockSha256`.
+Digest fields are lowercase `sha256:<64-hex>` for OCI identities and bare
+64-lowercase-hex for file/bytes identities; `targetArch` equals its map key,
+`utilLinuxPackage` is `util-linux`, and `flockRealpath` is `/usr/bin/flock`.
+All other fields are exact nonempty values captured from the pinned Node 22
+Debian image/platform and installed package for that architecture. Placeholders,
+mutable tags without both index/platform digests, extra architectures/fields,
+and duplicated tuples fail Task 4 tests.
+
+Task 4 is not complete until both concrete tuples are committed and a probe for
+each platform proves base index/platform identity, exact `/etc/os-release`
+bytes, `dpkg --print-architecture`, exact `dpkg-query` util-linux version,
+canonical flock realpath, and flock byte hash. Deferred Task 6 must use the
+tuple's pinned base digests and select only `dockerInit[TARGETARCH]`; unsupported
+`TARGETARCH` fails before package installation. Its builder/test/init stages
+repeat every tuple check after installation. Task 6 never generates, edits, or
+widens the allowlist. A future base/package/architecture change requires a
+separate explicit change to this Task-4-owned file and its probe evidence before
+Dockerfile consumption can change.
 
 Native inputs are split exactly:
 
@@ -2025,25 +2104,59 @@ Native inputs are split exactly:
 - `native/atomic-directory-publication-errors.test.c`: standalone errno-map
   test main.
 
-Every translation unit compiles separately. Addon objects use fixed ordered
-flags `-fPIC -std=c11 -DNAPI_VERSION=8 -Wall -Wextra -Werror -O2 -MD`, one
-derived Node include argument, then exact `-MF <unique-depfile> -c <source> -o
-<unique-object>`. Production addon/errors objects live under
-`build/obj/production/`; test addon/errors/hooks objects live under
-`build/obj/test/` and add exact `-DATOMIC_PUBLISH_TEST_HOOKS=1`; standalone
-errno-test main/errors objects live under `build/obj/errno-test/` and use no
-Node include or test-hook macro, with exact flags
-`-std=c11 -Wall -Wextra -Werror -O2 -MD`. Each object has its own
-same-basename `.d`;
-multi-source compilation and shared depfiles are forbidden.
+Every invocation uses the one fixed, build-locked staging root
+`build/.atomic-directory-publication-stage/`, mirroring `obj/production`,
+`obj/test`, `obj/errno-test`, `Release`, and `Test`. Final `build/obj`,
+`build/Release`, and `build/Test` paths are never compiler/linker outputs. Under
+the flock lock, `build-native.mjs` requires the staging root absent, creates it and each
+fixed directory with `mkdir(..., { recursive: false, mode: 0o700 })`, and
+pre-creates every selected declared object, depfile, addon/binary, map, trace, digest,
+and checksum leaf using numeric
+`O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` (`0600`, except the standalone test
+binary is `0700`). It verifies each pre-created leaf; non-trace leaves are
+verified-closed before their deterministic staging pathname is passed to a
+child, while each trace leaf's original O_EXCL fd remains open only as that
+linker's stdout and is verified-closed immediately after child exit. It also
+creates or validates the fixed final directories as owned no-follow `0700`
+directories and fsyncs `build/` before child spawn. Compiler/linker
+truncation is therefore confined to a newly created build-owned staging leaf;
+no child opens, truncates, or writes an existing final artifact.
 
-Link commands are separate fixed argv: `-shared` links production objects to
-`build/Release/atomic_directory_publication.node`; `-shared` links test objects
-to `build/Test/atomic_directory_publication_test.node`; ordinary executable
-linking produces `build/Test/atomic-directory-publication-errors.test`. The
-runner executes that standalone binary directly after `all`, requires exit
-zero, then load-checks both `.node` outputs. Test hooks add no production export,
-environment switch, or runtime path; production linkage rejects hook symbols.
+Every translation unit compiles separately. With `<S>` equal to the fixed
+staging root and `<NODE_INCLUDE>` the derived header directory, exact ordered
+addon argv is `<compiler> -fPIC -std=c11 -DNAPI_VERSION=8 -Wall -Wextra
+-Werror -O2 -MD -I <NODE_INCLUDE> -MF <S>/obj/<graph>/<base>.d -c
+<canonical-source> -o <S>/obj/<graph>/<base>.o`. Production addon/errors use
+graph `production`; test addon/errors/hooks use graph `test` and insert exactly
+`-DATOMIC_PUBLISH_TEST_HOOKS=1` immediately after `-DNAPI_VERSION=8`;
+standalone main/errors use graph `errno-test` and exact argv `<compiler>
+-std=c11 -Wall -Wextra -Werror -O2 -MD -MF
+<S>/obj/errno-test/<base>.d -c <canonical-source> -o
+<S>/obj/errno-test/<base>.o`, with no Node include or test-hook macro. Each
+object has its own same-basename staging `.d`; multi-source compilation,
+shared depfiles, response files, shell expansion, and final-path `-MF`/`-o`
+arguments are forbidden.
+
+Link commands also target staging only. Exact ordered production argv is
+`<compiler> -shared -Wl,-Map,<S>/Release/atomic_directory_publication.map
+-Wl,--trace <ordered-production-staging-objects> -o
+<S>/Release/atomic_directory_publication.node`; test-addon argv substitutes
+the fixed `Test/atomic_directory_publication_test.map`, ordered test objects,
+and `Test/atomic_directory_publication_test.node`; errno-runner argv omits
+`-shared` and uses `-Wl,-Map,<S>/Test/atomic-directory-publication-errors.map
+-Wl,--trace <ordered-errno-staging-objects> -o
+<S>/Test/atomic-directory-publication-errors.test`. For each link, child stdout
+is exactly the already-open O_EXCL staging trace leaf:
+`<S>/Release/atomic_directory_publication.trace`,
+`<S>/Test/atomic_directory_publication_test.trace`, or
+`<S>/Test/atomic-directory-publication-errors.trace`, respectively; stderr is
+bounded diagnostic capture and is never an artifact. Thus GNU ld `--trace`
+bytes go only to that fixed leaf, while `-Map` writes the fixed map leaf.
+Nonempty trace/map, exit zero, declared output, and zero undeclared staging
+leaves are mandatory. The locked build script executes the verified staging errno binary
+after `all`, requires exit zero, and load-checks both verified staging `.node`
+outputs. Test hooks add no production export, environment switch, or runtime
+path; production linkage rejects hook symbols.
 
 The script parses every `-MD` depfile including continuations/escaping,
 canonicalizes every dependency, rejects missing/duplicate/out-of-root paths,
@@ -2061,39 +2174,101 @@ Attestation also records/hashes the GCC driver's `-dumpspecs`,
 `-print-prog-name=<tool>`, records canonical path/version, and hashes regular
 binary bytes. Link steps emit fixed map/trace files; every resolved startup
 object, archive, shared-library input, and compiler-runtime file in that trace
-is canonicalized, inventoried, and hashed when readable. Final ELF `DT_NEEDED`
-entries are recorded as names plus resolved image-build inventory where
-available. Missing/unresolvable required tool or trace input fails build.
+is canonicalized, required readable, and hashed. Final ELF `DT_NEEDED`
+entries are recorded as names plus resolved image-build path/hash. An
+unreadable, missing, or unresolvable required tool, trace input, or needed
+library fails build.
 
-Exact digest sidecars are
+Exact final digest sidecars are
 `build/Release/atomic_directory_publication.inputs.sha256`,
 `build/Test/atomic_directory_publication_test.inputs.sha256`, and
 `build/Test/atomic-directory-publication-errors.test.inputs.sha256`. Each binds
 only its transitive objects/dependencies plus shared tool identity; each output
-has a distinct attestation. Fixed dot-prefixed staging files under the lock are
-created `O_EXCL`, fsynced, shape-checked, renamed to exact output/depfile/digest
-paths, and directory-fsynced. At invocation start under the lock, the script
-validates/removes only exact build-owned stale staging paths from a killed prior
-run; foreign type/owner/symlink fails. It then recompiles every translation unit
-and relinks every output selected by `production|all`, even when all existing
-outputs, depfiles, and digests match. Existing final artifacts remain only until
-their rebuilt replacements are fully verified. Digests, depfiles, tool
-inventory, and link traces are audit attestations only and are never cache keys,
-up-to-date checks, or skip conditions. This unconditional rebuild prevents
-stale reuse across unobserved `cc1`/assembler/linker/startup/library changes.
+has a distinct attestation. The script writes the selected subset of these
+three sidecars plus the already-declared depfiles, maps, and traces into their
+pre-created O_EXCL staging counterparts, never final paths.
+
+There are no separate tool-inventory leaves. Each named `.inputs.sha256` is
+itself canonical UTF-8 JSON plus one newline with exactly these ordered
+top-level keys: `schemaVersion` (`1`), `output`, `compileArgv`, `linkArgv`,
+`dependencies`, `scripts`, `node`, `compiler`, `driverProbes`, `subtools`,
+`linkInputs`, `needed`, and `toolchainAllowlistSha256`. `output` contains exact
+kind/final relative path/staging relative path/SHA-256. Argv arrays preserve
+execution order and exact strings. `dependencies` and `scripts` are raw-UTF-8-
+path-sorted objects of canonical path and byte SHA-256. `node` contains real
+executable path/hash/version/N-API/header-root and required-header hashes.
+`compiler` contains real path/hash/version-bytes hash/dumpmachine/
+dumpfullversion. `driverProbes` contains the three fixed probe names and output
+hashes. `subtools` contains exactly path/hash/version-output-hash entries for
+`cc1`, `as`, `collect2`, and `ld`, sorted by that fixed order. `linkInputs`
+contains canonical path/hash for every trace-resolved startup object, archive,
+shared library, and compiler runtime; `needed` contains each ELF soname plus
+resolved canonical path/hash, both sorted by raw UTF-8 path then soname.
+Unknown/missing/duplicate fields, null/unreadable required paths, noncanonical
+order/JSON/newline, or digest mismatch fails before publication. These three
+already-named attestation leaves are the sole storage for tool inventory data;
+staging creation/recovery grammars contain no inventory filename class.
+
+After each child exits, locked `build-native.mjs` no-follow opens every declared
+staging output, requires regular file/current uid/link count one/fixed mode and
+an unchanged staging-root chain, validates depfile/map/trace/ELF/addon/test
+shapes and hashes, then fsyncs and verified-closes every leaf. It fsyncs every
+staging directory bottom-up. Only after the complete selected `production|all`
+graph passes does publication begin. The fixed publication order is objects, depfiles, maps,
+traces, and input-digest sidecars; errno binary and test addon;
+production addon; runtime checksum last. Each leaf uses one Node
+`fs.promises.rename(stagingLeaf, finalLeaf)` on the same filesystem to
+atomically create/replace the final, followed immediately by `sync()` on both
+already-held source and destination directories. Final parents are no-follow
+verified build-owned directories. The locked script reopens/verifies published
+finals, runs the final errno binary/load checks for `all`, validates final addon
+against the checksum, removes now-empty staging directories bottom-up, and fsyncs
+`build/`. This is atomic per leaf, not a false multi-file transaction; the
+runtime checksum published last is the production generation commit marker, so
+a mixed crash state cannot pass prestart.
+
+At invocation start under the lock, an absent staging root starts a fresh
+generation. A present root is never resumed: `build-native.mjs` no-follow
+validates the exact finite directory/leaf grammar, allowing only the prefix/
+subset reachable at a declared create/write/publish crash seam, current uid, fixed modes,
+regular-file link count one, and absence of symlink/device/socket/fifo/hard-link/
+unknown content. It then removes that entire stale generation bottom-up and
+fsyncs `build/`. Any foreign shape/owner/mode/name fails without deletion or
+compiler spawn. Failure before the first child spawn may remove and sync only
+the current verified staging tree. After any child has spawned, every nonzero,
+signal, validation, or publication failure is terminal: the locked script
+spawns nothing else, performs no staging cleanup/reuse, closes its own non-lock
+fds, and exits, leaving the fixed tree for the next lock owner. This avoids
+racing an orphan subtool that may still hold/open a staging output. Kill/crash
+likewise leaves the fixed tree; inherited fd 9 prevents another generation
+until the last descendant exits, after which the next locked invocation
+discards the stale tree and performs a full fresh build. Failure during
+per-leaf publication may leave older/newer
+audit or binary leaves, but cannot publish the new checksum early; prestart
+fails and the next invocation unconditionally rebuilds/replaces the complete
+selected graph. It never resumes publication or trusts a staging/final digest
+as a cache key.
+
+Every invocation recompiles every selected translation unit and relinks every
+selected output even when all final objects, binaries, depfiles, maps, traces,
+and attestations match. Digests, depfiles, embedded tool inventory data, maps,
+and traces are audit evidence only, never up-to-date/skip inputs. This unconditional rebuild
+prevents stale reuse across unobserved compiler/linker/startup/library changes.
 Generated `build/` content is ignored and never committed.
 
 Production build additionally emits distinct runtime checksum attestation
 `build/Release/atomic-directory-publication.node.sha256`. Its exact canonical
 UTF-8 bytes are one fixed-key JSON object plus newline:
 `{"interfaceVersion":"1.0.0","napiVersion":8,"sha256":"<64 lowercase hex>"}\n`.
-The hash is computed from final verified
-`atomic_directory_publication.node` bytes after link and before atomic
-attestation publication. Unknown/missing/reordered fields, whitespace other
-than final newline, noncanonical number/string, wrong hash, or mismatched
-version fails. This file attests runtime artifact bytes only; `.d`,
-`.inputs.sha256`, maps, traces, objects, and tool inventory remain build-only
-audit artifacts and are never substituted for it.
+The hash is computed from verified staging
+`atomic_directory_publication.node` bytes after link. The canonical bytes are
+written/fsynced in the pre-created staging checksum leaf, then the addon and
+checksum are atomically published in that order. Unknown/missing/reordered
+fields, whitespace other than final newline, noncanonical number/string, wrong
+hash, or mismatched version fails. This file attests runtime artifact bytes
+only; `.d`, `.inputs.sha256`, maps, traces, and objects remain build-only audit
+artifacts and are never substituted for it. No separate tool-inventory artifact
+exists.
 
 `preinstall` checks platform, architecture, exact Node runtime, flock path, and
 build inputs without loading an artifact that does not exist yet.
@@ -2112,10 +2287,12 @@ the actual persistent filesystem. Any missing/inaccessible/wrong-type procfs,
 fd-identity mismatch, artifact, symbol, support, or proof leaves readiness
 false with no alternate path implementation.
 
-Current Task 4 proves deterministic host compilation/loading and unprivileged
-filesystem semantics only. It does not claim image, different-UID, privileged
-mount, read-only mount, bind-mount-ID, or named-volume acceptance on the host.
-Those require the exact downstream Docker harness.
+Current Task 4 proves deterministic host compilation/loading, unprivileged
+filesystem semantics, and the two isolated Docker-init allowlist probe tuples.
+Those probes establish base/package/binary identity only; they do not claim the
+deferred Browser/init image, different-UID, privileged mount, read-only mount,
+bind-mount-ID, or named-volume acceptance. Those require the exact downstream
+Docker harness.
 
 Original master-plan Task 6 remains owner of `src/server.ts`, `src/index.ts`,
 `Dockerfile`, and `src/dockerfile.test.ts`. Its amendment must add a compiler
@@ -2129,6 +2306,25 @@ The same Dockerfile defines a separate init target containing pinned util-linux
 Browser server. Task 6 also adds init tests and image-level different-UID,
 read-only, bind/cross-mount, native preflight, and final UID `1000:1000` checks
 after server/index exist.
+
+Task 6's Docker test runs two independent no-cache builds for every supported
+native CI `TARGETARCH`. From repository root it spawns the same fixed argv twice
+except tag: `docker buildx build --no-cache --progress=plain --platform
+linux/<TARGETARCH> --target browser-service-runtime --load -f
+apps/browser-service/Dockerfile -t
+firecrawl-browser-repro-a:<TARGETARCH> .`, then the identical argv with
+`firecrawl-browser-repro-b:<TARGETARCH>`. It creates one stopped container per image and `docker cp`s exactly
+`/app/apps/browser-service/build/Release/atomic_directory_publication.node`
+and `/app/apps/browser-service/build/Release/atomic-directory-publication.node.sha256`
+to two fresh test-owned extraction directories. It requires byte-for-byte
+`cmp` and SHA-256 equality across builds for both files, independently parses
+both canonical checksum files, and requires their embedded hash to equal the
+corresponding extracted addon. Container/image/extraction cleanup runs in a
+`finally` path. These addon and checksum files are the exact declared runtime
+reproducibility artifact set; maps, traces, objects, depfiles, and input
+attestations remain audit artifacts and are not mislabeled reproducible. Adding
+another declared reproducibility artifact requires adding it to this two-build
+extraction/equality gate.
 
 Original Task 14 remains owner of `compose.local.yaml`, local wrapper/harness,
 and named-volume lifecycle. Its amendment mounts the named volume only at
@@ -2171,21 +2367,48 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   aliased `ENOTSUP`/`EOPNOTSUPP` compilation branches and internal
   `atomic_publish_source_missing` for `ENOENT`;
 - build-runner tests create `build/` before lock invocation, assert exact
-  `/usr/bin/flock --exclusive --timeout 60` argv with real Node 22, serialize
-  concurrent builders, release on killed/crashed child, and prove timeout has no
-  compiler effect. Compiler tests assert separate fixed argv/object/unique-`.d`
-  graphs for production addon, test addon/hooks, and errno executable; reject
-  multi-source/shared depfiles; hash every allowed dependency/tool/script; and
+  `/usr/bin/flock --no-fork --exclusive --timeout 60 9` argv with real Node 22,
+  exact `ATOMIC_BUILD_LOCK_FD=9`, and Node stdio indices 3..8 ignored/fd 9
+  mapped from the verified lock handle. Real exec probes require fd 9 present
+  with CLOEXEC clear in build script, compiler driver, and pinned subtool.
+  Concurrent builders serialize and timeout has no compiler/staging effect.
+  A deterministic pipe barrier makes a compiler driver fork/exec a descendant
+  that retains fd 9, then SIGKILLs runner/build script/driver variants. A second
+  build must remain blocked with zero staging inspection/removal until that
+  descendant signals exit; only its final fd close admits the contender, which
+  then discards stale staging and fully rebuilds. Driver failure also proves the
+  current build spawns nothing further and leaves staging untouched rather than
+  racing orphan cleanup. Compiler tests assert every exact compile/link argv uses only
+  the fixed staging tree for object, unique depfile, map, binary/addon, and
+  `-o`/`-MF` output; linker tests assert exact `-Wl,-Map,<staging-map>` and
+  `-Wl,--trace`, with stdout wired to the exact pre-opened staging trace fd.
+  Spies reject any child open/truncate/write of a final path, undeclared output,
+  multi-source/shared depfile, response file, or abstract/uncollected trace;
+  they verify every staging leaf was O_EXCL-created, shape-checked, fsynced,
+  atomically renamed, and followed by source/destination directory fsync;
+- compiler inventory tests hash every allowed dependency/tool/script and
   inventory/hash driver specs, subordinate tools, link inputs, and final needed
-  libraries. Two consecutive matching invocations still recompile/relink every
-  selected object/output; matching attestations never skip work. Killed-build
-  exact staging is safely recovered under lock, while foreign staging fails.
-  Standalone errno runner and both addon load checks must pass. Runtime checksum
-  tests require exact canonical JSON/newline and reject addon-byte, checksum,
-  interface, N-API, field-order, extra-field, and whitespace tampering;
+  libraries. They require all inventory fields inside the exact canonical
+  schema of the three named `.inputs.sha256` sidecars and prove no separate
+  inventory leaf is created, accepted by stale recovery, or published. Two
+  consecutive invocations with identical inputs and matching
+  finals/attestations use child-spawn counters to require every selected source
+  compile exactly once and every selected addon/binary link exactly once on the
+  second invocation; zero cache/skip branches are permitted. Failure/crash at
+  every compile, link, validation, fsync, rename, and checksum-last boundary
+  proves prior finals remain or prestart rejects the mixed generation. Exact
+  stale staging is discarded and fully rebuilt under lock; foreign staging
+  fails without deletion or compiler spawn. Standalone errno runner and both
+  addon load checks pass from staging and finals. Runtime checksum tests require
+  exact canonical JSON/newline and reject addon-byte, checksum, interface,
+  N-API, field-order, extra-field, and whitespace tampering;
 - Docker build/init tests verify fixed flock path, pinned util-linux
-  version/binary digest from `native/toolchain-allowlist.json`, and absence of
-  flock from Browser runtime. Deferred Task 6 init tests serialize concurrent
+  version/binary digest from both complete Task-4-owned `amd64`/`arm64`
+  `dockerInit` tuples and absence of flock from Browser runtime. Schema/probe
+  tests reject missing, placeholder, extra, cross-architecture, mutable-base,
+  or mismatched base/platform/os/package/path/hash data. Task 6 tests prove the
+  Dockerfile consumes the selected tuple without modifying the allowlist.
+  Deferred Task 6 init tests serialize concurrent
   starters by locking the pre-existing trusted parent directory, create no lock
   artifact, release on timeout/exit/SIGKILL, prove marker
   mode selection, exclusive held-parent creation/bottom-up fsync, exact UID/GID
@@ -2194,12 +2417,23 @@ Real compiled-addon integration tests, not mocked rename results, cover:
 - final-image tests prove only production `.node` and
   `atomic-directory-publication.node.sha256` are copied from native build
   outputs; input dep/hash sidecars, objects, maps, traces, and test outputs are
-  absent. Prestart rejects independent tampering of addon or attestation before
-  service initialization;
+  absent. Two independent `--no-cache` Docker builds per native supported
+  `TARGETARCH` extract those exact runtime paths and require byte/hash equality
+  for both addon and canonical checksum plus embedded-addon-hash agreement.
+  Prestart rejects independent tampering of addon or attestation before service
+  initialization;
 - deferred Task 14 rendered-Compose tests prove only init and Browser Service
   mount the named volume at `/var/lib/firecrawl-browser-volume`, API has no
   volume mount, service root is exact child `state`, init gates service start,
   and activation remains false until final acceptance commit;
+- Task 14's exact `test:local-firecrawl:lifecycle` command proves fresh init,
+  candidate readiness/real canary/profile publication, Browser restart,
+  full validate-existing restart with byte-identical persistent profile, a new
+  real canary, rollback rejection without rollback-container start on the
+  disposable reserved-state clone, rollback-check/deploy success on naturally
+  clean primary state, preserved API/profile behavior, and finally zero labeled
+  containers/networks/volumes. Missing any phase, failed cleanup, or default
+  activation before the later commit fails acceptance;
 - held-procfd preflight tests cover missing `/proc`, inaccessible
   `/proc/self/fd`, injected non-procfs `statfs` type, fd-probe dev/ino/type
   mismatch, and unsupported Node operations; every case keeps readiness false
@@ -2329,7 +2563,14 @@ Real compiled-addon integration tests, not mocked rename results, cover:
   root-only, one-zero-byte-file, and multiple-zero-byte-file writers each have
   aggregate zero and fail `profile_schema_empty` before staging/finalize;
 - each operation-specific same-process and restart adoption path, plus forbidden
-  adoption without snapshot/capability and proof no recovery DB query occurs;
+  adoption without snapshot/capability and proof no recovery DB query occurs.
+  Startup spies require exactly one generation-scoped ProfileStore constructor
+  and one atomic install; every pre-ready adoption is visible only in the sealed
+  reconciliation outcome until that constructor consumes it, with zero earlier
+  Registry/store attachment. Constructor/install failure exposes no partial
+  bundle, never constructs a replacement store in-process, and verified-closes
+  the uninstalled store/handles. Runtime adoption attaches exactly once to the
+  already-installed store;
 - valid but snapshot-unreferenced committed publication is never adopted:
   source deletion recovers, intent releases target, intent disappears before
   Task 3 plan, and only then Task 3 quarantine may move it across every crash;
@@ -2435,6 +2676,47 @@ and the final local activation commit. No generated `.node`, runtime checksum
 attestation, native test binary, object, depfile, input-hash sidecar, map, trace,
 `build/`, or `node_modules/` content enters a commit.
 
+Task 14 adds exact package script
+`"test:local-firecrawl:lifecycle": "node ../../scripts/local-firecrawl.test.mjs --full-lifecycle"`
+to `apps/api/package.json`. The sole activation gate is this repository-root
+command:
+
+```bash
+pnpm --dir apps/api run test:local-firecrawl:lifecycle
+```
+
+CI/operator must export `FIRECRAWL_ACCEPTANCE_CANDIDATE_IMAGE` and
+`FIRECRAWL_ACCEPTANCE_ROLLBACK_IMAGE`; the script rejects missing, tag-only,
+equal, or non-`@sha256:` refs before Docker mutation.
+
+That one command owns a unique test Compose project and performs this exact
+real lifecycle: render/inspect API-no-volume and init/browser-only volume
+topology; create a fresh named volume; run `init-new`; start the candidate with
+an acceptance-only enable override; wait for real readiness and successful
+compiled-addon startup canary; publish a real profile generation through API;
+record its manifest/content identity; restart Browser Service; then fully stop
+and start without `down -v` so init runs `validate-existing`; require the same
+generation bytes plus a new successful real canary after both restarts.
+
+For rollback rejection, the harness clones the stopped primary volume into a
+second disposable rejection project, inserts one exact test-owned closed-grammar
+reserved-state fixture as uid `1000`, and proves `scripts/local-firecrawl`
+refuses the requested rollback before creating/starting any rollback container.
+It destroys that entire disposable project/volume; it never removes the fixture
+to make the checker pass and never mutates primary reserved state. On the
+primary project, normal service reconciliation must reach zero reserved
+intent/temp/wrapper/manifest/canary/private-deletion state. The wrapper's
+read-only checker must then succeed, deploy the immutable rollback image, and
+the harness must prove preserved profile bytes and healthy API behavior.
+
+A `finally` block stops/removes candidate and rollback containers, networks,
+both named volumes, temporary extraction/state, and acceptance overrides, then
+asserts by exact Compose project labels that none remain. Nonzero cleanup or a
+remaining resource fails the command. Task 14 may change the documented/default
+activation flag only in a later commit after this command exits zero and cleanup
+verification passes; partial lifecycle subcommands, rendered-config-only tests,
+or a retained acceptance volume cannot authorize activation.
+
 ## Rollout and observability
 
 Task 4 lands fail-closed code with local service activation still disabled. It
@@ -2475,6 +2757,9 @@ after checker success. Never delete reserved state to make rollback pass.
 Current acceptance is host build hashing, addon shape, pure reducer/controller
 tests, unprivileged native integration, and crash recovery. Deferred Task 6
 adds two deterministic image builds and image/init/UID/mount checks. Deferred
-Task 14 adds locked init mode selection, API-no-mount Compose topology, service
-restart, real named-volume canary, rollback invocation, and final flag
-activation. Claims do not move earlier than their owning task.
+Task 14's one exact full-lifecycle command adds locked init mode selection,
+API-no-mount Compose topology, candidate restart and full validate-existing
+restart, persistent profile identity, real named-volume canaries, rollback
+rejection on a disposable clone, rollback success on clean primary state, and
+zero-resource cleanup. Final flag activation follows only in a later commit.
+Claims do not move earlier than their owning task.
