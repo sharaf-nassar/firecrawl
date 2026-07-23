@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { constants } from "node:fs";
 import {
   chmod,
   lstat,
@@ -23,6 +24,7 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { chromium } from "playwright";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type {
@@ -30,11 +32,33 @@ import type {
   ReconciliationRequestV1,
 } from "./contracts.js";
 import { BrowserServiceError } from "./errors.js";
+import type {
+  AtomicObjectEvidenceV1,
+  FlightEffectId,
+  FlightSemanticId,
+} from "./atomic-directory-publication.js";
 import {
+  acquireAtomicPreReadyRecoveryAuthority,
+  applyAtomicEffect,
+  atomicHeldProfileHashImplementationIdentityForTest,
+  bindProfileGeneration,
+  canonicalizeHeldProfileTree,
   canonicalizeReconciliationSnapshot,
+  closeAtomicEffectController,
   canonicalizeProfileTree,
+  closeAnchoredProfileRoot,
+  consumeInternalReconciliationOutcome,
+  copyHeldProfileTree,
+  listHeldProfileGenerations,
+  launchPersistentChromiumForWorking,
   reconcileBrowserState,
+  reconcileBrowserStateWithAuthority,
+  releaseChromiumSessionAttachment,
+  retryFailedReconciliationOutcomeCleanups,
   runWithReconciliationFilesystemTestContext,
+  syncAndCanonicalizeHeldProfileTree,
+  writeHeldProfileFixtureFile,
+  type AnchoredProfileRoot,
 } from "./reconciliation.js";
 import type { ReconciliationExecutionAdmission } from "./startup-state.js";
 
@@ -52,6 +76,95 @@ const execFileAsync = promisify(execFile);
 
 function sha(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function atomicEffectId(): FlightEffectId {
+  return Object.freeze({}) as FlightEffectId;
+}
+
+async function atomicFileEvidence(
+  target: string,
+  contentSha256: string | null,
+): Promise<AtomicObjectEvidenceV1> {
+  const observed = await stat(target, { bigint: true });
+  const value = {
+    dev: String(observed.dev),
+    ino: String(observed.ino),
+    mode: Number(observed.mode & 0o7777n),
+    size: Number(observed.size),
+    contentSha256,
+  };
+  return Object.freeze({
+    ...value,
+    evidenceDigest: sha(JSON.stringify(value)),
+  }) as AtomicObjectEvidenceV1;
+}
+
+async function openAtomicBundlesParent(
+  lease: Awaited<ReturnType<typeof acquireAtomicPreReadyRecoveryAuthority>>,
+  canonicalRoot: string,
+) {
+  for (const reservation of [
+    {
+      reservation: "stable_files" as const,
+      count: 1,
+      byteSize: 0,
+    },
+    {
+      reservation: "payload_entries" as const,
+      count: 257,
+      byteSize: 0,
+    },
+  ]) {
+    const reserved = await applyAtomicEffect(lease.controller, {
+      kind: "reserve_budget",
+      effectId: atomicEffectId(),
+      operationId: CHECKPOINT_A,
+      ...reservation,
+    });
+    if (reserved.kind !== "effect_completed") {
+      throw new Error("atomic test reservation failed");
+    }
+  }
+  const expected = await atomicFileEvidence(
+    path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+    ),
+    null,
+  );
+  const opened = await applyAtomicEffect(lease.controller, {
+    kind: "open_pin_handle",
+    effectId: atomicEffectId(),
+    operationId: CHECKPOINT_A,
+    role: "bundles_parent",
+    parentId: lease.initialAuthority.stagingRootId,
+    leaf: "bundles",
+    flags: "directory_nofollow",
+    expected,
+  });
+  if (opened.kind !== "existing_handle_pinned") {
+    throw new Error("atomic bundles parent was not pinned");
+  }
+  return opened;
+}
+
+async function provisionAtomicNamespaces(canonicalRoot: string): Promise<void> {
+  await mkdir(path.join(canonicalRoot, "profiles"), {
+    mode: 0o700,
+  });
+  await mkdir(path.join(canonicalRoot, ".profile-publish-staging"), {
+    mode: 0o700,
+  });
+  await mkdir(
+    path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+    { mode: 0o700 },
+  );
+  await mkdir(
+    path.join(canonicalRoot, ".profile-publish-staging", "bundles"),
+    { mode: 0o700 },
+  );
 }
 
 function admission(controller = new AbortController()): {
@@ -87,10 +200,33 @@ async function put(
   bytes = STATE_BYTES,
   old = true,
 ): Promise<void> {
+  const profileMatch = /^profiles\/([^/]+)\/(working|staging|committed)\//u.exec(
+    relative,
+  );
+  if (profileMatch !== null) {
+    for (const state of ["working", "staging", "committed"]) {
+      await mkdir(
+        path.join(canonicalRoot, "profiles", profileMatch[1]!, state),
+        { recursive: true, mode: 0o700 },
+      );
+    }
+  }
   const target = path.join(canonicalRoot, relative);
   await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
   await writeFile(target, bytes, { mode: 0o600 });
   if (old) await utimes(target, OLD, OLD);
+}
+
+async function ensureProfileStates(
+  canonicalRoot: string,
+  profileId = PROFILE,
+): Promise<void> {
+  for (const state of ["working", "staging", "committed"]) {
+    await mkdir(path.join(canonicalRoot, "profiles", profileId, state), {
+      recursive: true,
+      mode: 0o700,
+    });
+  }
 }
 
 function reference(
@@ -149,6 +285,40 @@ async function rootDescriptors(canonicalRoot: string): Promise<string[]> {
     }
   }
   return leaked;
+}
+
+async function installedProfileRoot(
+  canonicalRoot: string,
+  installedAdmission?: ReconciliationExecutionAdmission,
+): Promise<{
+  root: AnchoredProfileRoot;
+  binding: {
+    processNonce: string;
+    controlGenerationNonce: string;
+    snapshotDigest: string;
+  };
+}> {
+  const value = request([]);
+  const outcome = await reconcileBrowserStateWithAuthority(
+    canonicalRoot,
+    value,
+    { admission: installedAdmission ?? admission().value, now: () => NOW },
+  );
+  const binding = {
+    processNonce: value.processNonce,
+    controlGenerationNonce: value.controlGenerationNonce,
+    snapshotDigest: value.snapshotDigest,
+  };
+  let installed: AnchoredProfileRoot | undefined;
+  await consumeInternalReconciliationOutcome(
+    outcome,
+    binding,
+    async (install) => {
+      installed = install.root;
+    },
+  );
+  if (installed === undefined) throw new Error("root was not installed");
+  return { root: installed, binding };
 }
 
 function parentRecord(
@@ -262,6 +432,1770 @@ describe("snapshot canonicalization", () => {
 });
 
 describe("filesystem reconciliation", () => {
+  test("resumes an authorized working deletion tombstone before readiness", async () => {
+    const canonicalRoot = await root();
+    await ensureProfileStates(canonicalRoot);
+    const tombstone = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      `.${CHECKPOINT_A}.deleting`,
+    );
+    await mkdir(path.join(tombstone, "Default"), { recursive: true });
+    await writeFile(path.join(tombstone, "Default", "Preferences"), "{}");
+    await expect(
+      reconcileBrowserState(canonicalRoot, request([]), {
+        admission: admission().value,
+        now: () => NOW,
+      }),
+    ).resolves.toMatchObject({ ready: true });
+    expect(await exists(tombstone)).toBe(false);
+  });
+
+  test("rejects malformed working deletion tombstones without removing them", async () => {
+    const canonicalRoot = await root();
+    const tombstone = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      ".not-a-generation.deleting",
+    );
+    await mkdir(tombstone, { recursive: true });
+    await expect(
+      reconcileBrowserState(canonicalRoot, request([]), {
+        admission: admission().value,
+        now: () => NOW,
+      }),
+    ).rejects.toBeDefined();
+    expect(await exists(tombstone)).toBe(true);
+  });
+
+  test("preflights all profile evidence before deleting a valid tombstone", async () => {
+    const canonicalRoot = await root();
+    await ensureProfileStates(canonicalRoot);
+    const tombstone = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      `.${CHECKPOINT_A}.deleting`,
+    );
+    await mkdir(tombstone, { mode: 0o700 });
+    await mkdir(
+      path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "committed",
+        "not-a-generation",
+      ),
+      { mode: 0o700 },
+    );
+    await expect(
+      reconcileBrowserState(canonicalRoot, request([]), {
+        admission: admission().value,
+        now: () => NOW,
+      }),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(await exists(tombstone)).toBe(true);
+  });
+
+  test.each(["tombstone-entry-remove", "tombstone-remove"])(
+    "never deletes a swapped tombstone leaf at %s",
+    async (point) => {
+      const canonicalRoot = await root();
+      await ensureProfileStates(canonicalRoot);
+      const tombstone = path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        `.${CHECKPOINT_A}.deleting`,
+      );
+      const child = path.join(tombstone, "state");
+      await mkdir(tombstone, { mode: 0o700 });
+      await writeFile(child, "trusted", { mode: 0o600 });
+      let replacement = "";
+      let held = "";
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            async beforeCall(candidate) {
+              if (candidate !== point || replacement !== "") return;
+              replacement = point === "tombstone-remove" ? tombstone : child;
+              held = `${replacement}.held`;
+              await rename(replacement, held);
+              if (point === "tombstone-remove") {
+                await mkdir(replacement, { mode: 0o700 });
+                await writeFile(path.join(replacement, "outside"), "safe");
+              } else {
+                await writeFile(replacement, "safe", { mode: 0o600 });
+              }
+            },
+          },
+          () =>
+            reconcileBrowserState(canonicalRoot, request([]), {
+              admission: admission().value,
+              now: () => NOW,
+            }),
+        ),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      expect(replacement).not.toBe("");
+      expect(
+        point === "tombstone-remove"
+          ? await readFile(path.join(replacement, "outside"), "utf8")
+          : await readFile(replacement, "utf8"),
+      ).toBe("safe");
+      expect(await exists(held)).toBe(true);
+    },
+  );
+
+  test.each([
+    "tombstone-entry-remove",
+    "tombstone-entry-parent-sync",
+    "tombstone-remove",
+    "tombstone-parent-sync",
+  ])("resumes tombstone recovery after %s crash", async (crashPoint) => {
+    const canonicalRoot = await root();
+    await ensureProfileStates(canonicalRoot);
+    const tombstone = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      `.${CHECKPOINT_A}.deleting`,
+    );
+    await mkdir(path.join(tombstone, "Default"), { recursive: true });
+    await writeFile(path.join(tombstone, "Default", "Preferences"), "{}");
+    let injected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(point) {
+            if (!injected && point === crashPoint) {
+              injected = true;
+              throw new Error(`crash:${point}`);
+            }
+          },
+        },
+        () =>
+          reconcileBrowserState(canonicalRoot, request([]), {
+            admission: admission().value,
+            now: () => NOW,
+          }),
+      ),
+    ).rejects.toBeDefined();
+    await expect(
+      reconcileBrowserState(canonicalRoot, request([]), {
+        admission: admission().value,
+        now: () => NOW,
+      }),
+    ).resolves.toMatchObject({ ready: true });
+    expect(await exists(tombstone)).toBe(false);
+  });
+
+  test("generation close revokes acquisitions and drains a paused operation", async () => {
+    const stage = async <T>(promise: Promise<T>, label: string): Promise<T> =>
+      Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error(`stuck:${label}`)), 1_000),
+        ),
+      ]);
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "Preferences", "{}");
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    let reached!: () => void;
+    const didReach = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const operation = runWithReconciliationFilesystemTestContext(
+      {
+        async beforeCall(point) {
+          if (point === "absolute-held-stat") {
+            reached();
+            await paused;
+          }
+        },
+      },
+      () => canonicalizeHeldProfileTree(working),
+    );
+    await stage(didReach, "reach");
+    let closed = false;
+    const closing = working.close().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    await expect(canonicalizeHeldProfileTree(working)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    resume();
+    await stage(operation, "operation");
+    await stage(closing, "closing");
+    await stage(closeAnchoredProfileRoot(installed.root), "root-close");
+  });
+
+  test("retains failed generation close ownership until a verified retry", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    let injected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async closeOperation(point, close) {
+            if (!injected && point === "generation") {
+              injected = true;
+              throw new Error("injected generation close failure");
+            }
+            await close();
+          },
+        },
+        () => working.close(),
+      ),
+    ).rejects.toThrow("injected generation close failure");
+    await expect(canonicalizeHeldProfileTree(working)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    await expect(
+      Promise.race([
+        closeAnchoredProfileRoot(installed.root),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("root close hung")), 1_000),
+        ),
+      ]),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await expect(working.close()).resolves.toBeUndefined();
+    await expect(closeAnchoredProfileRoot(installed.root)).resolves.toBeUndefined();
+  });
+
+  test("generation transition revokes acquisitions and waits for prior work", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "Preferences", "{}");
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    let reached!: () => void;
+    const didReach = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const operation = runWithReconciliationFilesystemTestContext(
+      {
+        async beforeCall(point) {
+          if (point === "absolute-held-stat") {
+            reached();
+            await paused;
+          }
+        },
+      },
+      () => canonicalizeHeldProfileTree(working),
+    );
+    await didReach;
+    const transition = working.transitionTo("staging");
+    await expect(canonicalizeHeldProfileTree(working)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    resume();
+    await operation;
+    const staging = await transition;
+    await staging.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("retains attacker replacement and fail-stops after create identity loss", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const generation = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_A,
+    );
+    const held = `${generation}.held`;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async afterCall(point) {
+            if (point !== "profile-mkdir-generation") return;
+            await rename(generation, held);
+            await mkdir(generation, { mode: 0o700 });
+            await writeFile(path.join(generation, "outside"), "safe");
+            throw new Error("injected generation identity loss");
+          },
+        },
+        () => bindProfileGeneration(installed.root, {
+          profileId: PROFILE,
+          state: "working",
+          generationId: CHECKPOINT_A,
+          openMode: "create_exclusive",
+        }),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(await readFile(path.join(generation, "outside"), "utf8")).toBe("safe");
+    expect(await exists(held)).toBe(true);
+    await expect(listHeldProfileGenerations(installed.root, "working"))
+      .rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await expect(closeAnchoredProfileRoot(installed.root)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    await rm(generation, { recursive: true });
+    await rename(held, generation);
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("copy rolls back its source lease when destination is revoked", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const sourceWorking = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(sourceWorking, "Preferences", "{}");
+    const sourceStaging = await sourceWorking.transitionTo("staging");
+    const source = await sourceStaging.transitionTo("committed");
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    let reached!: () => void;
+    const didReach = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let intercepted = false;
+    const operation = runWithReconciliationFilesystemTestContext(
+      {
+        async beforeCall(point) {
+          if (!intercepted && point === "absolute-held-stat") {
+            intercepted = true;
+            reached();
+            await paused;
+          }
+        },
+      },
+      () => canonicalizeHeldProfileTree(destination),
+    );
+    await didReach;
+    const transition = destination.transitionTo("staging");
+    await expect(copyHeldProfileTree(source, destination)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    resume();
+    await operation;
+    const destinationStaging = await transition;
+    await canonicalizeHeldProfileTree(source);
+    await destinationStaging.close();
+    await source.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each([
+    ["canonicalize", "before"],
+    ["canonicalize", "after"],
+    ["sync", "before"],
+    ["sync", "after"],
+    ["copy", "before"],
+    ["copy", "after"],
+    ["transition", "before"],
+    ["transition", "after"],
+  ] as const)("aborts held %s at %s-await admission boundary", async (operation, seam) => {
+    const canonicalRoot = await root();
+    const controller = new AbortController();
+    const installed = await installedProfileRoot(
+      canonicalRoot,
+      admission(controller).value,
+    );
+    let primary = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(primary, "state", "trusted");
+    let secondary: Awaited<ReturnType<typeof bindProfileGeneration>> | undefined;
+    if (operation === "copy") {
+      primary = await (await primary.transitionTo("staging")).transitionTo(
+        "committed",
+      );
+      secondary = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_B,
+        openMode: "create_exclusive",
+      });
+    }
+    let aborted = false;
+    const execute = (): Promise<unknown> => {
+      if (operation === "canonicalize") return canonicalizeHeldProfileTree(primary);
+      if (operation === "sync") return syncAndCanonicalizeHeldProfileTree(primary);
+      if (operation === "transition") return primary.transitionTo("staging");
+      return copyHeldProfileTree(primary, secondary!);
+    };
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (!aborted && seam === "before" && point === "generation-held-stat") {
+              aborted = true;
+              controller.abort();
+            }
+          },
+          afterCall(point) {
+            if (!aborted && seam === "after" && point === "generation-held-stat") {
+              aborted = true;
+              controller.abort();
+            }
+          },
+        },
+        execute,
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_required" });
+    expect(aborted).toBe(true);
+    await secondary?.close();
+    await primary.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each(["sync", "copy"] as const)(
+    "root rollover drains paused held %s before descriptor close",
+    async (operation) => {
+      const canonicalRoot = await root();
+      const installed = await installedProfileRoot(canonicalRoot);
+      let primary = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      });
+      await writeHeldProfileFixtureFile(primary, "state", "trusted");
+      let secondary: Awaited<ReturnType<typeof bindProfileGeneration>> | undefined;
+      if (operation === "copy") {
+        primary = await (await primary.transitionTo("staging")).transitionTo(
+          "committed",
+        );
+        secondary = await bindProfileGeneration(installed.root, {
+          profileId: PROFILE,
+          state: "working",
+          generationId: CHECKPOINT_B,
+          openMode: "create_exclusive",
+        });
+      }
+      let resume!: () => void;
+      const paused = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      let reached!: () => void;
+      const didReach = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      let intercepted = false;
+      const running = runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            const target = operation === "sync" ? "held-profile-sync" : "held-copy-write";
+            if (!intercepted && point === target) {
+              intercepted = true;
+              reached();
+              await paused;
+            }
+          },
+        },
+        () =>
+          operation === "sync"
+            ? syncAndCanonicalizeHeldProfileTree(primary)
+            : copyHeldProfileTree(primary, secondary!),
+      );
+      await didReach;
+      let rootClosed = false;
+      const closing = closeAnchoredProfileRoot(installed.root).then(() => {
+        rootClosed = true;
+      });
+      await Promise.resolve();
+      expect(rootClosed).toBe(false);
+      resume();
+      await running;
+      await secondary?.close();
+      await primary.close();
+      await closing;
+      expect(rootClosed).toBe(true);
+    },
+  );
+
+  test.each(
+    (["canonicalize", "sync", "copy", "transition"] as const).flatMap(
+      (operation) =>
+        (["root", "profiles", "profile", "state", "generation"] as const).map(
+          (component) => [operation, component] as const,
+        ),
+    ),
+  )(
+    "confines direct held %s across a %s hierarchy replacement",
+    async (operation, component) => {
+      const canonicalRoot = await root();
+      const installed = await installedProfileRoot(canonicalRoot);
+      let primary = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      });
+      await writeHeldProfileFixtureFile(primary, "state", "trusted");
+      let secondary: Awaited<ReturnType<typeof bindProfileGeneration>> | undefined;
+      let state = "working";
+      if (operation === "copy") {
+        primary = await (await primary.transitionTo("staging")).transitionTo(
+          "committed",
+        );
+        state = "committed";
+        secondary = await bindProfileGeneration(installed.root, {
+          profileId: PROFILE,
+          state: "working",
+          generationId: CHECKPOINT_B,
+          openMode: "create_exclusive",
+        });
+      }
+      const targets = {
+        root: canonicalRoot,
+        profiles: path.join(canonicalRoot, "profiles"),
+        profile: path.join(canonicalRoot, "profiles", PROFILE),
+        state: path.join(canonicalRoot, "profiles", PROFILE, state),
+        generation: path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          state,
+          CHECKPOINT_A,
+        ),
+      };
+      const target = targets[component];
+      const held = `${target}.held-matrix`;
+      let swapped = false;
+      let restored = false;
+      let attackerBytes: string | undefined;
+      const swap = async (): Promise<void> => {
+        await rename(target, held);
+        await mkdir(target, { recursive: true, mode: 0o700 });
+        await writeFile(path.join(target, "outside"), "safe", { mode: 0o600 });
+        swapped = true;
+      };
+      const restore = async (): Promise<void> => {
+        attackerBytes = await readFile(path.join(target, "outside"), "utf8");
+        await rm(target, { recursive: true });
+        await rename(held, target);
+        restored = true;
+      };
+      const seam =
+        operation === "canonicalize"
+          ? "profile-evidence-read"
+          : operation === "sync"
+            ? "held-profile-sync-stat"
+            : operation === "copy"
+              ? "held-copy-read"
+              : "profile-state-transition";
+      try {
+        const running = runWithReconciliationFilesystemTestContext(
+          {
+            async beforeCall(point) {
+              if (!swapped && point === seam) await swap();
+            },
+            async afterCall(point) {
+              if (
+                operation !== "transition" &&
+                swapped &&
+                !restored &&
+                point === seam
+              ) {
+                await restore();
+              }
+            },
+          },
+          () => {
+            if (operation === "canonicalize")
+              return canonicalizeHeldProfileTree(primary);
+            if (operation === "sync")
+              return syncAndCanonicalizeHeldProfileTree(primary);
+            if (operation === "copy")
+              return copyHeldProfileTree(primary, secondary!);
+            return primary.transitionTo("staging");
+          },
+        );
+        const rejectsReplacement =
+          operation === "transition" ||
+          (component === "generation" &&
+            (operation === "canonicalize" || operation === "sync"));
+        if (rejectsReplacement) {
+          await expect(running).rejects.toMatchObject({
+            category: "reconciliation_filesystem_unsafe",
+          });
+          if (operation === "transition") {
+            expect(await readFile(path.join(target, "outside"), "utf8")).toBe(
+              "safe",
+            );
+          }
+        } else {
+          await expect(running).resolves.toMatchObject({
+            checksum: expect.any(String),
+          });
+        }
+        expect(swapped).toBe(true);
+        expect(operation === "transition" ? "safe" : attackerBytes).toBe(
+          "safe",
+        );
+      } finally {
+        if (swapped && !restored) await restore();
+        await secondary?.close().catch(() => undefined);
+        await primary.close().catch(() => undefined);
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+  );
+
+  test("stops held sync and copy before effect at entry 25,001", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    let source = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const generation = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_A,
+    );
+    for (let offset = 0; offset < 25_000; offset += 250) {
+      await Promise.all(
+        Array.from({ length: 250 }, (_, index) =>
+          writeFile(
+            path.join(
+              generation,
+              `entry-${String(offset + index).padStart(5, "0")}`,
+            ),
+            Buffer.alloc(0),
+            { mode: 0o600 },
+          ),
+        ),
+      );
+    }
+    let syncEffects = 0;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (point === "held-profile-sync") syncEffects += 1;
+          },
+        },
+        () => syncAndCanonicalizeHeldProfileTree(source),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_snapshot_too_large" });
+    expect(syncEffects).toBe(0);
+
+    source = await (await source.transitionTo("staging")).transitionTo(
+      "committed",
+    );
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    let copyEffects = 0;
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            beforeCall(point) {
+              if (point.startsWith("held-copy-")) copyEffects += 1;
+            },
+          },
+          () => copyHeldProfileTree(source, destination),
+        ),
+      ).rejects.toMatchObject({
+        category: "reconciliation_snapshot_too_large",
+      });
+      expect(copyEffects).toBe(0);
+    } finally {
+      await destination.close();
+      await source.close();
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  }, 60_000);
+
+  test.each([
+    "held-copy-mkdir",
+    "held-copy-create-file",
+    "held-copy-write",
+    "held-copy-file-parent-sync",
+  ])("rejects nested destination parent swaps at %s", async (operationPoint) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const sourceWorking = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const sourcePath = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_A,
+      "Default",
+      "Nested",
+    );
+    await mkdir(sourcePath, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(sourcePath, "state"), "trusted", { mode: 0o600 });
+    const sourceStaging = await sourceWorking.transitionTo("staging");
+    const source = await sourceStaging.transitionTo("committed");
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    const destinationRoot = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_B,
+    );
+    const canonicalParent = path.join(destinationRoot, "Default");
+    const heldParent = path.join(destinationRoot, ".held-default");
+    let pointCount = 0;
+    let swapped = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            if (point !== operationPoint || swapped) return;
+            pointCount += 1;
+            if (operationPoint === "held-copy-mkdir" && pointCount === 1) return;
+            swapped = true;
+            await rename(canonicalParent, heldParent);
+            await mkdir(path.join(canonicalParent, "Nested"), {
+              recursive: true,
+              mode: 0o700,
+            });
+            await writeFile(path.join(canonicalParent, "outside"), "safe");
+          },
+        },
+        () => copyHeldProfileTree(source, destination),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(swapped).toBe(true);
+    expect(await readFile(path.join(canonicalParent, "outside"), "utf8")).toBe(
+      "safe",
+    );
+    await rm(canonicalParent, { recursive: true });
+    await rename(heldParent, canonicalParent);
+    await destination.close();
+    await source.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each([
+    "held-copy-read",
+    "held-copy-write",
+    "held-copy-eof",
+    "held-copy-source-stat-after-stream",
+    "held-copy-file-sync",
+    "held-copy-file-parent-sync",
+  ])("rejects same-inode source stream drift at %s", async (point) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const sourceWorking = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(sourceWorking, "state", "trusted");
+    const source = await (await sourceWorking.transitionTo("staging"))
+      .transitionTo("committed");
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    const sourceFile = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "committed",
+      CHECKPOINT_A,
+      "state",
+    );
+    let changed = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(candidate) {
+            if (!changed && candidate === point) {
+              changed = true;
+              await writeFile(sourceFile, "altered", { mode: 0o600 });
+            }
+          },
+        },
+        () => copyHeldProfileTree(source, destination),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(changed).toBe(true);
+    await destination.close();
+    await source.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each(
+    (["sync", "copy"] as const).flatMap((operation) =>
+      (["mode", "size", "prefix", "truncation", "trailing"] as const).map(
+        (drift) => [operation, drift] as const,
+      ),
+    ),
+  )("rejects held %s source %s drift", async (operation, drift) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    let source = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(source, "state", "trusted");
+    let destination: Awaited<ReturnType<typeof bindProfileGeneration>> | undefined;
+    let state = "working";
+    if (operation === "copy") {
+      source = await (await source.transitionTo("staging")).transitionTo(
+        "committed",
+      );
+      state = "committed";
+      destination = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_B,
+        openMode: "create_exclusive",
+      });
+    }
+    const sourceFile = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      state,
+      CHECKPOINT_A,
+      "state",
+    );
+    let changed = false;
+    const mutate = async (): Promise<void> => {
+      if (drift === "mode") await chmod(sourceFile, 0o640);
+      else if (drift === "size") await truncate(sourceFile, 8);
+      else if (drift === "prefix")
+        await writeFile(sourceFile, "Xrusted", { mode: 0o600 });
+      else if (drift === "truncation") await truncate(sourceFile, 3);
+      else await writeFile(sourceFile, "trusted-tail", { mode: 0o600 });
+    };
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            async beforeCall(point) {
+              const seam =
+                operation === "sync" ? "held-profile-sync" : "held-copy-read";
+              if (!changed && point === seam) {
+                changed = true;
+                await mutate();
+              }
+            },
+          },
+          () =>
+            operation === "sync"
+              ? syncAndCanonicalizeHeldProfileTree(source)
+              : copyHeldProfileTree(source, destination!),
+        ),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      expect(changed).toBe(true);
+    } finally {
+      await destination?.close().catch(() => undefined);
+      await source.close();
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test.each(["depth-65", "file-64mib-plus-1", "tree-256mib-plus-1"] as const)(
+    "stops held sync and copy before effect for %s",
+    async (shape) => {
+      const canonicalRoot = await root();
+      const installed = await installedProfileRoot(canonicalRoot);
+      let source = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      });
+      const generation = path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        CHECKPOINT_A,
+      );
+      if (shape === "depth-65") {
+        let nested = generation;
+        for (let depth = 0; depth < 65; depth += 1) {
+          nested = path.join(nested, "d");
+          await mkdir(nested, { mode: 0o700 });
+        }
+      } else if (shape === "file-64mib-plus-1") {
+        const file = path.join(generation, "oversized");
+        await writeFile(file, Buffer.alloc(0), { mode: 0o600 });
+        await truncate(file, 64 * 1024 * 1024 + 1);
+      } else {
+        for (let index = 0; index < 4; index += 1) {
+          const file = path.join(generation, `part-${index}`);
+          await writeFile(file, Buffer.alloc(0), { mode: 0o600 });
+          await truncate(file, 64 * 1024 * 1024);
+        }
+        await writeFile(path.join(generation, "part-4"), Buffer.from([1]), {
+          mode: 0o600,
+        });
+      }
+      let syncEffects = 0;
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            beforeCall(point) {
+              if (point === "held-profile-sync") syncEffects += 1;
+            },
+          },
+          () => syncAndCanonicalizeHeldProfileTree(source),
+        ),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      expect(syncEffects).toBe(0);
+
+      source = await (await source.transitionTo("staging")).transitionTo(
+        "committed",
+      );
+      const destination = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_B,
+        openMode: "create_exclusive",
+      });
+      let copyEffects = 0;
+      try {
+        await expect(
+          runWithReconciliationFilesystemTestContext(
+            {
+              beforeCall(point) {
+                if (point.startsWith("held-copy-")) copyEffects += 1;
+              },
+            },
+            () => copyHeldProfileTree(source, destination),
+          ),
+        ).rejects.toMatchObject({
+          category: "reconciliation_filesystem_unsafe",
+        });
+        expect(copyEffects).toBe(0);
+      } finally {
+        await destination.close();
+        await source.close();
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+    60_000,
+  );
+
+  test("rejects nested parent replacement inside held sync boundary", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const generation = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_A,
+    );
+    const nested = path.join(generation, "Default", "Nested");
+    await mkdir(nested, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(nested, "state"), "trusted", { mode: 0o600 });
+    const held = path.join(generation, ".held-default");
+    let swapped = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            if (!swapped && point === "held-profile-sync") {
+              swapped = true;
+              await rename(path.join(generation, "Default"), held);
+              await mkdir(path.join(generation, "Default", "Nested"), {
+                recursive: true,
+              });
+              await writeFile(path.join(generation, "Default", "outside"), "safe");
+            }
+          },
+        },
+        () => syncAndCanonicalizeHeldProfileTree(working),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(await readFile(path.join(generation, "Default", "outside"), "utf8"))
+      .toBe("safe");
+    await rm(path.join(generation, "Default"), { recursive: true });
+    await rename(held, path.join(generation, "Default"));
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("validates transition destination binding inside rename boundary", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const profile = path.join(canonicalRoot, "profiles", PROFILE);
+    const staging = path.join(profile, "staging");
+    const held = path.join(profile, ".held-staging");
+    let swapped = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            if (!swapped && point === "profile-state-transition") {
+              swapped = true;
+              await rename(staging, held);
+              await mkdir(staging, { mode: 0o700 });
+              await writeFile(path.join(staging, "outside"), "safe");
+            }
+          },
+        },
+        () => working.transitionTo("staging"),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(await readFile(path.join(staging, "outside"), "utf8")).toBe("safe");
+    await rm(staging, { recursive: true });
+    await rename(held, staging);
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("live inventory rejects malformed working deletion tombstones", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    await mkdir(
+      path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        ".00000000-0000-0000-0000-000000000000.deleting",
+      ),
+      { recursive: true },
+    );
+    await expect(
+      listHeldProfileGenerations(installed.root, "working"),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("attachment retry observes late context close without recalling it", async () => {
+    vi.useFakeTimers();
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    let settleContext!: () => void;
+    const contextClose = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          settleContext = resolve;
+        }),
+    );
+    const browserClose = vi.fn(async () => {
+      throw new Error("browser close failed");
+    });
+    const context = {
+      close: contextClose,
+      browser: () => ({ close: browserClose, isConnected: () => true }),
+    };
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue(context as never);
+    try {
+      const attachment = await launchPersistentChromiumForWorking(
+        working,
+        installed.binding,
+        {} as never,
+      );
+      const first = releaseChromiumSessionAttachment(attachment);
+      const firstFailure = expect(first).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await firstFailure;
+      settleContext();
+      await Promise.resolve();
+      await releaseChromiumSessionAttachment(attachment);
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(browserClose).toHaveBeenCalledOnce();
+      await expect(
+        releaseChromiumSessionAttachment(attachment),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    } finally {
+      launch.mockRestore();
+      vi.useRealTimers();
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("synchronous context close failure uses bounded browser fallback", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    let connected = true;
+    const contextClose = vi.fn(() => {
+      throw new Error("sync close failure");
+    });
+    const browserClose = vi.fn(async () => {
+      connected = false;
+    });
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue({
+        close: contextClose,
+        browser: () => ({
+          close: browserClose,
+          isConnected: () => connected,
+        }),
+      } as never);
+    try {
+      const attachment = await launchPersistentChromiumForWorking(
+        working,
+        installed.binding,
+        {} as never,
+      );
+      await releaseChromiumSessionAttachment(attachment);
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(browserClose).toHaveBeenCalledOnce();
+    } finally {
+      launch.mockRestore();
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("context close timeout uses one successful Browser fallback", async () => {
+    vi.useFakeTimers();
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const contextClose = vi.fn(() => new Promise<void>(() => undefined));
+    let connected = true;
+    const browserClose = vi.fn(async () => {
+      connected = false;
+    });
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue({
+        close: contextClose,
+        browser: () => ({
+          close: browserClose,
+          isConnected: () => connected,
+        }),
+      } as never);
+    try {
+      const attachment = await launchPersistentChromiumForWorking(
+        working,
+        installed.binding,
+        {} as never,
+      );
+      const releasing = releaseChromiumSessionAttachment(attachment);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await releasing;
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(browserClose).toHaveBeenCalledOnce();
+    } finally {
+      launch.mockRestore();
+      vi.useRealTimers();
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("retries failed Browser fallback without recalling context close", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const contextClose = vi.fn(async () => {
+      throw new Error("context close failed");
+    });
+    let connected = true;
+    const browserClose = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("browser close failed"))
+      .mockImplementationOnce(async () => {
+        connected = false;
+      });
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue({
+        close: contextClose,
+        browser: () => ({
+          close: browserClose,
+          isConnected: () => connected,
+        }),
+      } as never);
+    try {
+      const attachment = await launchPersistentChromiumForWorking(
+        working,
+        installed.binding,
+        {} as never,
+      );
+      await expect(
+        releaseChromiumSessionAttachment(attachment),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      await releaseChromiumSessionAttachment(attachment);
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(browserClose).toHaveBeenCalledTimes(2);
+    } finally {
+      launch.mockRestore();
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("retries timed-out Browser fallback without recalling context close", async () => {
+    vi.useFakeTimers();
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const contextClose = vi.fn(async () => {
+      throw new Error("context close failed");
+    });
+    let connected = true;
+    const browserClose = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockImplementationOnce(async () => {
+        connected = false;
+      });
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue({
+        close: contextClose,
+        browser: () => ({
+          close: browserClose,
+          isConnected: () => connected,
+        }),
+      } as never);
+    try {
+      const attachment = await launchPersistentChromiumForWorking(
+        working,
+        installed.binding,
+        {} as never,
+      );
+      const first = releaseChromiumSessionAttachment(attachment);
+      const firstFailure = expect(first).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await firstFailure;
+      await releaseChromiumSessionAttachment(attachment);
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(browserClose).toHaveBeenCalledTimes(2);
+    } finally {
+      launch.mockRestore();
+      vi.useRealTimers();
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("accepts already-disconnected Browser after Chromium crash", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const contextClose = vi.fn(async () => {
+      throw new Error("Chromium already crashed");
+    });
+    const browserClose = vi.fn(async () => undefined);
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue({
+        close: contextClose,
+        browser: () => ({
+          close: browserClose,
+          isConnected: () => false,
+        }),
+      } as never);
+    try {
+      const attachment = await launchPersistentChromiumForWorking(
+        working,
+        installed.binding,
+        {} as never,
+      );
+      await releaseChromiumSessionAttachment(attachment);
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(browserClose).not.toHaveBeenCalled();
+    } finally {
+      launch.mockRestore();
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each(["before", "after"] as const)(
+    "aborts Chromium launch at the %s-await admission edge",
+    async (edge) => {
+      const canonicalRoot = await root();
+      const controller = new AbortController();
+      const installed = await installedProfileRoot(
+        canonicalRoot,
+        admission(controller).value,
+      );
+      const working = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      });
+      const contextClose = vi.fn(async () => undefined);
+      let aborted = false;
+      const launch = vi.spyOn(chromium, "launchPersistentContext");
+      if (edge === "after") {
+        launch.mockImplementationOnce(async () => {
+          aborted = true;
+          controller.abort();
+          return {
+            close: contextClose,
+            browser: () => null,
+          } as never;
+        });
+      }
+      try {
+        await expect(
+          runWithReconciliationFilesystemTestContext(
+            {
+              beforeCall(point) {
+                if (!aborted && edge === "before" && point === "verify-procfd-generation") {
+                  aborted = true;
+                  controller.abort();
+                }
+              },
+            },
+            () =>
+              launchPersistentChromiumForWorking(
+                working,
+                installed.binding,
+                {} as never,
+              ),
+          ),
+        ).rejects.toMatchObject({ category: "reconciliation_required" });
+        expect(aborted).toBe(true);
+        expect(launch).toHaveBeenCalledTimes(edge === "after" ? 1 : 0);
+        expect(contextClose).toHaveBeenCalledTimes(edge === "after" ? 1 : 0);
+      } finally {
+        launch.mockRestore();
+        await working.close();
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+  );
+
+  test("launch uses procfd and rejects canonical generation swap after verify", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const generationPath = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_A,
+    );
+    const heldPath = `${generationPath}.held`;
+    const contextClose = vi.fn(async () => undefined);
+    const launch = vi
+      .spyOn(chromium, "launchPersistentContext")
+      .mockResolvedValue({
+        close: contextClose,
+        browser: () => null,
+      } as never);
+    let swapped = false;
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            async afterCall(point) {
+              if (!swapped && point === "verify-procfd-generation") {
+                swapped = true;
+                await rename(generationPath, heldPath);
+                await mkdir(generationPath, { mode: 0o700 });
+                await writeFile(path.join(generationPath, "outside"), "safe");
+              }
+            },
+          },
+          () =>
+            launchPersistentChromiumForWorking(
+              working,
+              installed.binding,
+              {} as never,
+            ),
+        ),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      expect(launch.mock.calls[0]![0]).toMatch(
+        new RegExp(`^/proc/${process.pid}/fd/[0-9]+$`, "u"),
+      );
+      expect(contextClose).toHaveBeenCalledOnce();
+      expect(await readFile(path.join(generationPath, "outside"), "utf8")).toBe(
+        "safe",
+      );
+    } finally {
+      launch.mockRestore();
+      if (swapped) {
+        await rm(generationPath, { recursive: true });
+        await rename(heldPath, generationPath);
+      }
+    }
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each(["before-launch", "during-launch"] as const)(
+    "real Chromium remains procfd-confined across a %s canonical swap",
+    async (swapAt) => {
+      const canonicalRoot = await root();
+      const installed = await installedProfileRoot(canonicalRoot);
+      const working = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      });
+      const generationPath = path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        CHECKPOINT_A,
+      );
+      const heldPath = `${generationPath}.held-real`;
+      const originalLaunch = chromium.launchPersistentContext.bind(chromium);
+      let swapped = false;
+      let realContext: Awaited<ReturnType<typeof originalLaunch>> | undefined;
+      const swap = async (): Promise<void> => {
+        if (swapped) return;
+        await rename(generationPath, heldPath);
+        await mkdir(generationPath, { mode: 0o700 });
+        await writeFile(path.join(generationPath, "outside"), "safe", {
+          mode: 0o600,
+        });
+        swapped = true;
+      };
+      const launch = vi
+        .spyOn(chromium, "launchPersistentContext")
+        .mockImplementation(async (userDataDir, options) => {
+          const launching = originalLaunch(userDataDir, options);
+          if (swapAt === "during-launch") await swap();
+          realContext = await launching;
+          return realContext;
+        });
+      try {
+        await expect(
+          runWithReconciliationFilesystemTestContext(
+            {
+              async afterCall(point) {
+                if (
+                  swapAt === "before-launch" &&
+                  point === "verify-procfd-generation"
+                ) {
+                  await swap();
+                }
+              },
+            },
+            () =>
+              launchPersistentChromiumForWorking(
+                working,
+                installed.binding,
+                {
+                  headless: true,
+                  acceptDownloads: false,
+                  timeout: 15_000,
+                },
+              ),
+          ),
+        ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+        expect(launch).toHaveBeenCalledOnce();
+        expect(launch.mock.calls[0]![0]).toMatch(
+          new RegExp(`^/proc/${process.pid}/fd/[0-9]+$`, "u"),
+        );
+        expect(swapped).toBe(true);
+        expect(await readFile(path.join(generationPath, "outside"), "utf8")).toBe(
+          "safe",
+        );
+        expect(realContext?.browser()?.isConnected() ?? false).toBe(false);
+      } finally {
+        launch.mockRestore();
+        if (swapped) {
+          await rm(generationPath, { recursive: true });
+          await rename(heldPath, generationPath);
+        }
+        await working.close().catch(() => undefined);
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+    30_000,
+  );
+
+  test.each([
+    ["state", "unknown", CHECKPOINT_A],
+    ["generation", "committed", "not-a-generation"],
+  ])("bind rejects unknown profile %s siblings before mutation", async (_kind, state, leaf) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    for (const stateName of ["working", "staging", "committed"]) {
+      await mkdir(path.join(canonicalRoot, "profiles", PROFILE, stateName), {
+        recursive: true,
+        mode: 0o700,
+      });
+    }
+    if (state === "unknown") {
+      await mkdir(path.join(canonicalRoot, "profiles", PROFILE, state), {
+        mode: 0o700,
+      });
+    } else {
+      await mkdir(path.join(canonicalRoot, "profiles", PROFILE, state, leaf), {
+        mode: 0o700,
+      });
+    }
+    await expect(
+      bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_B,
+        openMode: "create_exclusive",
+      }),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(
+      await exists(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "working",
+          CHECKPOINT_B,
+        ),
+      ),
+    ).toBe(false);
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("create does not repair an incomplete existing profile namespace", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "working"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await expect(
+      bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      }),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(await exists(path.join(canonicalRoot, "profiles", PROFILE, "staging")))
+      .toBe(false);
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("create race cannot insert and repair an incomplete target profile", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    let mkdirCount = 0;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            if (point !== "capability-mkdir-exclusive") return;
+            mkdirCount += 1;
+            if (mkdirCount === 2) {
+              await mkdir(
+                path.join(canonicalRoot, "profiles", PROFILE, "working"),
+                { recursive: true, mode: 0o700 },
+              );
+            }
+          },
+        },
+        () =>
+          bindProfileGeneration(installed.root, {
+            profileId: PROFILE,
+            state: "working",
+            generationId: CHECKPOINT_A,
+            openMode: "create_exclusive",
+          }),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(await exists(path.join(canonicalRoot, "profiles", PROFILE, "staging")))
+      .toBe(false);
+    expect(
+      await exists(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "working",
+          CHECKPOINT_A,
+        ),
+      ),
+    ).toBe(false);
+    await expect(closeAnchoredProfileRoot(installed.root)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    await rm(path.join(canonicalRoot, "profiles", PROFILE), {
+      recursive: true,
+    });
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("live list rejects malformed sibling state drift", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const unknown = path.join(canonicalRoot, "profiles", PROFILE, "unknown");
+    await mkdir(unknown, { mode: 0o700 });
+    await expect(
+      listHeldProfileGenerations(installed.root, "working"),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await rm(unknown, { recursive: true });
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("held create fails on an absolute-root swap without touching replacement", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const original = `${canonicalRoot}-original`;
+    let swapped = false;
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            async beforeCall(point) {
+              if (!swapped && point === "capability-mkdir-exclusive") {
+                swapped = true;
+                await rename(canonicalRoot, original);
+                await mkdir(canonicalRoot, { mode: 0o700 });
+                await writeFile(path.join(canonicalRoot, "outside"), "safe");
+              }
+            },
+          },
+          () =>
+            bindProfileGeneration(installed.root, {
+              profileId: PROFILE,
+              state: "working",
+              generationId: CHECKPOINT_A,
+              openMode: "create_exclusive",
+            }),
+        ),
+      ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+      expect(await readFile(path.join(canonicalRoot, "outside"), "utf8")).toBe(
+        "safe",
+      );
+    } finally {
+      if (swapped) {
+        await rm(canonicalRoot, { recursive: true, force: true });
+        await rename(original, canonicalRoot);
+      }
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
   test("validates all authorities before quarantining old orphan", async () => {
     const canonicalRoot = await root();
     const kept = `replay/owner/scrape/${CHECKPOINT_A}.json`;
@@ -328,6 +2262,7 @@ describe("filesystem reconciliation", () => {
   test("validates canonical profile tree authority", async () => {
     const canonicalRoot = await root();
     const profileId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await ensureProfileStates(canonicalRoot, profileId);
     const generation = `profiles/${profileId}/committed/${PROFILE}`;
     const generationRoot = path.join(canonicalRoot, generation);
     await mkdir(generationRoot, { recursive: true, mode: 0o700 });
@@ -419,6 +2354,644 @@ describe("filesystem reconciliation", () => {
     expect(tree.canonicalJson).toBe(expected);
     expect(tree.checksum).toBe(sha(expected));
     expect(tree.byteSize).toBe(2);
+  });
+
+  test("authenticates and consumes internal reconciliation outcomes once", async () => {
+    const canonicalRoot = await root();
+    const value = request([]);
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      value,
+      { admission: admission().value, now: () => NOW },
+    );
+    const binding = {
+      processNonce: value.processNonce,
+      controlGenerationNonce: value.controlGenerationNonce,
+      snapshotDigest: value.snapshotDigest,
+    };
+    let held: AnchoredProfileRoot | undefined;
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      binding,
+      async (install) => {
+        expect(install.publicResult).toMatchObject({ ready: true });
+        expect(install).not.toHaveProperty("evidence");
+        held = install.root;
+      },
+    );
+    await expect(
+      consumeInternalReconciliationOutcome(outcome, binding, async () => {}),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await expect(
+      consumeInternalReconciliationOutcome(
+        {} as never,
+        binding,
+        async () => {},
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await closeAnchoredProfileRoot(held!);
+  });
+
+  test("aggregates consume cleanup failure and retains root close ownership", async () => {
+    const canonicalRoot = await root();
+    const value = request([]);
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      value,
+      { admission: admission().value, now: () => NOW },
+    );
+    const binding = {
+      processNonce: value.processNonce,
+      controlGenerationNonce: value.controlGenerationNonce,
+      snapshotDigest: value.snapshotDigest,
+    };
+    const callbackFailure = new Error("injected consume callback failure");
+    const closeFailure = new Error("injected root close failure");
+    let injected = false;
+    let activeCloses = 0;
+    let maximumActiveCloses = 0;
+    const closePoints: string[] = [];
+    const failure = await runWithReconciliationFilesystemTestContext(
+      {
+        async closeOperation(point, close) {
+          activeCloses += 1;
+          maximumActiveCloses = Math.max(
+            maximumActiveCloses,
+            activeCloses,
+          );
+          closePoints.push(point);
+          try {
+            if (!injected && point === "root") {
+              injected = true;
+              throw closeFailure;
+            }
+            await close();
+          } finally {
+            activeCloses -= 1;
+          }
+        },
+      },
+      () =>
+        consumeInternalReconciliationOutcome(
+          outcome,
+          binding,
+          async () => {
+            throw callbackFailure;
+          },
+        ),
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      callbackFailure,
+      closeFailure,
+    ]);
+    expect(maximumActiveCloses).toBe(1);
+    expect(closePoints[0]).toBe("root");
+    expect(closePoints.slice(1)).toEqual(
+      closePoints.slice(1).map((_, index) => `root-chain-${index + 1}`),
+    );
+    await expect(
+      consumeInternalReconciliationOutcome(outcome, binding, async () => {}),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+
+    const retryFailure = new Error("injected retained cleanup retry failure");
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async closeOperation(point, close) {
+            if (point === "root") throw retryFailure;
+            await close();
+          },
+        },
+        () => retryFailedReconciliationOutcomeCleanups(),
+      ),
+    ).rejects.toBe(retryFailure);
+
+    const retryPoints: string[] = [];
+    await runWithReconciliationFilesystemTestContext(
+      {
+        async closeOperation(point, close) {
+          retryPoints.push(point);
+          await close();
+        },
+      },
+      () => retryFailedReconciliationOutcomeCleanups(),
+    );
+    expect(retryPoints[0]).toBe("root");
+
+    let repeatedRetryCloses = 0;
+    await runWithReconciliationFilesystemTestContext(
+      {
+        async closeOperation(_point, close) {
+          repeatedRetryCloses += 1;
+          await close();
+        },
+      },
+      () => retryFailedReconciliationOutcomeCleanups(),
+    );
+    expect(repeatedRetryCloses).toBe(0);
+  });
+
+  test("public reconciliation delegates through and disposes authority", async () => {
+    const canonicalRoot = await root();
+    let rootOpens = 0;
+    let rootCloses = 0;
+    const result = await runWithReconciliationFilesystemTestContext(
+      {
+        afterCall(point) {
+          if (point === "open-root") rootOpens += 1;
+        },
+        handleClosed(point) {
+          if (point === "root") rootCloses += 1;
+        },
+      },
+      () =>
+        reconcileBrowserState(canonicalRoot, request([]), {
+          admission: admission().value,
+          now: () => NOW,
+        }),
+    );
+    expect(Object.keys(result)).toEqual([
+      "version",
+      "processNonce",
+      "controlGenerationNonce",
+      "snapshotDigest",
+      "retained",
+      "removed",
+      "missing",
+      "corrupt",
+      "ready",
+    ]);
+    expect(rootOpens).toBe(2);
+    expect(rootCloses).toBe(2);
+  });
+
+  test("uses one held canonical engine for legacy and capability consumers", async () => {
+    const canonicalRoot = await root();
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "working"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "staging"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "committed"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const installed = await installedProfileRoot(canonicalRoot);
+    const generation = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    expect(generation).not.toHaveProperty("fd");
+    expect(generation).not.toHaveProperty("path");
+    const held = await canonicalizeHeldProfileTree(generation);
+    const synced = await syncAndCanonicalizeHeldProfileTree(generation);
+    const legacy = await canonicalizeProfileTree(
+      canonicalRoot,
+      `profiles/${PROFILE}/working/${CHECKPOINT_A}`,
+      admission().value,
+    );
+    expect(held.canonicalJson).toBe(legacy.canonicalJson);
+    expect(synced.checksum).toBe(legacy.checksum);
+    await generation.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("enforces held transition and committed-only copy state rules", async () => {
+    const canonicalRoot = await root();
+    for (const state of ["working", "staging", "committed"]) {
+      await mkdir(path.join(canonicalRoot, "profiles", PROFILE, state), {
+        recursive: true,
+        mode: 0o700,
+      });
+    }
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeFile(
+      path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        CHECKPOINT_A,
+        "Preferences",
+      ),
+      "state",
+      { mode: 0o600 },
+    );
+    const staging = await working.transitionTo("staging");
+    await expect(working.close()).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    const committed = await staging.transitionTo("committed");
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    await copyHeldProfileTree(committed, destination);
+    expect(await canonicalizeHeldProfileTree(destination)).toMatchObject({
+      checksum: (await canonicalizeHeldProfileTree(committed)).checksum,
+    });
+    await destination.remove();
+    await committed.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each([
+    "held-remove-file",
+    "held-remove-directory",
+    "held-remove-generation",
+  ])("never deletes a swapped held leaf at %s", async (point) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    const generation = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_A,
+    );
+    await mkdir(path.join(generation, "Default"), { mode: 0o700 });
+    await writeFile(path.join(generation, "Default", "state"), "trusted", {
+      mode: 0o600,
+    });
+    let replacement = "";
+    let held = "";
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(candidate) {
+            if (candidate !== point || replacement !== "") return;
+            const tombstoneRoot = path.join(
+              canonicalRoot,
+              "profiles",
+              PROFILE,
+              "working",
+              `.${CHECKPOINT_A}.deleting`,
+            );
+            if (point === "held-remove-file") {
+              replacement = path.join(tombstoneRoot, "Default", "state");
+            } else if (point === "held-remove-directory") {
+              replacement = path.join(tombstoneRoot, "Default");
+            } else {
+              replacement = tombstoneRoot;
+            }
+            held = `${replacement}.held`;
+            await rename(replacement, held);
+            if (point === "held-remove-file") {
+              await writeFile(replacement, "safe", { mode: 0o600 });
+            } else {
+              await mkdir(replacement, { mode: 0o700 });
+              await writeFile(path.join(replacement, "outside"), "safe");
+            }
+          },
+        },
+        () => working.remove(),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(replacement).not.toBe("");
+    expect(
+      point === "held-remove-file"
+        ? await readFile(replacement, "utf8")
+        : await readFile(path.join(replacement, "outside"), "utf8"),
+    ).toBe("safe");
+    expect(await exists(held)).toBe(true);
+    await rm(replacement, { recursive: true, force: true });
+    await rename(held, replacement);
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test.each([
+    "removal-leaf-pin-lstat",
+    "removal-leaf-pin-open",
+    "removal-leaf-fstat",
+  ])("fails closed and releases ownership after %s failure", async (point) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "state", "trusted");
+    let injected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(candidate) {
+            if (!injected && candidate === point) {
+              injected = true;
+              throw new Error(`injected:${point}`);
+            }
+          },
+        },
+        () => working.remove(),
+      ),
+    ).rejects.toBeDefined();
+    expect(injected).toBe(true);
+    await working.close();
+    await closeAnchoredProfileRoot(installed.root);
+    const leaked: string[] = [];
+    for (const descriptor of await readdir("/proc/self/fd")) {
+      try {
+        const target = await readlink(`/proc/self/fd/${descriptor}`);
+        if (target.includes(canonicalRoot)) leaked.push(target);
+      } catch {
+        // Descriptor may close while inventory runs.
+      }
+    }
+    expect(leaked).toEqual([]);
+  });
+
+  test.each([
+    "profile-create-cleanup-remove",
+    "profile-create-cleanup-parent-sync",
+    "profile-create-cleanup",
+  ])("fail-stops admission after unverified create cleanup at %s", async (point) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const descriptorBaseline = (await rootDescriptors(canonicalRoot)).length;
+    let primaryInjected = false;
+    let cleanupInjected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(candidate) {
+            if (
+              !primaryInjected &&
+              candidate === "profile-stat-created-generation"
+            ) {
+              primaryInjected = true;
+              throw new Error("injected generation acquisition failure");
+            }
+          },
+          beforeCleanup(candidate) {
+            if (!cleanupInjected && candidate === point) {
+              cleanupInjected = true;
+              throw new Error(`injected:${point}`);
+            }
+          },
+          async closeOperation(candidate, close) {
+            if (!cleanupInjected && point === "profile-create-cleanup" && candidate === point) {
+              cleanupInjected = true;
+              throw new Error(`injected:${point}`);
+            }
+            await close();
+          },
+        },
+        () => bindProfileGeneration(installed.root, {
+          profileId: PROFILE,
+          state: "working",
+          generationId: CHECKPOINT_A,
+          openMode: "create_exclusive",
+        }),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(primaryInjected).toBe(true);
+    expect(cleanupInjected).toBe(true);
+    expect((await rootDescriptors(canonicalRoot)).length).toBeGreaterThan(
+      descriptorBaseline,
+    );
+    await expect(listHeldProfileGenerations(installed.root, "working"))
+      .rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await closeAnchoredProfileRoot(installed.root);
+    expect(await rootDescriptors(canonicalRoot)).toEqual([]);
+  });
+
+  test.each([
+    ["capability-open-created-directory", false],
+    ["capability-stat-created-directory", false],
+    ["profile-open-created-generation", true],
+    ["profile-stat-created-generation", true],
+  ] as const)(
+    "recovers exclusive mkdir ownership after %s failure",
+    async (point, existingNamespace) => {
+      const canonicalRoot = await root();
+      if (existingNamespace) await ensureProfileStates(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const descriptorBaseline = (await rootDescriptors(canonicalRoot)).length;
+      let injected = false;
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            beforeCall(candidate) {
+              if (!injected && candidate === point) {
+                injected = true;
+                throw new Error(`injected:${point}`);
+              }
+            },
+          },
+          () =>
+            bindProfileGeneration(installed.root, {
+              profileId: PROFILE,
+              state: "working",
+              generationId: CHECKPOINT_A,
+              openMode: "create_exclusive",
+            }),
+        ),
+      ).rejects.toBeDefined();
+      expect(injected).toBe(true);
+      const createdPath = existingNamespace
+        ? path.join(
+            canonicalRoot,
+            "profiles",
+            PROFILE,
+            "working",
+            CHECKPOINT_A,
+          )
+        : path.join(canonicalRoot, "profiles");
+      expect(await exists(createdPath)).toBe(false);
+      expect((await rootDescriptors(canonicalRoot)).length).toBe(
+        descriptorBaseline,
+      );
+      await closeAnchoredProfileRoot(installed.root);
+      expect(await rootDescriptors(canonicalRoot)).toEqual([]);
+    },
+  );
+
+  test("never deletes an attacker leaf when mkdir identity is unverified", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const created = path.join(canonicalRoot, "profiles");
+    const displaced = path.join(canonicalRoot, ".created-profiles");
+    let identityFailure = false;
+    let replaced = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (!identityFailure && point === "capability-lstat-created-directory") {
+              identityFailure = true;
+              throw new Error("creation identity unavailable");
+            }
+          },
+          async beforeCleanup(point) {
+            if (!replaced && point === "profile-create-cleanup-pin-lstat") {
+              replaced = true;
+              await rename(created, displaced);
+              await mkdir(created, { mode: 0o700 });
+              await writeFile(path.join(created, "outside"), "safe");
+            }
+          },
+        },
+        () =>
+          bindProfileGeneration(installed.root, {
+            profileId: PROFILE,
+            state: "working",
+            generationId: CHECKPOINT_A,
+            openMode: "create_exclusive",
+          }),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(identityFailure).toBe(true);
+    expect(replaced).toBe(true);
+    await expect(closeAnchoredProfileRoot(installed.root)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(await readFile(path.join(created, "outside"), "utf8")).toBe("safe");
+    await rm(created, { recursive: true });
+    await rm(displaced, { recursive: true });
+    await expect(closeAnchoredProfileRoot(installed.root)).resolves.toBeUndefined();
+    expect(await rootDescriptors(canonicalRoot)).toEqual([]);
+  });
+
+  test.each([
+    "held-copy-open-directory",
+    "held-copy-stat-created-directory",
+  ])("cleans a copied directory after %s failure", async (failurePoint) => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    const sourceWorking = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await mkdir(
+      path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        CHECKPOINT_A,
+        "Default",
+      ),
+      { mode: 0o700 },
+    );
+    const source = await (await sourceWorking.transitionTo("staging"))
+      .transitionTo("committed");
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    const copied = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "working",
+      CHECKPOINT_B,
+      "Default",
+    );
+    let injected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (!injected && point === failurePoint) {
+              injected = true;
+              throw new Error(`injected:${failurePoint}`);
+            }
+          },
+        },
+        () => copyHeldProfileTree(source, destination),
+      ),
+    ).rejects.toBeDefined();
+    expect(injected).toBe(true);
+    expect(await exists(copied)).toBe(false);
+    await destination.close();
+    await source.close();
+    await closeAnchoredProfileRoot(installed.root);
+    expect(await rootDescriptors(canonicalRoot)).toEqual([]);
+  });
+
+  test("retains an exclusive copied file until close retry succeeds", async () => {
+    const canonicalRoot = await root();
+    const gate = admission();
+    const installed = await installedProfileRoot(canonicalRoot, gate.value);
+    const descriptorBaseline = (await rootDescriptors(canonicalRoot)).length;
+    const sourceWorking = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(sourceWorking, "state", "trusted");
+    const source = await (await sourceWorking.transitionTo("staging"))
+      .transitionTo("committed");
+    const destination = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_B,
+      openMode: "create_exclusive",
+    });
+    let postOpenFailure = false;
+    let closeRejected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(point) {
+            if (!postOpenFailure && point === "held-copy-create-file") {
+              postOpenFailure = true;
+              throw new Error("post-open failure");
+            }
+          },
+          async closeOperation(point, close) {
+            if (!closeRejected && point === "held-copy-output") {
+              closeRejected = true;
+              throw new Error("underlying close rejected");
+            }
+            await close();
+          },
+        },
+        () => copyHeldProfileTree(source, destination),
+      ),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(postOpenFailure).toBe(true);
+    expect(closeRejected).toBe(true);
+    expect((await rootDescriptors(canonicalRoot)).length).toBeGreaterThan(
+      descriptorBaseline,
+    );
+    await expect(listHeldProfileGenerations(installed.root, "working"))
+      .rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    await destination.close();
+    await source.close();
+    await closeAnchoredProfileRoot(installed.root);
+    expect(await rootDescriptors(canonicalRoot)).toEqual([]);
   });
 
   test("rejects a profile authority file", async () => {
@@ -649,6 +3222,7 @@ describe("filesystem reconciliation", () => {
   test("rejects profile depth 65 before descending further", async () => {
     const canonicalRoot = await root();
     const profileId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await ensureProfileStates(canonicalRoot, profileId);
     const generation = `profiles/${profileId}/working/${PROFILE}`;
     let target = path.join(canonicalRoot, generation);
     await mkdir(target, { recursive: true, mode: 0o700 });
@@ -695,6 +3269,7 @@ describe("filesystem reconciliation", () => {
   test("uses maximum descendant mtime for profile grace", async () => {
     const canonicalRoot = await root();
     const profileId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await ensureProfileStates(canonicalRoot, profileId);
     const generation = `profiles/${profileId}/working/${PROFILE}`;
     const generationRoot = path.join(canonicalRoot, generation);
     await mkdir(generationRoot, { recursive: true, mode: 0o700 });
@@ -764,6 +3339,39 @@ describe("filesystem reconciliation", () => {
     expect(streamBufferSizes.length).toBeGreaterThan(0);
     expect(streamBufferSizes.every((size) => size <= 32)).toBe(true);
   });
+
+  test("streams profile inventory at the exact shared 25k entry cap", async () => {
+    const canonicalRoot = await root();
+    const installed = await installedProfileRoot(canonicalRoot);
+    await ensureProfileStates(canonicalRoot);
+    const working = path.join(canonicalRoot, "profiles", PROFILE, "working");
+    const generationId = (index: number) =>
+      `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+    const count = 24_995;
+    for (let offset = 0; offset < count; offset += 500) {
+      await Promise.all(
+        Array.from({ length: Math.min(500, count - offset) }, (_, index) =>
+          mkdir(path.join(working, generationId(offset + index)), { mode: 0o700 }),
+        ),
+      );
+    }
+    const streamBufferSizes: number[] = [];
+    const inventory = await runWithReconciliationFilesystemTestContext(
+      {
+        directoryStreamOpened(bufferSize) {
+          streamBufferSizes.push(bufferSize);
+        },
+      },
+      () => listHeldProfileGenerations(installed.root, "working"),
+    );
+    expect(inventory).toHaveLength(count);
+    expect(streamBufferSizes.length).toBeGreaterThan(0);
+    expect(streamBufferSizes.every((size) => size <= 32)).toBe(true);
+    await mkdir(path.join(working, generationId(count)), { mode: 0o700 });
+    await expect(listHeldProfileGenerations(installed.root, "working"))
+      .rejects.toMatchObject({ category: "reconciliation_snapshot_too_large" });
+    await closeAnchoredProfileRoot(installed.root);
+  }, 30_000);
 
   test("charges an empty quarantine namespace root once globally", async () => {
     const canonicalRoot = await root();
@@ -1357,6 +3965,7 @@ describe("filesystem reconciliation", () => {
     "revalidates profile descendants at the %s boundary",
     async (boundary) => {
       const canonicalRoot = await root();
+      await ensureProfileStates(canonicalRoot);
       const relative = `profiles/${PROFILE}/working/${CHECKPOINT_A}`;
       const generation = path.join(canonicalRoot, relative);
       const descendant = path.join(generation, "state.json");
@@ -1441,6 +4050,7 @@ describe("filesystem reconciliation", () => {
 
   test("rejects profile-authority root replacement during held hashing", async () => {
     const canonicalRoot = await root();
+    await ensureProfileStates(canonicalRoot);
     const outsideRoot = await root();
     const relative = `profiles/${PROFILE}/working/${CHECKPOINT_A}`;
     const generation = path.join(canonicalRoot, relative);
@@ -1484,6 +4094,7 @@ describe("filesystem reconciliation", () => {
 
   test("revalidates profile-authority content after the last tree-stat hook", async () => {
     const canonicalRoot = await root();
+    await ensureProfileStates(canonicalRoot);
     const relative = `profiles/${PROFILE}/working/${CHECKPOINT_A}`;
     const generation = path.join(canonicalRoot, relative);
     const descendant = path.join(generation, "state.json");
@@ -1525,6 +4136,7 @@ describe("filesystem reconciliation", () => {
     "stops profile authority after admission loss at %s",
     async (abortPoint) => {
       const canonicalRoot = await root();
+      await ensureProfileStates(canonicalRoot);
       const relative = `profiles/${PROFILE}/working/${CHECKPOINT_A}`;
       const generation = path.join(canonicalRoot, relative);
       await mkdir(generation, { recursive: true, mode: 0o700 });
@@ -1577,6 +4189,7 @@ describe("filesystem reconciliation", () => {
     "stops %s after final profile-evidence admission loss",
     async (boundary) => {
       const canonicalRoot = await root();
+      await ensureProfileStates(canonicalRoot);
       const relative = `profiles/${PROFILE}/working/${CHECKPOINT_A}`;
       const generation = path.join(canonicalRoot, relative);
       const descendant = path.join(generation, "state.json");
@@ -1634,6 +4247,7 @@ describe("filesystem reconciliation", () => {
     "revalidates profile content after the last tree-stat hook before %s",
     async (boundary) => {
       const canonicalRoot = await root();
+      await ensureProfileStates(canonicalRoot);
       const relative = `profiles/${PROFILE}/working/${CHECKPOINT_A}`;
       const generation = path.join(canonicalRoot, relative);
       await mkdir(generation, { recursive: true, mode: 0o700 });
@@ -3365,7 +5979,11 @@ describe("filesystem reconciliation", () => {
       const isDirectory = (actual as { isDirectory(): boolean }).isDirectory();
       return new Proxy(actual, {
         get(target, property) {
-          if (property === "dev" && isDirectory) {
+          if (
+            property === "dev" &&
+            isDirectory &&
+            Reflect.get(target, "ino", target) === sourceParentStat.ino
+          ) {
             return Reflect.get(target, property, target) + offset;
           }
           const value = Reflect.get(target, property, target) as unknown;
@@ -3920,6 +6538,7 @@ describe("filesystem reconciliation", () => {
     const name = `${CHECKPOINT_A}.json`;
     const replay = `replay/owner/scrape/${name}`;
     const profileId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    await ensureProfileStates(canonicalRoot, profileId);
     const profile = `profiles/${profileId}/working/${CHECKPOINT_A}`;
     await put(canonicalRoot, replay);
     const profileRoot = path.join(canonicalRoot, profile);
@@ -4022,4 +6641,1594 @@ describe("filesystem reconciliation", () => {
     expect(serialized).not.toContain(GENERATION);
     expect(logger.error).not.toHaveBeenCalled();
   });
+});
+
+describe("atomic publication reconciliation ownership", () => {
+  test.each([
+    "missing",
+    "inaccessible",
+    "wrong_type",
+    "identity_mismatch",
+    "unsupported_operation",
+  ] as const)("rejects %s procfs preflight", async (atomicProcfsScenario) => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    try {
+      const attempt = runWithReconciliationFilesystemTestContext(
+        { atomicProcfsScenario },
+        () =>
+          acquireAtomicPreReadyRecoveryAuthority(
+            installed.root,
+            CHECKPOINT_A,
+          ),
+      );
+      await expect(attempt).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic publication procfs is unsupported",
+      });
+      await expect(attempt).rejects.not.toHaveProperty("cause");
+    } finally {
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("acquires fixed held authority and runs exact create/remove sequences", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const points: string[] = [];
+    const gates: string[] = [];
+    const openFlags: Array<readonly [string, number, number | undefined]> = [];
+    let createdId: FlightSemanticId | undefined;
+    let createdEvidence: AtomicObjectEvidenceV1 | undefined;
+    try {
+      const created = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (point.startsWith("atomic-")) points.push(point);
+          },
+          atomicGate(phase, point) {
+            gates.push(`${phase}:${point}`);
+          },
+          atomicOpenFlags(point, flags, mode) {
+            openFlags.push([point, flags, mode]);
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "create_and_pin_wrapper",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "wrapper",
+            parentId: bundles.handleId,
+            leaf: CHECKPOINT_A,
+            parentEvidenceDigest: bundles.evidence.evidenceDigest,
+            mode: 448,
+            expectedAbsence: true,
+          }),
+      );
+      expect(created.kind).toBe("create_and_pin_completed");
+      if (created.kind !== "create_and_pin_completed") {
+        throw new Error("wrapper was not created");
+      }
+      createdId = created.handleId;
+      createdEvidence = created.evidence;
+      expect(points).toEqual([
+        "atomic-create-mkdir",
+        "atomic-create-open",
+        "atomic-create-fstat",
+      ]);
+      expect(openFlags).toEqual([
+        [
+          "atomic-create-open",
+          constants.O_RDONLY |
+            constants.O_DIRECTORY |
+            constants.O_NOFOLLOW,
+          undefined,
+        ],
+      ]);
+      for (const point of points) {
+        expect(gates).toContain(`before:${point}`);
+        expect(gates).toContain(`after:${point}`);
+      }
+
+      points.length = 0;
+      openFlags.length = 0;
+      const removed = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (point.startsWith("atomic-")) points.push(point);
+          },
+          atomicOpenFlags(point, flags, mode) {
+            openFlags.push([point, flags, mode]);
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "remove_root",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "wrapper",
+            parentId: bundles.handleId,
+            leaf: CHECKPOINT_A,
+            objectId: created.handleId,
+            expected: created.evidence,
+            manifestSha256: sha("manifest"),
+            cursor: 0,
+          }),
+      );
+      expect(removed).toMatchObject({
+        kind: "removal_observed",
+        objectId: created.handleId,
+        removedEvidence: created.evidence,
+        state: "absent",
+        parentSynced: true,
+      });
+      expect(points).toEqual([
+        "atomic-remove-lstat",
+        "atomic-remove-open",
+        "atomic-remove-fstat",
+        "atomic-remove-recheck",
+        "atomic-remove-mutate",
+        "atomic-remove-absence",
+        "atomic-remove-parent-fsync",
+      ]);
+      expect(openFlags).toEqual([
+        [
+          "atomic-remove-open",
+          constants.O_RDONLY |
+            constants.O_DIRECTORY |
+            constants.O_NOFOLLOW,
+          undefined,
+        ],
+      ]);
+
+      const closed = await applyAtomicEffect(lease.controller, {
+        kind: "close_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "wrapper",
+        objectId: created.handleId,
+        cursor: 0,
+        byteLength: 0,
+        expected: created.evidence,
+      });
+      expect(closed).toMatchObject({
+        kind: "effect_completed",
+        requestKind: "close_handle",
+      });
+    } finally {
+      if (createdId !== undefined && createdEvidence !== undefined) {
+        // A failed assertion must not leave the test's created wrapper behind.
+        await rm(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            CHECKPOINT_A,
+          ),
+          { recursive: true, force: true },
+        );
+      }
+      await closeAtomicEffectController(lease.controller).catch(() => undefined);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("rejects strict-leaf and foreign semantic IDs before filesystem I/O", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const points: string[] = [];
+    try {
+      const invalidLeaf = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (point.startsWith("atomic-create")) points.push(point);
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "create_and_pin_directory",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            parentId: bundles.handleId,
+            leaf: "nested/leaf",
+            parentEvidenceDigest: bundles.evidence.evidenceDigest,
+            mode: 448,
+            expectedAbsence: true,
+          }),
+      );
+      expect(invalidLeaf).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+      expect(points).toEqual([]);
+
+      const foreign = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_directory",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "private_source",
+        parentId: Object.freeze({}) as FlightSemanticId,
+        leaf: "payload",
+        parentEvidenceDigest: bundles.evidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      });
+      expect(foreign).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+      expect(points).toEqual([]);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("uses exact numeric file and temp creation flags", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    await applyAtomicEffect(lease.controller, {
+      kind: "reserve_budget",
+      effectId: atomicEffectId(),
+      operationId: CHECKPOINT_A,
+      reservation: "scratch_files",
+      count: 1,
+      byteSize: 0,
+    });
+    const observed: Array<readonly [string, number, number | undefined]> = [];
+    try {
+      for (const request of [
+        {
+          kind: "create_and_pin_file" as const,
+          role: "payload_entry" as const,
+          leaf: "payload-file",
+        },
+        {
+          kind: "create_and_pin_temp_file" as const,
+          role: "manifest_temp" as const,
+          leaf: "manifest-temp",
+        },
+      ]) {
+        const created = await runWithReconciliationFilesystemTestContext(
+          {
+            atomicOpenFlags(point, flags, mode) {
+              observed.push([point, flags, mode]);
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              ...request,
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              parentId: bundles.handleId,
+              parentEvidenceDigest: bundles.evidence.evidenceDigest,
+              mode: 384,
+              expectedAbsence: true,
+            }),
+        );
+        expect(created.kind).toBe("create_and_pin_completed");
+      }
+      expect(observed).toEqual([
+        [
+          "atomic-create-open",
+          constants.O_RDWR |
+            constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_NOFOLLOW,
+          0o600,
+        ],
+        [
+          "atomic-create-open",
+          constants.O_RDWR |
+            constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_NOFOLLOW,
+          0o600,
+        ],
+      ]);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          "payload-file",
+        ),
+        { force: true },
+      );
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          "manifest-temp",
+        ),
+        { force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("verifies the complete destination digest after atomic writes", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const bytes = Buffer.from("verified-result", "utf8");
+    const leaves = ["write-valid", "write-invalid"] as const;
+    try {
+      const reserved = await applyAtomicEffect(lease.controller, {
+        kind: "reserve_budget",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        reservation: "payload_bytes",
+        count: 0,
+        byteSize: bytes.byteLength,
+      });
+      expect(reserved.kind).toBe("effect_completed");
+
+      const files = [];
+      for (const leaf of leaves) {
+        const created = await applyAtomicEffect(lease.controller, {
+          kind: "create_and_pin_file",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role: "payload_entry",
+          parentId: bundles.handleId,
+          leaf,
+          parentEvidenceDigest: bundles.evidence.evidenceDigest,
+          mode: 384,
+          expectedAbsence: true,
+        });
+        if (created.kind !== "create_and_pin_completed") {
+          throw new Error("atomic write destination was not created");
+        }
+        files.push(created);
+      }
+
+      const points: string[] = [];
+      const completed = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (point.startsWith("atomic-write")) points.push(point);
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "write_file_chunk",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            sourceFileId: null,
+            destinationFileId: files[0]!.handleId,
+            offset: 0,
+            byteLength: bytes.byteLength,
+            inlineBytes: bytes,
+            expectedChunkSha256: sha(bytes),
+            expectedResultSha256: sha(bytes),
+          }),
+      );
+      expect(completed).toMatchObject({
+        kind: "effect_completed",
+        requestKind: "write_file_chunk",
+      });
+      expect(points).toEqual([
+        "atomic-write-result-stat-before",
+        "atomic-write-chunk",
+        "atomic-write-result-stat-after",
+        "atomic-write-result-read",
+        "atomic-write-result-read",
+        "atomic-write-result-final-stat",
+      ]);
+      expect(
+        await readFile(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            leaves[0],
+          ),
+        ),
+      ).toEqual(bytes);
+
+      const rejected = await applyAtomicEffect(lease.controller, {
+        kind: "write_file_chunk",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        sourceFileId: null,
+        destinationFileId: files[1]!.handleId,
+        offset: 0,
+        byteLength: bytes.byteLength,
+        inlineBytes: bytes,
+        expectedChunkSha256: sha(bytes),
+        expectedResultSha256: sha("forged-result"),
+      });
+      expect(rejected).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: 1,
+        }),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic publication controller is not live",
+      });
+    } finally {
+      await closeAtomicEffectController(lease.controller).catch(() => undefined);
+      for (const leaf of leaves) {
+        await rm(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            leaf,
+          ),
+          { force: true },
+        );
+      }
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("enforces strict leaf boundaries before controller I/O", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const createdLeaves: string[] = [];
+    try {
+      for (const [role, leaf] of [
+        ["wrapper", "a"],
+        ["wrapper", `a${".".repeat(126)}z`],
+        ["payload_entry", "x"],
+        ["payload_entry", `${"é".repeat(127)}a`],
+      ] as const) {
+        const created = await applyAtomicEffect(lease.controller, {
+          kind: "create_and_pin_directory",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role,
+          parentId: bundles.handleId,
+          leaf,
+          parentEvidenceDigest: bundles.evidence.evidenceDigest,
+          mode: 448,
+          expectedAbsence: true,
+        });
+        expect(created.kind).toBe("create_and_pin_completed");
+        createdLeaves.push(leaf);
+      }
+
+      const points: string[] = [];
+      for (const [role, leaf] of [
+        ["wrapper", ""],
+        ["wrapper", "."],
+        ["wrapper", ".."],
+        ["wrapper", "Upper"],
+        ["wrapper", "-edge"],
+        ["wrapper", "edge-"],
+        ["wrapper", "bad!"],
+        ["payload_entry", "bad/slash"],
+        ["payload_entry", "bad\\slash"],
+        ["payload_entry", "\0"],
+        ["payload_entry", "e\u0301"],
+        ["payload_entry", "\ud800"],
+      ] as const) {
+        const rejected = await runWithReconciliationFilesystemTestContext(
+          {
+            beforeCall(point) {
+              if (point.startsWith("atomic-create")) points.push(point);
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind: "create_and_pin_directory",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              role,
+              parentId: bundles.handleId,
+              leaf,
+              parentEvidenceDigest: bundles.evidence.evidenceDigest,
+              mode: 448,
+              expectedAbsence: true,
+            }),
+        );
+        expect(rejected).toMatchObject({
+          kind: "effect_rejected",
+          code: "binding_invalid",
+        });
+      }
+      expect(points).toEqual([]);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      for (const leaf of createdLeaves) {
+        await rm(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            leaf,
+          ),
+          { recursive: true, force: true },
+        );
+      }
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("sanitizes rejected procfd operations and gates their rejection path", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const collision = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+    );
+    await mkdir(collision, { mode: 0o700 });
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    const gates: string[] = [];
+    try {
+      const result = await runWithReconciliationFilesystemTestContext(
+        {
+          atomicGate(phase, point) {
+            if (point === "atomic-create-mkdir") {
+              gates.push(`${phase}:${point}`);
+            }
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "create_and_pin_wrapper",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "wrapper",
+            parentId: bundles.handleId,
+            leaf: CHECKPOINT_A,
+            parentEvidenceDigest: bundles.evidence.evidenceDigest,
+            mode: 448,
+            expectedAbsence: true,
+          }),
+      );
+      expect(result).toMatchObject({
+        kind: "effect_rejected",
+        code: "conflict",
+      });
+      expect(JSON.stringify(result)).not.toContain("/proc/");
+      expect(gates).toContain("before:atomic-create-mkdir");
+      expect(gates).toContain("after:atomic-create-mkdir");
+      expect(atomicHeldProfileHashImplementationIdentityForTest()).toBe(
+        "reconciliation-private-held-profile-hash",
+      );
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("reserves exact payload capacity before bounded directory discovery", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const payload = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      "payload",
+    );
+    await mkdir(payload, { mode: 0o700 });
+    await writeFile(path.join(payload, "a"), "a", { mode: 0o600 });
+    await writeFile(path.join(payload, "b"), "b", { mode: 0o600 });
+    const expected = await atomicFileEvidence(payload, null);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    try {
+      const opened = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "payload_entry",
+        parentId: bundles.handleId,
+        leaf: "payload",
+        flags: "directory_nofollow",
+        expected,
+      });
+      expect(opened.kind).toBe("existing_handle_pinned");
+      if (opened.kind !== "existing_handle_pinned") {
+        throw new Error("payload directory was not pinned");
+      }
+      const points: string[] = [];
+      const unreserved = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (point.startsWith("atomic-enumerate")) points.push(point);
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "enumerate_directory",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            objectId: opened.handleId,
+            cursor: 0,
+            byteLength: 65_536,
+            expected: opened.evidence,
+          }),
+      );
+      expect(unreserved).toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+      expect(points).toEqual([]);
+
+      for (const reservation of [
+        {
+          reservation: "payload_entries" as const,
+          count: 257,
+          byteSize: 0,
+        },
+        {
+          reservation: "payload_bytes" as const,
+          count: 0,
+          byteSize: 65_536,
+        },
+      ]) {
+        const reserved = await applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          ...reservation,
+        });
+        expect(reserved.kind).toBe("effect_completed");
+      }
+      const failedEnumerationCloses: string[] = [];
+      let enumerationFailureInjected = false;
+      const failedEnumeration =
+        await runWithReconciliationFilesystemTestContext(
+          {
+            atomicOperationCompleted(point) {
+              if (
+                !enumerationFailureInjected &&
+                point === "atomic-enumerate-fstat"
+              ) {
+                enumerationFailureInjected = true;
+                throw Object.assign(
+                  new Error("injected enumeration fstat failure"),
+                  { code: "EIO" },
+                );
+              }
+            },
+            handleClosed(point) {
+              if (point.startsWith("atomic-enumerate-close")) {
+                failedEnumerationCloses.push(point);
+              }
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind: "enumerate_directory",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              role: "payload_entry",
+              objectId: opened.handleId,
+              cursor: 0,
+              byteLength: 65_536,
+              expected: opened.evidence,
+            }),
+        );
+      expect(failedEnumeration).toMatchObject({
+        kind: "effect_rejected",
+        code: "io",
+      });
+      expect(failedEnumerationCloses).toContain(
+        "atomic-enumerate-close-provisional",
+      );
+      expect(enumerationFailureInjected).toBe(true);
+      let streamBufferSize = 0;
+      const observed = await runWithReconciliationFilesystemTestContext(
+        {
+          directoryStreamOpened(bufferSize) {
+            streamBufferSize = bufferSize;
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "enumerate_directory",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            objectId: opened.handleId,
+            cursor: 0,
+            byteLength: 65_536,
+            expected: opened.evidence,
+          }),
+      );
+      expect(observed.kind).toBe("directory_observed");
+      if (observed.kind !== "directory_observed") {
+        throw new Error("payload directory was not observed");
+      }
+      expect(observed.entries.map((entry) => entry.leaf).sort()).toEqual([
+        "a",
+        "b",
+      ]);
+      expect(observed.done).toBe(true);
+      expect(streamBufferSize).toBe(32);
+      const payloadFile = observed.entries.find((entry) => entry.leaf === "a");
+      if (payloadFile === undefined) {
+        throw new Error("payload file was not discovered");
+      }
+      await applyAtomicEffect(lease.controller, {
+        kind: "release_budget",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        reservation: "payload_bytes",
+        count: 0,
+        byteSize: 65_536,
+      });
+      await applyAtomicEffect(lease.controller, {
+        kind: "reserve_budget",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        reservation: "manifest_bytes",
+        count: 0,
+        byteSize: 65_536,
+      });
+      const wrongCategoryPoints: string[] = [];
+      const fileEvidence = await atomicFileEvidence(
+        path.join(payload, "a"),
+        null,
+      );
+      const wrongRead = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (
+              point === "atomic-read-chunk" ||
+              point === "atomic-hash-chunk"
+            ) {
+              wrongCategoryPoints.push(point);
+            }
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "read_file_chunk",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            objectId: payloadFile.objectId,
+            cursor: 0,
+            byteLength: 1,
+            expected: fileEvidence,
+          }),
+      );
+      expect(wrongRead).toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+      const wrongHash = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (
+              point === "atomic-read-chunk" ||
+              point === "atomic-hash-chunk"
+            ) {
+              wrongCategoryPoints.push(point);
+            }
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "hash_content_chunk",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            objectId: payloadFile.objectId,
+            offset: 0,
+            byteLength: 1,
+            evidenceDigest: payloadFile.evidenceDigest,
+          }),
+      );
+      expect(wrongHash).toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+      expect(wrongCategoryPoints).toEqual([]);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("defers an unverified enumeration stream close to shutdown", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const payload = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      "payload-close",
+    );
+    await mkdir(payload, { mode: 0o700 });
+    const expected = await atomicFileEvidence(payload, null);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    let controllerClosed = false;
+    try {
+      const reserved = await applyAtomicEffect(lease.controller, {
+        kind: "reserve_budget",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        reservation: "payload_bytes",
+        count: 0,
+        byteSize: 65_536,
+      });
+      expect(reserved.kind).toBe("effect_completed");
+      const opened = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "payload_entry",
+        parentId: bundles.handleId,
+        leaf: "payload-close",
+        flags: "directory_nofollow",
+        expected,
+      });
+      if (opened.kind !== "existing_handle_pinned") {
+        throw new Error("payload directory was not pinned");
+      }
+
+      let effectCloseAttempts = 0;
+      const rejected = await runWithReconciliationFilesystemTestContext(
+        {
+          async closeOperation(point, close) {
+            if (point === "atomic-enumerate-close-stream") {
+              effectCloseAttempts += 1;
+              throw new Error("injected enumeration stream close failure");
+            }
+            await close();
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "enumerate_directory",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            objectId: opened.handleId,
+            cursor: 0,
+            byteLength: 65_536,
+            expected: opened.evidence,
+          }),
+      );
+      expect(rejected).toMatchObject({
+        kind: "effect_rejected",
+        code: "close_unverified",
+      });
+      expect(effectCloseAttempts).toBe(1);
+
+      let shutdownRetries = 0;
+      await runWithReconciliationFilesystemTestContext(
+        {
+          async closeOperation(point, close) {
+            if (point === "atomic-enumerate-retained-stream-close") {
+              shutdownRetries += 1;
+            }
+            await close();
+          },
+        },
+        () => closeAtomicEffectController(lease.controller),
+      );
+      controllerClosed = true;
+      expect(shutdownRetries).toBe(1);
+    } finally {
+      if (!controllerClosed) {
+        await closeAtomicEffectController(lease.controller).catch(
+          () => undefined,
+        );
+      }
+      await rm(payload, { recursive: true, force: true });
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("verifies held file bytes only after their exact reservation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const payload = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      "payload",
+    );
+    const bytes = Buffer.from("held-content", "utf8");
+    await mkdir(payload, { mode: 0o700 });
+    await writeFile(path.join(payload, "content"), bytes, { mode: 0o600 });
+    const directoryEvidence = await atomicFileEvidence(payload, null);
+    const fileEvidence = await atomicFileEvidence(
+      path.join(payload, "content"),
+      sha(bytes),
+    );
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    try {
+      const directory = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "payload_entry",
+        parentId: bundles.handleId,
+        leaf: "payload",
+        flags: "directory_nofollow",
+        expected: directoryEvidence,
+      });
+      expect(directory.kind).toBe("existing_handle_pinned");
+      if (directory.kind !== "existing_handle_pinned") {
+        throw new Error("payload directory was not pinned");
+      }
+      await applyAtomicEffect(lease.controller, {
+        kind: "reserve_budget",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        reservation: "manifest_bytes",
+        count: 0,
+        byteSize: bytes.byteLength,
+      });
+      const unreserved = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "payload_entry",
+        parentId: directory.handleId,
+        leaf: "content",
+        flags: "file_read_nofollow",
+        expected: fileEvidence,
+      });
+      expect(unreserved).toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+      await applyAtomicEffect(lease.controller, {
+        kind: "reserve_budget",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        reservation: "payload_bytes",
+        count: 0,
+        byteSize: bytes.byteLength,
+      });
+      const existingFlags: number[] = [];
+      const opened = await runWithReconciliationFilesystemTestContext(
+        {
+          atomicOpenFlags(point, flags) {
+            if (point === "atomic-open-existing") {
+              existingFlags.push(flags);
+            }
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "open_pin_handle",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            parentId: directory.handleId,
+            leaf: "content",
+            flags: "file_read_nofollow",
+            expected: fileEvidence,
+          }),
+      );
+      expect(opened).toMatchObject({
+        kind: "existing_handle_pinned",
+        evidence: fileEvidence,
+      });
+      expect(existingFlags).toEqual([
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      ]);
+      if (opened.kind !== "existing_handle_pinned") {
+        throw new Error("payload file was not pinned");
+      }
+      const readFailure =
+        await runWithReconciliationFilesystemTestContext(
+          {
+            atomicOperationCompleted(point) {
+              if (point === "atomic-read-chunk") {
+                throw Object.assign(
+                  new Error("private read path"),
+                  { code: "EIO", path: "/proc/self/fd/secret" },
+                );
+              }
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind: "read_file_chunk",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              role: "payload_entry",
+              objectId: opened.handleId,
+              cursor: 0,
+              byteLength: bytes.byteLength,
+              expected: opened.evidence,
+            }),
+        );
+      expect(readFailure).toMatchObject({
+        kind: "effect_rejected",
+        code: "io",
+      });
+      expect(JSON.stringify(readFailure)).not.toContain("/proc/");
+
+      const hashFailure =
+        await runWithReconciliationFilesystemTestContext(
+          {
+            atomicOperationCompleted(point) {
+              if (point === "atomic-hash-chunk") {
+                throw Object.assign(
+                  new Error("private hash path"),
+                  { code: "ENOSPC", path: "/proc/self/fd/secret" },
+                );
+              }
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind: "hash_content_chunk",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              objectId: opened.handleId,
+              offset: 0,
+              byteLength: bytes.byteLength,
+              evidenceDigest: opened.evidence.evidenceDigest,
+            }),
+        );
+      expect(hashFailure).toMatchObject({
+        kind: "effect_rejected",
+        code: "io",
+      });
+      expect(JSON.stringify(hashFailure)).not.toContain("/proc/");
+
+      await applyAtomicEffect(lease.controller, {
+        kind: "close_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "payload_entry",
+        objectId: opened.handleId,
+        cursor: 0,
+        byteLength: 0,
+        expected: opened.evidence,
+      });
+
+      const forgedValue = {
+        ...fileEvidence,
+        contentSha256: sha("forged"),
+      };
+      const forged = Object.freeze({
+        ...forgedValue,
+        evidenceDigest: sha(
+          JSON.stringify({
+            dev: forgedValue.dev,
+            ino: forgedValue.ino,
+            mode: forgedValue.mode,
+            size: forgedValue.size,
+            contentSha256: forgedValue.contentSha256,
+          }),
+        ),
+      });
+      const rejected = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "payload_entry",
+        parentId: directory.handleId,
+        leaf: "content",
+        flags: "file_read_nofollow",
+        expected: forged,
+      });
+      expect(rejected).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+
+      const unknownSync =
+        runWithReconciliationFilesystemTestContext(
+          {
+            atomicGate(phase, point) {
+              if (phase === "before" && point === "atomic-revalidate") {
+                throw Object.assign(
+                  new Error("secret revalidation path"),
+                  {
+                    code: "EUNKNOWN",
+                    path: "/proc/self/fd/secret",
+                  },
+                );
+              }
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind: "revalidate_handle",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              role: "payload_entry",
+              objectId: directory.handleId,
+              cursor: 0,
+              byteLength: 0,
+              expected: directory.evidence,
+            }),
+        );
+      await expect(unknownSync).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic publication filesystem operation failed",
+      });
+      await expect(unknownSync).rejects.not.toHaveProperty("cause");
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: 1,
+        }),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic publication controller is not live",
+      });
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("retains post-gate create authority until partial cleanup", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    try {
+      const partial = await runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(point) {
+            if (point === "atomic-create-mkdir") {
+              throw new Error("injected post-create gate failure");
+            }
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "create_and_pin_wrapper",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "wrapper",
+            parentId: bundles.handleId,
+            leaf: CHECKPOINT_A,
+            parentEvidenceDigest: bundles.evidence.evidenceDigest,
+            mode: 448,
+            expectedAbsence: true,
+          }),
+      );
+      expect(partial).toMatchObject({
+        kind: "create_and_pin_partial",
+        stage: "entry_created",
+        entryCreated: true,
+        handleOpened: false,
+      });
+      if (partial.kind !== "create_and_pin_partial") {
+        throw new Error("partial create authority was not returned");
+      }
+      const cleaned = await applyAtomicEffect(lease.controller, {
+        kind: "cleanup_partial_create",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        partialId: partial.partialId,
+      });
+      expect(cleaned).toMatchObject({
+        kind: "partial_create_cleanup_observed",
+        state: "absent",
+        parentSynced: true,
+      });
+    } finally {
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("sanitizes unknown errno after creation and closes admission", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    try {
+      const partial = await runWithReconciliationFilesystemTestContext(
+        {
+          atomicOperationCompleted(point) {
+            if (point === "atomic-create-open") {
+              throw Object.assign(
+                new Error("secret /proc/self/fd/999 path"),
+                {
+                  code: "EUNKNOWN",
+                  path: "/proc/self/fd/999/secret",
+                },
+              );
+            }
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "create_and_pin_file",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "payload_entry",
+            parentId: bundles.handleId,
+            leaf: "unknown-errno",
+            parentEvidenceDigest: bundles.evidence.evidenceDigest,
+            mode: 384,
+            expectedAbsence: true,
+          }),
+      );
+      expect(partial).toMatchObject({
+        kind: "create_and_pin_partial",
+        code: "io",
+      });
+      expect(JSON.stringify(partial)).not.toContain("/proc/");
+      expect(JSON.stringify(partial)).not.toContain("secret");
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: 1,
+        }),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+        message: "atomic publication controller is not live",
+      });
+      if (partial.kind !== "create_and_pin_partial") {
+        throw new Error("partial create authority was not returned");
+      }
+      const cleaned = await applyAtomicEffect(lease.controller, {
+        kind: "cleanup_partial_create",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        partialId: partial.partialId,
+      });
+      expect(cleaned.kind).toBe("partial_create_cleanup_observed");
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          "unknown-errno",
+        ),
+        { force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("fail-stops on unverified close and retries ownership at shutdown", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    try {
+      const created = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_wrapper",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "wrapper",
+        parentId: bundles.handleId,
+        leaf: CHECKPOINT_A,
+        parentEvidenceDigest: bundles.evidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      });
+      if (created.kind !== "create_and_pin_completed") {
+        throw new Error("wrapper was not created");
+      }
+      const rejected = await runWithReconciliationFilesystemTestContext(
+        {
+          closeOperation(point) {
+            if (point === "atomic-close") {
+              throw new Error("injected close rejection");
+            }
+            throw new Error("unexpected close operation");
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "close_handle",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "wrapper",
+            objectId: created.handleId,
+            cursor: 0,
+            byteLength: 0,
+            expected: created.evidence,
+          }),
+      );
+      expect(rejected).toMatchObject({
+        kind: "effect_rejected",
+        code: "close_unverified",
+      });
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("prioritizes failed removal close and retains its pin for shutdown", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    let controllerClosed = false;
+    try {
+      const created = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_wrapper",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "wrapper",
+        parentId: bundles.handleId,
+        leaf: CHECKPOINT_A,
+        parentEvidenceDigest: bundles.evidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      });
+      if (created.kind !== "create_and_pin_completed") {
+        throw new Error("wrapper was not created");
+      }
+      const rejected = await runWithReconciliationFilesystemTestContext(
+        {
+          atomicOperationCompleted(point) {
+            if (point === "atomic-remove-fstat") {
+              throw Object.assign(
+                new Error("injected primary removal failure"),
+                { code: "EIO" },
+              );
+            }
+          },
+          async closeOperation(point, close) {
+            if (point === "atomic-remove-final-close") {
+              throw new Error("injected removal close failure");
+            }
+            await close();
+          },
+        },
+        () =>
+          applyAtomicEffect(lease.controller, {
+            kind: "remove_root",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            role: "wrapper",
+            parentId: bundles.handleId,
+            leaf: CHECKPOINT_A,
+            objectId: created.handleId,
+            expected: created.evidence,
+            manifestSha256: sha("manifest"),
+            cursor: 0,
+          }),
+      );
+      expect(rejected).toMatchObject({
+        kind: "effect_rejected",
+        code: "close_unverified",
+      });
+
+      const retriedCloses: string[] = [];
+      await runWithReconciliationFilesystemTestContext(
+        {
+          handleClosed(point) {
+            retriedCloses.push(point);
+          },
+        },
+        () => closeAtomicEffectController(lease.controller),
+      );
+      controllerClosed = true;
+      expect(retriedCloses).toContain("atomic-remove-retained-close");
+    } finally {
+      if (!controllerClosed) {
+        await closeAtomicEffectController(lease.controller).catch(
+          () => undefined,
+        );
+      }
+      await rm(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "bundles",
+          CHECKPOINT_A,
+        ),
+        { recursive: true, force: true },
+      );
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test.each([
+    ["close", "atomic-partial-close"],
+    ["identity_verify", "atomic-partial-lstat"],
+    ["remove", "atomic-partial-remove"],
+    ["absence_verify", "atomic-partial-absence"],
+    ["parent_fsync", "atomic-partial-parent-fsync"],
+  ] as const)(
+    "reports exact %s partial-cleanup failure",
+    async (expectedStage, failurePoint) => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const lease = await acquireAtomicPreReadyRecoveryAuthority(
+        installed.root,
+        CHECKPOINT_A,
+      );
+      const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+      const leaf =
+        expectedStage === "close" ? "partial-file" : "partial-directory";
+      try {
+        const partial = await runWithReconciliationFilesystemTestContext(
+          {
+            afterCall(point) {
+              if (
+                point ===
+                (expectedStage === "close"
+                  ? "atomic-create-fstat"
+                  : "atomic-create-mkdir")
+              ) {
+                throw new Error("injected partial create boundary");
+              }
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind:
+                expectedStage === "close"
+                  ? "create_and_pin_file"
+                  : "create_and_pin_directory",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              role: "payload_entry",
+              parentId: bundles.handleId,
+              leaf,
+              parentEvidenceDigest: bundles.evidence.evidenceDigest,
+              mode: expectedStage === "close" ? 384 : 448,
+              expectedAbsence: true,
+            }),
+        );
+        if (partial.kind !== "create_and_pin_partial") {
+          throw new Error("partial create authority was not returned");
+        }
+        const failed = await runWithReconciliationFilesystemTestContext(
+          {
+            beforeCall(point) {
+              if (
+                failurePoint !== "atomic-partial-close" &&
+                point === failurePoint
+              ) {
+                throw new Error("injected partial cleanup failure");
+              }
+            },
+            closeOperation(point, close) {
+              if (
+                failurePoint === "atomic-partial-close" &&
+                point === failurePoint
+              ) {
+                throw new Error("injected partial close failure");
+              }
+              return close();
+            },
+          },
+          () =>
+            applyAtomicEffect(lease.controller, {
+              kind: "cleanup_partial_create",
+              effectId: atomicEffectId(),
+              operationId: CHECKPOINT_A,
+              partialId: partial.partialId,
+            }),
+        );
+        expect(failed).toMatchObject({
+          kind: "partial_create_cleanup_failed",
+          stage: expectedStage,
+          parentSynced: false,
+        });
+      } finally {
+        await closeAtomicEffectController(lease.controller);
+        await rm(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+            leaf,
+          ),
+          { recursive: true, force: true },
+        );
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+  );
 });
