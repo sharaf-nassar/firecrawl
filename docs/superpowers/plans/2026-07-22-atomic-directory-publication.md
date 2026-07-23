@@ -29,7 +29,7 @@ Vitest 4.1.9, Playwright 1.61.1.
 
 ## Scope, prerequisites, and dirty-worktree rules
 
-Authoritative contract is committed spec `ef47b9794`:
+Authoritative contract is committed spec `ae4a48591`:
 `docs/superpowers/specs/2026-07-22-atomic-directory-publication-design.md`.
 Do not edit that spec while executing this plan.
 
@@ -217,6 +217,15 @@ assert.deepEqual(Object.keys(native).sort(), [
 assert.equal(native.interfaceVersion, "1.0.0");
 assert.equal(native.napiVersion, 8);
 assert.equal(typeof native.renameNoReplace, "function");
+assert.deepEqual(Object.keys(testNative).sort(), [
+  "interfaceVersion", "napiVersion", "renameNoReplace", "testHooks",
+]);
+assert.deepEqual(Object.keys(testNative.testHooks).sort(), [
+  "becomeChildSubreaperForTest",
+  "claimAdoptedChildForTest",
+  "prepareInheritedLockFdForTest",
+  "reapClaimedChildForTest",
+]);
 assert.throws(
   () => validateAtomicNativeModuleShape(corruptFixture),
   /native artifact/i,
@@ -266,12 +275,30 @@ only properties are:
 
 ```text
 becomeChildSubreaperForTest
+prepareInheritedLockFdForTest
 claimAdoptedChildForTest
 reapClaimedChildForTest
 ```
 
 `becomeChildSubreaperForTest()` is synchronous and verifies
 `PR_SET_CHILD_SUBREAPER`/`PR_GET_CHILD_SUBREAPER`.
+`prepareInheritedLockFdForTest(evidence)` is synchronous, hard-codes fd 9, and
+accepts only canonical driver/descendant role, Node executable realpath/hash,
+fixture script realpath/hash, expected parent pid/starttime, and lock
+device/inode/current-uid/mode-`0600`/nlink-one evidence. It independently
+validates current process pid/starttime, exact cmdline, fixed role environment,
+and current/expected parent relationship. It authenticates the private lock
+leaf, captures `fstat`, procfd/fdinfo, and `F_GETFD`, clears only its own fd9
+`FD_CLOEXEC`, then repeats all checks and proves no other identity or descriptor
+flag changed. It accepts no fd number, alternate path, or caller token. Wrong,
+missing, duplicate, or late role rejects before later spawn/ready.
+
+Driver calls its module-private fixed wrapper after Node startup and before
+descendant spawn. Descendant independently calls its wrapper after Node
+startup and before ready. Module load, environment selection, and subreaper
+activation never mutate fd9; preparation has no subreaper, spawn, signal,
+wait, claim, reap, or publication effect.
+
 `claimAdoptedChildForTest(evidence)` is synchronous, accepts only the closed
 role/pid/starttime/Node executable+hash/script+hash/fd9/adoptive-parent evidence
 record, verifies current direct-child adoption and exact `/proc` identity,
@@ -283,8 +310,9 @@ strict same Promise while starting, pending, or settled; mismatched policy or
 foreign/finalized handle rejects without modifying that job. The one job
 releases only the bound pidfd child, exact-PID reaps it without blocking Node's
 event loop, and returns the closed exit/signal union. Test shape/link tests
-reject these properties and symbols from production and require them in the
-test artifact. Test-addon files and symbols never enter the final image.
+reject all four properties/symbols from production and require exact four
+top-level test-addon properties plus exact four nested hooks. Test-addon files
+and symbols never enter the final image.
 
 Export only module seam `runNativeBuildOrphanFixtureForTest()` from
 `run-native-build.mjs`. It accepts no executable, argv, environment, target,
@@ -311,16 +339,34 @@ descriptors remain the sole authority.
 Fixture mode spawns canonical fixture role `driver` with ready-write fd 3,
 release-read fd 4, lock fd 9, and exact driver environment
 `PATH=/usr/bin:/bin`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`,
-`ATOMIC_BUILD_LOCK_FD=9`, and
-`ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`. Driver execs the same canonical
-fixture as role `descendant`, changes role to `descendant`, adds only canonical
-decimal `ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`, closes its fd 3/4 duplicates,
-retains fd 9, and waits. Descendant validates exact argv/environment, role,
-driver relationship, FIFO directions/nonaliasing, and lock identity. It emits
-the spec's exact canonical ready record with role
+`ATOMIC_BUILD_LOCK_FD=9`, `ATOMIC_BUILD_LOCK_FIXTURE_ROLE=driver`, and
+canonical decimal `ATOMIC_BUILD_LOCK_FIXTURE_EXPECTED_PARENT_PID`/
+`ATOMIC_BUILD_LOCK_FIXTURE_EXPECTED_PARENT_STARTTIME`. After startup, driver
+loads fixed test addon and calls only the fixed
+`prepareInheritedLockFdForTest()` wrapper; it spawns nothing until native
+post-check proves fd9 identity and CLOEXEC clear.
+
+Driver execs same canonical fixture as role `descendant`, replaces role and
+expected-parent values with `descendant` and driver pid/starttime, and adds
+only canonical decimal `ATOMIC_BUILD_LOCK_FIXTURE_DRIVER_PID`; no inherited
+key is spread. After startup, descendant validates exact argv/environment,
+role, driver relationship, and FIFO directions/nonaliasing, then independently
+calls its fixed preparation wrapper. Only successful native post-check permits
+ready. Driver closes its fd 3/4 duplicates after spawn, retains prepared fd 9,
+and waits. Ready record has exact role
 `orphan_lock_descendant_v1`, driver/descendant pid+starttime, canonical Node
-and script identities/hashes, and fd9 device/inode/CLOEXEC-false evidence;
-then closes fd 3 and blocks on fd 4.
+and script identities/hashes, and fd9 device/inode/uid/mode/nlink/
+CLOEXEC-false evidence; descendant then closes fd 3 and blocks on fd 4.
+
+Preparation tests capture fd9 before/after and require identical
+device/inode/uid/mode/nlink plus unchanged descriptor flags except CLOEXEC.
+Negative real-child cases cover missing/duplicate/late call, wrong role,
+parent pid/starttime, Node/script/cmdline/hash/environment drift, replaced or
+nonprivate lock, wrong uid/mode/nlink, fd9 absent/nonregular, and attempted
+arbitrary-fd evidence. Each rejects before descendant spawn or ready as
+applicable, with zero subreaper/signal/wait/publication effect. Add explicit
+module-load and `becomeChildSubreaperForTest()` checks proving neither changes
+any descriptor.
 
 Harness owns one monotonic orphan-cleanup record. `claimState` is exactly
 `unclaimed | claimed_unconsumed | reap_pending | reaped`; independent
@@ -453,6 +499,25 @@ path. Close all FIFO descriptors and remove only verified FIFO/output/private
 directory state after bounded cleanup. This direct non-subreaper proof cannot
 be replaced by the orphan fixture.
 
+Acceptance must invoke three real implementation paths: the production
+orphan-cleanup dispatcher inside `run-native-build.mjs`, the production GCC
+cleanup state machine used by `native-build-gcc-probe.test.mjs`, and the real
+build publication effect executor inside `build-native.mjs`. Tests cannot pass
+with copied reducers/state machines, fake-only effects, mocked cleanup or
+publication results, or alternate GCC control.
+
+Boundary matrices may use only closed no-argument module-only functions under
+direct `VITEST=true` import. Each function selects its checked-in fixed matrix
+internally, invokes those same real state/effect adapters, and returns frozen
+canonical results. Export no parameterized reducer, effect callback,
+fd/path/executable/filesystem adapter, result injection, matrix selector, or
+production CLI/runtime entry. Pure reducer unit tests may substitute only
+closed observations; native publication/recovery, build-lock/orphan cleanup,
+build publication, and gcc/`cc1` acceptance still execute real effects.
+Module-surface tests require every such seam's `.length === 0`, exact guarded
+caller/import behavior, and no alternate exported function accepting an
+adapter, effect, result, selector, executable, path, or fd.
+
 `native/toolchain-allowlist.json` tests require exact top-level
 `schemaVersion:1` and `dockerInit`, with only concrete `amd64` and `arm64`
 tuples. Each tuple has exactly `targetArch`, `nodeBaseRepository`,
@@ -552,7 +617,8 @@ requires equal available `STATX_MNT_ID`, and invokes only
 `renameat2(..., RENAME_NOREPLACE)`. Return `undefined` only on success and
 expose stable code without raw errno/path/fd text. Production exports nothing
 else. The test addon adds only frozen `testHooks` with the exact synchronous
-subreaper/claim and asynchronous opaque-handle reap API from Step 1.
+subreaper, process-local fd9 preparation, adopted-child claim, and asynchronous
+opaque-handle reap API from Step 1.
 
 `run-native-build.mjs` accepts only `production|all`, runs closed inherited
 environment rejection before any child/filesystem action, sets umask `0077`,
@@ -598,6 +664,11 @@ wrapper `reapState`/`reapAttempted`/Promise/result, and endpoint-close-attempt
 fields from Step 1. Record each state/attempt before its external boundary.
 Never re-derive cleanup phase from `/proc`, descriptor liveness, or Promise
 state. Native owns handle+policy idempotency and strict same-Promise retrieval.
+Keep that dispatcher as the actual module-private implementation used by the
+orphan seam; keep GCC rendezvous/escalation/cleanup as its actual state machine;
+keep staging publication/crash-prefix execution as the actual build effect
+executor. Any closed no-argument test matrix delegates to those functions
+without exporting injectable parameters or alternate effects.
 
 Every build-script spawn declares its whole stdio array: stdin `ignore`, fds
 3..8 `ignore`, fd 9 mapped to inherited 9. Probe/compile/test/loader stdout and
@@ -830,7 +901,9 @@ claim/reap failures, graceful/TERM/KILL/KILL-timeout, and async exact-PID reap
 PASS; identical handle/policy calls return strict same Promise while forged/
 foreign/finalized handles and wrong policies reject; both concrete
 Docker-init platform probes PASS without skip; production exact-three and test
-exact-four/nested-three addon shapes PASS; runtime checksum and build PASS.
+exact-four/nested-four addon shapes PASS; driver/descendant post-startup fd9
+preparation and all negative identity/order cases PASS; closed matrices prove
+real orphan/GCC/build-publication adapters; runtime checksum and build PASS.
 
 - [ ] **Step 5: Review and commit exact Task 1 files**
 
@@ -1778,6 +1851,7 @@ corresponding original Steps 3-6:
    depfiles, input attestations, test addon, maps/traces, build cache, or package
    cache. It also excludes every test/fixture/FIFO file and rejects
    `testHooks`, `becomeChildSubreaperForTest`,
+   `prepareInheritedLockFdForTest`,
    `claimAdoptedChildForTest`, `reapClaimedChildForTest`, and
    `orphan-ready-v1` from all runtime bytes. Separate init target contains
    pinned util-linux/flock, Node 22, init
@@ -2291,7 +2365,7 @@ for n in 1 2; do
   run_owned --entrypoint /bin/sh "$test_image" -ceu 'test "$PWD" = /app/apps/browser-service; test "$(realpath "$(command -v pnpm)")" = /opt/pnpm/10.33.0/bin/pnpm.cjs; test "$(node -p "require(\"/opt/pnpm/10.33.0/package.json\").version")" = 10.33.0; test "$(pnpm --version)" = 10.33.0; test -x node_modules/.bin/vitest'
   run_owned --user 1000:1000 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e ATOMIC_IMAGE_CASE=native-and-mount --entrypoint pnpm "$test_image" exec vitest run --no-file-parallelism src/atomic-directory-publication.integration.test.ts src/dockerfile.test.ts
   docker image inspect "$final_image" --format "{{.Config.User}}" | rg "^1000:1000$"
-  run_owned --entrypoint /bin/sh "$final_image" -ceu 'test -f build/Release/atomic_directory_publication.node; test -f build/Release/atomic-directory-publication.node.sha256; test ! -e /usr/bin/flock; test ! -e build/Test; test ! -e /opt/pnpm; test ! -e /usr/local/bin/pnpm; test ! -e /root/.local/share/pnpm; test ! -e /home/pwuser/.local/share/pnpm; test -z "$(find build -type f \( -name "*.o" -o -name "*.d" -o -name "*.map" -o -name "*.trace" -o -name "*.inputs.sha256" \) -print -quit)"; test -z "$(find . -type f \( -name "*test*" -o -name "*fixture*" -o -name "*.fifo" -o -name "pnpm.cjs" -o -name "pnpmrc" \) -print -quit)"; ! grep -aR -m1 -E "testHooks|becomeChildSubreaperForTest|claimAdoptedChildForTest|reapClaimedChildForTest|orphan-ready-v1" .; ! command -v gcc; ! command -v cc; ! command -v pnpm; ! command -v corepack'
+  run_owned --entrypoint /bin/sh "$final_image" -ceu 'test -f build/Release/atomic_directory_publication.node; test -f build/Release/atomic-directory-publication.node.sha256; test ! -e /usr/bin/flock; test ! -e build/Test; test ! -e /opt/pnpm; test ! -e /usr/local/bin/pnpm; test ! -e /root/.local/share/pnpm; test ! -e /home/pwuser/.local/share/pnpm; test -z "$(find build -type f \( -name "*.o" -o -name "*.d" -o -name "*.map" -o -name "*.trace" -o -name "*.inputs.sha256" \) -print -quit)"; test -z "$(find . -type f \( -name "*test*" -o -name "*fixture*" -o -name "*.fifo" -o -name "pnpm.cjs" -o -name "pnpmrc" \) -print -quit)"; ! grep -aR -m1 -E "testHooks|becomeChildSubreaperForTest|prepareInheritedLockFdForTest|claimAdoptedChildForTest|reapClaimedChildForTest|orphan-ready-v1" .; ! command -v gcc; ! command -v cc; ! command -v pnpm; ! command -v corepack'
   created_containers+=("$server")
   docker create --label "firecrawl.acceptance.namespace=${namespace}" --name "$server" --user 1000:1000 --mount "type=volume,source=${volume},target=/var/lib/firecrawl-browser-volume" -e LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state -e BROWSER_SERVICE_API_KEY=0123456789abcdef0123456789abcdef -e PORT=3010 "$final_image" >/dev/null
   docker start "$server" >/dev/null
@@ -2596,6 +2670,14 @@ API-isolation, rollback, and persistent-canary acceptance pass."
   opaque claim/contention/FIFO release/asynchronous exact-PID reap cannot
   replace the earlier separate non-subreaper real gcc/compiler-driver/`cc1`
   fd-9 proof.
+- [ ] Test addon has exact production three plus frozen `testHooks` with exact
+  four nested hooks. Driver and descendant each perform canonical post-startup
+  fd9 preparation before spawn/ready; module load and subreaper setup mutate no
+  descriptor. Production/final-image symbols remain exact-three only.
+- [ ] Orphan cleanup, GCC cleanup, and build publication acceptance execute
+  their real module-private state/effect implementations. Any no-argument test
+  matrix delegates to those adapters and exports no parameterized reducer,
+  effect, fd/path/executable/filesystem injection, or fake acceptance path.
 - [ ] Task 1 commits complete concrete `amd64`/`arm64` `dockerInit` tuples and
   both isolated probes. Deferred Task 6 selects/verifies one tuple without
   editing the allowlist and extracts/compares addon plus checksum from two
