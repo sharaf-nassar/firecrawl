@@ -15,7 +15,7 @@
     "start": "node dist/index.js",
     "pretest": "node scripts/run-native-build.mjs all",
     "test:bootstrap": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs",
-    "test": "node --test src/runtime-preflight.test.mjs src/lockfile.test.mjs && vitest run --exclude 'src/**/*.test.mjs'"
+    "test": "node --test scripts/build-native.test.mjs scripts/check-atomic-publication-rollback.test.mjs src/runtime-preflight.test.mjs src/lockfile.test.mjs && vitest run"
   },
   "dependencies": {
     "express": "5.2.1",
