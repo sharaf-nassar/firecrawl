@@ -1924,8 +1924,11 @@ function matchesStaleTargetGrammar(observed, graph, candidateTarget) {
 }
 
 export function runBuildPublicationMatrixForTest() {
+  const sanctionedTestRunner =
+    process.env.VITEST === "true" ||
+    process.env.NODE_TEST_CONTEXT === "child-v8";
   if (
-    process.env.VITEST !== "true" ||
+    !sanctionedTestRunner ||
     resolve(process.argv[1] ?? "") !==
       resolve(packageRoot, "scripts/build-native.test.mjs")
   ) {

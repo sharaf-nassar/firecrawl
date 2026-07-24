@@ -74,6 +74,34 @@ test("exports only closed build test seams", async () => {
   assert.equal(Object.hasOwn(module, "parseElfNeeded"), false);
 });
 
+test("keeps publication matrix seam closed outside its test entry", () => {
+  const moduleUrl = new URL("./build-native.mjs", import.meta.url).href;
+  const testPath = new URL("./build-native.test.mjs", import.meta.url).pathname;
+  const probe = `
+import { runBuildPublicationMatrixForTest } from ${JSON.stringify(moduleUrl)};
+try {
+  runBuildPublicationMatrixForTest();
+} catch (error) {
+  if (String(error?.message).includes("matrix seam is unavailable")) {
+    process.exit(0);
+  }
+}
+process.exit(1);
+`;
+  for (const { argv, env } of [
+    { argv: [testPath], env: {} },
+    { argv: [], env: { VITEST: "true" } },
+    { argv: [], env: { NODE_TEST_CONTEXT: "child-v8" } },
+  ]) {
+    const result = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", probe, ...argv],
+      { encoding: "utf8", env },
+    );
+    assert.equal(result.status, 0, result.stderr);
+  }
+});
+
 test("proves concrete amd64 and arm64 dockerInit tuples", async () => {
   const bytes = await readFile(
     new URL("../native/toolchain-allowlist.json", import.meta.url),
