@@ -742,6 +742,70 @@ describe("startup admission", () => {
     });
   });
 
+  test("fences synchronously but awaits installed authority close separately", async () => {
+    const root = await authorityRoot();
+    const fixture = profileStoreFixture();
+    const state = createInternalStartupState({
+      createProfileStore: async () => fixture.store,
+      compareAndSwapInstall: () => true,
+    });
+    const generation = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      generation.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(input, (requestValue, admission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, { admission }),
+    );
+    expect(await authorityDescriptorCount(root)).toBeGreaterThan(0);
+
+    state.beginDraining();
+
+    expect(() => state.requireReady(generation)).toThrow(
+      expect.objectContaining({ category: "reconciliation_required" }),
+    );
+    expect(fixture.close).not.toHaveBeenCalled();
+    expect(await authorityDescriptorCount(root)).toBeGreaterThan(0);
+
+    await state.closeInstalledAuthority();
+
+    expect(fixture.close).toHaveBeenCalledOnce();
+    expect(await authorityDescriptorCount(root)).toBe(0);
+  });
+
+  test("does not swallow installed authority close failure", async () => {
+    const root = await authorityRoot();
+    const fixture = profileStoreFixture();
+    fixture.close.mockRejectedValueOnce(new Error("injected close failure"));
+    const state = createInternalStartupState({
+      createProfileStore: async () => fixture.store,
+      compareAndSwapInstall: () => true,
+    });
+    const generation = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      generation.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(input, (requestValue, admission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, { admission }),
+    );
+    state.beginDraining();
+
+    await expect(state.closeInstalledAuthority()).rejects.toThrow(
+      "injected close failure",
+    );
+  });
+
   test("requires compare-and-swap for production authority startup", () => {
     expect(() =>
       createStartupState({

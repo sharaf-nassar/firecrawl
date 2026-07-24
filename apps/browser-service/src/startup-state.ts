@@ -167,6 +167,7 @@ export type InternalStartupAdmission = Omit<StartupAdmission, "reconcile"> & {
       admission: ReconciliationExecutionAdmission,
     ) => Promise<InternalReconciliationOutcome>,
   ): Promise<ReconciliationResultV1>;
+  closeInstalledAuthority(): Promise<void>;
 };
 
 export type InternalProfileStoreFactory = (
@@ -1011,9 +1012,6 @@ function createStartupStateImpl(
     if (activeWave !== null) {
       failWave(activeWave, "drain_invariant_failed");
     }
-    if (internalDeps !== undefined) {
-      void closeInstalledAuthority().catch(() => undefined);
-    }
   }
 
   const admission: StartupAdmission = {
@@ -1034,6 +1032,7 @@ function createStartupStateImpl(
   return Object.freeze({
     ...authorityAdmission,
     reconcileWithAuthority,
+    closeInstalledAuthority,
   });
 }
 
