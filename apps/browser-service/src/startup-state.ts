@@ -20,6 +20,20 @@ import {
   BrowserServiceError,
   type BrowserServiceInternalDetail,
 } from "./errors.js";
+import {
+  closeAnchoredProfileRoot,
+  consumeInternalReconciliationOutcomeForStartup,
+  transferSealedProfileGenerations,
+  type AnchoredProfileRoot,
+  type InstalledReconciledAuthority,
+  type InternalReconciliationOutcome,
+  type InternalReconciliationStartupInstall,
+  type ReadyProfileRootBinding,
+} from "./reconciliation.js";
+import {
+  attachSealedProfileGenerations,
+  type ProfileStore,
+} from "./profile-store.js";
 
 const CONTROL_GENERATION_HISTORY_LIMIT = 1_024;
 
@@ -100,6 +114,26 @@ type ReconciliationFlight = {
   promise: Promise<ReconciliationResultV1>;
 };
 
+export type InstalledAuthorityBundle = Readonly<{
+  generation: ControlGenerationV1;
+  result: ReconciliationResultV1;
+  authority: InstalledReconciledAuthority;
+  root: AnchoredProfileRoot;
+  profileStore: ProfileStore;
+  binding: ReadyProfileRootBinding;
+}>;
+
+type InstalledAuthorityState = {
+  bundle: InstalledAuthorityBundle;
+  profileStoreClosed: boolean;
+  rootClosed: boolean;
+};
+
+type ReconciliationExecutionResult = {
+  publicResult: unknown;
+  authorityInstall: InstalledAuthorityState | null;
+};
+
 export type StartupAdmission = {
   readonly processNonce: string;
   createControlGeneration(
@@ -124,6 +158,22 @@ export type StartupAdmission = {
   ): Promise<ReconciliationResultV1>;
   beginDraining(): void;
 };
+
+export type InternalStartupAdmission = Omit<StartupAdmission, "reconcile"> & {
+  reconcileWithAuthority(
+    request: ReconciliationRequestV1,
+    execute: (
+      request: ReconciliationRequestV1,
+      admission: ReconciliationExecutionAdmission,
+    ) => Promise<InternalReconciliationOutcome>,
+  ): Promise<ReconciliationResultV1>;
+};
+
+export type InternalProfileStoreFactory = (
+  root: AnchoredProfileRoot,
+  binding: ReadyProfileRootBinding,
+  sealedGenerationCount: number,
+) => Promise<ProfileStore>;
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
@@ -203,11 +253,18 @@ function frozenError(
   return value;
 }
 
-export function createStartupState(
+function createStartupStateImpl(
   deps: {
     randomBytes?: (size: number) => Buffer;
-  } = {},
-): StartupAdmission {
+  },
+  internalDeps?: {
+    createProfileStore: InternalProfileStoreFactory;
+    compareAndSwapInstall: (
+      current: InstalledAuthorityBundle | null,
+      next: InstalledAuthorityBundle,
+    ) => boolean;
+  },
+): StartupAdmission | InternalStartupAdmission {
   const randomBytes = deps.randomBytes ?? systemRandomBytes;
 
   function mintToken(): string {
@@ -227,9 +284,66 @@ export function createStartupState(
   let currentGeneration: ControlGenerationV1 | null = null;
   let reconciliationCache: ReconciliationCache | null = null;
   let reconciliationFlight: ReconciliationFlight | null = null;
+  let installedAuthority: InstalledAuthorityState | null = null;
+  const authorityInstallAttemptedGenerations = new Set<string>();
+  let authorityClosePromise: Promise<void> | null = null;
   let draining = false;
   let status: "live_unreconciled" | "reconciling" | "ready" =
     "live_unreconciled";
+
+  async function closeProfileStore(profileStore: ProfileStore): Promise<void> {
+    const close = (
+      profileStore as ProfileStore & {
+        close?: () => Promise<void>;
+      }
+    ).close;
+    if (typeof close === "function") await close.call(profileStore);
+  }
+
+  async function closeAuthority(
+    installed: InstalledAuthorityState,
+  ): Promise<void> {
+    let failure: unknown;
+    if (!installed.profileStoreClosed) {
+      try {
+        await closeProfileStore(installed.bundle.profileStore);
+        installed.profileStoreClosed = true;
+      } catch (caught) {
+        failure = caught;
+      }
+    }
+    if (!installed.rootClosed) {
+      try {
+        await closeAnchoredProfileRoot(installed.bundle.root);
+        installed.rootClosed = true;
+      } catch (caught) {
+        failure ??= caught;
+      }
+    }
+    if (failure !== undefined) throw failure;
+  }
+
+  function closeInstalledAuthority(): Promise<void> {
+    if (authorityClosePromise !== null) return authorityClosePromise;
+    const installed = installedAuthority;
+    if (installed === null) return Promise.resolve();
+    const closePromise = Promise.resolve().then(() => closeAuthority(installed));
+    authorityClosePromise = closePromise;
+    void closePromise.then(
+      () => {
+        if (installedAuthority === installed) installedAuthority = null;
+        if (authorityClosePromise === closePromise) {
+          authorityClosePromise = null;
+        }
+      },
+      () => {
+        if (authorityClosePromise === closePromise) {
+          authorityClosePromise = null;
+        }
+      },
+    );
+    return closePromise;
+  }
 
   function abortReconciliation(): void {
     reconciliationFlight?.controller.abort();
@@ -505,7 +619,14 @@ export function createStartupState(
     activeWave = wave;
     void finishWave(wave);
     try {
-      Promise.resolve(drainRuntime(admission)).then(
+      const drainRuntimeAndAuthority = async (): Promise<void> => {
+        await drainRuntime(admission);
+        if (internalDeps === undefined) return;
+        admission.assertWaveActive();
+        await closeInstalledAuthority();
+        admission.assertWaveActive();
+      };
+      Promise.resolve(drainRuntimeAndAuthority()).then(
         () => drainOutcome.resolve(),
         (caught: unknown) => drainOutcome.reject(caught),
       );
@@ -515,12 +636,14 @@ export function createStartupState(
     return entry.outcome.promise;
   }
 
-  async function reconcile(
+  async function runReconciliation(
     input: ReconciliationRequestV1,
     execute: (
       request: ReconciliationRequestV1,
       admission: ReconciliationExecutionAdmission,
-    ) => Promise<ReconciliationResultV1>,
+      commit: (execution: ReconciliationExecutionResult) => void,
+      generation: ControlGenerationV1,
+    ) => Promise<ReconciliationExecutionResult>,
   ): Promise<ReconciliationResultV1> {
     const precheck = reconciliationRequestPrecheck(input);
     if (precheck === "too_large") {
@@ -622,13 +745,19 @@ export function createStartupState(
     reconciliationFlight = flight;
 
     const run = async (): Promise<void> => {
-      try {
-        admission.assertAdmitted();
-        const rawResult = await execute(request, admission);
+      let committedResult: ReconciliationResultV1 | null = null;
+      const commit = (execution: ReconciliationExecutionResult): void => {
+        if (committedResult !== null) {
+          throw error(
+            "reconciliation_execution_failed",
+            "reconciliation commit was repeated",
+          );
+        }
+        const authorityCandidate = execution.authorityInstall;
         admission.assertAdmitted();
         let result: ReconciliationResultV1;
         try {
-          result = reconciliationResultV1Schema.parse(rawResult);
+          result = reconciliationResultV1Schema.parse(execution.publicResult);
         } catch {
           throw error(
             "reconciliation_execution_failed",
@@ -647,6 +776,22 @@ export function createStartupState(
         }
         admission.assertAdmitted();
         const immutable = Object.freeze({ ...result });
+        if (authorityCandidate !== null) {
+          if (
+            installedAuthority !== null ||
+            internalDeps === undefined ||
+            !internalDeps.compareAndSwapInstall(
+              null,
+              authorityCandidate.bundle,
+            )
+          ) {
+            throw error(
+              "reconciliation_execution_failed",
+              "generation authority compare-and-swap failed",
+            );
+          }
+          installedAuthority = authorityCandidate;
+        }
         reconciliationCache = {
           generationNonce: generation.controlGenerationNonce,
           digest: request.snapshotDigest,
@@ -654,7 +799,18 @@ export function createStartupState(
         };
         status = "ready";
         if (reconciliationFlight === flight) reconciliationFlight = null;
-        outcome.resolve(immutable);
+        committedResult = immutable;
+      };
+      try {
+        admission.assertAdmitted();
+        const execution = await execute(
+          request,
+          admission,
+          commit,
+          generation,
+        );
+        if (committedResult === null) commit(execution);
+        outcome.resolve(committedResult!);
       } catch (caught) {
         if (reconciliationFlight === flight) {
           reconciliationFlight = null;
@@ -674,6 +830,122 @@ export function createStartupState(
       throw error("reconciliation_required", "reconciliation is not admitted");
     }
     return result;
+  }
+
+  function reconcile(
+    input: ReconciliationRequestV1,
+    execute: (
+      request: ReconciliationRequestV1,
+      admission: ReconciliationExecutionAdmission,
+    ) => Promise<ReconciliationResultV1>,
+  ): Promise<ReconciliationResultV1> {
+    return runReconciliation(input, async (request, admission) => ({
+      publicResult: await execute(request, admission),
+      authorityInstall: null,
+    }));
+  }
+
+  function reconcileWithAuthority(
+    input: ReconciliationRequestV1,
+    execute: (
+      request: ReconciliationRequestV1,
+      admission: ReconciliationExecutionAdmission,
+    ) => Promise<InternalReconciliationOutcome>,
+  ): Promise<ReconciliationResultV1> {
+    if (internalDeps === undefined) {
+      return Promise.reject(
+        error(
+          "reconciliation_filesystem_unsafe",
+          "internal reconciliation is not configured",
+        ),
+      );
+    }
+    return runReconciliation(
+      input,
+      async (request, admission, commit, generation) => {
+        if (
+          authorityInstallAttemptedGenerations.has(
+            request.controlGenerationNonce,
+          )
+        ) {
+          throw error(
+            "reconciliation_execution_failed",
+            "generation authority installation cannot be retried",
+          );
+        }
+        authorityInstallAttemptedGenerations.add(
+          request.controlGenerationNonce,
+        );
+        const opaqueOutcome = await execute(request, admission);
+        admission.assertAdmitted();
+        const binding: ReadyProfileRootBinding = Object.freeze({
+          processNonce,
+          controlGenerationNonce: request.controlGenerationNonce,
+          snapshotDigest: request.snapshotDigest,
+        });
+        return consumeInternalReconciliationOutcomeForStartup(
+          opaqueOutcome,
+          binding,
+          internalDeps.createProfileStore,
+          (install: InternalReconciliationStartupInstall) => {
+            admission.assertAdmitted();
+            let publicResult: ReconciliationResultV1;
+            try {
+              publicResult = Object.freeze(
+                reconciliationResultV1Schema.parse(install.publicResult),
+              );
+            } catch {
+              throw error(
+                "reconciliation_execution_failed",
+                "reconciliation returned an invalid result",
+              );
+            }
+            if (
+              publicResult.processNonce !== processNonce ||
+              publicResult.controlGenerationNonce !==
+                request.controlGenerationNonce ||
+              publicResult.snapshotDigest !== request.snapshotDigest
+            ) {
+              throw error(
+                "reconciliation_execution_failed",
+                "reconciliation result identity does not match",
+              );
+            }
+
+            admission.assertAdmitted();
+            if (install.sealedGenerations.length !== 0) {
+              transferSealedProfileGenerations(
+                install.root,
+                install.sealedGenerations,
+                generations =>
+                  attachSealedProfileGenerations(
+                    install.profileStore,
+                    generations,
+                  ),
+              );
+            }
+            const bundle: InstalledAuthorityBundle = Object.freeze({
+              generation: Object.freeze({ ...generation }),
+              result: publicResult,
+              authority: install.authority,
+              root: install.root,
+              profileStore: install.profileStore,
+              binding: Object.freeze({ ...binding }),
+            });
+            const execution = {
+              publicResult,
+              authorityInstall: {
+                bundle,
+                profileStoreClosed: false,
+                rootClosed: false,
+              },
+            };
+            commit(execution);
+            return execution;
+          },
+        );
+      },
+    );
   }
 
   function liveHealth(): LiveDiscoveryV1 {
@@ -739,9 +1011,12 @@ export function createStartupState(
     if (activeWave !== null) {
       failWave(activeWave, "drain_invariant_failed");
     }
+    if (internalDeps !== undefined) {
+      void closeInstalledAuthority().catch(() => undefined);
+    }
   }
 
-  return Object.freeze({
+  const admission: StartupAdmission = {
     processNonce,
     createControlGeneration,
     requireReady,
@@ -750,5 +1025,55 @@ export function createStartupState(
     readyHealth,
     reconcile,
     beginDraining,
+  };
+  if (internalDeps === undefined) return Object.freeze(admission);
+  const {
+    reconcile: _resultOnlyReconcile,
+    ...authorityAdmission
+  } = admission;
+  return Object.freeze({
+    ...authorityAdmission,
+    reconcileWithAuthority,
   });
+}
+
+type AuthorityStartupDependencies = {
+  randomBytes?: (size: number) => Buffer;
+  createProfileStore: InternalProfileStoreFactory;
+  compareAndSwapInstall: (
+    current: InstalledAuthorityBundle | null,
+    next: InstalledAuthorityBundle,
+  ) => boolean;
+};
+
+export function createStartupState(
+  deps: AuthorityStartupDependencies,
+): InternalStartupAdmission;
+export function createStartupState(
+  deps?: { randomBytes?: (size: number) => Buffer },
+): StartupAdmission;
+export function createStartupState(
+  deps:
+    | AuthorityStartupDependencies
+    | { randomBytes?: (size: number) => Buffer } = {},
+): StartupAdmission | InternalStartupAdmission {
+  if ("createProfileStore" in deps) {
+    if (typeof deps.compareAndSwapInstall !== "function") {
+      throw new TypeError("compareAndSwapInstall is required");
+    }
+    return createStartupStateImpl(deps, {
+      createProfileStore: deps.createProfileStore,
+      compareAndSwapInstall: deps.compareAndSwapInstall,
+    }) as InternalStartupAdmission;
+  }
+  return createStartupStateImpl(deps) as StartupAdmission;
+}
+
+export function createInternalStartupState(
+  deps: AuthorityStartupDependencies,
+): InternalStartupAdmission {
+  return createStartupStateImpl(deps, {
+    createProfileStore: deps.createProfileStore,
+    compareAndSwapInstall: deps.compareAndSwapInstall,
+  }) as InternalStartupAdmission;
 }

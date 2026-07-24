@@ -1,6 +1,18 @@
 import { Buffer } from "node:buffer";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  readlink,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type {
   CreateControlGenerationV1,
@@ -12,10 +24,23 @@ import {
   MAX_REPLAY_REQUEST_BYTES,
 } from "./contracts.js";
 import {
+  createInternalStartupState,
   createStartupState,
   type ControlGenerationRequestContext,
+  type InternalStartupAdmission,
+  type ReconciliationExecutionAdmission,
 } from "./startup-state.js";
 import { BrowserServiceError } from "./errors.js";
+import {
+  canonicalizeReconciliationSnapshot,
+  reconcileBrowserStateWithAuthority,
+  runWithReconciliationFilesystemTestContext,
+  type InternalReconciliationOutcome,
+} from "./reconciliation.js";
+import {
+  createProfileStore,
+  type ProfileStore,
+} from "./profile-store.js";
 
 const API_A = "11111111-1111-4111-8111-111111111111";
 const API_B = "22222222-2222-4222-8222-222222222222";
@@ -25,6 +50,41 @@ const KEY_B = Buffer.alloc(32, 2).toString("base64url");
 const KEY_C = Buffer.alloc(32, 3).toString("base64url");
 const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
+const EMPTY_SNAPSHOT_DIGEST =
+  canonicalizeReconciliationSnapshot([]).snapshotDigest;
+const authorityRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    authorityRoots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+
+async function authorityRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "startup-authority-"));
+  authorityRoots.push(root);
+  return root;
+}
+
+async function authorityDescriptorCount(root: string): Promise<number> {
+  const descriptors = await readdir("/proc/self/fd");
+  const targets = await Promise.all(
+    descriptors.map((descriptor) =>
+      readlink(`/proc/self/fd/${descriptor}`).catch(() => ""),
+    ),
+  );
+  return targets.filter((target) => target.startsWith(root)).length;
+}
+
+function profileStoreFixture() {
+  const close = vi.fn(async () => undefined);
+  return {
+    close,
+    store: { close } as unknown as ProfileStore,
+  };
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -602,6 +662,495 @@ describe("startup admission", () => {
       ),
     ).rejects.toMatchObject({ category: "control_generation_mismatch" });
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  test("atomically installs a genuine reconciliation authority before ready", async () => {
+    const root = await authorityRoot();
+    const fixture = profileStoreFixture();
+    const installOrder: string[] = [];
+    let state!: InternalStartupAdmission;
+    const createProfileStore = vi.fn(async (_root, binding, sealedCount) => {
+      installOrder.push("create-store");
+      expect(state.readyHealth()).toMatchObject({
+        status: "unready",
+      });
+      expect(binding).toEqual({
+        processNonce: state.processNonce,
+        controlGenerationNonce: expect.any(String),
+        snapshotDigest: EMPTY_SNAPSHOT_DIGEST,
+      });
+      expect(sealedCount).toBe(0);
+      return fixture.store;
+    });
+    const compareAndSwapInstall = vi.fn(() => true);
+    state = createStartupState({
+      randomBytes: () => Buffer.alloc(32, 31),
+      createProfileStore,
+      compareAndSwapInstall,
+    });
+    if (false) {
+      // @ts-expect-error Authority startup never exposes result-only reconcile.
+      void state.reconcile;
+    }
+    const generation = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      generation.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+
+    const result = await state.reconcileWithAuthority(
+      input,
+      async (requestValue, admission) => {
+        installOrder.push("execute");
+        return reconcileBrowserStateWithAuthority(root, requestValue, {
+          admission,
+        });
+      },
+    );
+    installOrder.push("ready");
+
+    expect(result).toEqual(reconciliationResult(input));
+    expect(installOrder).toEqual(["execute", "create-store", "ready"]);
+    expect(createProfileStore).toHaveBeenCalledOnce();
+    expect(compareAndSwapInstall).toHaveBeenCalledOnce();
+    expect("reconcile" in state).toBe(false);
+    const [current, bundle] = compareAndSwapInstall.mock.calls[0]!;
+    expect(current).toBeNull();
+    expect(Object.isFrozen(bundle)).toBe(true);
+    expect(Object.isFrozen(bundle.generation)).toBe(true);
+    expect(Object.isFrozen(bundle.result)).toBe(true);
+    expect(Object.isFrozen(bundle.binding)).toBe(true);
+    expect(bundle).toMatchObject({
+      generation,
+      result,
+      profileStore: fixture.store,
+      binding: {
+        processNonce: state.processNonce,
+        controlGenerationNonce: generation.controlGenerationNonce,
+        snapshotDigest: EMPTY_SNAPSHOT_DIGEST,
+      },
+    });
+    expect(state.requireReady(generation)).toEqual({
+      processNonce: state.processNonce,
+      controlGenerationNonce: generation.controlGenerationNonce,
+      snapshotDigest: EMPTY_SNAPSHOT_DIGEST,
+    });
+  });
+
+  test("requires compare-and-swap for production authority startup", () => {
+    expect(() =>
+      createStartupState({
+        createProfileStore: async () => profileStoreFixture().store,
+      } as Parameters<typeof createStartupState>[0]),
+    ).toThrow("compareAndSwapInstall is required");
+  });
+
+  test("rejects a forged reconciliation outcome without installing ready", async () => {
+    const createProfileStore = vi.fn(async () => profileStoreFixture().store);
+    const state = createInternalStartupState({
+      createProfileStore,
+      compareAndSwapInstall: () => true,
+    });
+    const generation = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      generation.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    const execute = vi.fn(async () =>
+      Object.freeze({}) as InternalReconciliationOutcome,
+    );
+
+    await expect(
+      state.reconcileWithAuthority(input, execute),
+    ).rejects.toMatchObject({ category: "reconciliation_filesystem_unsafe" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(createProfileStore).not.toHaveBeenCalled();
+    expect(state.readyHealth()).toMatchObject({
+      status: "unready",
+      category: "reconciliation_required",
+    });
+  });
+
+  test("store construction failure leaves authority uninstalled without reconstruction", async () => {
+    const root = await authorityRoot();
+    const createProfileStore = vi
+      .fn()
+      .mockRejectedValue(new Error("store construction failed"));
+    const state = createInternalStartupState({
+      createProfileStore,
+      compareAndSwapInstall: () => true,
+    });
+    const generation = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      generation.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    const execute = (
+      requestValue: ReconciliationRequestV1,
+      admission: ReconciliationExecutionAdmission,
+    ) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, { admission });
+
+    await expect(
+      state.reconcileWithAuthority(input, execute),
+    ).rejects.toBeInstanceOf(Error);
+    expect(state.readyHealth()).toMatchObject({
+      status: "unready",
+      category: "reconciliation_required",
+    });
+    expect(() => state.requireReady(generation)).toThrow(
+      expect.objectContaining({ category: "reconciliation_required" }),
+    );
+
+    await expect(
+      state.reconcileWithAuthority(input, execute),
+    ).rejects.toMatchObject({
+      category: "reconciliation_execution_failed",
+    });
+    expect(createProfileStore).toHaveBeenCalledOnce();
+    expect(() => state.requireReady(generation)).toThrow(
+      expect.objectContaining({ category: "reconciliation_required" }),
+    );
+    expect(await authorityDescriptorCount(root)).toBe(0);
+  });
+
+  test("CAS failure closes the one uninstalled store and exposes no bundle", async () => {
+    const root = await authorityRoot();
+    const fixture = profileStoreFixture();
+    const createProfileStore = vi.fn(async () => fixture.store);
+    const compareAndSwapInstall = vi.fn(() => false);
+    const state = createInternalStartupState({
+      createProfileStore,
+      compareAndSwapInstall,
+    });
+    const generation = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      generation.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+
+    await expect(
+      state.reconcileWithAuthority(input, (requestValue, admission) =>
+        reconcileBrowserStateWithAuthority(root, requestValue, { admission }),
+      ),
+    ).rejects.toMatchObject({
+      category: "reconciliation_execution_failed",
+    });
+    expect(createProfileStore).toHaveBeenCalledOnce();
+    expect(compareAndSwapInstall).toHaveBeenCalledOnce();
+    expect(fixture.close).toHaveBeenCalledOnce();
+    expect(state.readyHealth()).toMatchObject({
+      status: "unready",
+      category: "reconciliation_required",
+    });
+    expect(() => state.requireReady(generation)).toThrow(
+      expect.objectContaining({ category: "reconciliation_required" }),
+    );
+    expect(await authorityDescriptorCount(root)).toBe(0);
+  });
+
+  test("rollover remains unready until later authority reconciliation", async () => {
+    const root = await authorityRoot();
+    const stores = [profileStoreFixture(), profileStoreFixture()];
+    const createProfileStore = vi
+      .fn()
+      .mockResolvedValueOnce(stores[0]!.store)
+      .mockResolvedValueOnce(stores[1]!.store);
+    const state = createInternalStartupState({
+      randomBytes: (() => {
+        let byte = 41;
+        return () => Buffer.alloc(32, byte++);
+      })(),
+      createProfileStore,
+      compareAndSwapInstall: () => true,
+    });
+    const first = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const firstInput = reconciliationRequest(
+      state.processNonce,
+      first.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(firstInput, (requestValue, admission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, { admission }),
+    );
+    expect(state.readyHealth().status).toBe("ready");
+
+    const second = await state.createControlGeneration(
+      request(state.processNonce, API_B, KEY_B),
+      context().value,
+      async () => undefined,
+    );
+    expect(stores[0]!.close).toHaveBeenCalledOnce();
+    expect(state.readyHealth()).toMatchObject({
+      status: "unready",
+      controlGenerationNonce: second.controlGenerationNonce,
+      category: "reconciliation_required",
+    });
+    expect(() => state.requireReady(second)).toThrow(
+      expect.objectContaining({ category: "reconciliation_required" }),
+    );
+
+    const secondInput = reconciliationRequest(
+      state.processNonce,
+      second.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(secondInput, (requestValue, admission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, { admission }),
+    );
+    expect(createProfileStore).toHaveBeenCalledTimes(2);
+    expect(state.requireReady(second).snapshotDigest).toBe(
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+  });
+
+  test("control handoff retries unverified generation cleanup", async () => {
+    const root = await authorityRoot();
+    let installedStore: ProfileStore | undefined;
+    const state = createInternalStartupState({
+      randomBytes: (() => {
+        let byte = 51;
+        return () => Buffer.alloc(32, byte++);
+      })(),
+      async createProfileStore(anchoredRoot, binding) {
+        installedStore = await createProfileStore({
+          root: anchoredRoot,
+          binding,
+          randomUUID: () => API_C,
+        });
+        return installedStore;
+      },
+      compareAndSwapInstall: () => true,
+    });
+    const first = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      first.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(input, (requestValue, activeAdmission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, {
+        admission: activeAdmission,
+      }),
+    );
+    await installedStore!.createWorkingCopy(API_A, null, "snapshot", API_B);
+    let injected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async closeOperation(point, close) {
+            if (!injected && point === "generation") {
+              injected = true;
+              throw new Error("injected handoff generation close failure");
+            }
+            await close();
+          },
+        },
+        () => state.createControlGeneration(
+          request(state.processNonce, API_B, KEY_B),
+          context().value,
+          async () => undefined,
+        ),
+      ),
+    ).rejects.toBeDefined();
+    expect(injected).toBe(true);
+    await expect(
+      state.createControlGeneration(
+        request(state.processNonce, API_C, KEY_C),
+        context().value,
+        async () => undefined,
+      ),
+    ).resolves.toMatchObject({ apiInstanceId: API_C });
+  });
+
+  test("control handoff drains root-owned partial create cleanup", async () => {
+    const root = await authorityRoot();
+    let installedStore: ProfileStore | undefined;
+    const state = createInternalStartupState({
+      randomBytes: (() => {
+        let byte = 61;
+        return () => Buffer.alloc(32, byte++);
+      })(),
+      async createProfileStore(anchoredRoot, binding) {
+        installedStore = await createProfileStore({
+          root: anchoredRoot,
+          binding,
+          randomUUID: () => API_C,
+        });
+        return installedStore;
+      },
+      compareAndSwapInstall: () => true,
+    });
+    const first = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      first.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(input, (requestValue, activeAdmission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, {
+        admission: activeAdmission,
+      }),
+    );
+    const baseline = await authorityDescriptorCount(root);
+    let primaryInjected = false;
+    let closeRejected = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(point) {
+            if (!primaryInjected && point === "profile-mkdir-generation") {
+              primaryInjected = true;
+              throw new Error("injected partial bind failure");
+            }
+          },
+          async closeOperation(point, close) {
+            if (!closeRejected && point === "profile-create-cleanup") {
+              closeRejected = true;
+              throw new Error("injected actual close rejection");
+            }
+            await close();
+          },
+        },
+        () => installedStore!.createWorkingCopy(
+          API_A,
+          null,
+          "snapshot",
+          API_B,
+        ),
+      ),
+    ).rejects.toMatchObject({ cleanupUnverified: true });
+    expect(primaryInjected).toBe(true);
+    expect(closeRejected).toBe(true);
+    expect(await authorityDescriptorCount(root)).toBeGreaterThan(baseline);
+    await expect(
+      state.createControlGeneration(
+        request(state.processNonce, API_B, KEY_B),
+        context().value,
+        async () => undefined,
+      ),
+    ).resolves.toMatchObject({ apiInstanceId: API_B });
+    expect(await authorityDescriptorCount(root)).toBe(0);
+  });
+
+  test("control handoff fail-stops on an unverifiable created leaf", async () => {
+    const root = await authorityRoot();
+    let installedStore: ProfileStore | undefined;
+    const state = createInternalStartupState({
+      randomBytes: (() => {
+        let byte = 71;
+        return () => Buffer.alloc(32, byte++);
+      })(),
+      async createProfileStore(anchoredRoot, binding) {
+        installedStore = await createProfileStore({
+          root: anchoredRoot,
+          binding,
+          randomUUID: () => API_C,
+        });
+        return installedStore;
+      },
+      compareAndSwapInstall: () => true,
+    });
+    const first = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const input = reconciliationRequest(
+      state.processNonce,
+      first.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(input, (requestValue, activeAdmission) =>
+      reconcileBrowserStateWithAuthority(root, requestValue, {
+        admission: activeAdmission,
+      }),
+    );
+    const created = join(root, "profiles", API_A, "working", API_C);
+    const displaced = `${created}.unverified`;
+    let identityRejected = false;
+    let replaced = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            if (!identityRejected && point === "profile-lstat-created-generation") {
+              identityRejected = true;
+              throw new Error("injected creation identity failure");
+            }
+          },
+          async beforeCleanup(point) {
+            if (!replaced && point === "profile-create-cleanup-pin-lstat") {
+              replaced = true;
+              await rename(created, displaced);
+              await mkdir(created, { mode: 0o700 });
+              await writeFile(join(created, "outside"), "safe");
+            }
+          },
+        },
+        () => installedStore!.createWorkingCopy(
+          API_A,
+          null,
+          "snapshot",
+          API_B,
+        ),
+      ),
+    ).rejects.toMatchObject({ cleanupUnverified: true });
+    expect(identityRejected).toBe(true);
+    expect(replaced).toBe(true);
+    await expect(
+      state.createControlGeneration(
+        request(state.processNonce, API_B, KEY_B),
+        context().value,
+        async () => undefined,
+      ),
+    ).rejects.toMatchObject({
+      category: "control_generation_drain_failed",
+      detail: "close_failed",
+    });
+    expect(await readFile(join(created, "outside"), "utf8")).toBe("safe");
+    await rm(created, { recursive: true });
+    await rm(displaced, { recursive: true });
+    await expect(
+      state.createControlGeneration(
+        request(state.processNonce, API_C, KEY_C),
+        context().value,
+        async () => undefined,
+      ),
+    ).resolves.toMatchObject({ apiInstanceId: API_C });
+    expect(await authorityDescriptorCount(root)).toBe(0);
   });
 
   test("caches exact success and rejects a conflicting digest", async () => {

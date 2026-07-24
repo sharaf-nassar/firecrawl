@@ -144,6 +144,7 @@ export type ProfileStore = Readonly<{
 const storeRecords = new WeakMap<object, StoreRecord>();
 const workRecords = new WeakMap<object, WorkRecord>();
 const preparedRecords = new WeakMap<object, PreparedRecord>();
+const attachedGenerationOwners = new WeakMap<object, StoreRecord>();
 const MAX_FINALIZED_HISTORY = 256;
 
 function assertUuid(value: string, label: string): void {
@@ -182,6 +183,32 @@ function requireStore(store: ProfileStore): StoreRecord {
     );
   }
   return record;
+}
+
+export function attachSealedProfileGenerations(
+  store: ProfileStore,
+  generations: readonly BoundProfileGeneration[],
+): void {
+  const record = requireStore(store);
+  const unique = new Set(generations);
+  if (unique.size !== generations.length) {
+    throw new ProfileStoreError(
+      "profile_prepare_failed",
+      "sealed generation attachment is duplicated",
+    );
+  }
+  for (const generation of generations) {
+    if (attachedGenerationOwners.has(generation as object)) {
+      throw new ProfileStoreError(
+        "profile_prepare_failed",
+        "sealed generation is already attached",
+      );
+    }
+  }
+  for (const generation of generations) {
+    attachedGenerationOwners.set(generation as object, record);
+    record.auxiliaryCapabilities.add(generation);
+  }
 }
 
 function requireWork(work: WorkingProfile): WorkRecord {
@@ -697,24 +724,18 @@ export async function createProfileStore(options: {
         );
       }
       live.state = "closing";
-      const targets = [
-        ...[...live.works]
-          .filter((work) => work.state !== "discarded")
-          .map((work) => ({
-            close: work.capability.close(),
-            settled: () => {
-              live.works.delete(work);
-              workRecords.delete(work.token as object);
-              if (work.prepared !== undefined) {
-                preparedRecords.delete(work.prepared as object);
-              }
-            },
-          })),
-        ...[...live.auxiliaryCapabilities].map((capability) => ({
-          close: capability.close(),
-          settled: () => live.auxiliaryCapabilities.delete(capability),
-        })),
-      ];
+      const targets = [...live.works]
+        .filter((work) => work.state !== "discarded")
+        .map((work) => ({
+          close: work.capability.close(),
+          settled: () => {
+            live.works.delete(work);
+            workRecords.delete(work.token as object);
+            if (work.prepared !== undefined) {
+              preparedRecords.delete(work.prepared as object);
+            }
+          },
+        }));
       const results = await Promise.allSettled(
         targets.map((target) => target.close),
       );
@@ -724,11 +745,22 @@ export async function createProfileStore(options: {
       const failures = results.filter(
         (result): result is PromiseRejectedResult =>
           result.status === "rejected",
-      );
+      ).map((failure) => failure.reason);
+      for (const capability of [
+        ...live.auxiliaryCapabilities,
+      ].reverse()) {
+        try {
+          await capability.close();
+          live.auxiliaryCapabilities.delete(capability);
+          attachedGenerationOwners.delete(capability as object);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
       if (failures.length !== 0) {
         live.state = "close_unverified";
         throw new AggregateError(
-          failures.map((failure) => failure.reason),
+          failures,
           "profile capability cleanup failed",
         );
       }

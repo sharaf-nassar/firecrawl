@@ -32,6 +32,7 @@ import {
   isAtomicControlLeafV1,
   isAtomicPayloadLeafV1,
   reduceAtomicPublication,
+  reduceAtomicStartupRecoveryV1,
   validateAtomicInventoryBoundsV1,
   type AtomicEffectObservationV1,
   type AtomicEffectRequestDraftV1,
@@ -63,6 +64,95 @@ const EVIDENCE: AtomicObjectEvidenceV1 = Object.freeze({
   evidenceDigest: createHash("sha256")
     .update(JSON.stringify(EVIDENCE_VALUE))
     .digest("hex"),
+});
+
+describe("startup recovery reducer", () => {
+  const topology = {
+    stableIntent: true,
+    intentTemp: false,
+    wrapper: true,
+    privateSource: true,
+    publicSource: false,
+    publicTarget: "absent" as const,
+    manifest: "absent" as const,
+  };
+
+  test.each(["allocated", "building", "aborting_prepublication"] as const)(
+    "aborts %s with never-attempted classification",
+    phase => {
+      expect(
+        reduceAtomicStartupRecoveryV1({
+          kind: "working",
+          phase,
+          classification: null,
+          authorizedByFreshSnapshot: false,
+          topology,
+        }),
+      ).toEqual({
+        kind: "abort_prepublication",
+        classification: "never_attempted",
+      });
+    },
+  );
+
+  test.each([
+    ["scaffold", true, "adopt"],
+    ["prepare", true, "adopt"],
+    ["finalize", true, "adopt"],
+    ["working", true, "release_to_reconciliation"],
+    ["finalize", false, "release_to_reconciliation"],
+  ] as const)("resolves published %s authority", (kind, authorized, disposition) => {
+    expect(
+      reduceAtomicStartupRecoveryV1({
+        kind,
+        phase: "manifest_published",
+        classification: "published",
+        authorizedByFreshSnapshot: authorized,
+        topology: {
+          ...topology,
+          publicTarget: "match",
+          manifest: "stable",
+        },
+      }),
+    ).toEqual({ kind: "recover_published", disposition });
+  });
+
+  test("recovers ready after native success from observed locations", () => {
+    expect(
+      reduceAtomicStartupRecoveryV1({
+        kind: "prepare",
+        phase: "ready",
+        classification: null,
+        authorizedByFreshSnapshot: true,
+        topology: {
+          ...topology,
+          privateSource: false,
+          publicTarget: "match",
+        },
+      }),
+    ).toEqual({ kind: "recover_published", disposition: "adopt" });
+  });
+
+  test("fails closed for ambiguous and orphan topology", () => {
+    expect(
+      reduceAtomicStartupRecoveryV1({
+        kind: "finalize",
+        phase: "renamed",
+        classification: "published",
+        authorizedByFreshSnapshot: true,
+        topology: { ...topology, publicTarget: "other" },
+      }),
+    ).toEqual({ kind: "fail_stop", reason: "ambiguous" });
+    expect(
+      reduceAtomicStartupRecoveryV1({
+        kind: "working",
+        phase: "building",
+        classification: null,
+        authorizedByFreshSnapshot: false,
+        topology: { ...topology, stableIntent: false, intentTemp: true },
+      }),
+    ).toEqual({ kind: "fail_stop", reason: "orphan_temp" });
+  });
 });
 
 function evidence(
@@ -3549,14 +3639,26 @@ describe("manifest planned recovery", () => {
     });
   });
 
-  test("rejects noncanonical planned names, bytes, size, and count", () => {
+  test("accepts an empty abort manifest and rejects invalid bindings", () => {
     const binding = manifestBinding();
+    const emptyBytes = new TextEncoder().encode("{}\n");
+    expect(() =>
+      createAtomicManifestPlannedRecoveryState({
+        ...binding,
+        canonicalBytes: emptyBytes,
+        manifestSha256: createHash("sha256")
+          .update(emptyBytes)
+          .digest("hex"),
+        manifestByteSize: emptyBytes.byteLength,
+        entryCount: 0,
+      }),
+    ).not.toThrow();
     for (const invalid of [
       { ...binding, stableLeaf: "other.identities.json" },
       { ...binding, tempLeaf: `${OPERATION_ID}.identities.not-a-uuid.tmp` },
       { ...binding, manifestSha256: HASH },
       { ...binding, manifestByteSize: binding.manifestByteSize + 1 },
-      { ...binding, entryCount: 0 },
+      { ...binding, entryCount: -1 },
     ]) {
       expect(() =>
         createAtomicManifestPlannedRecoveryState(invalid),

@@ -33,6 +33,8 @@ import type {
   AtomicProtectedCleanupStateV1,
   AtomicProtectedCleanupTerminalObservationV1,
   AtomicProtectedCleanupTerminalStepV1,
+  AtomicStartupRecoveryDecisionV1,
+  AtomicStartupRecoveryTopologyV1,
   FlightEffectId,
   FlightPartialCreateId,
   FlightSemanticId,
@@ -49,6 +51,7 @@ import {
   ATOMIC_MAX_SCRATCH_METADATA_FILES,
   ATOMIC_MAX_SCRATCH_MANIFEST_BYTES,
   ATOMIC_MAX_SCRATCH_OTHER_METADATA_BYTES,
+  ATOMIC_MAX_STABLE_METADATA_FILES,
   ATOMIC_MAX_STABLE_MANIFEST_BYTES,
   ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES,
   assertAtomicProfileSchemaV1,
@@ -67,8 +70,15 @@ import {
   isAtomicCanaryProofV1,
   isAtomicPayloadLeafV1,
   reduceAtomicPublication,
+  reduceAtomicStartupRecoveryV1,
 } from "./atomic-directory-publication.js";
 import { loadAtomicDirectoryPublicationNative } from "./atomic-directory-publication-native.js";
+import {
+  createAtomicPublicationObservability,
+  type AtomicPublicationCounter,
+  type AtomicPublicationObservability,
+  type AtomicPublicationObservabilitySink,
+} from "./atomic-publication-observability.js";
 import {
   encodeAtomicPublishIntent,
   encodeCleanupIdentityManifest,
@@ -94,6 +104,7 @@ import {
   type ReconciliationResultV1,
 } from "./contracts.js";
 import { BrowserServiceError } from "./errors.js";
+import type { ProfileStore } from "./profile-store.js";
 import type { ReconciliationExecutionAdmission } from "./startup-state.js";
 
 const CHECKPOINT_MAX_BYTES = 2 * 1024 * 1024;
@@ -144,6 +155,7 @@ export type ReconciliationDependencies = {
   maxManagedEntries?: number;
   correlationId?: string;
   logger?: Pick<Logger, "info" | "error">;
+  atomicPublicationSink?: AtomicPublicationObservabilitySink;
 };
 
 export type ReconciliationFilesystemTestContext = {
@@ -185,6 +197,12 @@ export type ReconciliationFilesystemTestContext = {
   ) => void;
   atomicOpenFlags?: (point: string, flags: number, mode?: number) => void;
   atomicOperationCompleted?: (point: string) => void;
+  sealedGenerationClosing?: (locator: ProfileGenerationLocator) => void;
+  atomicStartupRecoveryDecision?: (
+    operationId: string,
+    topology: AtomicStartupRecoveryTopologyV1,
+    decision: AtomicStartupRecoveryDecisionV1,
+  ) => void;
   atomicProtectedCleanupObservation?: (
     observation:
       | AtomicProtectedCleanupObservationV1
@@ -382,6 +400,21 @@ export type InternalReconciliationInstall = Readonly<{
   authority: InstalledReconciledAuthority;
   root: AnchoredProfileRoot;
 }>;
+
+export type InternalReconciliationStartupInstall =
+  InternalReconciliationInstall &
+    Readonly<{
+      binding: ReadyProfileRootBinding;
+      profileStore: ProfileStore;
+      sealedGenerationCount: number;
+      sealedGenerations: readonly BoundProfileGeneration[];
+    }>;
+
+export type InternalReconciliationProfileStoreFactory = (
+  root: AnchoredProfileRoot,
+  binding: ReadyProfileRootBinding,
+  sealedGenerationCount: number,
+) => Promise<ProfileStore>;
 
 export type ValidatedPersistentChromiumOptions = NonNullable<
   Parameters<typeof chromium.launchPersistentContext>[1]
@@ -2046,7 +2079,18 @@ async function validateAuthorities(
   root: AnchoredRoot,
   references: readonly ReconciliationReferenceV1[],
   budget: Budget,
+  rootRecord?: RootCapabilityRecord,
 ): Promise<Set<string>> {
+  const sealedByPath = new Map<string, GenerationCapabilityRecord>();
+  if (rootRecord !== undefined) {
+    for (const generation of rootRecord.sealedGenerations.values()) {
+      const record = requireGeneration(generation);
+      sealedByPath.set(
+        `profiles/${record.locator.profileId}/${record.locator.state}/${record.locator.generationId}`,
+        record,
+      );
+    }
+  }
   const retained = new Set<string>();
   for (const reference of references) {
     if (
@@ -2087,7 +2131,11 @@ async function validateAuthorities(
       assertProfilePath(reference.path);
       let tree: CanonicalProfileTree;
       try {
-        tree = await hashProfileTree(root, reference.path, budget);
+        const sealed = sealedByPath.get(reference.path);
+        tree =
+          sealed === undefined
+            ? await hashProfileTree(root, reference.path, budget)
+            : await heldProfileHash(sealed);
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
           throw err("reconciliation_reference_missing", "authority is missing");
@@ -2311,6 +2359,7 @@ async function removeHeldDeletionTombstone(
 async function enumerateCandidates(
   root: AnchoredRoot,
   budget: Budget,
+  excludedProfilePaths: ReadonlySet<string> = new Set(),
 ): Promise<{ candidates: Candidate[]; namespaces: Set<string> }> {
   const result: Candidate[] = [];
   const top = await root.readdir(root.handle, budget);
@@ -2444,10 +2493,13 @@ async function enumerateCandidates(
         if (!generation.isDirectory() || !UUID.test(generation.name)) {
           throw err("reconciliation_filesystem_unsafe", "unknown generation");
         }
+        const generationPath =
+          `profiles/${profile.name}/${state.name}/${generation.name}`;
+        if (excludedProfilePaths.has(generationPath)) continue;
         result.push(
           await profileCandidate(
             root,
-            `profiles/${profile.name}/${state.name}/${generation.name}`,
+            generationPath,
             budget,
           ),
         );
@@ -5575,7 +5627,7 @@ function classifyRequest(
 }
 
 async function reconcileBrowserStateCore(
-  canonicalRoot: string,
+  rootRecord: RootCapabilityRecord,
   input: ReconciliationRequestV1,
   deps: ReconciliationDependencies,
   sealEvidence?: (evidence: ReconciledRootEvidence) => void,
@@ -5584,7 +5636,7 @@ async function reconcileBrowserStateCore(
   let state = "validating";
   let retained = 0;
   let removed = 0;
-  let root: AnchoredRoot | undefined;
+  const root = rootRecord.anchored;
   try {
     assertAdmitted(deps.admission);
     const request = classifyRequest(input);
@@ -5597,16 +5649,26 @@ async function reconcileBrowserStateCore(
       throw err("reconciliation_snapshot_invalid", "entry bound is invalid");
     }
     const budget = new Budget(maximum);
-    root = await openAnchoredRoot(canonicalRoot, deps.admission);
+    const intentOwnedPaths = new Set(
+      [...rootRecord.sealedGenerations.values()].map(generation => {
+        const locator = requireGeneration(generation).locator;
+        return `profiles/${locator.profileId}/${locator.state}/${locator.generationId}`;
+      }),
+    );
     const authoritativePaths = await validateAuthorities(
       root,
       request.references,
       budget,
+      rootRecord,
     );
     retained = authoritativePaths.size;
 
     state = "recovering";
-    const enumeration = await enumerateCandidates(root, budget);
+    const enumeration = await enumerateCandidates(
+      root,
+      budget,
+      intentOwnedPaths,
+    );
     const allCandidates = enumeration.candidates;
     const quarantinePresent = enumeration.namespaces.has("quarantine");
     const records = await enumerateManifests(root, budget, quarantinePresent);
@@ -5844,8 +5906,6 @@ async function reconcileBrowserStateCore(
       }),
     );
     throw actual;
-  } finally {
-    if (root !== undefined) await root.close();
   }
 }
 
@@ -5867,6 +5927,8 @@ type OutcomeRecord = {
   result: ReconciliationResultV1;
   evidence: ReconciledRootEvidence;
   admission: ReconciliationExecutionAdmission;
+  observability: AtomicPublicationObservability | null;
+  root: AnchoredProfileRoot;
   retainedCleanup?:
     | { kind: "root"; root: AnchoredProfileRoot }
     | { kind: "anchored"; anchored: AnchoredRoot };
@@ -5898,6 +5960,7 @@ type RootCapabilityRecord = {
   childDrainWaiters: Set<() => void>;
   authorities: Set<AuthorityRecord>;
   partialCreateCleanups: Set<PartialCreateCleanupRecord>;
+  observability: AtomicPublicationObservability | null;
 };
 
 type GenerationCapabilityRecord = {
@@ -6056,58 +6119,104 @@ function sameReadyBinding(
   );
 }
 
-async function reacquireRootFromEvidence(
-  evidence: ReconciledRootEvidence,
-  admission: ReconciliationExecutionAdmission,
-): Promise<AnchoredRoot> {
-  const names = evidence.canonicalAbsoluteComponents;
-  if (names.length < 2 || names[0] !== path.parse(path.sep).root) {
-    throw unsafeCapability("reconciled root evidence is invalid");
-  }
-  const canonical = path.join(path.sep, ...names.slice(1));
-  const anchored = await openAnchoredRoot(canonical, admission);
-  try {
-    const current = anchored.evidence(evidence.binding);
-    if (
-      JSON.stringify(current.canonicalAbsoluteComponents) !==
-        JSON.stringify(evidence.canonicalAbsoluteComponents) ||
-      JSON.stringify(current.componentIdentities) !==
-        JSON.stringify(evidence.componentIdentities)
-    ) {
-      throw unsafeCapability("reconciled root authority changed");
-    }
-    return anchored;
-  } catch (error) {
-    await anchored.close();
-    throw error;
-  }
-}
-
 export async function reconcileBrowserStateWithAuthority(
   canonicalRoot: string,
   input: ReconciliationRequestV1,
   deps: ReconciliationDependencies,
 ): Promise<InternalReconciliationOutcome> {
-  let evidence: ReconciledRootEvidence | undefined;
-  const result = await reconcileBrowserStateCore(
-    canonicalRoot,
-    input,
-    deps,
-    (sealed) => {
-      evidence = sealed;
-    },
-  );
-  if (evidence === undefined) {
-    throw unsafeCapability("reconciliation authority was not sealed");
+  const observability =
+    deps.atomicPublicationSink === undefined
+      ? null
+      : createAtomicPublicationObservability(deps.atomicPublicationSink);
+  if (observability !== null) {
+    let result: "ready" | "unsupported" | "failed" = "ready";
+    let compiledNapiVersion = 0;
+    try {
+      compiledNapiVersion = loadAtomicDirectoryPublicationNative().napiVersion;
+    } catch {
+      result = "failed";
+    }
+    const runtimeNapiVersion = Number.parseInt(process.versions.napi ?? "0", 10);
+    observability.preflight({
+      platform: process.platform,
+      architecture: process.arch,
+      interfaceVersion: "1.0.0",
+      compiledNapiVersion,
+      runtimeNapiVersion: Number.isSafeInteger(runtimeNapiVersion)
+        ? runtimeNapiVersion
+        : 0,
+      filesystem: "unknown",
+      result,
+    });
+    if (result !== "ready") {
+      observability.count("unsupported");
+    }
   }
-  const token = Object.freeze({}) as InternalReconciliationOutcome;
-  outcomeRecords.set(token, {
-    state: "fresh",
-    result: Object.freeze({ ...result }),
-    evidence,
-    admission: deps.admission,
+  const classifiedInput = classifyRequest(input);
+  const binding: ReadyProfileRootBinding = Object.freeze({
+    processNonce: classifiedInput.processNonce,
+    controlGenerationNonce: classifiedInput.controlGenerationNonce,
+    snapshotDigest: classifiedInput.snapshotDigest,
   });
-  return token;
+  const anchored = await openAnchoredRoot(canonicalRoot, deps.admission);
+  const rootRecord: RootCapabilityRecord = {
+    state: "live",
+    token: null,
+    anchored,
+    binding,
+    children: new Set(),
+    sealedGenerations: new Map(),
+    acceptingOperations: true,
+    activeOperations: 0,
+    drainWaiters: new Set(),
+    childDrainWaiters: new Set(),
+    authorities: new Set(),
+    partialCreateCleanups: new Set(),
+    observability,
+  };
+  const root = Object.freeze({}) as AnchoredProfileRoot;
+  rootRecord.token = root;
+  rootCapabilityRecords.set(root as object, rootRecord);
+  try {
+    await recoverAtomicDurablePublicationsBeforeTask3(
+      root,
+      classifiedInput,
+      deps,
+      observability,
+    );
+    let evidence: ReconciledRootEvidence | undefined;
+    const result = await reconcileBrowserStateCore(
+      rootRecord,
+      classifiedInput,
+      deps,
+      (sealed) => {
+        evidence = sealed;
+      },
+    );
+    if (evidence === undefined) {
+      throw unsafeCapability("reconciliation authority was not sealed");
+    }
+    const token = Object.freeze({}) as InternalReconciliationOutcome;
+    outcomeRecords.set(token, {
+      state: "fresh",
+      result: Object.freeze({ ...result }),
+      evidence,
+      admission: deps.admission,
+      observability,
+      root,
+    });
+    return token;
+  } catch (error) {
+    try {
+      await closeAnchoredProfileRoot(root);
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        "reconciliation root cleanup failed",
+      );
+    }
+    throw error;
+  }
 }
 
 export async function consumeInternalReconciliationOutcome<T>(
@@ -6124,31 +6233,21 @@ export async function consumeInternalReconciliationOutcome<T>(
     throw unsafeCapability("reconciliation outcome is not consumable");
   }
   record.state = "consuming";
-  let anchored: AnchoredRoot | undefined;
-  let rootToken: AnchoredProfileRoot | undefined;
-  let authority: InstalledReconciledAuthority | undefined;
+  const rootToken = record.root;
   try {
     assertAdmitted(record.admission);
-    anchored = await reacquireRootFromEvidence(record.evidence, record.admission);
+    const rootRecord = requireRoot(rootToken);
+    const currentEvidence = rootRecord.anchored.evidence(rootRecord.binding);
+    if (
+      JSON.stringify(currentEvidence.canonicalAbsoluteComponents) !==
+        JSON.stringify(record.evidence.canonicalAbsoluteComponents) ||
+      JSON.stringify(currentEvidence.componentIdentities) !==
+        JSON.stringify(record.evidence.componentIdentities)
+    ) {
+      throw unsafeCapability("reconciled root authority changed");
+    }
     assertAdmitted(record.admission);
-    const rootRecord: RootCapabilityRecord = {
-      state: "live",
-      token: null,
-      anchored,
-      binding: Object.freeze({ ...binding }),
-      children: new Set(),
-      sealedGenerations: new Map(),
-      acceptingOperations: true,
-      activeOperations: 0,
-      drainWaiters: new Set(),
-      childDrainWaiters: new Set(),
-      authorities: new Set(),
-      partialCreateCleanups: new Set(),
-    };
-    rootToken = Object.freeze({}) as AnchoredProfileRoot;
-    rootRecord.token = rootToken;
-    rootCapabilityRecords.set(rootToken, rootRecord);
-    authority = Object.freeze({}) as InstalledReconciledAuthority;
+    const authority = Object.freeze({}) as InstalledReconciledAuthority;
     const authorityRecord: AuthorityRecord = {
       state: "live",
       root: rootRecord,
@@ -6167,24 +6266,13 @@ export async function consumeInternalReconciliationOutcome<T>(
     return result;
   } catch (error) {
     record.state = "consumed";
-    const retainedCleanup =
-      rootToken !== undefined
-        ? ({ kind: "root", root: rootToken } as const)
-        : anchored !== undefined
-          ? ({ kind: "anchored", anchored } as const)
-          : undefined;
+    const retainedCleanup = { kind: "root", root: rootToken } as const;
     try {
-      if (retainedCleanup?.kind === "root") {
-        await closeAnchoredProfileRoot(retainedCleanup.root);
-      } else if (retainedCleanup?.kind === "anchored") {
-        await retainedCleanup.anchored.close();
-      }
+      await closeAnchoredProfileRoot(retainedCleanup.root);
     } catch (closeError) {
-      if (retainedCleanup !== undefined) {
-        record.state = "cleanup_unverified";
-        record.retainedCleanup = retainedCleanup;
-        retainedOutcomeCleanupRecords.add(record);
-      }
+      record.state = "cleanup_unverified";
+      record.retainedCleanup = retainedCleanup;
+      retainedOutcomeCleanupRecords.add(record);
       throw new AggregateError(
         [error, closeError],
         "reconciliation outcome cleanup failed",
@@ -6192,6 +6280,67 @@ export async function consumeInternalReconciliationOutcome<T>(
     }
     throw error;
   }
+}
+
+export async function consumeInternalReconciliationOutcomeForStartup<T>(
+  outcome: InternalReconciliationOutcome,
+  binding: ReadyProfileRootBinding,
+  createProfileStore: InternalReconciliationProfileStoreFactory,
+  compareAndSwapInstall: (
+    install: InternalReconciliationStartupInstall,
+  ) => T,
+): Promise<T> {
+  if (
+    typeof createProfileStore !== "function" ||
+    typeof compareAndSwapInstall !== "function"
+  ) {
+    throw unsafeCapability("reconciliation startup consumer is invalid");
+  }
+  return consumeInternalReconciliationOutcome(
+    outcome,
+    binding,
+    async install => {
+      if (
+        install.publicResult.processNonce !== binding.processNonce ||
+        install.publicResult.controlGenerationNonce !==
+          binding.controlGenerationNonce ||
+        install.publicResult.snapshotDigest !== binding.snapshotDigest
+      ) {
+        throw unsafeCapability(
+          "reconciliation startup result identity does not match",
+        );
+      }
+      const rootRecord = requireRoot(install.root);
+      const sealedGenerationCount = rootRecord.sealedGenerations.size;
+      const sealedGenerations = Object.freeze([
+        ...rootRecord.sealedGenerations.values(),
+      ]);
+      let profileStore: ProfileStore | null = null;
+      let installed = false;
+      try {
+        profileStore = await createProfileStore(
+          install.root,
+          binding,
+          sealedGenerationCount,
+        );
+        assertAdmitted(rootRecord.anchored.admission);
+        const bundle = Object.freeze({
+          ...install,
+          binding: Object.freeze({ ...binding }),
+          profileStore,
+          sealedGenerationCount,
+          sealedGenerations,
+        });
+        const result = compareAndSwapInstall(bundle);
+        installed = true;
+        return result;
+      } finally {
+        if (!installed && profileStore !== null) {
+          await profileStore.close();
+        }
+      }
+    },
+  );
 }
 
 async function drainFailedReconciliationOutcomeCleanups(): Promise<void> {
@@ -6289,7 +6438,18 @@ export async function closeAnchoredProfileRoot(
     // resources. Descriptor release must therefore remain possible after
     // revocation; only operational capability use is admission-gated.
     await waitCapabilityDrain(record);
-    for (const generation of record.sealedGenerations.values()) {
+    for (const generation of [
+      ...record.sealedGenerations.values(),
+    ].reverse()) {
+      const generationRecord = generationCapabilityRecords.get(
+        generation as object,
+      );
+      if (generationRecord === undefined) {
+        throw unsafeCapability("sealed profile generation is unavailable");
+      }
+      filesystemTestContext
+        .getStore()
+        ?.sealedGenerationClosing?.(generationRecord.locator);
       await generation.close();
     }
     record.sealedGenerations.clear();
@@ -6303,6 +6463,32 @@ export async function closeAnchoredProfileRoot(
   } catch (error) {
     record.state = "close_unverified";
     throw error;
+  }
+}
+
+export function transferSealedProfileGenerations(
+  root: AnchoredProfileRoot,
+  generations: readonly BoundProfileGeneration[],
+  attach: (generations: readonly BoundProfileGeneration[]) => void,
+): void {
+  if (typeof attach !== "function") {
+    throw unsafeCapability("sealed generation attachment is invalid");
+  }
+  const record = requireRoot(root);
+  const requested = new Set(generations);
+  if (requested.size !== generations.length) {
+    throw unsafeCapability("sealed generation transfer is duplicated");
+  }
+  const entries = [...record.sealedGenerations.entries()].filter(([, token]) =>
+    requested.has(token),
+  );
+  if (entries.length !== generations.length) {
+    throw unsafeCapability("sealed generation transfer is unavailable");
+  }
+  const ordered = Object.freeze(entries.map(([, token]) => token));
+  attach(ordered);
+  for (const [operationId] of entries) {
+    record.sealedGenerations.delete(operationId);
   }
 }
 
@@ -8512,10 +8698,14 @@ export type AtomicInitialAuthorityV1 = Readonly<{
   stateRootId: FlightSemanticId;
   profilesParentId: FlightSemanticId;
   stagingRootId: FlightSemanticId;
+  bundlesParentId: FlightSemanticId;
+  intentsParentId: FlightSemanticId;
   evidence: Readonly<{
     stateRoot: AtomicObjectEvidenceV1;
     profilesParent: AtomicObjectEvidenceV1;
     stagingRoot: AtomicObjectEvidenceV1;
+    bundlesParent: AtomicObjectEvidenceV1;
+    intentsParent: AtomicObjectEvidenceV1;
   }>;
 }>;
 
@@ -8581,6 +8771,7 @@ type AtomicEffectFlightRecord = {
   operationId: string;
   epoch: object;
   root: RootCapabilityRecord;
+  binding: ReadyProfileRootBinding;
   releaseRootOperation: () => void;
   registry: WeakMap<object, AtomicHeldRecord>;
   recordTokens: WeakMap<AtomicHeldRecord, FlightSemanticId>;
@@ -8848,7 +9039,7 @@ function resolveAtomicRecord(
   if (
     record === undefined ||
     record.operationId !== flight.operationId ||
-    !sameReadyBinding(record.binding, flight.root.binding)
+    !sameReadyBinding(record.binding, flight.binding)
   ) {
     throw atomicFailure("atomic publication semantic ID is invalid");
   }
@@ -9531,14 +9722,25 @@ async function acquireAtomicFixedDirectory(
   }
 }
 
-export async function acquireAtomicPreReadyRecoveryAuthority(
+async function acquireAtomicPreReadyRecoveryAuthorityForBinding(
   root: AnchoredProfileRoot,
   operationId: string,
+  durableBinding: ReadyProfileRootBinding,
 ): Promise<AtomicPreReadyRecoveryLeaseV1> {
   if (!UUID.test(operationId)) {
     throw atomicFailure("atomic publication operation ID is invalid");
   }
   const rootRecord = requireRoot(root);
+  const binding = Object.freeze({
+    ...durableBinding,
+  });
+  if (
+    !tokenSchema.safeParse(binding.processNonce).success ||
+    !tokenSchema.safeParse(binding.controlGenerationNonce).success ||
+    !/^[a-f0-9]{64}$/u.test(binding.snapshotDigest)
+  ) {
+    throw atomicFailure("atomic publication root binding is invalid");
+  }
   const releaseRootOperation = acquireRootOperation(rootRecord);
   const opened: FileHandle[] = [];
   try {
@@ -9569,20 +9771,37 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
       ".profile-publish-staging",
     );
     opened.push(staging.handle);
+    const bundles = await acquireAtomicFixedDirectory(
+      rootRecord,
+      staging.handle,
+      "bundles",
+    );
+    opened.push(bundles.handle);
+    const intents = await acquireAtomicFixedDirectory(
+      rootRecord,
+      staging.handle,
+      "intents",
+    );
+    opened.push(intents.handle);
     if (
       profiles.stat.dev !== stateStat.dev ||
-      staging.stat.dev !== stateStat.dev
+      staging.stat.dev !== stateStat.dev ||
+      bundles.stat.dev !== stateStat.dev ||
+      intents.stat.dev !== stateStat.dev
     ) {
       throw atomicFailure("atomic publication authority device is invalid");
     }
     assertAtomicAllowedFilesystem(profiles.handle);
     assertAtomicAllowedFilesystem(staging.handle);
+    assertAtomicAllowedFilesystem(bundles.handle);
+    assertAtomicAllowedFilesystem(intents.handle);
     const controller = Object.freeze({}) as AtomicEffectControllerV1;
     const flight: AtomicEffectFlightRecord = {
       state: "live",
       operationId,
       epoch: Object.freeze({}),
       root: rootRecord,
+      binding,
       releaseRootOperation,
       registry: new WeakMap(),
       recordTokens: new WeakMap(),
@@ -9648,7 +9867,6 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
       stableIntents: new Map(),
     };
     atomicEffectFlightRecords.set(controller as object, flight);
-    const binding = rootRecord.binding;
     const stateRootRecord: AtomicHeldRecord = Object.freeze({
       role: "state_root",
       operationId,
@@ -9685,6 +9903,30 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
       owned: true,
     });
     const stagingRootId = mintAtomicSemanticId(flight, stagingRecord);
+    const bundlesRecord: AtomicHeldRecord = Object.freeze({
+      role: "bundles_parent",
+      operationId,
+      parentId: stagingRootId,
+      leaf: "bundles",
+      handle: bundles.handle,
+      binding,
+      evidence: atomicEvidenceFromStat(bundles.stat),
+      stat: bundles.stat,
+      owned: true,
+    });
+    const bundlesParentId = mintAtomicSemanticId(flight, bundlesRecord);
+    const intentsRecord: AtomicHeldRecord = Object.freeze({
+      role: "intents_parent",
+      operationId,
+      parentId: stagingRootId,
+      leaf: "intents",
+      handle: intents.handle,
+      binding,
+      evidence: atomicEvidenceFromStat(intents.stat),
+      stat: intents.stat,
+      owned: true,
+    });
+    const intentsParentId = mintAtomicSemanticId(flight, intentsRecord);
     const authority = Object.freeze({}) as PreReadyRecoveryAuthority;
     preReadyRecoveryAuthorityRecords.set(authority as object, {
       controller,
@@ -9697,6 +9939,8 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
           state: stateRootRecord.evidence.evidenceDigest,
           profiles: profilesRecord.evidence.evidenceDigest,
           staging: stagingRecord.evidence.evidenceDigest,
+          bundles: bundlesRecord.evidence.evidenceDigest,
+          intents: intentsRecord.evidence.evidenceDigest,
         }),
       ),
     });
@@ -9707,10 +9951,14 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
         stateRootId,
         profilesParentId,
         stagingRootId,
+        bundlesParentId,
+        intentsParentId,
         evidence: Object.freeze({
           stateRoot: stateRootRecord.evidence,
           profilesParent: profilesRecord.evidence,
           stagingRoot: stagingRecord.evidence,
+          bundlesParent: bundlesRecord.evidence,
+          intentsParent: intentsRecord.evidence,
         }),
       }),
     });
@@ -9732,6 +9980,17 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
     }
     throw error;
   }
+}
+
+export async function acquireAtomicPreReadyRecoveryAuthority(
+  root: AnchoredProfileRoot,
+  operationId: string,
+): Promise<AtomicPreReadyRecoveryLeaseV1> {
+  return acquireAtomicPreReadyRecoveryAuthorityForBinding(
+    root,
+    operationId,
+    requireRoot(root).binding,
+  );
 }
 
 export type AtomicCanonicalRootRecoveryLeaseV1 =
@@ -9767,6 +10026,7 @@ export async function acquireAtomicPreReadyRecoveryAuthorityFromCanonicalRoot(
     childDrainWaiters: new Set(),
     authorities: new Set(),
     partialCreateCleanups: new Set(),
+    observability: null,
   };
   const root = Object.freeze({}) as AnchoredProfileRoot;
   rootRecord.token = root;
@@ -11295,6 +11555,7 @@ async function applyAtomicEnumerate(
       return atomicRejected(flight, request, "binding_invalid");
     }
     const requirement =
+      directory.role === "profiles_parent" ||
       directory.role === "private_source" ||
       directory.role === "payload_entry"
         ? ({
@@ -12960,7 +13221,7 @@ async function applyAtomicObservePersistence(
   }
 }
 
-export async function applyAtomicEffect(
+async function applyAtomicEffectRaw(
   controller: AtomicEffectControllerV1,
   request: AtomicEffectRequestV1,
 ): Promise<AtomicEffectObservationV1> {
@@ -13075,6 +13336,84 @@ export async function applyAtomicEffect(
     case "release_publication":
       return atomicRejected(flight, request, "unsupported");
   }
+}
+
+function atomicObservationCounter(
+  observation: AtomicEffectObservationV1,
+): AtomicPublicationCounter | null {
+  if (observation.kind === "native_resolved") {
+    switch (observation.rawCode) {
+      case "success":
+        return "success";
+      case "atomic_publish_exists":
+        return "conflict";
+      case "atomic_publish_unsupported":
+        return "unsupported";
+      case "atomic_publish_cross_device":
+        return "cross_device";
+      case "atomic_publish_binding_invalid":
+      case "atomic_publish_source_missing":
+      case "atomic_publish_invalid_argument":
+        return "binding_invalid";
+      case "atomic_publish_denied":
+        return "denied";
+      case "atomic_publish_io":
+        return "io";
+    }
+  }
+  if (observation.kind === "effect_rejected") {
+    switch (observation.code) {
+      case "binding_invalid":
+        return "binding_invalid";
+      case "conflict":
+        return "conflict";
+      case "unsupported":
+        return "unsupported";
+      case "denied":
+        return "denied";
+      case "io":
+        return "io";
+      case "close_unverified":
+        return "close_unverified";
+      case "budget_exceeded":
+        return null;
+    }
+  }
+  return null;
+}
+
+export async function applyAtomicEffect(
+  controller: AtomicEffectControllerV1,
+  request: AtomicEffectRequestV1,
+): Promise<AtomicEffectObservationV1> {
+  const flight = requireAtomicFlight(
+    controller,
+    request.kind === "cleanup_partial_create",
+  );
+  if (request.kind === "native_no_replace") {
+    flight.root.observability?.count("attempts");
+  }
+  const observation = await applyAtomicEffectRaw(controller, request);
+  const counter = atomicObservationCounter(observation);
+  if (counter !== null) flight.root.observability?.count(counter);
+  if (request.kind === "close_admission") {
+    const mapped: AtomicPublicationCounter | null =
+      request.reason === "ambiguous"
+        ? "ambiguous"
+        : request.reason === "cross_device"
+          ? "cross_device"
+          : request.reason === "binding_invalid"
+            ? "binding_invalid"
+            : request.reason === "unsupported"
+              ? "unsupported"
+              : request.reason === "denied"
+                ? "denied"
+                : request.reason === "io"
+                  ? "io"
+                  : "close_unverified";
+    flight.root.observability?.count(mapped);
+  }
+  return observation;
 }
 
 type AtomicProtocolRunResult = Readonly<{
@@ -14012,7 +14351,7 @@ function assertAtomicPrivateControlAuthority(
   flight: AtomicEffectFlightRecord,
   input: AtomicPrivateProfilePublicationInputV1,
 ): AtomicHeldRecord {
-  if (!sameReadyBinding(input.binding, flight.root.binding)) {
+  if (!sameReadyBinding(input.binding, flight.binding)) {
     throw atomicFailure("atomic private publication binding is invalid");
   }
   const bundlesParent = resolveAtomicRecord(flight, input.bundlesParentId);
@@ -15317,35 +15656,34 @@ async function openAtomicExpectedChild(
   return opened;
 }
 
-async function openAtomicControlChild(
+async function getAtomicInitialControlChild(
   controller: AtomicEffectControllerV1,
   parentId: FlightSemanticId,
   role: "bundles_parent" | "intents_parent",
   leaf: "bundles" | "intents",
   flightNonce: string,
   operationId: string,
-): Promise<Extract<
-  AtomicEffectObservationV1,
-  { kind: "existing_handle_pinned" }
->> {
+): Promise<
+  Readonly<{
+    handleId: FlightSemanticId;
+    evidence: AtomicObjectEvidenceV1;
+  }>
+> {
   const flight = requireAtomicFlight(controller);
-  const parent = resolveAtomicRecord(flight, parentId);
-  const stat = await atomicAwait(
-    flight,
-    [parent],
-    `atomic-transition-open-${leaf}-evidence`,
-    () => fs.lstat(procPath(parent.handle, leaf), { bigint: true }),
+  const record = [...flight.records].find(
+    value =>
+      value.parentId === parentId &&
+      value.role === role &&
+      value.leaf === leaf &&
+      value.operationId === operationId,
   );
-  return openAtomicExpectedChild(
-    controller,
-    flightNonce,
-    operationId,
-    role,
-    parentId,
-    leaf,
-    atomicEvidenceFromStat(stat),
-    "directory_nofollow",
-  );
+  const handleId =
+    record === undefined ? undefined : flight.recordTokens.get(record);
+  if (record === undefined || handleId === undefined) {
+    void flightNonce;
+    throw atomicFailure("atomic initial control authority is unavailable");
+  }
+  return Object.freeze({ handleId, evidence: record.evidence });
 }
 
 function atomicIntentRecord(
@@ -16584,6 +16922,11 @@ type AtomicRecoveryDirectory = Readonly<{
   stat: BigIntStats;
 }>;
 
+type AtomicPinnedAuthority = Readonly<{
+  handleId: FlightSemanticId;
+  evidence: AtomicObjectEvidenceV1;
+}>;
+
 async function openAtomicRecoveryDirectory(
   flight: AtomicEffectFlightRecord,
   parent: AtomicHeldRecord | AtomicRecoveryDirectory,
@@ -16665,8 +17008,8 @@ async function atomicRecoveryTreeEntries(
   root: AtomicRecoveryDirectory,
   scope: "private_profile_payload" | "public_source",
   prefix: "payload" | "source",
-  expectedChecksum: string,
-  expectedByteSize: number,
+  expectedChecksum: string | null,
+  expectedByteSize: number | null,
 ): Promise<readonly CleanupIdentityEntryV1[]> {
   const budget = new Budget(MAX_RECONCILIATION_REFERENCES);
   budget.take();
@@ -16681,8 +17024,8 @@ async function atomicRecoveryTreeEntries(
     first.evidence,
   );
   if (
-    first.checksum !== expectedChecksum ||
-    first.byteSize !== expectedByteSize ||
+    (expectedChecksum !== null && first.checksum !== expectedChecksum) ||
+    (expectedByteSize !== null && first.byteSize !== expectedByteSize) ||
     second.checksum !== first.checksum ||
     second.byteSize !== first.byteSize
   ) {
@@ -16717,10 +17060,7 @@ async function atomicRecoveryTreeEntries(
 async function reconstructAtomicManifestPlannedBytes(
   controller: AtomicEffectControllerV1,
   intent: AtomicPublishIntentV1,
-  bundles: Extract<
-    AtomicEffectObservationV1,
-    { kind: "existing_handle_pinned" }
-  >,
+  bundles: AtomicPinnedAuthority,
   profilesParentId: FlightSemanticId,
 ): Promise<Readonly<{
   manifest: CleanupIdentityManifestV1;
@@ -16730,8 +17070,8 @@ async function reconstructAtomicManifestPlannedBytes(
     intent.phase !== "manifest_planned" ||
     intent.identityManifest?.phase !== "planned" ||
     intent.wrapper === null ||
-    intent.privateSource === null ||
-    intent.classification === null ||
+    (intent.prepublicationAbort === null &&
+      (intent.privateSource === null || intent.classification === null)) ||
     intent.target.kind === "canary_parent"
   ) {
     throw atomicFailure("atomic recovery intent is not reconstructible");
@@ -16749,8 +17089,11 @@ async function reconstructAtomicManifestPlannedBytes(
       "atomic-recovery-wrapper",
     );
     opened.push(wrapper);
-    let payload: AtomicRecoveryDirectory;
-    if (intent.classification.outcome === "published") {
+    let payload: AtomicRecoveryDirectory | null;
+    if (intent.classification?.outcome === "published") {
+      if (intent.privateSource === null) {
+        throw atomicFailure("atomic recovery published source is missing");
+      }
       if (intent.target.kind === "profile") {
         payload = await openAtomicRecoveryDirectory(
           flight,
@@ -16787,27 +17130,44 @@ async function reconstructAtomicManifestPlannedBytes(
         opened.push(payload);
       }
     } else {
-      payload = await openAtomicRecoveryDirectory(
-        flight,
-        wrapper,
-        "payload",
-        intent.privateSource,
-        "atomic-recovery-private-payload",
-      );
-      opened.push(payload);
+      try {
+        payload = await openAtomicRecoveryDirectory(
+          flight,
+          wrapper,
+          "payload",
+          intent.privateSource,
+          "atomic-recovery-private-payload",
+        );
+        opened.push(payload);
+      } catch (error) {
+        if (
+          intent.prepublicationAbort?.from === "building" &&
+          intent.privateSource === null &&
+          intent.identityManifest.entryCount === 0 &&
+          isNodeError(error) &&
+          error.code === "ENOENT"
+        ) {
+          payload = null;
+        } else {
+          throw error;
+        }
+      }
     }
-    const entries = [
-      ...(await atomicRecoveryTreeEntries(
-        flight,
-        payload,
-        "private_profile_payload",
-        "payload",
-        intent.privateSource.checksum,
-        intent.privateSource.byteSize,
-      )),
-    ];
+    const entries =
+      payload === null
+        ? []
+        : [
+            ...(await atomicRecoveryTreeEntries(
+              flight,
+              payload,
+              "private_profile_payload",
+              "payload",
+              intent.privateSource?.checksum ?? null,
+              intent.privateSource?.byteSize ?? null,
+            )),
+          ];
     if (
-      intent.classification.outcome === "published" &&
+      intent.classification?.outcome === "published" &&
       intent.publicSource !== null
     ) {
       const sourceProfile = await openAtomicRecoveryDirectory(
@@ -17015,7 +17375,7 @@ export async function recoverAtomicManifestPlannedPublication(
   const controller = lease.controller;
   const flight = requireAtomicFlight(controller);
   const operationId = flight.operationId;
-  const bundles = await openAtomicControlChild(
+  const bundles = await getAtomicInitialControlChild(
     controller,
     lease.initialAuthority.stagingRootId,
     "bundles_parent",
@@ -17023,7 +17383,7 @@ export async function recoverAtomicManifestPlannedPublication(
     `${operationId}:manifest-recovery:bundles`,
     operationId,
   );
-  const intents = await openAtomicControlChild(
+  const intents = await getAtomicInitialControlChild(
     controller,
     lease.initialAuthority.stagingRootId,
     "intents_parent",
@@ -17048,7 +17408,7 @@ export async function recoverAtomicManifestPlannedPublication(
     intent.operationId !== operationId ||
     intent.phase !== "manifest_planned" ||
     intent.identityManifest?.phase !== "planned" ||
-    !sameReadyBinding(intent.binding, flight.root.binding)
+    !sameReadyBinding(intent.binding, flight.binding)
   ) {
     throw atomicFailure("atomic recovery stable intent is invalid");
   }
@@ -17444,14 +17804,8 @@ export async function recoverAtomicManifestPlannedPublicationFromCanonicalRoot(
 }
 
 type AtomicDurablePublicationAuthorityV1 = Readonly<{
-  bundles: Extract<
-    AtomicEffectObservationV1,
-    { kind: "existing_handle_pinned" }
-  >;
-  intents: Extract<
-    AtomicEffectObservationV1,
-    { kind: "existing_handle_pinned" }
-  >;
+  bundles: AtomicPinnedAuthority;
+  intents: AtomicPinnedAuthority;
   stable: AtomicPublishedIntentRecord;
   manifest: CleanupIdentityManifestV1 | null;
   manifestObjectId: FlightSemanticId | null;
@@ -17464,7 +17818,7 @@ async function loadAtomicDurablePublicationAuthority(
   const controller = lease.controller;
   const flight = requireAtomicFlight(controller);
   const operationId = flight.operationId;
-  const bundles = await openAtomicControlChild(
+  const bundles = await getAtomicInitialControlChild(
     controller,
     lease.initialAuthority.stagingRootId,
     "bundles_parent",
@@ -17472,7 +17826,7 @@ async function loadAtomicDurablePublicationAuthority(
     `${operationId}:continuation:bundles`,
     operationId,
   );
-  const intents = await openAtomicControlChild(
+  const intents = await getAtomicInitialControlChild(
     controller,
     lease.initialAuthority.stagingRootId,
     "intents_parent",
@@ -17495,7 +17849,7 @@ async function loadAtomicDurablePublicationAuthority(
   const intent = parseAtomicPublishIntent(intentSnapshot.bytes);
   if (
     intent.operationId !== operationId ||
-    !sameReadyBinding(intent.binding, flight.root.binding) ||
+    !sameReadyBinding(intent.binding, flight.binding) ||
     intent.identityManifest === null ||
     intent.phase === "manifest_planned"
   ) {
@@ -17603,6 +17957,2431 @@ async function loadAtomicDurablePublicationAuthority(
     manifestObjectId,
     manifestEvidence,
   });
+}
+
+type AtomicDiscoveredDurableIntent = Readonly<{
+  operationId: string;
+  intent: AtomicPublishIntentV1;
+  topology: AtomicStartupRecoveryTopologyV1;
+}>;
+
+type AtomicDiscoveredDirectoryEntry = Extract<
+  AtomicEffectObservationV1,
+  { kind: "directory_observed" }
+>["entries"][number];
+
+async function runAtomicDiscoveryReducerRequest(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  request: Readonly<{
+    kind: "enumerate_directory" | "read_file_chunk";
+    operationId: string;
+    role: AtomicObjectRoleV1;
+    objectId: FlightSemanticId;
+    cursor: number;
+    byteLength: number;
+    expected: AtomicObjectEvidenceV1;
+  }>,
+  semanticIds: readonly FlightSemanticId[],
+): Promise<AtomicEffectObservationV1> {
+  let step = reduceAtomicPublication(
+    createAtomicReducerState({
+      flightNonce,
+      request: request as AtomicEffectRequestDraftV1,
+      semanticIds,
+      reservations:
+        request.kind === "enumerate_directory"
+          ? {
+              directoryEntries: ATOMIC_DIRECTORY_PAGE_LIMIT,
+              directoryBytes: ATOMIC_OBSERVATION_BYTE_LIMIT,
+              fileBytes: 0,
+            }
+          : {
+              directoryEntries: 0,
+              directoryBytes: 0,
+              fileBytes: request.byteLength,
+            },
+      cursors:
+        request.kind === "enumerate_directory"
+          ? { directory: request.cursor }
+          : { file: request.cursor },
+    }),
+    null,
+  );
+  if (step.kind !== "effect") {
+    throw atomicFailure("atomic discovery reducer did not emit an effect");
+  }
+  const observation = await applyAtomicEffect(controller, step.request);
+  step = reduceAtomicPublication(step.state, observation);
+  if (
+    step.kind !== "terminal" ||
+    step.result.kind !== "protocol_complete"
+  ) {
+    throw atomicFailure("atomic discovery reducer did not complete");
+  }
+  return observation;
+}
+
+async function discoverAtomicDirectoryEntries(
+  controller: AtomicEffectControllerV1,
+  operationId: string,
+  directory: AtomicPinnedAuthority,
+  role: AtomicObjectRoleV1,
+  label: string,
+): Promise<readonly AtomicDiscoveredDirectoryEntry[]> {
+  const discovered: AtomicDiscoveredDirectoryEntry[] = [];
+  let cursor = 0;
+  for (let page = 0; page <= ATOMIC_MAX_METADATA_FILES; page += 1) {
+    const observation = await runAtomicDiscoveryReducerRequest(
+      controller,
+      `${operationId}:discovery:${label}:${cursor}`,
+      {
+        kind: "enumerate_directory",
+        operationId,
+        role,
+        objectId: directory.handleId,
+        cursor,
+        byteLength: ATOMIC_OBSERVATION_BYTE_LIMIT,
+        expected: directory.evidence,
+      },
+      [directory.handleId],
+    );
+    if (observation.kind !== "directory_observed") {
+      throw atomicFailure("atomic directory discovery observation is invalid");
+    }
+    discovered.push(...observation.entries);
+    cursor += observation.entries.length;
+    if (observation.done) {
+      return Object.freeze(discovered);
+    }
+  }
+  throw atomicFailure("atomic directory discovery bound exceeded");
+}
+
+async function discoverAtomicDurablePublicationIntents(
+  root: AnchoredProfileRoot,
+  binding: ReadyProfileRootBinding,
+): Promise<readonly AtomicDiscoveredDurableIntent[]> {
+  const operationId = atomicUuidFromDigest(
+    `startup-recovery-discovery\0${binding.processNonce}\0${binding.controlGenerationNonce}\0${binding.snapshotDigest}`,
+  );
+  const lease = await acquireAtomicPreReadyRecoveryAuthority(
+    root,
+    operationId,
+  );
+  try {
+    const controller = lease.controller;
+    const flight = requireAtomicFlight(controller);
+    const intents = await getAtomicInitialControlChild(
+      controller,
+      lease.initialAuthority.stagingRootId,
+      "intents_parent",
+      "intents",
+      `${operationId}:discovery:intents`,
+      operationId,
+    );
+    const bundles = await getAtomicInitialControlChild(
+      controller,
+      lease.initialAuthority.stagingRootId,
+      "bundles_parent",
+      "bundles",
+      `${operationId}:discovery:bundles`,
+      operationId,
+    );
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:discovery:stable-files`,
+      operationId,
+      "stable_files",
+      ATOMIC_MAX_STABLE_METADATA_FILES,
+      0,
+    );
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:discovery:payload-entries`,
+      operationId,
+      "payload_entries",
+      ATOMIC_MAX_METADATA_FILES,
+      0,
+    );
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:discovery:metadata-bytes`,
+      operationId,
+      "other_metadata_bytes",
+      0,
+      ATOMIC_MAX_OTHER_METADATA_BYTES,
+    );
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:discovery:manifest-bytes`,
+      operationId,
+      "manifest_bytes",
+      0,
+      ATOMIC_MAX_MANIFEST_BYTES,
+    );
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:discovery:payload-bytes`,
+      operationId,
+      "payload_bytes",
+      0,
+      ATOMIC_MAX_PAYLOAD_BYTES,
+    );
+    const discovered = await discoverAtomicDirectoryEntries(
+      controller,
+      operationId,
+      intents,
+      "intents_parent",
+      "intents",
+    );
+    const discoveredBundles = await discoverAtomicDirectoryEntries(
+      controller,
+      operationId,
+      bundles,
+      "bundles_parent",
+      "bundles",
+    );
+    const parsed = discovered.map(entry => ({
+      entry,
+      leaf: parseAtomicPublicationIntentLeaf(entry.leaf),
+    }));
+    const results: AtomicDiscoveredDurableIntent[] = [];
+    const operationIds = [
+      ...new Set(parsed.map(value => value.leaf.operationId)),
+    ].sort(rawCompare);
+    for (const discoveredOperationId of operationIds) {
+      const artifacts = parsed.filter(
+        candidate =>
+          candidate.leaf.operationId === discoveredOperationId,
+      );
+      const value =
+        artifacts.find(
+          candidate => candidate.leaf.kind === "intent_stable",
+        ) ??
+        artifacts.find(
+          candidate => candidate.leaf.kind === "intent_temp",
+        );
+      if (value === undefined) {
+        flight.root.observability?.count("orphan_temp");
+        throw atomicFailure(
+          "atomic publication orphan metadata is unresolved",
+        );
+      }
+      const record = resolveAtomicRecord(flight, value.entry.objectId);
+      if (!record.stat.isFile() || record.evidence.size <= 0) {
+        throw atomicFailure("atomic durable intent is invalid");
+      }
+      const bytes = Buffer.alloc(record.evidence.size);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const byteLength = Math.min(
+          ATOMIC_OBSERVATION_BYTE_LIMIT,
+          bytes.byteLength - offset,
+        );
+        const observation = await runAtomicDiscoveryReducerRequest(
+          controller,
+          `${operationId}:discovery:read:${discoveredOperationId}:${offset}`,
+          {
+            kind: "read_file_chunk",
+            operationId,
+            role: "payload_entry",
+            objectId: value.entry.objectId,
+            cursor: offset,
+            byteLength,
+            expected: record.evidence,
+          },
+          [value.entry.objectId],
+        );
+        if (
+          observation.kind !== "file_chunk_observed" ||
+          observation.cursor !== offset
+        ) {
+          throw atomicFailure("atomic durable intent read is invalid");
+        }
+        const chunk = Buffer.from(observation.bytesBase64, "base64");
+        chunk.copy(bytes, offset);
+        offset += chunk.byteLength;
+        if (chunk.byteLength === 0 && offset < bytes.byteLength) {
+          throw atomicFailure("atomic durable intent was truncated");
+        }
+      }
+      const intent = parseAtomicPublishIntent(bytes);
+      if (intent.operationId !== discoveredOperationId) {
+        throw atomicFailure("atomic durable intent identity mismatched");
+      }
+      const identityStable = artifacts.some(
+        candidate => candidate.leaf.kind === "identity_stable",
+      );
+      const identityTemp = artifacts.some(
+        candidate => candidate.leaf.kind === "identity_temp",
+      );
+      const wrapper = discoveredBundles.some(
+        entry =>
+          entry.leaf === intent.operationId && entry.type === "directory",
+      );
+      const targetOther =
+        intent.classification?.targetOther === true ||
+        (intent.classification?.outcome === "conflict" &&
+          intent.classification.targetMatches === false);
+      const targetMatches =
+        intent.classification?.targetMatches === true ||
+        intent.classification?.outcome === "published" ||
+        intent.phase === "renamed" ||
+        intent.phase === "manifest_planned" ||
+        intent.phase === "manifest_published" ||
+        intent.phase === "source_deleting" ||
+        intent.phase === "adopted" ||
+        intent.phase === "discarding" ||
+        intent.phase === "manifest_deleting" ||
+        intent.phase === "cleaned";
+      results.push(
+        Object.freeze({
+          operationId: intent.operationId,
+          intent,
+          topology: Object.freeze({
+            stableIntent: artifacts.some(
+              candidate => candidate.leaf.kind === "intent_stable",
+            ),
+            intentTemp: artifacts.some(
+              candidate => candidate.leaf.kind === "intent_temp",
+            ),
+            wrapper,
+            privateSource:
+              intent.privateSource !== null ||
+              (wrapper && intent.phase !== "allocated"),
+            publicSource:
+              intent.publicSource !== null &&
+              intent.sourceDeletion?.phase !== "removed",
+            publicTarget: targetOther
+              ? ("other" as const)
+              : targetMatches
+                ? ("match" as const)
+                : ("absent" as const),
+            manifest:
+              identityStable && identityTemp
+                ? ("both" as const)
+                : identityStable
+                  ? ("stable" as const)
+                  : identityTemp
+                    ? ("temp" as const)
+                    : ("absent" as const),
+          }),
+        }),
+      );
+    }
+    return Object.freeze(
+      results.sort((left, right) =>
+        rawCompare(left.operationId, right.operationId),
+      ),
+    );
+  } finally {
+    try {
+      const flight = atomicEffectFlightRecords.get(lease.controller as object);
+      if (flight?.state === "live") {
+        await closeAtomicOwnedRecordsThroughReducer(lease.controller);
+      }
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+    }
+  }
+}
+
+type AtomicStartupHeldDirectory = AtomicPinnedAuthority &
+  Readonly<{ role: AtomicObjectRoleV1 }>;
+
+function atomicIntentIdentityMatches(
+  evidence: AtomicObjectEvidenceV1 | null,
+  identity: Readonly<{ dev: string; ino: string; mode: number }> | null,
+): boolean {
+  return (
+    evidence !== null &&
+    identity !== null &&
+    evidence.dev === identity.dev &&
+    evidence.ino === identity.ino &&
+    evidence.mode === identity.mode
+  );
+}
+
+async function observeAtomicStartupRecoveryTopology(
+  root: AnchoredProfileRoot,
+  durable: AtomicDiscoveredDurableIntent,
+): Promise<AtomicStartupRecoveryTopologyV1> {
+  const intent = durable.intent;
+  const lease = await acquireAtomicPreReadyRecoveryAuthorityForBinding(
+    root,
+    durable.operationId,
+    intent.binding,
+  );
+  try {
+    const controller = lease.controller;
+    const flight = requireAtomicFlight(controller);
+    for (const reservation of [
+      {
+        kind: "stable_files" as const,
+        count: ATOMIC_MAX_STABLE_METADATA_FILES,
+        byteSize: 0,
+      },
+      {
+        kind: "payload_entries" as const,
+        count: ATOMIC_MAX_METADATA_FILES,
+        byteSize: 0,
+      },
+      {
+        kind: "other_metadata_bytes" as const,
+        count: 0,
+        byteSize: ATOMIC_MAX_OTHER_METADATA_BYTES,
+      },
+      {
+        kind: "manifest_bytes" as const,
+        count: 0,
+        byteSize: ATOMIC_MAX_MANIFEST_BYTES,
+      },
+      {
+        kind: "payload_bytes" as const,
+        count: 0,
+        byteSize: ATOMIC_MAX_PAYLOAD_BYTES,
+      },
+    ]) {
+      await reserveAtomicBudget(
+        controller,
+        `${durable.operationId}:topology:${reservation.kind}`,
+        durable.operationId,
+        reservation.kind,
+        reservation.count,
+        reservation.byteSize,
+      );
+    }
+    const bundles: AtomicStartupHeldDirectory = {
+      handleId: lease.initialAuthority.bundlesParentId,
+      evidence: lease.initialAuthority.evidence.bundlesParent,
+      role: "bundles_parent",
+    };
+    const profiles: AtomicStartupHeldDirectory = {
+      handleId: lease.initialAuthority.profilesParentId,
+      evidence: lease.initialAuthority.evidence.profilesParent,
+      role: "profiles_parent",
+    };
+    const cache = new WeakMap<
+      object,
+      readonly AtomicDiscoveredDirectoryEntry[]
+    >();
+    const entries = async (
+      directory: AtomicStartupHeldDirectory,
+    ): Promise<readonly AtomicDiscoveredDirectoryEntry[]> => {
+      const cached = cache.get(directory.handleId as object);
+      if (cached !== undefined) return cached;
+      const discovered = await discoverAtomicDirectoryEntries(
+        controller,
+        durable.operationId,
+        directory,
+        directory.role,
+        `topology:${directory.role}`,
+      );
+      cache.set(directory.handleId as object, discovered);
+      return discovered;
+    };
+    const child = async (
+      directory: AtomicStartupHeldDirectory,
+      leaf: string,
+    ): Promise<AtomicStartupHeldDirectory | null> => {
+      const entry = (await entries(directory)).find(
+        candidate => candidate.leaf === leaf,
+      );
+      if (entry === undefined || entry.type !== "directory") return null;
+      return {
+        handleId: entry.objectId,
+        evidence: resolveAtomicRecord(flight, entry.objectId).evidence,
+        role: "payload_entry",
+      };
+    };
+    const profileState = async (
+      profileId: string,
+      state: string,
+    ): Promise<AtomicStartupHeldDirectory | null> => {
+      const profile = await child(profiles, profileId);
+      return profile === null ? null : child(profile, state);
+    };
+
+    const wrapper = await child(bundles, durable.operationId);
+    const wrapperMatches = atomicIntentIdentityMatches(
+      wrapper?.evidence ?? null,
+      intent.wrapper,
+    );
+    const privatePayload =
+      wrapper === null ? null : await child(wrapper, "payload");
+
+    let targetParent: AtomicStartupHeldDirectory | null;
+    if (intent.target.kind === "profile") {
+      targetParent = profiles;
+    } else if (intent.target.kind === "profile_state") {
+      targetParent = await profileState(
+        intent.target.profileId,
+        intent.target.state,
+      );
+    } else {
+      targetParent = null;
+    }
+    const targetLeaf =
+      intent.target.kind === "canary_parent"
+        ? null
+        : intent.target.leaf;
+    const target =
+      targetParent === null || targetLeaf === null
+        ? null
+        : await child(targetParent, targetLeaf);
+
+    let sourceEvidence = privatePayload?.evidence ?? null;
+    if (sourceEvidence === null) sourceEvidence = target?.evidence ?? null;
+    if (sourceEvidence === null) {
+      const value = {
+        dev: intent.privateSource?.dev ?? "0",
+        ino: intent.privateSource?.ino ?? "0",
+        mode: intent.privateSource?.mode ?? 448,
+        size: 0,
+        contentSha256: null,
+      };
+      sourceEvidence = Object.freeze({
+        ...value,
+        evidenceDigest: sha256(JSON.stringify(value)),
+      });
+    }
+
+    let privateSource = atomicIntentIdentityMatches(
+      privatePayload?.evidence ?? null,
+      intent.privateSource,
+    );
+    let publicTarget: AtomicStartupRecoveryTopologyV1["publicTarget"] =
+      target === null
+        ? "absent"
+        : atomicIntentIdentityMatches(
+              target.evidence,
+              intent.privateSource,
+            )
+          ? "match"
+          : "other";
+    if (targetParent !== null && targetLeaf !== null) {
+      const sourceParent = wrapper ?? targetParent;
+      const observed = await runAtomicRequest(
+        controller,
+        `${durable.operationId}:topology:locations`,
+        {
+          kind: "observe_locations",
+          requestKind: "native_no_replace",
+          operationId: durable.operationId,
+          move: "profile_publish",
+          sourceParentId: sourceParent.handleId,
+          sourceId: null,
+          sourceLeaf: "payload",
+          targetParentId: targetParent.handleId,
+          targetLeaf,
+          expectedSource: sourceEvidence,
+          expectedTarget: { absent: true },
+          evidenceDigest: sha256(
+            JSON.stringify({
+              operationId: durable.operationId,
+              source: sourceEvidence.evidenceDigest,
+              targetParent: targetParent.evidence.evidenceDigest,
+            }),
+          ),
+        },
+        [sourceParent.handleId, targetParent.handleId],
+      );
+      const locations = observed.observations.find(
+        (
+          observation,
+        ): observation is Extract<
+          AtomicEffectObservationV1,
+          {
+            kind: "locations_observed";
+            requestKind: "native_no_replace";
+          }
+        > =>
+          observation.kind === "locations_observed" &&
+          observation.requestKind === "native_no_replace",
+      );
+      if (locations === undefined) {
+        throw atomicFailure(
+          "atomic startup topology location observation is missing",
+        );
+      }
+      privateSource =
+        locations.source.state === "match" &&
+        atomicIntentIdentityMatches(
+          locations.source.evidence,
+          intent.privateSource,
+        );
+      publicTarget =
+        locations.target.state === "absent"
+          ? "absent"
+          : atomicIntentIdentityMatches(
+                locations.target.evidence,
+                intent.privateSource,
+              )
+            ? "match"
+            : "other";
+    }
+
+    let publicSource = false;
+    if (intent.publicSource !== null) {
+      const sourceState = await profileState(
+        intent.publicSource.profileId,
+        intent.publicSource.state,
+      );
+      const source =
+        sourceState === null
+          ? null
+          : await child(sourceState, intent.publicSource.generationId);
+      publicSource = atomicIntentIdentityMatches(
+        source?.evidence ?? null,
+        intent.publicSource,
+      );
+    }
+
+    await closeAtomicOwnedRecordsThroughReducer(controller);
+    return Object.freeze({
+      ...durable.topology,
+      wrapper: wrapperMatches,
+      privateSource,
+      publicSource,
+      publicTarget,
+    });
+  } finally {
+    await closeAtomicEffectController(lease.controller);
+  }
+}
+
+async function planAtomicBuildingAbortManifest(
+  lease: AtomicPreReadyRecoveryLeaseV1,
+): Promise<void> {
+  const controller = lease.controller;
+  const flight = requireAtomicFlight(controller);
+  const operationId = flight.operationId;
+  const bundles = await getAtomicInitialControlChild(
+    controller,
+    lease.initialAuthority.stagingRootId,
+    "bundles_parent",
+    "bundles",
+    `${operationId}:building-recovery:bundles`,
+    operationId,
+  );
+  const intents = await getAtomicInitialControlChild(
+    controller,
+    lease.initialAuthority.stagingRootId,
+    "intents_parent",
+    "intents",
+    `${operationId}:building-recovery:intents`,
+    operationId,
+  );
+  const intentsRecord = resolveAtomicRecord(flight, intents.handleId);
+  const snapshot = await snapshotAtomicManifestPlannedFile(
+    flight,
+    intentsRecord,
+    `${operationId}.json`,
+    ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES,
+    "atomic-building-recovery-intent",
+  );
+  if (snapshot === null) {
+    throw atomicFailure("atomic building recovery intent is missing");
+  }
+  const parsed = parseAtomicPublishIntent(snapshot.bytes);
+  if (
+    parsed.operationId !== operationId ||
+    (parsed.phase !== "building" &&
+      !(
+        parsed.phase === "aborting_prepublication" &&
+        parsed.prepublicationAbort?.from === "building"
+      )) ||
+    parsed.wrapper === null ||
+    parsed.privateSource !== null
+  ) {
+    throw atomicFailure("atomic building recovery intent is invalid");
+  }
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-recovery:stable-files`,
+    operationId,
+    "stable_files",
+    1,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-recovery:intent-bytes`,
+    operationId,
+    "other_metadata_bytes",
+    0,
+    snapshot.bytes.byteLength,
+  );
+  flight.stableIntents.set(`${operationId}.json`, {
+    contentSha256: snapshot.evidence.contentSha256!,
+    intent: parsed,
+  });
+  const opened = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:building-recovery:open-intent`,
+    operationId,
+    "intent_stable",
+    intents.handleId,
+    `${operationId}.json`,
+    snapshot.evidence,
+    "file_read_nofollow",
+  );
+  let stable: AtomicPublishedIntentRecord = {
+    intent: parsed,
+    objectId: opened.handleId,
+    evidence: opened.evidence,
+  };
+  const bundlesRecord = resolveAtomicRecord(flight, bundles.handleId);
+  const recoveryDirectories: AtomicRecoveryDirectory[] = [];
+  try {
+    const wrapper = await openAtomicRecoveryDirectory(
+      flight,
+      bundlesRecord,
+      operationId,
+      parsed.wrapper,
+      "atomic-building-recovery-wrapper",
+    );
+    recoveryDirectories.push(wrapper);
+    let entries: readonly CleanupIdentityEntryV1[] = [];
+    try {
+      const payload = await openAtomicRecoveryDirectory(
+        flight,
+        wrapper,
+        "payload",
+        null,
+        "atomic-building-recovery-payload",
+      );
+      recoveryDirectories.push(payload);
+      entries = await atomicRecoveryTreeEntries(
+        flight,
+        payload,
+        "private_profile_payload",
+        "payload",
+        null,
+        null,
+      );
+    } catch (error) {
+      if (!(isNodeError(error) && error.code === "ENOENT")) throw error;
+    }
+    if (stable.intent.phase === "building") {
+      const evidenceDigest = sha256(
+        JSON.stringify({
+          operationId,
+          from: "building",
+          outcome: "never_attempted",
+        }),
+      );
+      stable = await createAndReplaceAtomicIntent(
+        controller,
+        `${operationId}:building-recovery:abort`,
+        stable,
+        {
+          ...stable.intent,
+          phase: "aborting_prepublication",
+          prepublicationAbort: {
+            outcome: "never_attempted",
+            from: "building",
+            evidenceDigest,
+          },
+          cleanup: {
+            phase: "aborting_prepublication",
+            outcome: "never_attempted",
+            evidenceDigest,
+            suffix: "private_source_entries",
+            nextIndex: 0,
+          },
+        },
+        intents.handleId,
+        intents.evidence,
+      );
+    }
+    const indexed = entries.map((entry, index) =>
+      Object.freeze({ ...entry, index }),
+    );
+    const manifest: CleanupIdentityManifestV1 = Object.freeze({
+      version: 1,
+      operationId,
+      binding: stable.intent.binding,
+      targetLocatorDigest: publicationTargetLocatorDigest(
+        stable.intent.target,
+      ),
+      entries: Object.freeze(indexed),
+    });
+    const encoded = encodeCleanupIdentityManifest(manifest);
+    const transitionId = atomicTransitionId(
+      operationId,
+      "building-recovery-manifest",
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:building-recovery:manifest-planned`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "manifest_planned",
+        identityManifest: {
+          phase: "planned",
+          filename: `${operationId}.identities.json`,
+          tempFilename:
+            `${operationId}.identities.${transitionId}.tmp`,
+          sha256: encoded.sha256,
+          entryCount: encoded.entryCount,
+          byteSize: encoded.bytes.byteLength,
+          dev: null,
+          ino: null,
+          mode: null,
+        },
+      },
+      intents.handleId,
+      intents.evidence,
+    );
+  } finally {
+    await closeAtomicRecoveryDirectories(recoveryDirectories);
+  }
+}
+
+async function openAtomicRecoveryTargetParent(
+  lease: AtomicPreReadyRecoveryLeaseV1,
+  intent: AtomicPublishIntentV1,
+): Promise<Readonly<{
+  handleId: FlightSemanticId;
+  evidence: AtomicObjectEvidenceV1;
+  role: "profiles_parent" | "public_target";
+}>> {
+  if (intent.target.kind === "canary_parent") {
+    throw atomicFailure("atomic profile target parent is invalid");
+  }
+  if (intent.target.kind === "profile") {
+    return Object.freeze({
+      handleId: lease.initialAuthority.profilesParentId,
+      evidence: lease.initialAuthority.evidence.profilesParent,
+      role: "profiles_parent" as const,
+    });
+  }
+  const target = intent.target;
+  const controller = lease.controller;
+  const flight = requireAtomicFlight(controller);
+  const profiles = resolveAtomicRecord(
+    flight,
+    lease.initialAuthority.profilesParentId,
+  );
+  const profileStat = await atomicAwait(
+    flight,
+    [profiles],
+    "atomic-early-profile-stat",
+    () =>
+      fs.lstat(procPath(profiles.handle, target.profileId), {
+        bigint: true,
+      }),
+  );
+  const profile = await openAtomicExpectedChild(
+    controller,
+    `${intent.operationId}:early:profile`,
+    intent.operationId,
+    "public_target",
+    lease.initialAuthority.profilesParentId,
+    target.profileId,
+    atomicEvidenceFromStat(profileStat),
+    "directory_nofollow",
+  );
+  const profileRecord = resolveAtomicRecord(flight, profile.handleId);
+  const stateStat = await atomicAwait(
+    flight,
+    [profileRecord],
+    "atomic-early-state-stat",
+    () =>
+      fs.lstat(procPath(profileRecord.handle, target.state), {
+        bigint: true,
+      }),
+  );
+  const state = await openAtomicExpectedChild(
+    controller,
+    `${intent.operationId}:early:state`,
+    intent.operationId,
+    "public_target",
+    profile.handleId,
+    target.state,
+    atomicEvidenceFromStat(stateStat),
+    "directory_nofollow",
+  );
+  if (
+    state.evidence.dev !== target.parent.dev ||
+    state.evidence.ino !== target.parent.ino ||
+    state.evidence.mode !== target.parent.mode
+  ) {
+    throw atomicFailure("atomic early target parent drifted");
+  }
+  return Object.freeze({
+    handleId: state.handleId,
+    evidence: state.evidence,
+    role: "public_target" as const,
+  });
+}
+
+async function planAtomicEarlyProfileManifest(
+  lease: AtomicPreReadyRecoveryLeaseV1,
+  startupTopology: AtomicStartupRecoveryTopologyV1,
+): Promise<AtomicPublishIntentV1> {
+  const controller = lease.controller;
+  const flight = requireAtomicFlight(controller);
+  const operationId = flight.operationId;
+  const bundles = await getAtomicInitialControlChild(
+    controller,
+    lease.initialAuthority.stagingRootId,
+    "bundles_parent",
+    "bundles",
+    `${operationId}:early:bundles`,
+    operationId,
+  );
+  const intents = await getAtomicInitialControlChild(
+    controller,
+    lease.initialAuthority.stagingRootId,
+    "intents_parent",
+    "intents",
+    `${operationId}:early:intents`,
+    operationId,
+  );
+  const intentsRecord = resolveAtomicRecord(flight, intents.handleId);
+  const snapshot = await snapshotAtomicManifestPlannedFile(
+    flight,
+    intentsRecord,
+    `${operationId}.json`,
+    ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES,
+    "atomic-early-intent",
+  );
+  if (snapshot === null) {
+    throw atomicFailure("atomic early intent is missing");
+  }
+  const parsed = parseAtomicPublishIntent(snapshot.bytes);
+  if (
+    parsed.operationId !== operationId ||
+    !["ready", "classified", "renamed"].includes(parsed.phase) ||
+    parsed.wrapper === null ||
+    parsed.privateSource === null ||
+    parsed.target.kind === "canary_parent"
+  ) {
+    throw atomicFailure("atomic early intent is invalid");
+  }
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:early:stable-files`,
+    operationId,
+    "stable_files",
+    1,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:early:intent-bytes`,
+    operationId,
+    "other_metadata_bytes",
+    0,
+    snapshot.bytes.byteLength,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:early:scratch-entries`,
+    operationId,
+    "scratch_entries",
+    2,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:early:payload-entries`,
+    operationId,
+    "payload_entries",
+    4,
+    0,
+  );
+  flight.stableIntents.set(`${operationId}.json`, {
+    contentSha256: snapshot.evidence.contentSha256!,
+    intent: parsed,
+  });
+  const openedIntent = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:early:open-intent`,
+    operationId,
+    "intent_stable",
+    intents.handleId,
+    `${operationId}.json`,
+    snapshot.evidence,
+    "file_read_nofollow",
+  );
+  let stable: AtomicPublishedIntentRecord = {
+    intent: parsed,
+    objectId: openedIntent.handleId,
+    evidence: openedIntent.evidence,
+  };
+  const wrapperLocation = await observeAtomicContinuationDirectory(
+    flight,
+    resolveAtomicRecord(flight, bundles.handleId),
+    operationId,
+    "atomic-early-wrapper",
+  );
+  if (
+    wrapperLocation.state !== "present" ||
+    wrapperLocation.evidence!.dev !== parsed.wrapper.dev ||
+    wrapperLocation.evidence!.ino !== parsed.wrapper.ino ||
+    wrapperLocation.evidence!.mode !== parsed.wrapper.mode
+  ) {
+    throw atomicFailure("atomic early wrapper identity mismatched");
+  }
+  const wrapper = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:early:open-wrapper`,
+    operationId,
+    "wrapper",
+    bundles.handleId,
+    operationId,
+    wrapperLocation.evidence!,
+    "directory_nofollow",
+  );
+  const targetParent = await openAtomicRecoveryTargetParent(lease, parsed);
+  if (stable.intent.phase === "ready") {
+    let classification: AtomicNativeClassificationV1;
+    if (
+      !startupTopology.privateSource &&
+      startupTopology.publicTarget === "match"
+    ) {
+      classification = Object.freeze({
+        outcome: "published",
+        nativeCode: "success",
+        sourceMatches: false,
+        targetMatches: true,
+        targetOther: false,
+        nativePrecheckEvidenceDigest: sha256(
+          JSON.stringify({
+            operationId,
+            recovery: "ready_after_native_success",
+          }),
+        ),
+        locationEvidenceDigest: sha256(
+          JSON.stringify(startupTopology),
+        ),
+      });
+    } else {
+      const sourceLocation = await observeAtomicContinuationDirectory(
+        flight,
+        resolveAtomicRecord(flight, wrapper.handleId),
+        "payload",
+        "atomic-early-source",
+      );
+      if (
+        !startupTopology.privateSource ||
+        sourceLocation.state !== "present" ||
+        sourceLocation.evidence!.dev !== parsed.privateSource.dev ||
+        sourceLocation.evidence!.ino !== parsed.privateSource.ino ||
+        sourceLocation.evidence!.mode !== parsed.privateSource.mode
+      ) {
+        throw atomicFailure("atomic early source identity mismatched");
+      }
+      const source = await openAtomicExpectedChild(
+        controller,
+        `${operationId}:early:open-source`,
+        operationId,
+        "private_source",
+        wrapper.handleId,
+        "payload",
+        sourceLocation.evidence!,
+        "directory_nofollow",
+      );
+      for (const [label, role, objectId, evidence] of [
+        ["source-parent", "wrapper", wrapper.handleId, wrapper.evidence],
+        [
+          "target-parent",
+          targetParent.role,
+          targetParent.handleId,
+          targetParent.evidence,
+        ],
+      ] as const) {
+        await runAtomicRequest(
+          controller,
+          `${operationId}:early:${label}:revalidate`,
+          {
+            kind: "revalidate_handle",
+            operationId,
+            role,
+            objectId,
+            cursor: 0,
+            byteLength: 0,
+            expected: evidence,
+          },
+          [objectId],
+        );
+        await runAtomicRequest(
+          controller,
+          `${operationId}:early:${label}:statfs`,
+          {
+            kind: "statfs_parent",
+            operationId,
+            role,
+            objectId,
+            expected: evidence,
+          },
+          [objectId],
+        );
+      }
+      const native = await runAtomicRequest(
+        controller,
+        `${operationId}:early:native`,
+        {
+          kind: "native_no_replace",
+          operationId,
+          move: "profile_publish",
+          sourceParentId: wrapper.handleId,
+          sourceId: source.handleId,
+          sourceLeaf: "payload",
+          targetParentId: targetParent.handleId,
+          targetLeaf: parsed.target.leaf,
+          expectedSource: source.evidence,
+          expectedTarget: { absent: true },
+          evidenceDigest: sha256(
+            JSON.stringify({
+              source: source.evidence.evidenceDigest,
+              target: targetParent.evidence.evidenceDigest,
+            }),
+          ),
+        },
+        [wrapper.handleId, source.handleId, targetParent.handleId],
+      );
+      if (native.classification === null) {
+        throw atomicFailure("atomic early publication is ambiguous");
+      }
+      classification = native.classification;
+    }
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:early:classified`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "classified",
+        classification: {
+          outcome: classification.outcome,
+          nativeCode: classification.nativeCode,
+          sourceMatches: classification.sourceMatches,
+          targetMatches: classification.targetMatches,
+          targetOther: classification.targetOther,
+          evidenceDigest: sha256(
+            JSON.stringify({
+              precheck: classification.nativePrecheckEvidenceDigest,
+              locations: classification.locationEvidenceDigest,
+            }),
+          ),
+        },
+      },
+      intents.handleId,
+      intents.evidence,
+    );
+  }
+  if (
+    stable.intent.phase === "classified" &&
+    stable.intent.classification?.outcome === "published"
+  ) {
+    await syncAtomicHeld(
+      controller,
+      `${operationId}:early:source-parent-sync`,
+      operationId,
+      "fsync_parent",
+      "wrapper",
+      wrapper.handleId,
+      wrapper.evidence,
+    );
+    await syncAtomicHeld(
+      controller,
+      `${operationId}:early:target-parent-sync`,
+      operationId,
+      "fsync_parent",
+      targetParent.role,
+      targetParent.handleId,
+      targetParent.evidence,
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:early:renamed`,
+      stable,
+      { ...stable.intent, phase: "renamed" },
+      intents.handleId,
+      intents.evidence,
+    );
+  }
+  const recoveryDirectories: AtomicRecoveryDirectory[] = [];
+  const target = stable.intent.target;
+  const privateSource = stable.intent.privateSource;
+  if (target.kind === "canary_parent" || privateSource === null) {
+    throw atomicFailure("atomic early manifest authority is invalid");
+  }
+  try {
+    const wrapperDirectory = await openAtomicRecoveryDirectory(
+      flight,
+      resolveAtomicRecord(flight, bundles.handleId),
+      operationId,
+      parsed.wrapper,
+      "atomic-early-manifest-wrapper",
+    );
+    recoveryDirectories.push(wrapperDirectory);
+    let payload: AtomicRecoveryDirectory;
+    if (stable.intent.classification?.outcome === "published") {
+      const profiles = resolveAtomicRecord(
+        flight,
+        lease.initialAuthority.profilesParentId,
+      );
+      if (target.kind === "profile") {
+        payload = await openAtomicRecoveryDirectory(
+          flight,
+          profiles,
+          target.leaf,
+          privateSource,
+          "atomic-early-manifest-target",
+        );
+        recoveryDirectories.push(payload);
+      } else {
+        const profile = await openAtomicRecoveryDirectory(
+          flight,
+          profiles,
+          target.profileId,
+          null,
+          "atomic-early-manifest-profile",
+        );
+        recoveryDirectories.push(profile);
+        const state = await openAtomicRecoveryDirectory(
+          flight,
+          profile,
+          target.state,
+          target.parent,
+          "atomic-early-manifest-state",
+        );
+        recoveryDirectories.push(state);
+        payload = await openAtomicRecoveryDirectory(
+          flight,
+          state,
+          target.leaf,
+          privateSource,
+          "atomic-early-manifest-target",
+        );
+        recoveryDirectories.push(payload);
+      }
+    } else {
+      payload = await openAtomicRecoveryDirectory(
+        flight,
+        wrapperDirectory,
+        "payload",
+        privateSource,
+        "atomic-early-manifest-source",
+      );
+      recoveryDirectories.push(payload);
+    }
+    const entries = [
+      ...(await atomicRecoveryTreeEntries(
+        flight,
+        payload,
+        "private_profile_payload",
+        "payload",
+        privateSource.checksum,
+        privateSource.byteSize,
+      )),
+    ];
+    if (
+      stable.intent.classification?.outcome === "published" &&
+      stable.intent.publicSource !== null
+    ) {
+      const profiles = resolveAtomicRecord(
+        flight,
+        lease.initialAuthority.profilesParentId,
+      );
+      const profile = await openAtomicRecoveryDirectory(
+        flight,
+        profiles,
+        stable.intent.publicSource.profileId,
+        null,
+        "atomic-early-source-profile",
+      );
+      recoveryDirectories.push(profile);
+      const state = await openAtomicRecoveryDirectory(
+        flight,
+        profile,
+        stable.intent.publicSource.state,
+        null,
+        "atomic-early-source-state",
+      );
+      recoveryDirectories.push(state);
+      const source = await openAtomicRecoveryDirectory(
+        flight,
+        state,
+        stable.intent.publicSource.generationId,
+        {
+          dev: stable.intent.publicSource.dev,
+          ino: stable.intent.publicSource.ino,
+          mode: stable.intent.publicSource.mode,
+        },
+        "atomic-early-public-source",
+      );
+      recoveryDirectories.push(source);
+      entries.push(
+        ...(await atomicRecoveryTreeEntries(
+          flight,
+          source,
+          "public_source",
+          "source",
+          stable.intent.publicSource.checksum,
+          stable.intent.publicSource.byteSize,
+        )),
+      );
+    }
+    entries.sort((left, right) => {
+      const depth =
+        right.path.split("/").length - left.path.split("/").length;
+      return depth !== 0 ? depth : rawCompare(left.path, right.path);
+    });
+    const indexed = entries.map((entry, index) =>
+      Object.freeze({ ...entry, index }),
+    );
+    const manifest: CleanupIdentityManifestV1 = Object.freeze({
+      version: 1,
+      operationId,
+      binding: stable.intent.binding,
+      targetLocatorDigest: publicationTargetLocatorDigest(
+        stable.intent.target,
+      ),
+      entries: Object.freeze(indexed),
+    });
+    const encoded = encodeCleanupIdentityManifest(manifest);
+    const transitionId = atomicTransitionId(
+      operationId,
+      "early-recovery-manifest",
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:early:manifest-planned`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "manifest_planned",
+        identityManifest: {
+          phase: "planned",
+          filename: `${operationId}.identities.json`,
+          tempFilename:
+            `${operationId}.identities.${transitionId}.tmp`,
+          sha256: encoded.sha256,
+          entryCount: encoded.entryCount,
+          byteSize: encoded.bytes.byteLength,
+          dev: null,
+          ino: null,
+          mode: null,
+        },
+      },
+      intents.handleId,
+      intents.evidence,
+    );
+    return stable.intent;
+  } finally {
+    await closeAtomicRecoveryDirectories(recoveryDirectories);
+  }
+}
+
+async function withAtomicRecoveryLease<T>(
+  root: AnchoredProfileRoot,
+  binding: ReadyProfileRootBinding,
+  operationId: string,
+  run: (lease: AtomicPreReadyRecoveryLeaseV1) => Promise<T>,
+): Promise<T> {
+  const lease = await acquireAtomicPreReadyRecoveryAuthorityForBinding(
+    root,
+    operationId,
+    binding,
+  );
+  try {
+    const result = await run(lease);
+    await closeAtomicOwnedRecordsThroughReducer(lease.controller);
+    return result;
+  } finally {
+    await closeAtomicEffectController(lease.controller);
+  }
+}
+
+async function closeAtomicOwnedRecordsThroughReducer(
+  controller: AtomicEffectControllerV1,
+): Promise<void> {
+  const flight = requireAtomicFlight(controller);
+  const owned = [...flight.records]
+    .filter(record => record.owned)
+    .sort(
+      (left, right) =>
+        atomicRecordDepth(flight, right) - atomicRecordDepth(flight, left),
+    );
+  for (const record of owned) {
+    const objectId = flight.recordTokens.get(record);
+    if (objectId === undefined) {
+      throw atomicFailure("atomic owned handle identity is unavailable");
+    }
+    const expected =
+      record.stat.isFile()
+        ? atomicPinnedContentEvidence(flight, objectId, record) ??
+          record.evidence
+        : record.evidence;
+    await runAtomicRequest(
+      controller,
+      `${flight.operationId}:close-owned:${record.role}`,
+      {
+        kind: "close_handle",
+        operationId: flight.operationId,
+        role: record.role,
+        objectId,
+        cursor: 0,
+        byteLength: 0,
+        expected,
+      },
+      [objectId],
+    );
+  }
+}
+
+async function recoverAtomicDurablePublicationsBeforeTask3(
+  root: AnchoredProfileRoot,
+  request: ReconciliationRequestV1,
+  deps: ReconciliationDependencies,
+  observability: AtomicPublicationObservability | null,
+): Promise<void> {
+  const binding: ReadyProfileRootBinding = Object.freeze({
+    processNonce: request.processNonce,
+    controlGenerationNonce: request.controlGenerationNonce,
+    snapshotDigest: request.snapshotDigest,
+  });
+  let intents: readonly AtomicDiscoveredDurableIntent[];
+  try {
+    intents = await discoverAtomicDurablePublicationIntents(root, binding);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+
+  for (const durable of intents) {
+    const intent = durable.intent;
+    const topology = await observeAtomicStartupRecoveryTopology(
+      root,
+      durable,
+    );
+    const staleBinding = !sameReadyBinding(intent.binding, binding);
+    const recoveryBinding: ReadyProfileRootBinding = Object.freeze({
+      ...intent.binding,
+    });
+    const targetPath =
+      intent.target.kind === "profile_state"
+        ? `profiles/${intent.target.profileId}/${intent.target.state}/${intent.target.generationId}`
+        : intent.target.kind === "profile"
+          ? `profiles/${intent.target.profileId}`
+          : null;
+    const authorizedByFreshSnapshot =
+      targetPath !== null &&
+      intent.privateSource !== null &&
+      request.references.some(
+        reference =>
+          reference.kind === "profile_generation" &&
+          reference.path === targetPath &&
+          reference.checksum === intent.privateSource!.checksum,
+      );
+    const durablyAdopted =
+      intent.phase === "adopted" ||
+      intent.adoption !== null ||
+      intent.cleanup?.outcome === "adopted";
+    const reducerAuthorized =
+      !staleBinding &&
+      (authorizedByFreshSnapshot ||
+        intent.kind === "scaffold" ||
+        durablyAdopted);
+    const decision = reduceAtomicStartupRecoveryV1({
+      kind: intent.kind,
+      phase: intent.phase,
+      classification: intent.classification?.outcome ?? null,
+      authorizedByFreshSnapshot: reducerAuthorized,
+      topology,
+    });
+    filesystemTestContext
+      .getStore()
+      ?.atomicStartupRecoveryDecision?.(
+        durable.operationId,
+        topology,
+        decision,
+      );
+    if (decision.kind === "fail_stop") {
+      observability?.count(
+        decision.reason === "orphan_temp"
+          ? "orphan_temp"
+          : decision.reason === "ambiguous"
+            ? "ambiguous"
+            : "binding_invalid",
+      );
+      throw atomicFailure(
+        `atomic startup recovery fail-stopped: ${decision.reason}`,
+      );
+    }
+    const reducerDisposition =
+      decision.kind === "recover_published"
+        ? decision.disposition
+        : decision.kind === "resume_cleanup"
+          ? reducerAuthorized
+            ? ("adopt" as const)
+            : ("release_to_reconciliation" as const)
+          : null;
+    if (
+      intent.phase === "building" ||
+      (intent.phase === "aborting_prepublication" &&
+        intent.prepublicationAbort?.from === "building")
+    ) {
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        planAtomicBuildingAbortManifest,
+      );
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        recoverAtomicManifestPlannedPublication,
+      );
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        recoverAtomicBuildingAbortPublication,
+      );
+      observability?.count("recovered_unpublished");
+      continue;
+    }
+    if (
+      intent.phase === "ready" ||
+      intent.phase === "classified" ||
+      intent.phase === "renamed"
+    ) {
+      const planned = await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        lease => planAtomicEarlyProfileManifest(lease, topology),
+      );
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        recoverAtomicManifestPlannedPublication,
+      );
+      if (planned.classification?.outcome === "published") {
+        const disposition =
+          reducerDisposition ??
+          (decision.kind === "recover_unpublished"
+            ? reducerAuthorized &&
+              planned.kind !== "working" &&
+              planned.kind !== "canary"
+              ? ("adopt" as const)
+              : ("release_to_reconciliation" as const)
+            : null);
+        if (disposition === null) {
+          throw atomicFailure(
+            "atomic startup recovery decision forbids publication",
+          );
+        }
+        if (
+          planned.kind === "scaffold" ||
+          planned.kind === "working"
+        ) {
+          await withAtomicRecoveryLease(
+            root,
+            recoveryBinding,
+            durable.operationId,
+            lease =>
+              recoverAtomicPublishedProfilePublication(lease, disposition),
+          );
+        } else {
+          await withAtomicRecoveryLease(
+            root,
+            recoveryBinding,
+            durable.operationId,
+            lease =>
+              recoverAtomicProtectedPublication(lease, disposition),
+          );
+        }
+        observability?.count(
+          disposition === "adopt"
+            ? "recovered_published"
+            : "recovered_unpublished",
+        );
+      } else {
+        await withAtomicRecoveryLease(
+          root,
+          recoveryBinding,
+          durable.operationId,
+          recoverAtomicBuildingAbortPublication,
+        );
+        observability?.count("recovered_unpublished");
+      }
+      continue;
+    }
+    if (intent.phase === "manifest_planned") {
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        recoverAtomicManifestPlannedPublication,
+      );
+    }
+    if (
+      intent.prepublicationAbort?.from === "building" &&
+      (intent.phase === "manifest_planned" ||
+        intent.phase === "manifest_published")
+    ) {
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        recoverAtomicBuildingAbortPublication,
+      );
+      observability?.count("recovered_unpublished");
+      continue;
+    }
+    if (
+      (intent.kind === "scaffold" || intent.kind === "working") &&
+      intent.classification?.outcome === "published" &&
+      (intent.phase === "manifest_planned" ||
+        intent.phase === "manifest_published")
+    ) {
+      if (reducerDisposition === null) {
+        throw atomicFailure(
+          "atomic startup recovery decision forbids publication",
+        );
+      }
+      const disposition = reducerDisposition;
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        lease =>
+          recoverAtomicPublishedProfilePublication(lease, disposition),
+      );
+      observability?.count(
+        disposition === "adopt"
+          ? "recovered_published"
+          : "recovered_unpublished",
+      );
+      continue;
+    }
+    if (
+      intent.phase === "allocated" ||
+      (intent.phase === "aborting_prepublication" &&
+        intent.prepublicationAbort?.from === "allocated")
+    ) {
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        recoverAtomicAllocatedPublication,
+      );
+      observability?.count("recovered_unpublished");
+      continue;
+    }
+    if (
+      intent.phase === "manifest_planned" ||
+      intent.phase === "manifest_published" ||
+      intent.phase === "source_deleting" ||
+      intent.phase === "adopted" ||
+      intent.phase === "discarding" ||
+      intent.phase === "manifest_deleting" ||
+      intent.phase === "cleaned"
+    ) {
+      if (reducerDisposition === null) {
+        throw atomicFailure(
+          "atomic startup recovery decision forbids protected cleanup",
+        );
+      }
+      const disposition = reducerDisposition;
+      await withAtomicRecoveryLease(
+        root,
+        recoveryBinding,
+        durable.operationId,
+        lease =>
+          recoverAtomicProtectedPublication(lease, disposition),
+      );
+      observability?.count(
+        disposition === "adopt"
+          ? "recovered_published"
+          : "recovered_unpublished",
+      );
+      continue;
+    }
+    if (
+      intent.phase === "aborting_prepublication" ||
+      intent.phase === "ready"
+    ) {
+      observability?.count(
+        intent.classification?.outcome === "published"
+          ? "ambiguous"
+          : "recovered_unpublished",
+      );
+      throw atomicFailure(
+        "atomic publication early durable phase requires protected recovery",
+      );
+    }
+  }
+}
+
+async function recoverAtomicAllocatedPublication(
+  lease: AtomicPreReadyRecoveryLeaseV1,
+): Promise<void> {
+  const controller = lease.controller;
+  const flight = requireAtomicFlight(controller);
+  const operationId = flight.operationId;
+  const intents = await getAtomicInitialControlChild(
+    controller,
+    lease.initialAuthority.stagingRootId,
+    "intents_parent",
+    "intents",
+    `${operationId}:allocated-recovery:intents`,
+    operationId,
+  );
+  const intentsRecord = resolveAtomicRecord(flight, intents.handleId);
+  const snapshot = await snapshotAtomicManifestPlannedFile(
+    flight,
+    intentsRecord,
+    `${operationId}.json`,
+    ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES,
+    "atomic-allocated-recovery-intent",
+  );
+  if (snapshot === null) {
+    throw atomicFailure("atomic allocated recovery intent is missing");
+  }
+  const parsed = parseAtomicPublishIntent(snapshot.bytes);
+  if (
+    parsed.operationId !== operationId ||
+    (parsed.phase !== "allocated" &&
+      !(
+        parsed.phase === "aborting_prepublication" &&
+        parsed.prepublicationAbort?.from === "allocated"
+      ))
+  ) {
+    throw atomicFailure("atomic allocated recovery intent is invalid");
+  }
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:allocated-recovery:stable`,
+    operationId,
+    "stable_files",
+    1,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:allocated-recovery:bytes`,
+    operationId,
+    "other_metadata_bytes",
+    0,
+    snapshot.bytes.byteLength,
+  );
+  flight.stableIntents.set(`${operationId}.json`, {
+    contentSha256: snapshot.evidence.contentSha256!,
+    intent: parsed,
+  });
+  const opened = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:allocated-recovery:open`,
+    operationId,
+    "intent_stable",
+    intents.handleId,
+    `${operationId}.json`,
+    snapshot.evidence,
+    "file_read_nofollow",
+  );
+  let stable: AtomicPublishedIntentRecord = {
+    intent: parsed,
+    objectId: opened.handleId,
+    evidence: opened.evidence,
+  };
+  if (stable.intent.phase === "allocated") {
+    const evidenceDigest = sha256(
+      JSON.stringify({
+        operationId,
+        from: "allocated",
+        outcome: "never_attempted",
+      }),
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:allocated-recovery:abort`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "aborting_prepublication",
+        prepublicationAbort: {
+          outcome: "never_attempted",
+          from: "allocated",
+          evidenceDigest,
+        },
+        cleanup: {
+          phase: "aborting_prepublication",
+          outcome: "never_attempted",
+          evidenceDigest,
+          suffix: "private_source_entries",
+          nextIndex: 0,
+        },
+      },
+      intents.handleId,
+      intents.evidence,
+    );
+  }
+  stable = await createAndReplaceAtomicIntent(
+    controller,
+    `${operationId}:allocated-recovery:cleaned`,
+    stable,
+    {
+      ...stable.intent,
+      phase: "cleaned",
+      cleanup: {
+        ...stable.intent.cleanup!,
+        phase: "cleaned",
+        suffix: "done",
+        nextIndex: 0,
+      },
+    },
+    intents.handleId,
+    intents.evidence,
+  );
+  await runAtomicRequest(
+    controller,
+    `${operationId}:allocated-recovery:remove-intent`,
+    {
+      kind: "remove_intent",
+      operationId,
+      stableParentId: intents.handleId,
+      stableLeaf: `${operationId}.json`,
+      stableObjectId: stable.objectId,
+      expectedStable: stable.evidence,
+    },
+    [intents.handleId, stable.objectId],
+  );
+  await closeAndReleaseAtomicRecord(
+    controller,
+    `${operationId}:allocated-recovery:close-intent`,
+    operationId,
+    "intent_stable",
+    stable.objectId,
+    stable.evidence,
+    { kind: "stable_files", count: 1, byteSize: 0 },
+  );
+  await releaseAtomicBudget(
+    controller,
+    `${operationId}:allocated-recovery:release-bytes`,
+    operationId,
+    "other_metadata_bytes",
+    0,
+    stable.evidence.size,
+  );
+}
+
+async function recoverAtomicBuildingAbortPublication(
+  lease: AtomicPreReadyRecoveryLeaseV1,
+): Promise<void> {
+  const controller = lease.controller;
+  const flight = requireAtomicFlight(controller);
+  const operationId = flight.operationId;
+  const authority = await loadAtomicDurablePublicationAuthority(lease);
+  let stable = authority.stable;
+  const manifest = authority.manifest;
+  const cleanupOutcome =
+    stable.intent.prepublicationAbort?.from === "building"
+      ? ("never_attempted" as const)
+      : stable.intent.classification?.outcome === "unpublished"
+        ? ("unpublished" as const)
+        : stable.intent.classification?.outcome === "conflict"
+          ? ("conflict" as const)
+          : null;
+  if (
+    stable.intent.phase !== "manifest_published" ||
+    cleanupOutcome === null ||
+    (cleanupOutcome === "never_attempted"
+      ? stable.intent.cleanup?.outcome !== "never_attempted"
+      : stable.intent.cleanup !== null) ||
+    manifest === null ||
+    authority.manifestObjectId === null ||
+    authority.manifestEvidence === null ||
+    manifest.entries.some(
+      entry => entry.scope !== "private_profile_payload",
+    )
+  ) {
+    throw atomicFailure("atomic building abort authority is invalid");
+  }
+  const wrapperExpected = stable.intent.wrapper;
+  if (wrapperExpected === null) {
+    throw atomicFailure("atomic building abort wrapper is missing");
+  }
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-abort:scratch-entries`,
+    operationId,
+    "scratch_entries",
+    2,
+    0,
+  );
+  const children = manifest.entries.filter(entry => entry.path !== "payload");
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-abort:payload-entries`,
+    operationId,
+    "payload_entries",
+    children.length,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-abort:payload-bytes`,
+    operationId,
+    "payload_bytes",
+    0,
+    children.reduce(
+      (total, entry) => total + (entry.type === "file" ? entry.size : 0),
+      0,
+    ),
+  );
+  const wrapperLocation = await observeAtomicContinuationDirectory(
+    flight,
+    resolveAtomicRecord(flight, authority.bundles.handleId),
+    operationId,
+    "atomic-building-abort-wrapper",
+  );
+  if (
+    wrapperLocation.state !== "present" ||
+    wrapperLocation.evidence!.dev !== wrapperExpected.dev ||
+    wrapperLocation.evidence!.ino !== wrapperExpected.ino ||
+    wrapperLocation.evidence!.mode !== wrapperExpected.mode
+  ) {
+    throw atomicFailure("atomic building abort wrapper identity mismatched");
+  }
+  const wrapper = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:building-abort:open-wrapper`,
+    operationId,
+    "wrapper",
+    authority.bundles.handleId,
+    operationId,
+    wrapperLocation.evidence!,
+    "directory_nofollow",
+  );
+  const openedByPath = new Map<
+    string,
+    Readonly<{
+      objectId: FlightSemanticId;
+      evidence: AtomicObjectEvidenceV1;
+      role: "private_source" | "payload_entry";
+    }>
+  >();
+  for (const entry of [...manifest.entries].sort((left, right) => {
+    const depth =
+      left.path.split("/").length - right.path.split("/").length;
+    return depth !== 0 ? depth : rawCompare(left.path, right.path);
+  })) {
+    const isRoot = entry.path === "payload";
+    const separator = entry.path.lastIndexOf("/");
+    const parentId = isRoot
+      ? wrapper.handleId
+      : openedByPath.get(entry.path.slice(0, separator))?.objectId;
+    if (parentId === undefined) {
+      throw atomicFailure("atomic building abort parent is missing");
+    }
+    const opened = await openAtomicExpectedChild(
+      controller,
+      `${operationId}:building-abort:open:${entry.index}`,
+      operationId,
+      isRoot ? "private_source" : "payload_entry",
+      parentId,
+      isRoot ? "payload" : entry.path.slice(separator + 1),
+      atomicEvidenceFromManifestEntry(entry),
+      entry.type === "directory"
+        ? "directory_nofollow"
+        : "file_read_nofollow",
+    );
+    openedByPath.set(entry.path, {
+      objectId: opened.handleId,
+      evidence: opened.evidence,
+      role: isRoot ? "private_source" : "payload_entry",
+    });
+  }
+  stable = await createAndReplaceAtomicIntent(
+    controller,
+    `${operationId}:building-abort:discarding`,
+    stable,
+    {
+      ...stable.intent,
+      phase: "discarding",
+      cleanup: {
+        phase: "discarding",
+        outcome: cleanupOutcome,
+        evidenceDigest:
+          stable.intent.cleanup?.evidenceDigest ??
+          sha256(
+            JSON.stringify({
+              operationId,
+              manifestSha256: stable.intent.identityManifest!.sha256,
+              outcome: cleanupOutcome,
+            }),
+          ),
+        suffix: "private_source_entries",
+        nextIndex: 0,
+      },
+    },
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  const entryDigests = manifest.entries.map((entry, index) =>
+    sha256(JSON.stringify({ index, entry })),
+  );
+  for (const [logicalIndex, entry] of manifest.entries.entries()) {
+    const opened = openedByPath.get(entry.path);
+    if (opened === undefined) {
+      throw atomicFailure("atomic building abort entry is missing");
+    }
+    const isRoot = entry.path === "payload";
+    const separator = entry.path.lastIndexOf("/");
+    const parentId = isRoot
+      ? wrapper.handleId
+      : openedByPath.get(entry.path.slice(0, separator))?.objectId;
+    if (parentId === undefined) {
+      throw atomicFailure("atomic building abort deletion parent is missing");
+    }
+    const result = await executeAtomicProtectedCleanupEntry(
+      controller,
+      stable,
+      authority.intents,
+      createAtomicProtectedCleanupState({
+        operationId,
+        manifestSha256: stable.intent.identityManifest!.sha256,
+        entryCount: manifest.entries.length,
+        entryCounts: {
+          privateSourceEntries: manifest.entries.length,
+          wrapperTemps: 0,
+          intentTemps: 0,
+        },
+        entryDigests,
+        cursor: logicalIndex,
+        suffix: "private_source_entries",
+      }),
+      {
+        operationId,
+        manifestSha256: stable.intent.identityManifest!.sha256,
+        index: logicalIndex,
+        suffix: "private_source_entries",
+        scope: "private_profile_payload",
+        entryDigest: entryDigests[logicalIndex]!,
+        requestKind: isRoot
+          ? "remove_root"
+          : entry.type === "file"
+            ? "remove_file"
+            : "remove_directory",
+        role: opened.role,
+        parentId,
+        leaf: isRoot ? "payload" : entry.path.slice(separator + 1),
+        objectId: opened.objectId,
+        expected: opened.evidence,
+        release: {
+          reservation: isRoot ? "scratch_entries" : "payload_entries",
+          count: 1,
+          byteSize: entry.type === "file" ? entry.size : 0,
+        },
+      },
+      true,
+      "cleanup",
+    );
+    stable = result.stable;
+  }
+  for (const suffix of ["private_source_root", "wrapper_temps"] as const) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:building-abort:${suffix}`,
+      stable,
+      suffix,
+      0,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:building-abort:wrapper-temp:${cursor + 1}`,
+      stable,
+      "wrapper_temps",
+      cursor + 1,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:building-abort:wrapper-root`,
+    stable,
+    "wrapper_root",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  await runAtomicRequest(
+    controller,
+    `${operationId}:building-abort:remove-wrapper`,
+    {
+      kind: "remove_root",
+      operationId,
+      role: "wrapper",
+      parentId: authority.bundles.handleId,
+      leaf: operationId,
+      objectId: wrapper.handleId,
+      expected: wrapper.evidence,
+      manifestSha256: stable.intent.identityManifest!.sha256,
+      cursor: 0,
+    },
+    [authority.bundles.handleId, wrapper.handleId],
+  );
+  await closeAndReleaseAtomicRecord(
+    controller,
+    `${operationId}:building-abort:close-wrapper`,
+    operationId,
+    "wrapper",
+    wrapper.handleId,
+    wrapper.evidence,
+    { kind: "scratch_entries", count: 1, byteSize: 0 },
+  );
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:building-abort:intent-temps`,
+    stable,
+    "intent_temps",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:building-abort:intent-temp:${cursor + 1}`,
+      stable,
+      "intent_temps",
+      cursor + 1,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:building-abort:done`,
+    stable,
+    "done",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  await executeAtomicProtectedCleanupTerminal(
+    controller,
+    createAtomicProtectedCleanupState({
+      operationId,
+      manifestSha256: stable.intent.identityManifest!.sha256,
+      entryCount: manifest.entries.length,
+      entryCounts: {
+        privateSourceEntries: manifest.entries.length,
+        wrapperTemps: 0,
+        intentTemps: 0,
+      },
+      entryDigests,
+      cursor: manifest.entries.length,
+      suffix: "done",
+    }),
+    stable,
+    authority.intents,
+    {
+      objectId: authority.manifestObjectId,
+      evidence: authority.manifestEvidence,
+    },
+  );
+}
+
+async function recoverAtomicPublishedProfilePublication(
+  lease: AtomicPreReadyRecoveryLeaseV1,
+  disposition: "adopt" | "release_to_reconciliation",
+): Promise<void> {
+  const controller = lease.controller;
+  const flight = requireAtomicFlight(controller);
+  const operationId = flight.operationId;
+  const authority = await loadAtomicDurablePublicationAuthority(lease);
+  let stable = authority.stable;
+  const manifest = authority.manifest;
+  if (
+    stable.intent.phase !== "manifest_published" ||
+    stable.intent.classification?.outcome !== "published" ||
+    (stable.intent.kind !== "scaffold" &&
+      stable.intent.kind !== "working") ||
+    manifest === null ||
+    authority.manifestObjectId === null ||
+    authority.manifestEvidence === null ||
+    manifest.entries.some(
+      entry => entry.scope !== "private_profile_payload",
+    )
+  ) {
+    throw atomicFailure("atomic published profile authority is invalid");
+  }
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:published-profile:scratch`,
+    operationId,
+    "scratch_entries",
+    2,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:published-profile:payload`,
+    operationId,
+    "payload_entries",
+    4,
+    0,
+  );
+  const wrapperExpected = stable.intent.wrapper!;
+  const wrapperLocation = await observeAtomicContinuationDirectory(
+    flight,
+    resolveAtomicRecord(flight, authority.bundles.handleId),
+    operationId,
+    "atomic-published-profile-wrapper",
+  );
+  if (
+    wrapperLocation.state !== "present" ||
+    wrapperLocation.evidence!.dev !== wrapperExpected.dev ||
+    wrapperLocation.evidence!.ino !== wrapperExpected.ino
+  ) {
+    throw atomicFailure("atomic published profile wrapper drifted");
+  }
+  const wrapper = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:published-profile:open-wrapper`,
+    operationId,
+    "wrapper",
+    authority.bundles.handleId,
+    operationId,
+    wrapperLocation.evidence!,
+    "directory_nofollow",
+  );
+  const targetParent = await openAtomicRecoveryTargetParent(
+    lease,
+    stable.intent,
+  );
+  const rootEntry = manifest.entries.find(
+    entry =>
+      entry.scope === "private_profile_payload" &&
+      entry.path === "payload",
+  );
+  if (rootEntry === undefined || stable.intent.target.kind === "canary_parent") {
+    throw atomicFailure("atomic published profile target is unbound");
+  }
+  const target = await openAtomicExpectedChild(
+    controller,
+    `${operationId}:published-profile:open-target`,
+    operationId,
+    "public_target",
+    targetParent.handleId,
+    stable.intent.target.leaf,
+    atomicEvidenceFromManifestEntry(rootEntry),
+    "directory_nofollow",
+  );
+  const targetRecord = resolveAtomicRecord(flight, target.handleId);
+  await atomicRecoveryTreeEntries(
+    flight,
+    { handle: targetRecord.handle, stat: targetRecord.stat },
+    "private_profile_payload",
+    "payload",
+    stable.intent.privateSource!.checksum,
+    stable.intent.privateSource!.byteSize,
+  );
+  if (disposition === "adopt") {
+    const adoption = {
+      authority:
+        stable.intent.kind === "scaffold"
+          ? ("scaffold" as const)
+          : ("registry" as const),
+      authorityDigest: sha256(
+        JSON.stringify({
+          operationId,
+          binding: stable.intent.binding,
+          target: publicationTargetLocatorDigest(stable.intent.target),
+        }),
+      ),
+    };
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:published-profile:adopted`,
+      stable,
+      { ...stable.intent, phase: "adopted", adoption },
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+    if (
+      stable.intent.kind === "working" &&
+      stable.intent.target.kind === "profile_state"
+    ) {
+      adoptAtomicPublishedGeneration(
+        controller,
+        target.handleId,
+        {
+          profileId: stable.intent.target.profileId,
+          state: stable.intent.target.state,
+          generationId: stable.intent.target.generationId,
+        },
+        operationId,
+      );
+    }
+  }
+  const outcome =
+    disposition === "adopt"
+      ? ("adopted" as const)
+      : ("released_to_reconciliation" as const);
+  stable = await createAndReplaceAtomicIntent(
+    controller,
+    `${operationId}:published-profile:discarding`,
+    stable,
+    {
+      ...stable.intent,
+      phase: "discarding",
+      cleanup: {
+        phase: "discarding",
+        outcome,
+        evidenceDigest: sha256(
+          JSON.stringify({
+            operationId,
+            manifestSha256: stable.intent.identityManifest!.sha256,
+            outcome,
+          }),
+        ),
+        suffix: "private_source_entries",
+        nextIndex: 0,
+      },
+    },
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:published-profile:private:${cursor + 1}`,
+      stable,
+      "private_source_entries",
+      cursor + 1,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  for (const suffix of ["private_source_root", "wrapper_temps"] as const) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:published-profile:${suffix}`,
+      stable,
+      suffix,
+      0,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:published-profile:wrapper-temp:${cursor + 1}`,
+      stable,
+      "wrapper_temps",
+      cursor + 1,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:published-profile:wrapper-root`,
+    stable,
+    "wrapper_root",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  await runAtomicRequest(
+    controller,
+    `${operationId}:published-profile:remove-wrapper`,
+    {
+      kind: "remove_root",
+      operationId,
+      role: "wrapper",
+      parentId: authority.bundles.handleId,
+      leaf: operationId,
+      objectId: wrapper.handleId,
+      expected: wrapper.evidence,
+      manifestSha256: stable.intent.identityManifest!.sha256,
+      cursor: 0,
+    },
+    [authority.bundles.handleId, wrapper.handleId],
+  );
+  await closeAndReleaseAtomicRecord(
+    controller,
+    `${operationId}:published-profile:close-wrapper`,
+    operationId,
+    "wrapper",
+    wrapper.handleId,
+    wrapper.evidence,
+    { kind: "scratch_entries", count: 1, byteSize: 0 },
+  );
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:published-profile:intent-temps`,
+    stable,
+    "intent_temps",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:published-profile:intent-temp:${cursor + 1}`,
+      stable,
+      "intent_temps",
+      cursor + 1,
+      authority.intents.handleId,
+      authority.intents.evidence,
+    );
+  }
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:published-profile:done`,
+    stable,
+    "done",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  await executeAtomicProtectedCleanupTerminal(
+    controller,
+    createAtomicProtectedCleanupState({
+      operationId,
+      manifestSha256: stable.intent.identityManifest!.sha256,
+      entryCount: manifest.entries.length,
+      entryCounts: {
+        privateSourceEntries: manifest.entries.length,
+        wrapperTemps: 0,
+        intentTemps: 0,
+      },
+      entryDigests: manifest.entries.map((entry, index) =>
+        sha256(JSON.stringify({ index, entry })),
+      ),
+      cursor: manifest.entries.length,
+      suffix: "done",
+    }),
+    stable,
+    authority.intents,
+    {
+      objectId: authority.manifestObjectId,
+      evidence: authority.manifestEvidence,
+    },
+  );
 }
 
 type AtomicContinuationDirectoryLocationV1 = Readonly<{
@@ -17855,6 +20634,7 @@ export type AtomicProtectedPublicationRecoveryResultV1 = Readonly<{
 
 async function executeAtomicProtectedPublicationRecovery(
   lease: AtomicPreReadyRecoveryLeaseV1,
+  disposition: "adopt" | "release_to_reconciliation" = "adopt",
 ): Promise<AtomicProtectedPublicationRecoveryResultV1> {
   const controller = lease.controller;
   const flight = requireAtomicFlight(controller);
@@ -17912,7 +20692,10 @@ async function executeAtomicProtectedPublicationRecovery(
       cleanedProfile.sourceState.evidence,
       undefined,
     );
-    if (!flight.root.sealedGenerations.has(operationId)) {
+    if (
+      disposition === "adopt" &&
+      !flight.root.sealedGenerations.has(operationId)
+    ) {
       if (stable.intent.target.kind !== "profile_state") {
         throw atomicFailure("atomic cleaned target locator is invalid");
       }
@@ -18517,21 +21300,49 @@ async function executeAtomicProtectedPublicationRecovery(
     if (publicSourceOpened !== null || privateSourceOpened !== null) {
       throw atomicFailure("atomic continuation removed source is ambiguous");
     }
-    const adoption = {
-      authority:
-        stable.intent.kind === "prepare"
-          ? ("prepare_token" as const)
-          : ("reconciliation_snapshot" as const),
-      authorityDigest: publicSource.capabilityDigest,
-    };
-    stable = await createAndReplaceAtomicIntent(
-      controller,
-      `${operationId}:continuation:adopted`,
-      stable,
-      { ...stable.intent, phase: "adopted", adoption },
-      intents.handleId,
-      intents.evidence,
-    );
+    if (disposition === "adopt") {
+      const adoption = {
+        authority:
+          stable.intent.kind === "prepare"
+            ? ("prepare_token" as const)
+            : ("reconciliation_snapshot" as const),
+        authorityDigest: publicSource.capabilityDigest,
+      };
+      stable = await createAndReplaceAtomicIntent(
+        controller,
+        `${operationId}:continuation:adopted`,
+        stable,
+        { ...stable.intent, phase: "adopted", adoption },
+        intents.handleId,
+        intents.evidence,
+      );
+    } else {
+      const evidenceDigest = sha256(
+        JSON.stringify({
+          operationId,
+          manifestSha256,
+          outcome: "released_to_reconciliation",
+        }),
+      );
+      stable = await createAndReplaceAtomicIntent(
+        controller,
+        `${operationId}:continuation:released`,
+        stable,
+        {
+          ...stable.intent,
+          phase: "discarding",
+          cleanup: {
+            phase: "discarding",
+            outcome: "released_to_reconciliation",
+            evidenceDigest,
+            suffix: "private_source_entries",
+            nextIndex: 0,
+          },
+        },
+        intents.handleId,
+        intents.evidence,
+      );
+    }
   }
   if (
     stable.intent.phase === "adopted" ||
@@ -18563,7 +21374,10 @@ async function executeAtomicProtectedPublicationRecovery(
         undefined,
       );
     }
-    if (!flight.root.sealedGenerations.has(operationId)) {
+    if (
+      disposition === "adopt" &&
+      !flight.root.sealedGenerations.has(operationId)
+    ) {
       adoptAtomicPublishedGeneration(
         controller,
         profileAuthority.target.handleId,
@@ -18583,6 +21397,10 @@ async function executeAtomicProtectedPublicationRecovery(
     }
   }
   if (stable.intent.phase === "adopted") {
+    const cleanupOutcome =
+      disposition === "adopt"
+        ? ("adopted" as const)
+        : ("released_to_reconciliation" as const);
     stable = await createAndReplaceAtomicIntent(
       controller,
       `${operationId}:continuation:discarding`,
@@ -18592,14 +21410,22 @@ async function executeAtomicProtectedPublicationRecovery(
         phase: "discarding",
         cleanup: {
           phase: "discarding",
-          outcome: "adopted",
+          outcome: cleanupOutcome,
           evidenceDigest: sha256(
-            JSON.stringify({
-              operationId,
-              manifestSha256,
-              outcome: "adopted",
-              authority: stable.intent.adoption!.authorityDigest,
-            }),
+            JSON.stringify(
+              cleanupOutcome === "adopted"
+                ? {
+                    operationId,
+                    manifestSha256,
+                    outcome: cleanupOutcome,
+                    authority: stable.intent.adoption!.authorityDigest,
+                  }
+                : {
+                    operationId,
+                    manifestSha256,
+                    outcome: cleanupOutcome,
+                  },
+            ),
           ),
           suffix: "private_source_entries",
           nextIndex: 0,
@@ -18609,9 +21435,40 @@ async function executeAtomicProtectedPublicationRecovery(
       intents.evidence,
     );
   }
+  if (
+    stable.intent.phase === "discarding" &&
+    disposition === "release_to_reconciliation" &&
+    stable.intent.cleanup?.outcome === "adopted"
+  ) {
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:continuation:released`,
+      stable,
+      {
+        ...stable.intent,
+        cleanup: {
+          ...stable.intent.cleanup,
+          outcome: "released_to_reconciliation",
+          evidenceDigest: sha256(
+            JSON.stringify({
+              operationId,
+              manifestSha256,
+              outcome: "released_to_reconciliation",
+            }),
+          ),
+        },
+      },
+      intents.handleId,
+      intents.evidence,
+    );
+  }
   if (stable.intent.phase === "discarding") {
     if (
-      !flight.root.sealedGenerations.has(operationId) ||
+      (disposition === "adopt" &&
+        !flight.root.sealedGenerations.has(operationId)) ||
+      (disposition === "release_to_reconciliation" &&
+        stable.intent.cleanup?.outcome !==
+          "released_to_reconciliation") ||
       manifest.entries.some(
         entry =>
           entry.scope === "wrapper_temp" ||
@@ -18859,10 +21716,14 @@ async function executeAtomicProtectedPublicationRecovery(
 
 export async function recoverAtomicProtectedPublication(
   lease: AtomicPreReadyRecoveryLeaseV1,
+  disposition: "adopt" | "release_to_reconciliation" = "adopt",
 ): Promise<AtomicProtectedPublicationRecoveryResultV1> {
   const flight = requireAtomicFlight(lease.controller);
   try {
-    return await executeAtomicProtectedPublicationRecovery(lease);
+    return await executeAtomicProtectedPublicationRecovery(
+      lease,
+      disposition,
+    );
   } catch (error) {
     flight.state = "fail_stopped";
     flight.root.acceptingOperations = false;
@@ -18875,6 +21736,7 @@ export async function recoverAtomicProtectedPublicationFromCanonicalRoot(
   binding: ReadyProfileRootBinding,
   admission: ReconciliationExecutionAdmission,
   operationId: string,
+  disposition: "adopt" | "release_to_reconciliation" = "adopt",
 ): Promise<AtomicProtectedPublicationRecoveryResultV1> {
   const lease = await acquireAtomicPreReadyRecoveryAuthorityFromCanonicalRoot(
     canonicalRoot,
@@ -18883,7 +21745,7 @@ export async function recoverAtomicProtectedPublicationFromCanonicalRoot(
     operationId,
   );
   try {
-    return await recoverAtomicProtectedPublication(lease);
+    return await recoverAtomicProtectedPublication(lease, disposition);
   } finally {
     const failures: unknown[] = [];
     try {
@@ -18961,7 +21823,7 @@ export async function transitionHeldProfileGenerationAtomically(
     );
     const controller = lease.controller;
     const flight = requireAtomicFlight(controller);
-    const bundles = await openAtomicControlChild(
+    const bundles = await getAtomicInitialControlChild(
       controller,
       lease.initialAuthority.stagingRootId,
       "bundles_parent",
@@ -18969,7 +21831,7 @@ export async function transitionHeldProfileGenerationAtomically(
       `${operationId}:bundles`,
       operationId,
     );
-    const intents = await openAtomicControlChild(
+    const intents = await getAtomicInitialControlChild(
       controller,
       lease.initialAuthority.stagingRootId,
       "intents_parent",

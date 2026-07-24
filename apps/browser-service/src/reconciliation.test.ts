@@ -63,6 +63,7 @@ import {
   canonicalizeProfileTree,
   closeAnchoredProfileRoot,
   consumeInternalReconciliationOutcome,
+  consumeInternalReconciliationOutcomeForStartup,
   copyHeldProfileTree,
   listHeldProfileGenerations,
   launchPersistentChromiumForWorking,
@@ -80,10 +81,15 @@ import {
   runAtomicPinnedPersistenceProtocol,
   runWithReconciliationFilesystemTestContext,
   syncAndCanonicalizeHeldProfileTree,
+  transferSealedProfileGenerations,
   transitionHeldProfileGenerationAtomically,
   writeHeldProfileFixtureFile,
   type AnchoredProfileRoot,
 } from "./reconciliation.js";
+import {
+  attachSealedProfileGenerations,
+  createProfileStore,
+} from "./profile-store.js";
 import type { ReconciliationExecutionAdmission } from "./startup-state.js";
 
 const PROCESS = Buffer.alloc(32, 4).toString("base64url");
@@ -462,6 +468,7 @@ async function publishAtomicPrepareContinuationFixture(
   const finalIntent = parseAtomicPublishIntent(await readFile(intentPath));
   await closeAtomicEffectController(lease.controller);
   return {
+    tree,
     finalIntent,
     intentPath,
     manifestPath: path.join(
@@ -477,6 +484,49 @@ async function publishAtomicPrepareContinuationFixture(
     sourceRoot,
     targetRoot,
   };
+}
+
+async function markAtomicPrepareFixtureAdopted(
+  fixture: Awaited<
+    ReturnType<typeof publishAtomicPrepareContinuationFixture>
+  >,
+): Promise<void> {
+  const manifest = parseCleanupIdentityManifest(
+    await readFile(fixture.manifestPath),
+  );
+  const manifestSha256 = fixture.finalIntent.identityManifest!.sha256;
+  const privateDeletionLeaf = `delete-${CHECKPOINT_A}` as const;
+  const authorityDigest =
+    fixture.finalIntent.publicSource!.capabilityDigest;
+  await rm(fixture.sourceRoot, { recursive: true });
+  await writeFile(
+    fixture.intentPath,
+    encodeAtomicPublishIntent({
+      ...fixture.finalIntent,
+      phase: "adopted",
+      sourceDeletion: {
+        phase: "removed",
+        privateDeletionLeaf,
+        evidenceDigest: sha(
+          JSON.stringify({
+            operationId: CHECKPOINT_A,
+            manifestSha256,
+            publicSource: fixture.finalIntent.publicSource,
+            privateDeletionLeaf,
+          }),
+        ),
+        entryCount: manifest.entries.filter(
+          entry => entry.scope === "public_source",
+        ).length,
+        nextIndex: 0,
+      },
+      adoption: {
+        authority: "prepare_token",
+        authorityDigest,
+      },
+    }).bytes,
+    { mode: 0o600 },
+  );
 }
 
 async function createAtomicCanaryFixture(
@@ -2791,6 +2841,189 @@ describe("filesystem reconciliation", () => {
     await closeAnchoredProfileRoot(held!);
   });
 
+  test("emits one sanitized atomic preflight through the injected sink", async () => {
+    const canonicalRoot = await root();
+    const events: unknown[] = [];
+    const value = request([]);
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      value,
+      {
+        admission: admission().value,
+        now: () => NOW,
+        atomicPublicationSink(event) {
+          events.push(event);
+        },
+      },
+    );
+    const preflight = events.filter(
+      event =>
+        typeof event === "object" &&
+        event !== null &&
+        "event" in event &&
+        event.event === "atomic_publish_preflight",
+    );
+    expect(preflight).toHaveLength(1);
+    expect(preflight[0]).toEqual({
+      event: "atomic_publish_preflight",
+      platform: process.platform,
+      architecture: process.arch,
+      interfaceVersion: "1.0.0",
+      compiledNapiVersion: 8,
+      runtimeNapiVersion: Number(process.versions.napi),
+      source: "bundled_package_relative",
+      filesystem: "unknown",
+      result: "ready",
+    });
+    expect(JSON.stringify(preflight[0])).not.toContain(canonicalRoot);
+
+    const binding = {
+      processNonce: value.processNonce,
+      controlGenerationNonce: value.controlGenerationNonce,
+      snapshotDigest: value.snapshotDigest,
+    };
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      binding,
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+  });
+
+  test("keeps recovery metrics and alerts process-wide across reconciliations", async () => {
+    const eventSets: unknown[][] = [];
+    for (let index = 0; index < 2; index += 1) {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const value = request(
+        [],
+        PROCESS,
+        Buffer.alloc(32, 40 + index).toString("base64url"),
+      );
+      const profilesEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles"),
+        null,
+      );
+      const encoded = encodeAtomicPublishIntent({
+        version: 1,
+        operationId: CHECKPOINT_A,
+        kind: "scaffold",
+        phase: "allocated",
+        binding: {
+          processNonce: value.processNonce,
+          controlGenerationNonce: value.controlGenerationNonce,
+          snapshotDigest: value.snapshotDigest,
+        },
+        target: {
+          kind: "profile",
+          profileId: PROFILE,
+          leaf: PROFILE,
+          parent: {
+            dev: profilesEvidence.dev,
+            ino: profilesEvidence.ino,
+            mode: 448,
+          },
+        },
+        wrapper: null,
+        privateSource: null,
+        publicSource: null,
+        classification: null,
+        sourceDeletion: null,
+        adoption: null,
+        cleanup: null,
+        canaryProof: null,
+        prepublicationAbort: null,
+        identityManifest: null,
+      }).bytes;
+      await writeFile(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+          `${CHECKPOINT_A}.allocated.${CHECKPOINT_B}.tmp`,
+        ),
+        encoded,
+        { mode: 0o600 },
+      );
+      const events: unknown[] = [];
+      let orphanTopologyObserved = false;
+      eventSets.push(events);
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            atomicStartupRecoveryDecision(
+              operationId,
+              topology,
+              decision,
+            ) {
+              expect(operationId).toBe(CHECKPOINT_A);
+              expect(topology).toEqual({
+                stableIntent: false,
+                intentTemp: true,
+                wrapper: false,
+                privateSource: false,
+                publicSource: false,
+                publicTarget: "absent",
+                manifest: "absent",
+              });
+              expect(decision).toEqual({
+                kind: "fail_stop",
+                reason: "orphan_temp",
+              });
+              orphanTopologyObserved = true;
+            },
+          },
+          () =>
+            reconcileBrowserStateWithAuthority(
+              canonicalRoot,
+              value,
+              {
+                admission: admission().value,
+                now: () => NOW,
+                atomicPublicationSink(event) {
+                  events.push(event);
+                },
+              },
+            ),
+        ),
+      ).rejects.toThrow(
+        /atomic startup recovery fail-stopped: orphan_temp/u,
+      );
+      expect(orphanTopologyObserved).toBe(true);
+    }
+    const orphanCounters = eventSets.map(events =>
+      events.find(
+        event =>
+          typeof event === "object" &&
+          event !== null &&
+          "event" in event &&
+          event.event === "atomic_publish_counter" &&
+          "counter" in event &&
+          event.counter === "orphan_temp",
+      ),
+    );
+    expect(orphanCounters[0]).toMatchObject({
+      counter: "orphan_temp",
+      value: expect.any(Number),
+    });
+    expect(orphanCounters[1]).toMatchObject({
+      counter: "orphan_temp",
+      value: (orphanCounters[0] as { value: number }).value + 1,
+    });
+    expect(
+      eventSets
+        .flat()
+        .filter(
+          event =>
+            typeof event === "object" &&
+            event !== null &&
+            "event" in event &&
+            event.event === "atomic_publish_alert" &&
+            "category" in event &&
+            event.category === "orphan_temp",
+        ),
+    ).toHaveLength(1);
+  });
+
   test("aggregates consume cleanup failure and retains root close ownership", async () => {
     const canonicalRoot = await root();
     const value = request([]);
@@ -2924,8 +3157,8 @@ describe("filesystem reconciliation", () => {
       "corrupt",
       "ready",
     ]);
-    expect(rootOpens).toBe(2);
-    expect(rootCloses).toBe(2);
+    expect(rootOpens).toBe(1);
+    expect(rootCloses).toBe(1);
   });
 
   test("uses one held canonical engine for legacy and capability consumers", async () => {
@@ -7043,6 +7276,300 @@ describe("filesystem reconciliation", () => {
 });
 
 describe("atomic publication reconciliation ownership", () => {
+  test("recovers an allocated intent before Task 3 enumeration", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const value = request([]);
+    const profilesEvidence = await atomicFileEvidence(
+      path.join(canonicalRoot, "profiles"),
+      null,
+    );
+    const intent: AtomicPublishIntentV1 = {
+      version: 1,
+      operationId: CHECKPOINT_A,
+      kind: "scaffold",
+      phase: "allocated",
+      binding: {
+        processNonce: value.processNonce,
+        controlGenerationNonce: value.controlGenerationNonce,
+        snapshotDigest: value.snapshotDigest,
+      },
+      target: {
+        kind: "profile",
+        profileId: PROFILE,
+        leaf: PROFILE,
+        parent: {
+          dev: profilesEvidence.dev,
+          ino: profilesEvidence.ino,
+          mode: 448,
+        },
+      },
+      wrapper: null,
+      privateSource: null,
+      publicSource: null,
+      classification: null,
+      sourceDeletion: null,
+      adoption: null,
+      cleanup: null,
+      canaryProof: null,
+      prepublicationAbort: null,
+      identityManifest: null,
+    };
+    const encoded = encodeAtomicPublishIntent(intent);
+    await writeFile(
+      path.join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "intents",
+        `${CHECKPOINT_A}.json`,
+      ),
+      encoded.bytes,
+      { mode: 0o600 },
+    );
+    const events: unknown[] = [];
+
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      value,
+      {
+        admission: admission().value,
+        now: () => NOW,
+        atomicPublicationSink(event) {
+          events.push(event);
+        },
+      },
+    );
+    expect(
+      await readdir(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        ),
+      ),
+    ).toEqual([]);
+    expect(events).toContainEqual({
+      event: "atomic_publish_counter",
+      counter: "recovered_unpublished",
+      value: 1,
+    });
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      intent.binding,
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+  });
+
+  test.each(["empty", "partial"] as const)(
+    "manifests and cleans a %s building tree before Task 3",
+    async topology => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const value = request([]);
+      const profilesEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles"),
+        null,
+      );
+      const wrapperPath = path.join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "bundles",
+        CHECKPOINT_A,
+      );
+      await mkdir(wrapperPath, { mode: 0o700 });
+      if (topology === "partial") {
+        await mkdir(path.join(wrapperPath, "payload"), { mode: 0o700 });
+        await writeFile(
+          path.join(wrapperPath, "payload", "partial.bin"),
+          "partial",
+          { mode: 0o600 },
+        );
+      }
+      const wrapperEvidence = await atomicFileEvidence(wrapperPath, null);
+      const intent: AtomicPublishIntentV1 = {
+        version: 1,
+        operationId: CHECKPOINT_A,
+        kind: "scaffold",
+        phase: "building",
+        binding: {
+          processNonce: value.processNonce,
+          controlGenerationNonce: value.controlGenerationNonce,
+          snapshotDigest: value.snapshotDigest,
+        },
+        target: {
+          kind: "profile",
+          profileId: PROFILE,
+          leaf: PROFILE,
+          parent: {
+            dev: profilesEvidence.dev,
+            ino: profilesEvidence.ino,
+            mode: 448,
+          },
+        },
+        wrapper: {
+          dev: wrapperEvidence.dev,
+          ino: wrapperEvidence.ino,
+          mode: 448,
+        },
+        privateSource: null,
+        publicSource: null,
+        classification: null,
+        sourceDeletion: null,
+        adoption: null,
+        cleanup: null,
+        canaryProof: null,
+        prepublicationAbort: null,
+        identityManifest: null,
+      };
+      await writeFile(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+          `${CHECKPOINT_A}.json`,
+        ),
+        encodeAtomicPublishIntent(intent).bytes,
+        { mode: 0o600 },
+      );
+      const outcome = await reconcileBrowserStateWithAuthority(
+        canonicalRoot,
+        value,
+        {
+          admission: admission().value,
+          now: () => NOW,
+        },
+      );
+      await expect(lstat(wrapperPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(
+        await readdir(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+          ),
+        ),
+      ).toEqual([]);
+      await consumeInternalReconciliationOutcome(
+        outcome,
+        intent.binding,
+        async install => closeAnchoredProfileRoot(install.root),
+      );
+    },
+  );
+
+  test("manifests and cleans a classified unpublished payload before Task 3", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const value = request([]);
+    const profilesEvidence = await atomicFileEvidence(
+      path.join(canonicalRoot, "profiles"),
+      null,
+    );
+    const wrapperPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+    );
+    const payloadPath = path.join(wrapperPath, "payload");
+    await mkdir(payloadPath, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(payloadPath, "partial.bin"), "partial", {
+      mode: 0o600,
+    });
+    const wrapperEvidence = await atomicFileEvidence(wrapperPath, null);
+    const payloadEvidence = await atomicFileEvidence(payloadPath, null);
+    const tree = await canonicalizeProfileTree(
+      canonicalRoot,
+      path.relative(canonicalRoot, payloadPath),
+      admission().value,
+    );
+    const intent: AtomicPublishIntentV1 = {
+      version: 1,
+      operationId: CHECKPOINT_A,
+      kind: "scaffold",
+      phase: "classified",
+      binding: {
+        processNonce: value.processNonce,
+        controlGenerationNonce: value.controlGenerationNonce,
+        snapshotDigest: value.snapshotDigest,
+      },
+      target: {
+        kind: "profile",
+        profileId: PROFILE,
+        leaf: PROFILE,
+        parent: {
+          dev: profilesEvidence.dev,
+          ino: profilesEvidence.ino,
+          mode: 448,
+        },
+      },
+      wrapper: {
+        dev: wrapperEvidence.dev,
+        ino: wrapperEvidence.ino,
+        mode: 448,
+      },
+      privateSource: {
+        dev: payloadEvidence.dev,
+        ino: payloadEvidence.ino,
+        mode: 448,
+        checksum: tree.checksum,
+        byteSize: tree.byteSize,
+      },
+      publicSource: null,
+      classification: {
+        outcome: "unpublished",
+        nativeCode: "atomic_publish_unsupported",
+        sourceMatches: true,
+        targetMatches: false,
+        targetOther: false,
+        evidenceDigest: sha("classified-unpublished"),
+      },
+      sourceDeletion: null,
+      adoption: null,
+      cleanup: null,
+      canaryProof: null,
+      prepublicationAbort: null,
+      identityManifest: null,
+    };
+    await writeFile(
+      path.join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "intents",
+        `${CHECKPOINT_A}.json`,
+      ),
+      encodeAtomicPublishIntent(intent).bytes,
+      { mode: 0o600 },
+    );
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      value,
+      {
+        admission: admission().value,
+        now: () => NOW,
+      },
+    );
+    await expect(lstat(wrapperPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(
+      await readdir(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        ),
+      ),
+    ).toEqual([]);
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      intent.binding,
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+  });
+
   test.each([
     "missing",
     "inaccessible",
@@ -10157,6 +10684,348 @@ describe("atomic publication reconciliation ownership", () => {
     }
   });
 
+  test("transfers one recovered held generation through Task 3 and outcome", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    await markAtomicPrepareFixtureAdopted(fixture);
+    await closeAnchoredProfileRoot(installed.root);
+
+    let rootOpens = 0;
+    const profileReads: string[] = [];
+    const outcome = await runWithReconciliationFilesystemTestContext(
+      {
+        afterCall(point) {
+          if (point === "open-root") rootOpens += 1;
+        },
+        beforeCall(point) {
+          if (point.startsWith("profile-evidence-")) {
+            profileReads.push(point);
+          }
+        },
+      },
+      () =>
+        reconcileBrowserStateWithAuthority(
+          canonicalRoot,
+          request([]),
+          { admission: admission().value, now: () => NOW },
+        ),
+    );
+    expect(rootOpens).toBe(1);
+    expect(profileReads).toEqual([
+      "profile-evidence-lstat",
+      "profile-evidence-open-file",
+      "profile-evidence-read",
+      "profile-evidence-read",
+      "profile-evidence-file-stat",
+      "profile-evidence-root-stat",
+      "profile-evidence-final-stat",
+    ]);
+
+    let transferred: readonly import("./reconciliation.js").BoundProfileGeneration[] =
+      [];
+    await consumeInternalReconciliationOutcomeForStartup(
+      outcome,
+      installed.binding,
+      async (_root, _binding, sealedCount) => {
+        expect(sealedCount).toBe(1);
+        return createProfileStore({
+          root: _root,
+          binding: _binding,
+        });
+      },
+      async install => {
+        expect(install.root).toBeDefined();
+        expect(install.sealedGenerationCount).toBe(1);
+        transferred = install.sealedGenerations;
+        expect(
+          await syncAndCanonicalizeHeldProfileTree(transferred[0]!),
+        ).toMatchObject({
+          checksum: fixture.tree.checksum,
+          byteSize: fixture.tree.byteSize,
+        });
+        transferSealedProfileGenerations(
+          install.root,
+          transferred,
+          generations =>
+            attachSealedProfileGenerations(
+              install.profileStore,
+              generations,
+            ),
+        );
+        expect(atomicSealedGenerationCountForTest(install.root)).toBe(0);
+        expect(() =>
+          transferSealedProfileGenerations(
+            install.root,
+            transferred,
+            generations =>
+              attachSealedProfileGenerations(
+                install.profileStore,
+                generations,
+              ),
+          ),
+        ).toThrow(/transfer is unavailable/u);
+        await install.profileStore.close();
+        await closeAnchoredProfileRoot(install.root);
+      },
+    );
+    expect(transferred).toHaveLength(1);
+    await expect(
+      syncAndCanonicalizeHeldProfileTree(transferred[0]!),
+    ).rejects.toThrow(/not live/u);
+  });
+
+  test.each(["constructor", "compare-and-swap"] as const)(
+    "%s failure closes one recovered root and sealed chain exactly once",
+    async failurePoint => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const fixture = await publishAtomicPrepareContinuationFixture(
+        canonicalRoot,
+        installed,
+      );
+      await markAtomicPrepareFixtureAdopted(fixture);
+      await closeAnchoredProfileRoot(installed.root);
+      const outcome = await reconcileBrowserStateWithAuthority(
+        canonicalRoot,
+        request([]),
+        { admission: admission().value, now: () => NOW },
+      );
+      const failure = new Error(`${failurePoint} failed`);
+      const storeClose = vi.fn(async () => undefined);
+      let sealedGenerationCount = -1;
+      const closes: string[] = [];
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            handleClosed(point) {
+              closes.push(point);
+            },
+          },
+          () =>
+            consumeInternalReconciliationOutcomeForStartup(
+              outcome,
+              installed.binding,
+              async (_root, _binding, count) => {
+                sealedGenerationCount = count;
+                if (failurePoint === "constructor") throw failure;
+                return {
+                  close: storeClose,
+                } as unknown as import("./profile-store.js").ProfileStore;
+              },
+              () => {
+                throw failure;
+              },
+          ),
+        ),
+      ).rejects.toBe(failure);
+      expect(sealedGenerationCount).toBe(1);
+      expect(storeClose).toHaveBeenCalledTimes(
+        failurePoint === "compare-and-swap" ? 1 : 0,
+      );
+      for (const point of [
+        "generation",
+        "generation-state",
+        "generation-profile",
+        "generation-profiles",
+        "root",
+      ]) {
+        expect(closes.filter(value => value === point)).toHaveLength(1);
+      }
+    },
+  );
+
+  test("never adopts a durably adopted generation from a stale binding", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    await markAtomicPrepareFixtureAdopted(fixture);
+    await closeAnchoredProfileRoot(installed.root);
+
+    const current = request([], PROCESS, Buffer.alloc(32, 29).toString("base64url"));
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      current,
+      { admission: admission().value, now: () => NOW },
+    );
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      {
+        processNonce: current.processNonce,
+        controlGenerationNonce: current.controlGenerationNonce,
+        snapshotDigest: current.snapshotDigest,
+      },
+      async install => {
+        expect(atomicSealedGenerationCountForTest(install.root)).toBe(0);
+        await closeAnchoredProfileRoot(install.root);
+      },
+    );
+  });
+
+  test("fresh controller releases an unreferenced protected target", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    try {
+      await expect(
+        recoverAtomicProtectedPublication(
+          recovery,
+          "release_to_reconciliation",
+        ),
+      ).resolves.toEqual({
+        sealed: true,
+        operationId: CHECKPOINT_A,
+        phase: "cleaned",
+      });
+      expect(atomicSealedGenerationCountForTest(installed.root)).toBe(0);
+      await expect(lstat(fixture.sourceRoot)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(
+        readFile(path.join(fixture.targetRoot, "source.bin"), "utf8"),
+      ).resolves.toBe("protected-source");
+      await expect(lstat(fixture.wrapperPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(fixture.manifestPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(fixture.intentPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await closeAtomicEffectController(recovery.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("full reconciliation adopts a published scaffold before Task 3", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicScaffoldFixture(
+      canonicalRoot,
+      installed,
+    );
+    await closeAnchoredProfileRoot(installed.root);
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      request([]),
+      { admission: admission().value, now: () => NOW },
+    );
+    await expect(lstat(fixture.intentPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(lstat(fixture.manifestPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      readdir(path.join(canonicalRoot, "profiles", PROFILE)),
+    ).resolves.toEqual(["committed", "staging", "working"]);
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      installed.binding,
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+  });
+
+  test("full reconciliation resumes a ready scaffold through publication", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicScaffoldFixture(
+      canonicalRoot,
+      installed,
+    );
+    const durable = parseAtomicPublishIntent(
+      await readFile(fixture.intentPath),
+    );
+    const wrapperPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+    );
+    await rename(
+      path.join(canonicalRoot, "profiles", PROFILE),
+      path.join(wrapperPath, "payload"),
+    );
+    await rm(fixture.manifestPath);
+    await writeFile(
+      fixture.intentPath,
+      encodeAtomicPublishIntent({
+        ...durable,
+        phase: "ready",
+        classification: null,
+        identityManifest: null,
+      }).bytes,
+      { mode: 0o600 },
+    );
+    await closeAnchoredProfileRoot(installed.root);
+    let topologyObserved = false;
+    let decisionObserved = false;
+    const outcome = await runWithReconciliationFilesystemTestContext(
+      {
+        atomicStartupRecoveryDecision(operationId, topology, decision) {
+          expect(operationId).toBe(CHECKPOINT_A);
+          expect(topology).toEqual({
+            stableIntent: true,
+            intentTemp: false,
+            wrapper: true,
+            privateSource: true,
+            publicSource: false,
+            publicTarget: "absent",
+            manifest: "absent",
+          });
+          expect(decision).toEqual({ kind: "recover_unpublished" });
+          topologyObserved = true;
+        },
+        beforeCall(point) {
+          if (point === "atomic-replace-intent") {
+            expect(topologyObserved).toBe(true);
+            decisionObserved = true;
+          }
+        },
+      },
+      () =>
+        reconcileBrowserStateWithAuthority(
+          canonicalRoot,
+          request([]),
+          { admission: admission().value, now: () => NOW },
+        ),
+    );
+    expect(topologyObserved).toBe(true);
+    expect(decisionObserved).toBe(true);
+    await expect(lstat(wrapperPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      readdir(path.join(canonicalRoot, "profiles", PROFILE)),
+    ).resolves.toEqual(["committed", "staging", "working"]);
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      installed.binding,
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+  });
+
   test.each([
     "pending",
     "moved_private",
@@ -11577,6 +12446,43 @@ describe("atomic publication reconciliation ownership", () => {
       ),
     ).resolves.toBe("source");
     await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("closes multiple sealed generations in reverse ownership order", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    for (const generationId of [CHECKPOINT_A, CHECKPOINT_B]) {
+      const working = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId,
+        openMode: "create_exclusive",
+      });
+      await writeHeldProfileFixtureFile(
+        working,
+        "source.bin",
+        generationId,
+      );
+      await transitionHeldProfileGenerationAtomically(working, {
+        binding: installed.binding,
+        kind: "prepare",
+        authorityDigest: sha(`pre-ready-${generationId}`),
+        adoptionMode: "pre_ready",
+      });
+    }
+    expect(atomicSealedGenerationCountForTest(installed.root)).toBe(2);
+
+    const closing: string[] = [];
+    await runWithReconciliationFilesystemTestContext(
+      {
+        sealedGenerationClosing(locator) {
+          closing.push(locator.generationId);
+        },
+      },
+      () => closeAnchoredProfileRoot(installed.root),
+    );
+    expect(closing).toEqual([CHECKPOINT_B, CHECKPOINT_A]);
   });
 
   test("drives protected source and terminal cleanup through reducers", async () => {

@@ -4287,6 +4287,7 @@ function observationSpecificMismatch(
         const pending = state.pendingNativeResolution;
         const verification = state.canaryWorkflow;
         const authorizedRequest =
+          pending === null ||
           (pending !== null &&
             pending.request.operationId === request.operationId &&
             pending.request.move === request.move &&
@@ -5919,7 +5920,7 @@ export function reduceAtomicPublication(
       );
     }
     const pending = accepted.pendingNativeResolution;
-    if (pending === null) return fail(accepted, "observation_mismatch");
+    if (pending === null) return completed(accepted);
     const classification = nativeClassificationFromLocations(
       pending,
       accepted.canaryReplayAuthority,
@@ -6061,6 +6062,137 @@ export function reduceAtomicPublication(
     );
   }
   return completed(accepted);
+}
+
+export type AtomicStartupRecoveryTopologyV1 = Readonly<{
+  stableIntent: boolean;
+  intentTemp: boolean;
+  wrapper: boolean;
+  privateSource: boolean;
+  publicSource: boolean;
+  publicTarget: "absent" | "match" | "other";
+  manifest: "absent" | "temp" | "stable" | "both";
+}>;
+
+export type AtomicStartupRecoveryDecisionV1 =
+  | Readonly<{
+      kind: "abort_prepublication";
+      classification: "never_attempted";
+    }>
+  | Readonly<{
+      kind: "recover_unpublished";
+    }>
+  | Readonly<{
+      kind: "recover_published";
+      disposition: "adopt" | "release_to_reconciliation";
+    }>
+  | Readonly<{
+      kind: "resume_cleanup";
+    }>
+  | Readonly<{
+      kind: "fail_stop";
+      reason: "ambiguous" | "orphan_temp" | "invalid_topology";
+    }>;
+
+export function reduceAtomicStartupRecoveryV1(input: Readonly<{
+  kind: "scaffold" | "working" | "prepare" | "finalize" | "canary";
+  phase: AtomicPublishPhaseV1;
+  classification: "unpublished" | "conflict" | "published" | "ambiguous" | null;
+  authorizedByFreshSnapshot: boolean;
+  topology: AtomicStartupRecoveryTopologyV1;
+}>): AtomicStartupRecoveryDecisionV1 {
+  const topology = input.topology;
+  if (!topology.stableIntent) {
+    return topology.intentTemp || topology.wrapper || topology.privateSource
+      ? Object.freeze({ kind: "fail_stop", reason: "orphan_temp" })
+      : Object.freeze({ kind: "fail_stop", reason: "invalid_topology" });
+  }
+  if (topology.publicTarget === "other") {
+    return Object.freeze({ kind: "fail_stop", reason: "ambiguous" });
+  }
+  if (
+    input.phase === "allocated" ||
+    input.phase === "building" ||
+    input.phase === "aborting_prepublication"
+  ) {
+    if (
+      input.classification !== null ||
+      topology.publicTarget !== "absent" ||
+      topology.manifest === "stable" ||
+      topology.manifest === "both"
+    ) {
+      return Object.freeze({ kind: "fail_stop", reason: "invalid_topology" });
+    }
+    return Object.freeze({
+      kind: "abort_prepublication",
+      classification: "never_attempted",
+    });
+  }
+  if (input.classification === "ambiguous") {
+    return Object.freeze({ kind: "fail_stop", reason: "ambiguous" });
+  }
+  if (
+    input.phase === "discarding" ||
+    input.phase === "manifest_deleting" ||
+    input.phase === "cleaned"
+  ) {
+    return Object.freeze({ kind: "resume_cleanup" });
+  }
+  if (
+    (input.phase === "manifest_planned" ||
+      input.phase === "manifest_published") &&
+    input.classification === null &&
+    topology.publicTarget === "absent" &&
+    topology.privateSource
+  ) {
+    return Object.freeze({ kind: "recover_unpublished" });
+  }
+  if (
+    input.phase === "ready" &&
+    input.classification === null &&
+    topology.publicTarget === "absent" &&
+    topology.privateSource
+  ) {
+    return Object.freeze({ kind: "recover_unpublished" });
+  }
+  const published =
+    input.classification === "published" ||
+    (input.phase === "ready" &&
+      input.classification === null &&
+      !topology.privateSource &&
+      topology.publicTarget === "match") ||
+    input.phase === "renamed" ||
+    input.phase === "manifest_planned" ||
+    input.phase === "manifest_published" ||
+    input.phase === "source_deleting" ||
+    input.phase === "adopted";
+  if (published) {
+    if (
+      topology.publicTarget !== "match" ||
+      input.classification === "conflict" ||
+      input.classification === "unpublished"
+    ) {
+      return Object.freeze({ kind: "fail_stop", reason: "ambiguous" });
+    }
+    return Object.freeze({
+      kind: "recover_published",
+      disposition:
+        input.authorizedByFreshSnapshot &&
+        input.kind !== "working" &&
+        input.kind !== "canary"
+          ? "adopt"
+          : "release_to_reconciliation",
+    });
+  }
+  if (
+    (input.classification === "unpublished" ||
+      input.classification === "conflict") &&
+    topology.publicTarget === "absent" &&
+    topology.privateSource
+  ) {
+    return Object.freeze({ kind: "recover_unpublished" });
+  }
+  return Object.freeze({ kind: "fail_stop", reason: "invalid_topology" });
 }
 
 export type AtomicManifestPlannedBindingV1 = Readonly<{
@@ -6289,7 +6421,7 @@ function validManifestPlannedBinding(
     binding.manifestByteSize === binding.canonicalBytes.byteLength &&
     binding.manifestByteSize <= ATOMIC_MAX_MANIFEST_BYTES &&
     Number.isSafeInteger(binding.entryCount) &&
-    binding.entryCount > 0 &&
+    binding.entryCount >= 0 &&
     binding.entryCount <= ATOMIC_MAX_PAYLOAD_ENTRIES &&
     isFlightId(binding.intentsParentId) &&
     binding.stableLeaf === `${binding.operationId}.identities.json` &&

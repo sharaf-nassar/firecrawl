@@ -1225,6 +1225,16 @@ function validateIntentMatrix(intent: AtomicPublishIntentV1): void {
   const classifiedNonAmbiguous =
     intent.classification !== null &&
     intent.classification.outcome !== "ambiguous";
+  if (
+    intent.identityManifest?.entryCount === 0 &&
+    !(
+      intent.prepublicationAbort?.from === "building" &&
+      intent.wrapper !== null &&
+      intent.privateSource === null
+    )
+  ) {
+    invalid("empty identity manifest requires empty building abort");
+  }
   if (isAbort) {
     if (
       intent.classification !== null ||

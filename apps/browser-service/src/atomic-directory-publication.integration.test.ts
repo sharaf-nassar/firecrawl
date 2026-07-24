@@ -27,9 +27,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { loadAtomicDirectoryPublicationNative } from "./atomic-directory-publication-native.js";
-import type {
-  AtomicCanaryProofV1,
-  AtomicObjectEvidenceV1,
+import {
+  reduceAtomicStartupRecoveryV1,
+  type AtomicCanaryProofV1,
+  type AtomicObjectEvidenceV1,
 } from "./atomic-directory-publication.js";
 
 const roots: string[] = [];
@@ -50,6 +51,38 @@ afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+describe("durable startup topology", () => {
+  test("classifies a real published target without pathname data in the result", () => {
+    const directory = root();
+    const wrapper = join(directory, "wrapper");
+    const target = join(directory, "target");
+    mkdirSync(wrapper, { mode: 0o700 });
+    mkdirSync(target, { mode: 0o700 });
+
+    const decision = reduceAtomicStartupRecoveryV1({
+      kind: "finalize",
+      phase: "manifest_published",
+      classification: "published",
+      authorizedByFreshSnapshot: true,
+      topology: {
+        stableIntent: true,
+        intentTemp: false,
+        wrapper: existsSync(wrapper),
+        privateSource: false,
+        publicSource: false,
+        publicTarget: existsSync(target) ? "match" : "absent",
+        manifest: "stable",
+      },
+    });
+
+    expect(decision).toEqual({
+      kind: "recover_published",
+      disposition: "adopt",
+    });
+    expect(JSON.stringify(decision)).not.toContain(directory);
+  });
 });
 
 function root(): string {
@@ -338,12 +371,13 @@ const fs = require("node:fs");
   const canonicalRoot = process.argv[1];
   const fixture = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
   const barrierPhase = process.argv[3];
+  const barrierMove = process.argv[4];
   const readyFd = fs.openSync(
-    process.argv[4],
+    process.argv[5],
     fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
   );
   const releaseFd = fs.openSync(
-    process.argv[5],
+    process.argv[6],
     fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
   );
   const snapshot =
@@ -415,7 +449,7 @@ const fs = require("node:fs");
         if (
           rendezvoused ||
           phase !== barrierPhase ||
-          move !== "profile_source_to_private"
+          move !== barrierMove
         ) {
           return;
         }
@@ -470,6 +504,9 @@ function spawnProtectedPublisherBarrier(
   canonicalRoot: string,
   fixturePath: string,
   phase: "before" | "after" | "remove",
+  move:
+    | "profile_source_to_private"
+    | "profile_publish" = "profile_source_to_private",
 ): CanaryBarrierFixture {
   const readyPath = `${fixturePath}.ready`;
   const releasePath = `${fixturePath}.release`;
@@ -533,6 +570,7 @@ function spawnProtectedPublisherBarrier(
       canonicalRoot,
       fixturePath,
       phase,
+      move,
       readyPath,
       releasePath,
     ],
@@ -861,6 +899,67 @@ function runFreshProtectedRecovery(
   };
 }
 
+const freshStartupRecoveryChild = String.raw`
+const fs = require("node:fs");
+(async () => {
+  const reconciliation = await import("./src/reconciliation.ts");
+  const fixture = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  const snapshot = reconciliation.canonicalizeReconciliationSnapshot([]);
+  const request = {
+    version: 1,
+    processNonce: fixture.binding.processNonce,
+    controlGenerationNonce: fixture.binding.controlGenerationNonce,
+    snapshotDigest: snapshot.snapshotDigest,
+    references: [],
+  };
+  const admission = {
+    signal: new AbortController().signal,
+    assertAdmitted() {},
+  };
+  const outcome =
+    await reconciliation.reconcileBrowserStateWithAuthority(
+      process.argv[1],
+      request,
+      { admission },
+    );
+  let installed = false;
+  await reconciliation.consumeInternalReconciliationOutcome(
+    outcome,
+    fixture.binding,
+    async install => {
+      installed = true;
+      await reconciliation.closeAnchoredProfileRoot(install.root);
+    },
+  );
+  process.stdout.write(JSON.stringify({ installed }));
+})().catch(error => {
+  process.stderr.write(String(error?.stack ?? error));
+  process.exitCode = 1;
+});
+`;
+
+function runFreshStartupRecovery(
+  canonicalRoot: string,
+  fixturePath: string,
+): { installed: boolean } {
+  const result = spawnSync(
+    tsxPath,
+    [
+      "-e",
+      freshStartupRecoveryChild,
+      canonicalRoot,
+      fixturePath,
+    ],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      encoding: "utf8",
+      timeout: 10_000,
+    },
+  );
+  expect(result.status, result.stderr).toBe(0);
+  return JSON.parse(result.stdout) as { installed: boolean };
+}
+
 describe("atomic directory publication host integration", () => {
   test("selects exactly one complete winner across concurrent processes", async () => {
     const directory = root();
@@ -991,12 +1090,29 @@ describe("atomic directory publication host integration", () => {
   );
 
   test.each([
-    { seam: "native-before", phase: "before" },
-    { seam: "native-after", phase: "after" },
-    { seam: "cursor-before-remove", phase: "remove" },
+    {
+      seam: "source-native-before",
+      phase: "before",
+      move: "profile_source_to_private",
+    },
+    {
+      seam: "source-native-after",
+      phase: "after",
+      move: "profile_source_to_private",
+    },
+    {
+      seam: "publication-native-after",
+      phase: "after",
+      move: "profile_publish",
+    },
+    {
+      seam: "cursor-before-remove",
+      phase: "remove",
+      move: "profile_source_to_private",
+    },
   ] as const)(
-    "recovers protected source deletion after SIGKILL at $seam seam",
-    async ({ phase }) => {
+    "recovers protected publication after SIGKILL at $seam seam",
+    async ({ phase, move }) => {
       const canonicalRoot = root();
       const fixtureDirectory = root();
       const stagingPath = join(
@@ -1006,6 +1122,7 @@ describe("atomic directory publication host integration", () => {
       mkdirSync(stagingPath, { mode: 0o700 });
       mkdirSync(join(stagingPath, "bundles"), { mode: 0o700 });
       mkdirSync(join(stagingPath, "intents"), { mode: 0o700 });
+      mkdirSync(join(canonicalRoot, "profiles"), { mode: 0o700 });
       const binding = {
         processNonce: Buffer.alloc(32, 6).toString("base64url"),
         controlGenerationNonce:
@@ -1031,6 +1148,7 @@ describe("atomic directory publication host integration", () => {
         canonicalRoot,
         fixturePath,
         phase,
+        move,
       );
       let operationId = "";
       try {
@@ -1050,6 +1168,18 @@ describe("atomic directory publication host integration", () => {
           code: null,
           signal: "SIGKILL",
         });
+        if (move === "profile_publish") {
+          const durable = JSON.parse(
+            readFileSync(
+              join(intentsPath, `${operationId}.json`),
+              "utf8",
+            ),
+          );
+          expect(durable).toMatchObject({
+            phase: "ready",
+            classification: null,
+          });
+        }
       } finally {
         fixture.close();
       }
@@ -1089,20 +1219,29 @@ describe("atomic directory publication host integration", () => {
       }).toEqual(
         phase === "before"
           ? { publicSource: true, privateSource: false }
-          : { publicSource: false, privateSource: true },
+          : {
+              publicSource: move === "profile_publish",
+              privateSource: move !== "profile_publish",
+            },
       );
       writeFileSync(
         fixturePath,
         JSON.stringify({ binding, operationId }),
         { flag: "w", mode: 0o600 },
       );
-      expect(
-        runFreshProtectedRecovery(canonicalRoot, fixturePath),
-      ).toEqual({
-        operationId,
-        phase: "cleaned",
-        sealed: true,
-      });
+      if (move === "profile_publish") {
+        expect(
+          runFreshStartupRecovery(canonicalRoot, fixturePath),
+        ).toEqual({ installed: true });
+      } else {
+        expect(
+          runFreshProtectedRecovery(canonicalRoot, fixturePath),
+        ).toEqual({
+          operationId,
+          phase: "cleaned",
+          sealed: true,
+        });
+      }
       expect(
         readFileSync(join(targetPath, "source.bin"), "utf8"),
       ).toBe("protected-source");

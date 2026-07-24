@@ -1670,6 +1670,70 @@ describe("atomic publication durable codecs", () => {
     );
   });
 
+  it("binds zero-entry manifests only to empty building aborts", () => {
+    const building: AtomicPublishIntentV1 = {
+      ...allocatedIntent(),
+      phase: "building",
+      wrapper: { dev: "1", ino: "5", mode: 448 },
+    };
+    const aborting: AtomicPublishIntentV1 = {
+      ...building,
+      phase: "aborting_prepublication",
+      prepublicationAbort: {
+        outcome: "never_attempted",
+        from: "building",
+        evidenceDigest: SHA_A,
+      },
+      cleanup: {
+        phase: "aborting_prepublication",
+        outcome: "never_attempted",
+        evidenceDigest: SHA_B,
+        suffix: "private_source_entries",
+        nextIndex: 0,
+      },
+    };
+    const manifest: CleanupIdentityManifestV1 = {
+      version: 1,
+      operationId: OPERATION_ID,
+      binding: building.binding,
+      targetLocatorDigest: publicationTargetLocatorDigest(building.target),
+      entries: [],
+    };
+    const encoded = encodeCleanupIdentityManifest(manifest);
+    const planned: AtomicPublishIntentV1 = {
+      ...aborting,
+      phase: "manifest_planned",
+      identityManifest: {
+        phase: "planned",
+        filename: `${OPERATION_ID}.identities.json`,
+        tempFilename: `${OPERATION_ID}.identities.${TRANSITION_ID}.tmp`,
+        sha256: encoded.sha256,
+        entryCount: 0,
+        byteSize: encoded.bytes.byteLength,
+        dev: null,
+        ino: null,
+        mode: null,
+      },
+    };
+    expect(validateAtomicPublishIntentTransition(aborting, planned)).toEqual(
+      planned,
+    );
+    expect(() =>
+      encodeAtomicPublishIntent({
+        ...planned,
+        prepublicationAbort: null,
+        classification: {
+          outcome: "unpublished",
+          nativeCode: "atomic_publish_unsupported",
+          sourceMatches: true,
+          targetMatches: false,
+          targetOther: false,
+          evidenceDigest: SHA_C,
+        },
+      }),
+    ).toThrow(/empty identity manifest/u);
+  });
+
   it("uses the shared canonical profile permission-bit range", () => {
     const manifest = cleanupManifest();
     expect(() =>
