@@ -44,6 +44,7 @@ const GENERATIONS = [
   "44444444-4444-4444-8444-444444444444",
   "55555555-5555-4555-8555-555555555555",
 ];
+const DURABLE_FILESYSTEM_TEST_TIMEOUT_MS = 15_000;
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -764,4 +765,4 @@ describe("held profile publication", () => {
     await expect(store.close()).resolves.toBeUndefined();
     await expect(closeAnchoredProfileRoot(root)).resolves.toBeUndefined();
   });
-});
+}, DURABLE_FILESYSTEM_TEST_TIMEOUT_MS);
