@@ -164,6 +164,14 @@ export type AtomicObjectRoleV1 =
   | "public_source"
   | "public_target";
 
+export type AtomicProtectedRemovalRoleV1 =
+  | "payload_entry"
+  | "private_source"
+  | "private_deletion"
+  | "wrapper"
+  | "intent_temp"
+  | "manifest_temp";
+
 export type AtomicEffectKindV1 =
   | "reserve_budget"
   | "release_budget"
@@ -480,7 +488,7 @@ export type AtomicEffectRequestV1 =
       kind: "remove_file" | "remove_directory" | "remove_root";
       effectId: FlightEffectId;
       operationId: CanonicalUuid;
-      role: AtomicObjectRoleV1;
+      role: AtomicProtectedRemovalRoleV1;
       parentId: FlightSemanticId;
       leaf: string;
       objectId: FlightSemanticId;
@@ -948,6 +956,7 @@ export type AtomicTerminalResultV1 =
   | Readonly<{
       kind: "cleanup_pending";
       proof: AtomicCanaryProofV1;
+      privateDeletionObjectId: FlightSemanticId | null;
     }>
   | Readonly<{
       kind: "canary_cleaned";
@@ -1284,6 +1293,37 @@ const ATOMIC_OBJECT_ROLES = [
   "public_source",
   "public_target",
 ] as const;
+
+const ATOMIC_PROTECTED_REMOVAL_ROLES = [
+  "payload_entry",
+  "private_source",
+  "private_deletion",
+  "wrapper",
+  "intent_temp",
+  "manifest_temp",
+] as const;
+
+function protectedRemovalKindMatchesRole(
+  kind: "remove_file" | "remove_directory" | "remove_root",
+  role: AtomicProtectedRemovalRoleV1,
+): boolean {
+  switch (kind) {
+    case "remove_file":
+      return (
+        role === "payload_entry" ||
+        role === "intent_temp" ||
+        role === "manifest_temp"
+      );
+    case "remove_directory":
+      return role === "payload_entry";
+    case "remove_root":
+      return (
+        role === "private_source" ||
+        role === "private_deletion" ||
+        role === "wrapper"
+      );
+  }
+}
 
 const ATOMIC_NATIVE_MOVES = [
   "profile_publish",
@@ -1893,7 +1933,8 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
           "manifestSha256",
           "cursor",
         ]) &&
-        isOneOf(request.role, ATOMIC_OBJECT_ROLES) &&
+        isOneOf(request.role, ATOMIC_PROTECTED_REMOVAL_ROLES) &&
+        protectedRemovalKindMatchesRole(request.kind, request.role) &&
         isFlightId(request.parentId) &&
         isFlightId(request.objectId) &&
         typeof request.leaf === "string" &&
@@ -2242,6 +2283,1118 @@ export function advanceAtomicCanaryCleanup(
     sourceParentSynced: true,
     targetParentSynced: true,
   });
+}
+
+export function authorizeAtomicCanaryCleanupRemoval(
+  proof: AtomicCanaryProofV1,
+  manifestSha256: Sha256,
+): AtomicCanaryProofV1 {
+  if (
+    !validCanaryProof(proof) ||
+    proof.phase !== "deleting" ||
+    proof.privateDeletionEvidence === null ||
+    proof.manifestSha256 !== manifestSha256 ||
+    proof.cleanupNextIndex >= proof.cleanupEntryCount
+  ) {
+    throw new TypeError("invalid atomic canary cleanup authorization");
+  }
+  return Object.freeze({
+    ...proof,
+    cleanupNextIndex: proof.cleanupNextIndex + 1,
+  });
+}
+
+export function completeAtomicCanaryCleanupRemoval(
+  proof: AtomicCanaryProofV1,
+  input: Readonly<{
+    operationId: CanonicalUuid;
+    manifestSha256: Sha256;
+    privateDeletionAbsent: true;
+    sourceParentSynced: true;
+    targetParentSynced: true;
+    evidenceDigest: Sha256;
+  }>,
+): AtomicCanaryProofV1 {
+  if (
+    !validCanaryProof(proof) ||
+    proof.phase !== "deleting" ||
+    proof.privateDeletionEvidence === null ||
+    proof.cleanupNextIndex !== proof.cleanupEntryCount ||
+    input.operationId !== proof.operationId ||
+    input.manifestSha256 !== proof.manifestSha256 ||
+    input.privateDeletionAbsent !== true ||
+    input.sourceParentSynced !== true ||
+    input.targetParentSynced !== true ||
+    !isSha256(input.evidenceDigest)
+  ) {
+    throw new TypeError("invalid atomic canary cleanup completion");
+  }
+  return Object.freeze({
+    ...proof,
+    phase: "cleaned" as const,
+    sourceParentSynced: true,
+    targetParentSynced: true,
+  });
+}
+
+export type AtomicProtectedCleanupSuffixV1 =
+  | "private_source_entries"
+  | "private_source_root"
+  | "wrapper_temps"
+  | "wrapper_root"
+  | "intent_temps"
+  | "done";
+
+export type AtomicProtectedCleanupEntrySuffixV1 = Extract<
+  AtomicProtectedCleanupSuffixV1,
+  "private_source_entries" | "wrapper_temps" | "intent_temps"
+>;
+
+export type AtomicProtectedCleanupScopeV1 =
+  | "private_profile_payload"
+  | "private_canary_proof"
+  | "public_source"
+  | "private_profile_deletion"
+  | "private_canary_deletion"
+  | "wrapper_temp"
+  | "intent_temp";
+
+export type AtomicProtectedCleanupEntryCountsV1 = Readonly<{
+  privateSourceEntries: number;
+  wrapperTemps: number;
+  intentTemps: number;
+}>;
+
+type AtomicBudgetReservationV1 =
+  | "payload_entries"
+  | "payload_bytes"
+  | "scratch_entries"
+  | "stable_files"
+  | "scratch_files"
+  | "manifest_bytes"
+  | "other_metadata_bytes";
+
+export type AtomicProtectedCleanupEntryV1 = Readonly<{
+  operationId: CanonicalUuid;
+  manifestSha256: Sha256;
+  index: number;
+  suffix: AtomicProtectedCleanupEntrySuffixV1;
+  scope: AtomicProtectedCleanupScopeV1;
+  entryDigest: Sha256;
+  requestKind: "remove_file" | "remove_directory" | "remove_root";
+  role: AtomicProtectedRemovalRoleV1;
+  parentId: FlightSemanticId;
+  leaf: string;
+  objectId: FlightSemanticId;
+  expected: AtomicObjectEvidenceV1;
+  release: Readonly<{
+    reservation: AtomicBudgetReservationV1;
+    count: 1;
+    byteSize: number;
+  }>;
+}>;
+
+export type AtomicProtectedCleanupStageV1 =
+  | "ready"
+  | "cursor_persist_pending"
+  | "remove_pending"
+  | "close_pending"
+  | "release_pending";
+
+export type AtomicProtectedCleanupStateV1 = Readonly<{
+  version: 1;
+  operationId: CanonicalUuid;
+  manifestSha256: Sha256;
+  entryCount: number;
+  entryCounts: AtomicProtectedCleanupEntryCountsV1;
+  entryDigests: ReadonlyArray<Sha256>;
+  cursor: number;
+  suffix: AtomicProtectedCleanupSuffixV1;
+  stage: AtomicProtectedCleanupStageV1;
+  activeEntry: AtomicProtectedCleanupEntryV1 | null;
+}>;
+
+export type AtomicProtectedCleanupActionV1 =
+  | Readonly<{
+      kind: "persist_cursor";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      suffix: AtomicProtectedCleanupEntrySuffixV1;
+      previousCursor: number;
+      nextIndex: number;
+      entryDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "remove";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      entryDigest: Sha256;
+      request: Extract<
+        AtomicEffectRequestDraftV1,
+        { kind: "remove_file" | "remove_directory" | "remove_root" }
+      >;
+    }>
+  | Readonly<{
+      kind: "close";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      entryDigest: Sha256;
+      request: AtomicEffectRequestDraftV1 & Readonly<{ kind: "close_handle" }>;
+    }>
+  | Readonly<{
+      kind: "release";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      entryDigest: Sha256;
+      request: AtomicEffectRequestDraftV1 &
+        Readonly<{ kind: "release_budget" }>;
+    }>;
+
+export type AtomicProtectedCleanupObservationV1 =
+  | Readonly<{
+      kind: "cursor_persisted";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      suffix: AtomicProtectedCleanupEntrySuffixV1;
+      previousCursor: number;
+      nextIndex: number;
+      entryDigest: Sha256;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "removal_observed";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      entryDigest: Sha256;
+      requestKind: "remove_file" | "remove_directory" | "remove_root";
+      objectId: FlightSemanticId;
+      removedEvidence: AtomicObjectEvidenceV1;
+      state: "absent";
+      parentSynced: true;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "handle_closed";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      entryDigest: Sha256;
+      role: AtomicProtectedRemovalRoleV1;
+      objectId: FlightSemanticId;
+      closedEvidence: AtomicObjectEvidenceV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "reservation_released";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      entryDigest: Sha256;
+      reservation: AtomicBudgetReservationV1;
+      count: 1;
+      byteSize: number;
+      evidenceDigest: Sha256;
+    }>;
+
+export type AtomicProtectedCleanupStepV1 = Readonly<{
+  state: AtomicProtectedCleanupStateV1;
+  action: AtomicProtectedCleanupActionV1 | null;
+}>;
+
+function protectedCleanupSuffixForScope(
+  scope: AtomicProtectedCleanupScopeV1,
+): AtomicProtectedCleanupEntrySuffixV1 {
+  if (scope === "wrapper_temp") return "wrapper_temps";
+  if (scope === "intent_temp") return "intent_temps";
+  return "private_source_entries";
+}
+
+function protectedCleanupCursorBounds(
+  counts: AtomicProtectedCleanupEntryCountsV1,
+): Readonly<{
+  privateEnd: number;
+  wrapperEnd: number;
+  intentEnd: number;
+}> {
+  const privateEnd = counts.privateSourceEntries;
+  const wrapperEnd = privateEnd + counts.wrapperTemps;
+  return Object.freeze({
+    privateEnd,
+    wrapperEnd,
+    intentEnd: wrapperEnd + counts.intentTemps,
+  });
+}
+
+function validProtectedCleanupSuffixCursor(
+  suffix: AtomicProtectedCleanupSuffixV1,
+  cursor: number,
+  counts: AtomicProtectedCleanupEntryCountsV1,
+): boolean {
+  const bounds = protectedCleanupCursorBounds(counts);
+  switch (suffix) {
+    case "private_source_entries":
+      return cursor >= 0 && cursor <= bounds.privateEnd;
+    case "private_source_root":
+      return cursor === bounds.privateEnd;
+    case "wrapper_temps":
+      return cursor >= bounds.privateEnd && cursor <= bounds.wrapperEnd;
+    case "wrapper_root":
+      return cursor === bounds.wrapperEnd;
+    case "intent_temps":
+      return cursor >= bounds.wrapperEnd && cursor <= bounds.intentEnd;
+    case "done":
+      return cursor === bounds.intentEnd;
+  }
+}
+
+function validProtectedCleanupEntry(
+  entry: AtomicProtectedCleanupEntryV1,
+  state: AtomicProtectedCleanupStateV1,
+): boolean {
+  const expectedSuffix = protectedCleanupSuffixForScope(entry.scope);
+  const privateRole =
+    entry.role === "payload_entry" ||
+    entry.role === "private_source" ||
+    entry.role === "private_deletion";
+  const scopeRoleValid =
+    entry.scope === "intent_temp"
+      ? entry.role === "intent_temp"
+      : entry.scope === "wrapper_temp"
+        ? entry.role === "payload_entry"
+        : privateRole;
+  const bounds = protectedCleanupCursorBounds(state.entryCounts);
+  const indexInSuffix =
+    entry.suffix === "private_source_entries"
+      ? entry.index < bounds.privateEnd
+      : entry.suffix === "wrapper_temps"
+        ? entry.index >= bounds.privateEnd &&
+          entry.index < bounds.wrapperEnd
+        : entry.index >= bounds.wrapperEnd &&
+          entry.index < bounds.intentEnd;
+  return (
+    entry.operationId === state.operationId &&
+    entry.manifestSha256 === state.manifestSha256 &&
+    entry.index === state.cursor &&
+    entry.index < state.entryCount &&
+    entry.entryDigest === state.entryDigests[entry.index] &&
+    entry.suffix === state.suffix &&
+    entry.suffix === expectedSuffix &&
+    indexInSuffix &&
+    isSha256(entry.entryDigest) &&
+    isOneOf(entry.role, ATOMIC_PROTECTED_REMOVAL_ROLES) &&
+    protectedRemovalKindMatchesRole(entry.requestKind, entry.role) &&
+    scopeRoleValid &&
+    isFlightId(entry.parentId) &&
+    isFlightId(entry.objectId) &&
+    validLeaf(entry.role, entry.leaf) &&
+    isEvidence(entry.expected) &&
+    isRecord(entry.release) &&
+    isOneOf(entry.release.reservation, [
+      "payload_entries",
+      "payload_bytes",
+      "scratch_entries",
+      "stable_files",
+      "scratch_files",
+      "manifest_bytes",
+      "other_metadata_bytes",
+    ]) &&
+    entry.release.count === 1 &&
+    isNonNegativeInteger(entry.release.byteSize) &&
+    entry.release.byteSize ===
+      (entry.requestKind === "remove_file" ? entry.expected.size : 0)
+  );
+}
+
+function validProtectedCleanupState(
+  state: AtomicProtectedCleanupStateV1,
+): boolean {
+  if (
+    !isRecord(state) ||
+    state.version !== 1 ||
+    !isCanonicalUuid(state.operationId) ||
+    !isSha256(state.manifestSha256) ||
+    !isNonNegativeInteger(state.entryCount) ||
+    state.entryCount > ATOMIC_MAX_PAYLOAD_ENTRIES ||
+    !isRecord(state.entryCounts) ||
+    !isNonNegativeInteger(state.entryCounts.privateSourceEntries) ||
+    !isNonNegativeInteger(state.entryCounts.wrapperTemps) ||
+    !isNonNegativeInteger(state.entryCounts.intentTemps) ||
+    !Array.isArray(state.entryDigests) ||
+    state.entryDigests.length !== state.entryCount ||
+    !state.entryDigests.every(isSha256) ||
+    new Set(state.entryDigests).size !== state.entryDigests.length ||
+    !isNonNegativeInteger(state.cursor) ||
+    state.cursor > state.entryCount ||
+    !isOneOf(state.suffix, [
+      "private_source_entries",
+      "private_source_root",
+      "wrapper_temps",
+      "wrapper_root",
+      "intent_temps",
+      "done",
+    ]) ||
+    !isOneOf(state.stage, [
+      "ready",
+      "cursor_persist_pending",
+      "remove_pending",
+      "close_pending",
+      "release_pending",
+    ])
+  ) {
+    return false;
+  }
+  const bounds = protectedCleanupCursorBounds(state.entryCounts);
+  if (
+    bounds.intentEnd !== state.entryCount ||
+    !validProtectedCleanupSuffixCursor(
+      state.suffix,
+      state.cursor,
+      state.entryCounts,
+    )
+  ) {
+    return false;
+  }
+  return state.stage === "ready"
+    ? state.activeEntry === null
+    : state.activeEntry !== null &&
+        state.activeEntry.index === state.cursor &&
+        validProtectedCleanupEntry(state.activeEntry, {
+          ...state,
+          suffix: state.activeEntry.suffix,
+        });
+}
+
+export function createAtomicProtectedCleanupState(
+  input: Readonly<{
+    operationId: CanonicalUuid;
+    manifestSha256: Sha256;
+    entryCount: number;
+    entryCounts: AtomicProtectedCleanupEntryCountsV1;
+    entryDigests: ReadonlyArray<Sha256>;
+    cursor: number;
+    suffix: AtomicProtectedCleanupSuffixV1;
+  }>,
+): AtomicProtectedCleanupStateV1 {
+  const state: AtomicProtectedCleanupStateV1 = Object.freeze({
+    version: 1 as const,
+    operationId: input.operationId,
+    manifestSha256: input.manifestSha256,
+    entryCount: input.entryCount,
+    entryCounts: Object.freeze({ ...input.entryCounts }),
+    entryDigests: Object.freeze([...input.entryDigests]),
+    cursor: input.cursor,
+    suffix: input.suffix,
+    stage: "ready" as const,
+    activeEntry: null,
+  });
+  if (!validProtectedCleanupState(state)) {
+    throw new TypeError("invalid atomic protected cleanup state");
+  }
+  return state;
+}
+
+export function beginAtomicProtectedCleanupEntry(
+  state: AtomicProtectedCleanupStateV1,
+  entry: AtomicProtectedCleanupEntryV1,
+): AtomicProtectedCleanupStepV1 {
+  if (
+    !validProtectedCleanupState(state) ||
+    state.stage !== "ready" ||
+    state.activeEntry !== null ||
+    !validProtectedCleanupEntry(entry, state)
+  ) {
+    throw new TypeError("invalid atomic protected cleanup entry");
+  }
+  const activeEntry = Object.freeze({
+    ...entry,
+    expected: cloneEvidence(entry.expected),
+    release: Object.freeze({ ...entry.release }),
+  });
+  const nextState = Object.freeze({
+    ...state,
+    stage: "cursor_persist_pending" as const,
+    activeEntry,
+  });
+  return Object.freeze({
+    state: nextState,
+    action: Object.freeze({
+      kind: "persist_cursor" as const,
+      operationId: state.operationId,
+      manifestSha256: state.manifestSha256,
+      suffix: entry.suffix,
+      previousCursor: state.cursor,
+      nextIndex: state.cursor + 1,
+      entryDigest: entry.entryDigest,
+    }),
+  });
+}
+
+function protectedCleanupObservationBindingMatches(
+  state: AtomicProtectedCleanupStateV1,
+  observation: Exclude<
+    AtomicProtectedCleanupObservationV1,
+    Readonly<{ kind: "cursor_persisted" }>
+  >,
+): boolean {
+  const entry = state.activeEntry;
+  return (
+    entry !== null &&
+    observation.operationId === state.operationId &&
+    observation.manifestSha256 === state.manifestSha256 &&
+    observation.cursor === state.cursor + 1 &&
+    observation.entryDigest === entry.entryDigest &&
+    isSha256(observation.evidenceDigest)
+  );
+}
+
+export function advanceAtomicProtectedCleanupEntry(
+  state: AtomicProtectedCleanupStateV1,
+  observation: AtomicProtectedCleanupObservationV1,
+): AtomicProtectedCleanupStepV1 {
+  if (!validProtectedCleanupState(state) || state.activeEntry === null) {
+    throw new TypeError("invalid atomic protected cleanup state");
+  }
+  const entry = state.activeEntry;
+  if (state.stage === "cursor_persist_pending") {
+    if (
+      observation.kind !== "cursor_persisted" ||
+      observation.operationId !== state.operationId ||
+      observation.manifestSha256 !== state.manifestSha256 ||
+      observation.suffix !== state.suffix ||
+      observation.previousCursor !== state.cursor ||
+      observation.nextIndex !== state.cursor + 1 ||
+      observation.entryDigest !== entry.entryDigest ||
+      !isSha256(observation.evidenceDigest)
+    ) {
+      throw new TypeError("atomic protected cleanup cursor mismatch");
+    }
+    const request = Object.freeze({
+      kind: entry.requestKind,
+      operationId: state.operationId,
+      role: entry.role,
+      parentId: entry.parentId,
+      leaf: entry.leaf,
+      objectId: entry.objectId,
+      expected: cloneEvidence(entry.expected),
+      manifestSha256: state.manifestSha256,
+      cursor: observation.nextIndex,
+    }) as Extract<
+      AtomicEffectRequestDraftV1,
+      { kind: "remove_file" | "remove_directory" | "remove_root" }
+    >;
+    return Object.freeze({
+      state: Object.freeze({
+        ...state,
+        stage: "remove_pending" as const,
+      }),
+      action: Object.freeze({
+        kind: "remove" as const,
+        operationId: state.operationId,
+        manifestSha256: state.manifestSha256,
+        cursor: observation.nextIndex,
+        entryDigest: entry.entryDigest,
+        request,
+      }),
+    });
+  }
+  if (state.stage === "remove_pending") {
+    if (
+      observation.kind !== "removal_observed" ||
+      !protectedCleanupObservationBindingMatches(state, observation) ||
+      observation.requestKind !== entry.requestKind ||
+      observation.objectId !== entry.objectId ||
+      !evidenceEquals(observation.removedEvidence, entry.expected) ||
+      observation.state !== "absent" ||
+      observation.parentSynced !== true
+    ) {
+      throw new TypeError("atomic protected cleanup removal mismatch");
+    }
+    return Object.freeze({
+      state: Object.freeze({
+        ...state,
+        stage: "close_pending" as const,
+      }),
+      action: Object.freeze({
+        kind: "close" as const,
+        operationId: state.operationId,
+        manifestSha256: state.manifestSha256,
+        cursor: state.cursor + 1,
+        entryDigest: entry.entryDigest,
+        request: Object.freeze({
+          kind: "close_handle" as const,
+          operationId: state.operationId,
+          role: entry.role,
+          objectId: entry.objectId,
+          cursor: state.cursor + 1,
+          byteLength: 0,
+          expected: cloneEvidence(entry.expected),
+        }),
+      }),
+    });
+  }
+  if (state.stage === "close_pending") {
+    if (
+      observation.kind !== "handle_closed" ||
+      !protectedCleanupObservationBindingMatches(state, observation) ||
+      observation.role !== entry.role ||
+      observation.objectId !== entry.objectId ||
+      !evidenceEquals(observation.closedEvidence, entry.expected)
+    ) {
+      throw new TypeError("atomic protected cleanup close mismatch");
+    }
+    return Object.freeze({
+      state: Object.freeze({
+        ...state,
+        stage: "release_pending" as const,
+      }),
+      action: Object.freeze({
+        kind: "release" as const,
+        operationId: state.operationId,
+        manifestSha256: state.manifestSha256,
+        cursor: state.cursor + 1,
+        entryDigest: entry.entryDigest,
+        request: Object.freeze({
+          kind: "release_budget" as const,
+          operationId: state.operationId,
+          reservation: entry.release.reservation,
+          count: entry.release.count,
+          byteSize: entry.release.byteSize,
+        }),
+      }),
+    });
+  }
+  if (
+    state.stage !== "release_pending" ||
+    observation.kind !== "reservation_released" ||
+    !protectedCleanupObservationBindingMatches(state, observation) ||
+    observation.reservation !== entry.release.reservation ||
+    observation.count !== entry.release.count ||
+    observation.byteSize !== entry.release.byteSize
+  ) {
+    throw new TypeError("atomic protected cleanup release mismatch");
+  }
+  return Object.freeze({
+    state: Object.freeze({
+      ...state,
+      cursor: state.cursor + 1,
+      stage: "ready" as const,
+      activeEntry: null,
+    }),
+    action: null,
+  });
+}
+
+const ATOMIC_PROTECTED_CLEANUP_SUFFIXES = [
+  "private_source_entries",
+  "private_source_root",
+  "wrapper_temps",
+  "wrapper_root",
+  "intent_temps",
+  "done",
+] as const;
+
+export function advanceAtomicProtectedCleanupSuffix(
+  state: AtomicProtectedCleanupStateV1,
+  nextSuffix: AtomicProtectedCleanupSuffixV1,
+): AtomicProtectedCleanupStateV1 {
+  const currentIndex = ATOMIC_PROTECTED_CLEANUP_SUFFIXES.indexOf(
+    state.suffix,
+  );
+  const nextIndex = ATOMIC_PROTECTED_CLEANUP_SUFFIXES.indexOf(nextSuffix);
+  if (
+    !validProtectedCleanupState(state) ||
+    state.stage !== "ready" ||
+    state.activeEntry !== null ||
+    currentIndex < 0 ||
+    nextIndex !== currentIndex + 1 ||
+    !validProtectedCleanupSuffixCursor(
+      nextSuffix,
+      state.cursor,
+      state.entryCounts,
+    )
+  ) {
+    throw new TypeError("invalid atomic protected cleanup suffix");
+  }
+  return Object.freeze({ ...state, suffix: nextSuffix });
+}
+
+export type AtomicProtectedStableCleanupRecordV1 = Readonly<{
+  role: "manifest_stable" | "intent_stable";
+  parentId: FlightSemanticId;
+  leaf: string;
+  objectId: FlightSemanticId;
+  expected: AtomicObjectEvidenceV1;
+  release: Readonly<{
+    reservation: AtomicBudgetReservationV1;
+    count: 1;
+    byteSize: number;
+  }>;
+}>;
+
+export type AtomicProtectedCleanupTerminalStageV1 =
+  | "manifest_deleting_persist_pending"
+  | "manifest_remove_pending"
+  | "manifest_close_pending"
+  | "manifest_release_pending"
+  | "cleaned_persist_pending"
+  | "intent_remove_pending"
+  | "intent_close_pending"
+  | "intent_release_pending"
+  | "complete";
+
+export type AtomicProtectedCleanupTerminalStateV1 = Readonly<{
+  version: 1;
+  operationId: CanonicalUuid;
+  manifestSha256: Sha256;
+  cursor: number;
+  entryCount: number;
+  stage: AtomicProtectedCleanupTerminalStageV1;
+  manifest: AtomicProtectedStableCleanupRecordV1;
+  intent: AtomicProtectedStableCleanupRecordV1;
+}>;
+
+export type AtomicProtectedCleanupTerminalActionV1 =
+  | Readonly<{
+      kind: "persist_phase";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      phase: "manifest_deleting" | "cleaned";
+    }>
+  | Readonly<{
+      kind: "remove_stable";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      role: "manifest_stable" | "intent_stable";
+      request: AtomicEffectRequestDraftV1 &
+        Readonly<{ kind: "remove_manifest" | "remove_intent" }>;
+    }>
+  | Readonly<{
+      kind: "close_stable";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      role: "manifest_stable" | "intent_stable";
+      request: AtomicEffectRequestDraftV1 & Readonly<{ kind: "close_handle" }>;
+    }>
+  | Readonly<{
+      kind: "release_stable";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      role: "manifest_stable" | "intent_stable";
+      request: AtomicEffectRequestDraftV1 &
+        Readonly<{ kind: "release_budget" }>;
+    }>;
+
+export type AtomicProtectedCleanupTerminalObservationV1 =
+  | Readonly<{
+      kind: "phase_persisted";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      phase: "manifest_deleting" | "cleaned";
+      intent: AtomicProtectedStableCleanupRecordV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "removal_observed";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      role: "manifest_stable" | "intent_stable";
+      objectId: FlightSemanticId;
+      removedEvidence: AtomicObjectEvidenceV1;
+      state: "absent";
+      parentSynced: true;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "handle_closed";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      role: "manifest_stable" | "intent_stable";
+      objectId: FlightSemanticId;
+      closedEvidence: AtomicObjectEvidenceV1;
+      evidenceDigest: Sha256;
+    }>
+  | Readonly<{
+      kind: "reservation_released";
+      operationId: CanonicalUuid;
+      manifestSha256: Sha256;
+      cursor: number;
+      role: "manifest_stable" | "intent_stable";
+      reservation: AtomicBudgetReservationV1;
+      count: 1;
+      byteSize: number;
+      evidenceDigest: Sha256;
+    }>;
+
+export type AtomicProtectedCleanupTerminalStepV1 = Readonly<{
+  state: AtomicProtectedCleanupTerminalStateV1;
+  action: AtomicProtectedCleanupTerminalActionV1 | null;
+}>;
+
+function validProtectedStableCleanupRecord(
+  record: AtomicProtectedStableCleanupRecordV1,
+  role: "manifest_stable" | "intent_stable",
+): boolean {
+  return (
+    isRecord(record) &&
+    record.role === role &&
+    isFlightId(record.parentId) &&
+    isAtomicControlLeafV1(record.leaf) &&
+    isFlightId(record.objectId) &&
+    isEvidence(record.expected) &&
+    isRecord(record.release) &&
+    isOneOf(record.release.reservation, [
+      "payload_entries",
+      "payload_bytes",
+      "scratch_entries",
+      "stable_files",
+      "scratch_files",
+      "manifest_bytes",
+      "other_metadata_bytes",
+    ]) &&
+    record.release.count === 1 &&
+    isNonNegativeInteger(record.release.byteSize) &&
+    record.release.byteSize === record.expected.size
+  );
+}
+
+function cloneProtectedStableCleanupRecord(
+  record: AtomicProtectedStableCleanupRecordV1,
+): AtomicProtectedStableCleanupRecordV1 {
+  return Object.freeze({
+    ...record,
+    expected: cloneEvidence(record.expected),
+    release: Object.freeze({ ...record.release }),
+  });
+}
+
+function validProtectedCleanupTerminalState(
+  state: AtomicProtectedCleanupTerminalStateV1,
+): boolean {
+  return (
+    isRecord(state) &&
+    state.version === 1 &&
+    isCanonicalUuid(state.operationId) &&
+    isSha256(state.manifestSha256) &&
+    isNonNegativeInteger(state.cursor) &&
+    isNonNegativeInteger(state.entryCount) &&
+    state.entryCount <= ATOMIC_MAX_PAYLOAD_ENTRIES &&
+    state.cursor === state.entryCount &&
+    isOneOf(state.stage, [
+      "manifest_deleting_persist_pending",
+      "manifest_remove_pending",
+      "manifest_close_pending",
+      "manifest_release_pending",
+      "cleaned_persist_pending",
+      "intent_remove_pending",
+      "intent_close_pending",
+      "intent_release_pending",
+      "complete",
+    ]) &&
+    validProtectedStableCleanupRecord(state.manifest, "manifest_stable") &&
+    validProtectedStableCleanupRecord(state.intent, "intent_stable") &&
+    state.manifest.leaf === `${state.operationId}.identities.json` &&
+    state.manifest.expected.contentSha256 === state.manifestSha256 &&
+    state.intent.leaf === `${state.operationId}.json`
+  );
+}
+
+export function beginAtomicProtectedCleanupTerminal(
+  cleanup: AtomicProtectedCleanupStateV1,
+  stable: Readonly<{
+    manifest: AtomicProtectedStableCleanupRecordV1;
+    intent: AtomicProtectedStableCleanupRecordV1;
+  }>,
+): AtomicProtectedCleanupTerminalStepV1 {
+  if (
+    !validProtectedCleanupState(cleanup) ||
+    cleanup.stage !== "ready" ||
+    cleanup.suffix !== "done" ||
+    cleanup.cursor !== cleanup.entryCount ||
+    !validProtectedStableCleanupRecord(stable.manifest, "manifest_stable") ||
+    !validProtectedStableCleanupRecord(stable.intent, "intent_stable") ||
+    stable.manifest.leaf !== `${cleanup.operationId}.identities.json` ||
+    stable.manifest.expected.contentSha256 !== cleanup.manifestSha256 ||
+    stable.intent.leaf !== `${cleanup.operationId}.json`
+  ) {
+    throw new TypeError("invalid atomic protected cleanup terminal state");
+  }
+  const state = Object.freeze({
+    version: 1 as const,
+    operationId: cleanup.operationId,
+    manifestSha256: cleanup.manifestSha256,
+    cursor: cleanup.cursor,
+    entryCount: cleanup.entryCount,
+    stage: "manifest_deleting_persist_pending" as const,
+    manifest: cloneProtectedStableCleanupRecord(stable.manifest),
+    intent: cloneProtectedStableCleanupRecord(stable.intent),
+  });
+  return Object.freeze({
+    state,
+    action: Object.freeze({
+      kind: "persist_phase" as const,
+      operationId: state.operationId,
+      manifestSha256: state.manifestSha256,
+      cursor: state.cursor,
+      phase: "manifest_deleting" as const,
+    }),
+  });
+}
+
+function terminalObservationBindingMatches(
+  state: AtomicProtectedCleanupTerminalStateV1,
+  observation: AtomicProtectedCleanupTerminalObservationV1,
+): boolean {
+  return (
+    observation.operationId === state.operationId &&
+    observation.manifestSha256 === state.manifestSha256 &&
+    observation.cursor === state.cursor &&
+    isSha256(observation.evidenceDigest)
+  );
+}
+
+function protectedStableRemoveAction(
+  state: AtomicProtectedCleanupTerminalStateV1,
+  record: AtomicProtectedStableCleanupRecordV1,
+): AtomicProtectedCleanupTerminalActionV1 {
+  return Object.freeze({
+    kind: "remove_stable" as const,
+    operationId: state.operationId,
+    manifestSha256: state.manifestSha256,
+    cursor: state.cursor,
+    role: record.role,
+    request: Object.freeze({
+      kind:
+        record.role === "manifest_stable"
+          ? ("remove_manifest" as const)
+          : ("remove_intent" as const),
+      operationId: state.operationId,
+      stableParentId: record.parentId,
+      stableLeaf: record.leaf,
+      stableObjectId: record.objectId,
+      expectedStable: cloneEvidence(record.expected),
+    }),
+  });
+}
+
+function protectedStableCloseAction(
+  state: AtomicProtectedCleanupTerminalStateV1,
+  record: AtomicProtectedStableCleanupRecordV1,
+): AtomicProtectedCleanupTerminalActionV1 {
+  return Object.freeze({
+    kind: "close_stable" as const,
+    operationId: state.operationId,
+    manifestSha256: state.manifestSha256,
+    cursor: state.cursor,
+    role: record.role,
+    request: Object.freeze({
+      kind: "close_handle" as const,
+      operationId: state.operationId,
+      role: record.role,
+      objectId: record.objectId,
+      cursor: state.cursor,
+      byteLength: 0,
+      expected: cloneEvidence(record.expected),
+    }),
+  });
+}
+
+function protectedStableReleaseAction(
+  state: AtomicProtectedCleanupTerminalStateV1,
+  record: AtomicProtectedStableCleanupRecordV1,
+): AtomicProtectedCleanupTerminalActionV1 {
+  return Object.freeze({
+    kind: "release_stable" as const,
+    operationId: state.operationId,
+    manifestSha256: state.manifestSha256,
+    cursor: state.cursor,
+    role: record.role,
+    request: Object.freeze({
+      kind: "release_budget" as const,
+      operationId: state.operationId,
+      reservation: record.release.reservation,
+      count: record.release.count,
+      byteSize: record.release.byteSize,
+    }),
+  });
+}
+
+export function advanceAtomicProtectedCleanupTerminal(
+  state: AtomicProtectedCleanupTerminalStateV1,
+  observation: AtomicProtectedCleanupTerminalObservationV1,
+): AtomicProtectedCleanupTerminalStepV1 {
+  if (
+    !validProtectedCleanupTerminalState(state) ||
+    state.stage === "complete" ||
+    !terminalObservationBindingMatches(state, observation)
+  ) {
+    throw new TypeError("invalid atomic protected cleanup terminal observation");
+  }
+  const manifest = state.manifest;
+  const intent = state.intent;
+  switch (state.stage) {
+    case "manifest_deleting_persist_pending":
+      if (
+        observation.kind !== "phase_persisted" ||
+        observation.phase !== "manifest_deleting" ||
+        !validProtectedStableCleanupRecord(
+          observation.intent,
+          "intent_stable",
+        ) ||
+        observation.intent.leaf !== `${state.operationId}.json`
+      ) {
+        throw new TypeError("atomic manifest deletion was not authorized");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "manifest_remove_pending" as const,
+          intent: cloneProtectedStableCleanupRecord(observation.intent),
+        }),
+        action: protectedStableRemoveAction(state, manifest),
+      });
+    case "manifest_remove_pending":
+      if (
+        observation.kind !== "removal_observed" ||
+        observation.role !== "manifest_stable" ||
+        observation.objectId !== manifest.objectId ||
+        !evidenceEquals(observation.removedEvidence, manifest.expected) ||
+        observation.state !== "absent" ||
+        observation.parentSynced !== true
+      ) {
+        throw new TypeError("atomic manifest removal mismatch");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "manifest_close_pending" as const,
+        }),
+        action: protectedStableCloseAction(state, manifest),
+      });
+    case "manifest_close_pending":
+      if (
+        observation.kind !== "handle_closed" ||
+        observation.role !== "manifest_stable" ||
+        observation.objectId !== manifest.objectId ||
+        !evidenceEquals(observation.closedEvidence, manifest.expected)
+      ) {
+        throw new TypeError("atomic manifest close mismatch");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "manifest_release_pending" as const,
+        }),
+        action: protectedStableReleaseAction(state, manifest),
+      });
+    case "manifest_release_pending":
+      if (
+        observation.kind !== "reservation_released" ||
+        observation.role !== "manifest_stable" ||
+        observation.reservation !== manifest.release.reservation ||
+        observation.count !== manifest.release.count ||
+        observation.byteSize !== manifest.release.byteSize
+      ) {
+        throw new TypeError("atomic manifest release mismatch");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "cleaned_persist_pending" as const,
+        }),
+        action: Object.freeze({
+          kind: "persist_phase" as const,
+          operationId: state.operationId,
+          manifestSha256: state.manifestSha256,
+          cursor: state.cursor,
+          phase: "cleaned" as const,
+        }),
+      });
+    case "cleaned_persist_pending":
+      if (
+        observation.kind !== "phase_persisted" ||
+        observation.phase !== "cleaned" ||
+        !validProtectedStableCleanupRecord(
+          observation.intent,
+          "intent_stable",
+        ) ||
+        observation.intent.leaf !== `${state.operationId}.json`
+      ) {
+        throw new TypeError("atomic cleaned phase was not persisted");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "intent_remove_pending" as const,
+          intent: cloneProtectedStableCleanupRecord(observation.intent),
+        }),
+        action: protectedStableRemoveAction(
+          state,
+          observation.intent,
+        ),
+      });
+    case "intent_remove_pending":
+      if (
+        observation.kind !== "removal_observed" ||
+        observation.role !== "intent_stable" ||
+        observation.objectId !== intent.objectId ||
+        !evidenceEquals(observation.removedEvidence, intent.expected) ||
+        observation.state !== "absent" ||
+        observation.parentSynced !== true
+      ) {
+        throw new TypeError("atomic stable intent removal mismatch");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "intent_close_pending" as const,
+        }),
+        action: protectedStableCloseAction(state, intent),
+      });
+    case "intent_close_pending":
+      if (
+        observation.kind !== "handle_closed" ||
+        observation.role !== "intent_stable" ||
+        observation.objectId !== intent.objectId ||
+        !evidenceEquals(observation.closedEvidence, intent.expected)
+      ) {
+        throw new TypeError("atomic stable intent close mismatch");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "intent_release_pending" as const,
+        }),
+        action: protectedStableReleaseAction(state, intent),
+      });
+    case "intent_release_pending":
+      if (
+        observation.kind !== "reservation_released" ||
+        observation.role !== "intent_stable" ||
+        observation.reservation !== intent.release.reservation ||
+        observation.count !== intent.release.count ||
+        observation.byteSize !== intent.release.byteSize
+      ) {
+        throw new TypeError("atomic stable intent release mismatch");
+      }
+      return Object.freeze({
+        state: Object.freeze({
+          ...state,
+          stage: "complete" as const,
+        }),
+        action: null,
+      });
+  }
 }
 
 function requestKindForObservation(
@@ -3614,7 +4767,7 @@ function validCanaryProof(value: AtomicCanaryProofV1): boolean {
   }
   if (value.phase === "deleting") {
     return (
-      value.cleanupNextIndex < value.cleanupEntryCount &&
+      value.cleanupNextIndex <= value.cleanupEntryCount &&
       (value.privateDeletionEvidence === null
         ? !value.sourceParentSynced && !value.targetParentSynced
         : value.sourceParentSynced && value.targetParentSynced)
@@ -4286,6 +5439,7 @@ export function reduceAtomicPublication(
           : Object.freeze({
               kind: "cleanup_pending" as const,
               proof: workflow.proof,
+              privateDeletionObjectId: null,
             });
       return terminal(
         Object.freeze({
@@ -4907,4 +6061,644 @@ export function reduceAtomicPublication(
     );
   }
   return completed(accepted);
+}
+
+export type AtomicManifestPlannedBindingV1 = Readonly<{
+  operationId: CanonicalUuid;
+  canonicalBytes: Uint8Array;
+  manifestSha256: Sha256;
+  manifestByteSize: number;
+  entryCount: number;
+  intentsParentId: FlightSemanticId;
+  tempLeaf: string;
+  stableLeaf: string;
+}>;
+
+export type AtomicManifestPlannedLocationV1 =
+  | Readonly<{
+      state: "absent";
+      leaf: string;
+      objectId: null;
+      evidence: null;
+    }>
+  | Readonly<{
+      state: "present" | "other";
+      leaf: string;
+      objectId: FlightSemanticId;
+      evidence: AtomicObjectEvidenceV1;
+    }>;
+
+export type AtomicManifestStablePublicationProofV1 = Readonly<{
+  operationId: CanonicalUuid;
+  tempObjectId: FlightSemanticId;
+  stableObjectId: FlightSemanticId;
+  tempEvidence: AtomicObjectEvidenceV1;
+  stableEvidence: AtomicObjectEvidenceV1;
+  sourceState: "present";
+  targetState: "present";
+  stableParentSynced: true;
+  evidenceDigest: Sha256;
+}>;
+
+export type AtomicManifestPlannedRecoveryStageV1 =
+  | "locations_pending"
+  | "recreate_pending"
+  | "publish_pending"
+  | "cleanup_authorization_pending"
+  | "temp_removal_pending"
+  | "manifest_published_pending"
+  | "complete"
+  | "fail_stop";
+
+export type AtomicManifestPlannedRecoveryStateV1 = Readonly<{
+  binding: AtomicManifestPlannedBindingV1;
+  stage: AtomicManifestPlannedRecoveryStageV1;
+  temp:
+    | Readonly<{
+        objectId: FlightSemanticId;
+        evidence: AtomicObjectEvidenceV1;
+      }>
+    | null;
+  stable:
+    | Readonly<{
+        objectId: FlightSemanticId;
+        evidence: AtomicObjectEvidenceV1;
+      }>
+    | null;
+  cleanupAuthorizationDigest: Sha256 | null;
+}>;
+
+type AtomicManifestPlannedActionBindingV1 = Readonly<{
+  operationId: CanonicalUuid;
+  manifestSha256: Sha256;
+  manifestByteSize: number;
+  entryCount: number;
+  intentsParentId: FlightSemanticId;
+  tempLeaf: string;
+  stableLeaf: string;
+}>;
+
+export type AtomicManifestPlannedRecoveryActionV1 =
+  | (AtomicManifestPlannedActionBindingV1 &
+      Readonly<{
+        kind: "observe_manifest_locations";
+        expectedMode: 384;
+      }>)
+  | (AtomicManifestPlannedActionBindingV1 &
+      Readonly<{
+        kind: "recreate_manifest_temp";
+        canonicalBytes: Uint8Array;
+        mode: 384;
+        expectedAbsence: true;
+      }>)
+  | (AtomicManifestPlannedActionBindingV1 &
+      Readonly<{
+        kind: "publish_manifest_temp";
+        tempObjectId: FlightSemanticId;
+        expectedTemp: AtomicObjectEvidenceV1;
+        expectedStable: Readonly<{ absent: true }>;
+      }>)
+  | (AtomicManifestPlannedActionBindingV1 &
+      Readonly<{
+        kind: "authorize_manifest_temp_cleanup";
+        tempObjectId: FlightSemanticId;
+        expectedTemp: AtomicObjectEvidenceV1;
+        stableObjectId: FlightSemanticId;
+        expectedStable: AtomicObjectEvidenceV1;
+        authorizationDigest: Sha256;
+      }>)
+  | (AtomicManifestPlannedActionBindingV1 &
+      Readonly<{
+        kind: "remove_manifest_temp";
+        tempObjectId: FlightSemanticId;
+        expectedTemp: AtomicObjectEvidenceV1;
+        authorizationDigest: Sha256;
+      }>)
+  | (AtomicManifestPlannedActionBindingV1 &
+      Readonly<{
+        kind: "persist_manifest_published";
+        stableObjectId: FlightSemanticId;
+        expectedStable: AtomicObjectEvidenceV1;
+        stableParentSynced: true;
+      }>);
+
+type AtomicManifestPlannedObservationBindingV1 = Readonly<{
+  operationId: CanonicalUuid;
+  manifestSha256: Sha256;
+  manifestByteSize: number;
+  entryCount: number;
+  intentsParentId: FlightSemanticId;
+  tempLeaf: string;
+  stableLeaf: string;
+}>;
+
+export type AtomicManifestPlannedRecoveryObservationV1 =
+  | (AtomicManifestPlannedObservationBindingV1 &
+      Readonly<{
+        kind: "manifest_locations_observed";
+        temp: AtomicManifestPlannedLocationV1;
+        stable: AtomicManifestPlannedLocationV1;
+        stableParentSynced: boolean;
+        publicationProof: AtomicManifestStablePublicationProofV1 | null;
+      }>)
+  | (AtomicManifestPlannedObservationBindingV1 &
+      Readonly<{
+        kind: "manifest_temp_recreated";
+        tempObjectId: FlightSemanticId;
+        tempEvidence: AtomicObjectEvidenceV1;
+        tempParentSynced: true;
+      }>)
+  | (AtomicManifestPlannedObservationBindingV1 &
+      Readonly<{
+        kind: "manifest_publication_observed";
+        tempObjectId: FlightSemanticId;
+        tempEvidence: AtomicObjectEvidenceV1;
+        stableObjectId: FlightSemanticId;
+        stableEvidence: AtomicObjectEvidenceV1;
+        sourceState: "absent";
+        targetState: "present";
+        stableParentSynced: true;
+      }>)
+  | (AtomicManifestPlannedObservationBindingV1 &
+      Readonly<{
+        kind: "manifest_temp_cleanup_authorized";
+        authorizationDigest: Sha256;
+      }>)
+  | (AtomicManifestPlannedObservationBindingV1 &
+      Readonly<{
+        kind: "manifest_temp_removed";
+        tempObjectId: FlightSemanticId;
+        removedEvidence: AtomicObjectEvidenceV1;
+        state: "absent";
+        parentSynced: true;
+        authorizationDigest: Sha256;
+      }>)
+  | (AtomicManifestPlannedObservationBindingV1 &
+      Readonly<{
+        kind: "manifest_published_persisted";
+        phase: "manifest_published";
+        stableObjectId: FlightSemanticId;
+        stableEvidence: AtomicObjectEvidenceV1;
+        stableParentSynced: true;
+      }>);
+
+export type AtomicManifestPlannedRecoveryResultV1 =
+  | Readonly<{ kind: "complete" }>
+  | Readonly<{
+      kind: "fail_stop";
+      code:
+        | "binding_mismatch"
+        | "unknown_topology"
+        | "observation_mismatch";
+    }>;
+
+export type AtomicManifestPlannedRecoveryStepV1 = Readonly<{
+  state: AtomicManifestPlannedRecoveryStateV1;
+  action: AtomicManifestPlannedRecoveryActionV1 | null;
+  result: AtomicManifestPlannedRecoveryResultV1 | null;
+}>;
+
+function manifestPlannedActionBinding(
+  binding: AtomicManifestPlannedBindingV1,
+): AtomicManifestPlannedActionBindingV1 {
+  return {
+    operationId: binding.operationId,
+    manifestSha256: binding.manifestSha256,
+    manifestByteSize: binding.manifestByteSize,
+    entryCount: binding.entryCount,
+    intentsParentId: binding.intentsParentId,
+    tempLeaf: binding.tempLeaf,
+    stableLeaf: binding.stableLeaf,
+  };
+}
+
+function validManifestPlannedBinding(
+  binding: AtomicManifestPlannedBindingV1,
+): boolean {
+  const tempMatch = new RegExp(
+    `^${binding.operationId}\\.identities\\.([0-9a-f-]+)\\.tmp$`,
+    "u",
+  ).exec(binding.tempLeaf);
+  return (
+    isCanonicalUuid(binding.operationId) &&
+    binding.canonicalBytes instanceof Uint8Array &&
+    isSha256(binding.manifestSha256) &&
+    sha256(binding.canonicalBytes) === binding.manifestSha256 &&
+    Number.isSafeInteger(binding.manifestByteSize) &&
+    binding.manifestByteSize > 0 &&
+    binding.manifestByteSize === binding.canonicalBytes.byteLength &&
+    binding.manifestByteSize <= ATOMIC_MAX_MANIFEST_BYTES &&
+    Number.isSafeInteger(binding.entryCount) &&
+    binding.entryCount > 0 &&
+    binding.entryCount <= ATOMIC_MAX_PAYLOAD_ENTRIES &&
+    isFlightId(binding.intentsParentId) &&
+    binding.stableLeaf === `${binding.operationId}.identities.json` &&
+    tempMatch !== null &&
+    isCanonicalUuid(tempMatch[1])
+  );
+}
+
+function manifestPlannedObservationMatches(
+  binding: AtomicManifestPlannedBindingV1,
+  observation: AtomicManifestPlannedObservationBindingV1,
+): boolean {
+  return (
+    observation.operationId === binding.operationId &&
+    observation.manifestSha256 === binding.manifestSha256 &&
+    observation.manifestByteSize === binding.manifestByteSize &&
+    observation.entryCount === binding.entryCount &&
+    observation.intentsParentId === binding.intentsParentId &&
+    observation.tempLeaf === binding.tempLeaf &&
+    observation.stableLeaf === binding.stableLeaf
+  );
+}
+
+function exactManifestEvidence(
+  binding: AtomicManifestPlannedBindingV1,
+  evidence: AtomicObjectEvidenceV1,
+): boolean {
+  return (
+    isEvidence(evidence) &&
+    evidence.mode === 384 &&
+    evidence.size === binding.manifestByteSize &&
+    evidence.contentSha256 === binding.manifestSha256
+  );
+}
+
+function manifestLocationValid(
+  binding: AtomicManifestPlannedBindingV1,
+  expectedLeaf: string,
+  location: AtomicManifestPlannedLocationV1,
+): boolean {
+  if (location.leaf !== expectedLeaf) return false;
+  if (location.state === "absent") {
+    return location.objectId === null && location.evidence === null;
+  }
+  return (
+    isFlightId(location.objectId) &&
+    exactManifestEvidence(binding, location.evidence)
+  );
+}
+
+function sameManifestIdentity(
+  left: AtomicObjectEvidenceV1,
+  right: AtomicObjectEvidenceV1,
+): boolean {
+  return (
+    evidenceEquals(left, right) &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
+}
+
+function manifestCleanupAuthorizationDigest(
+  binding: AtomicManifestPlannedBindingV1,
+  tempEvidence: AtomicObjectEvidenceV1,
+  stableEvidence: AtomicObjectEvidenceV1,
+  publicationProof: AtomicManifestStablePublicationProofV1,
+): Sha256 {
+  return sha256(
+    new TextEncoder().encode(
+      JSON.stringify({
+        operationId: binding.operationId,
+        manifestSha256: binding.manifestSha256,
+        manifestByteSize: binding.manifestByteSize,
+        entryCount: binding.entryCount,
+        tempLeaf: binding.tempLeaf,
+        stableLeaf: binding.stableLeaf,
+        tempEvidence: tempEvidence.evidenceDigest,
+        stableEvidence: stableEvidence.evidenceDigest,
+        publicationProof: publicationProof.evidenceDigest,
+      }),
+    ),
+  );
+}
+
+function manifestPlannedFail(
+  state: AtomicManifestPlannedRecoveryStateV1,
+  code: Extract<
+    AtomicManifestPlannedRecoveryResultV1,
+    { kind: "fail_stop" }
+  >["code"],
+): AtomicManifestPlannedRecoveryStepV1 {
+  return Object.freeze({
+    state: Object.freeze({ ...state, stage: "fail_stop" as const }),
+    action: null,
+    result: Object.freeze({ kind: "fail_stop" as const, code }),
+  });
+}
+
+function manifestPlannedStep(
+  state: AtomicManifestPlannedRecoveryStateV1,
+  action: AtomicManifestPlannedRecoveryActionV1 | null,
+  result: AtomicManifestPlannedRecoveryResultV1 | null = null,
+): AtomicManifestPlannedRecoveryStepV1 {
+  return Object.freeze({ state, action, result });
+}
+
+function publishManifestTempAction(
+  state: AtomicManifestPlannedRecoveryStateV1,
+): AtomicManifestPlannedRecoveryActionV1 {
+  if (state.temp === null) {
+    throw new TypeError("atomic manifest recovery temp is missing");
+  }
+  return Object.freeze({
+    kind: "publish_manifest_temp" as const,
+    ...manifestPlannedActionBinding(state.binding),
+    tempObjectId: state.temp.objectId,
+    expectedTemp: state.temp.evidence,
+    expectedStable: Object.freeze({ absent: true as const }),
+  });
+}
+
+function persistManifestPublishedAction(
+  state: AtomicManifestPlannedRecoveryStateV1,
+): AtomicManifestPlannedRecoveryActionV1 {
+  if (state.stable === null) {
+    throw new TypeError("atomic manifest recovery stable file is missing");
+  }
+  return Object.freeze({
+    kind: "persist_manifest_published" as const,
+    ...manifestPlannedActionBinding(state.binding),
+    stableObjectId: state.stable.objectId,
+    expectedStable: state.stable.evidence,
+    stableParentSynced: true as const,
+  });
+}
+
+export function createAtomicManifestPlannedRecoveryState(
+  binding: AtomicManifestPlannedBindingV1,
+): AtomicManifestPlannedRecoveryStepV1 {
+  if (!validManifestPlannedBinding(binding)) {
+    throw new TypeError("invalid atomic manifest planned binding");
+  }
+  const frozenBinding = Object.freeze({
+    ...binding,
+    canonicalBytes: Uint8Array.from(binding.canonicalBytes),
+  });
+  const state = Object.freeze({
+    binding: frozenBinding,
+    stage: "locations_pending" as const,
+    temp: null,
+    stable: null,
+    cleanupAuthorizationDigest: null,
+  });
+  return manifestPlannedStep(
+    state,
+    Object.freeze({
+      kind: "observe_manifest_locations" as const,
+      ...manifestPlannedActionBinding(frozenBinding),
+      expectedMode: 384 as const,
+    }),
+  );
+}
+
+export function advanceAtomicManifestPlannedRecovery(
+  state: AtomicManifestPlannedRecoveryStateV1,
+  observation: AtomicManifestPlannedRecoveryObservationV1,
+): AtomicManifestPlannedRecoveryStepV1 {
+  if (
+    state.stage === "complete" ||
+    state.stage === "fail_stop" ||
+    !manifestPlannedObservationMatches(state.binding, observation)
+  ) {
+    return manifestPlannedFail(state, "observation_mismatch");
+  }
+  const binding = state.binding;
+  switch (state.stage) {
+    case "locations_pending": {
+      if (observation.kind !== "manifest_locations_observed") {
+        return manifestPlannedFail(state, "observation_mismatch");
+      }
+      if (
+        !manifestLocationValid(binding, binding.tempLeaf, observation.temp) ||
+        !manifestLocationValid(
+          binding,
+          binding.stableLeaf,
+          observation.stable,
+        )
+      ) {
+        return manifestPlannedFail(state, "binding_mismatch");
+      }
+      if (
+        observation.temp.state === "other" ||
+        observation.stable.state === "other"
+      ) {
+        return manifestPlannedFail(state, "unknown_topology");
+      }
+      if (
+        observation.temp.state === "absent" &&
+        observation.stable.state === "absent"
+      ) {
+        const next = Object.freeze({
+          ...state,
+          stage: "recreate_pending" as const,
+        });
+        return manifestPlannedStep(
+          next,
+          Object.freeze({
+            kind: "recreate_manifest_temp" as const,
+            ...manifestPlannedActionBinding(binding),
+            canonicalBytes: Uint8Array.from(binding.canonicalBytes),
+            mode: 384 as const,
+            expectedAbsence: true as const,
+          }),
+        );
+      }
+      if (
+        observation.temp.state === "present" &&
+        observation.stable.state === "absent"
+      ) {
+        const next = Object.freeze({
+          ...state,
+          stage: "publish_pending" as const,
+          temp: Object.freeze({
+            objectId: observation.temp.objectId,
+            evidence: observation.temp.evidence,
+          }),
+        });
+        return manifestPlannedStep(next, publishManifestTempAction(next));
+      }
+      if (
+        observation.temp.state === "absent" &&
+        observation.stable.state === "present"
+      ) {
+        if (observation.stableParentSynced !== true) {
+          return manifestPlannedFail(state, "binding_mismatch");
+        }
+        const next = Object.freeze({
+          ...state,
+          stage: "manifest_published_pending" as const,
+          stable: Object.freeze({
+            objectId: observation.stable.objectId,
+            evidence: observation.stable.evidence,
+          }),
+        });
+        return manifestPlannedStep(
+          next,
+          persistManifestPublishedAction(next),
+        );
+      }
+      if (
+        observation.temp.state !== "present" ||
+        observation.stable.state !== "present" ||
+        observation.stableParentSynced !== true ||
+        observation.publicationProof === null
+      ) {
+        return manifestPlannedFail(state, "unknown_topology");
+      }
+      const proof = observation.publicationProof;
+      if (
+        proof.operationId !== binding.operationId ||
+        proof.tempObjectId !== observation.temp.objectId ||
+        proof.stableObjectId !== observation.stable.objectId ||
+        !evidenceEquals(proof.tempEvidence, observation.temp.evidence) ||
+        !evidenceEquals(proof.stableEvidence, observation.stable.evidence) ||
+        !isSha256(proof.evidenceDigest)
+      ) {
+        return manifestPlannedFail(state, "binding_mismatch");
+      }
+      const authorizationDigest = manifestCleanupAuthorizationDigest(
+        binding,
+        observation.temp.evidence,
+        observation.stable.evidence,
+        proof,
+      );
+      const next = Object.freeze({
+        ...state,
+        stage: "cleanup_authorization_pending" as const,
+        temp: Object.freeze({
+          objectId: observation.temp.objectId,
+          evidence: observation.temp.evidence,
+        }),
+        stable: Object.freeze({
+          objectId: observation.stable.objectId,
+          evidence: observation.stable.evidence,
+        }),
+        cleanupAuthorizationDigest: authorizationDigest,
+      });
+      return manifestPlannedStep(
+        next,
+        Object.freeze({
+          kind: "authorize_manifest_temp_cleanup" as const,
+          ...manifestPlannedActionBinding(binding),
+          tempObjectId: observation.temp.objectId,
+          expectedTemp: observation.temp.evidence,
+          stableObjectId: observation.stable.objectId,
+          expectedStable: observation.stable.evidence,
+          authorizationDigest,
+        }),
+      );
+    }
+    case "recreate_pending": {
+      if (
+        observation.kind !== "manifest_temp_recreated" ||
+        !exactManifestEvidence(binding, observation.tempEvidence)
+      ) {
+        return manifestPlannedFail(state, "binding_mismatch");
+      }
+      const next = Object.freeze({
+        ...state,
+        stage: "publish_pending" as const,
+        temp: Object.freeze({
+          objectId: observation.tempObjectId,
+          evidence: observation.tempEvidence,
+        }),
+      });
+      return manifestPlannedStep(next, publishManifestTempAction(next));
+    }
+    case "publish_pending": {
+      if (
+        observation.kind !== "manifest_publication_observed" ||
+        state.temp === null ||
+        observation.tempObjectId !== state.temp.objectId ||
+        !evidenceEquals(observation.tempEvidence, state.temp.evidence) ||
+        !exactManifestEvidence(binding, observation.stableEvidence) ||
+        !sameManifestIdentity(
+          observation.tempEvidence,
+          observation.stableEvidence,
+        )
+      ) {
+        return manifestPlannedFail(state, "binding_mismatch");
+      }
+      const next = Object.freeze({
+        ...state,
+        stage: "manifest_published_pending" as const,
+        stable: Object.freeze({
+          objectId: observation.stableObjectId,
+          evidence: observation.stableEvidence,
+        }),
+      });
+      return manifestPlannedStep(
+        next,
+        persistManifestPublishedAction(next),
+      );
+    }
+    case "cleanup_authorization_pending": {
+      if (
+        observation.kind !== "manifest_temp_cleanup_authorized" ||
+        state.temp === null ||
+        state.cleanupAuthorizationDigest === null ||
+        observation.authorizationDigest !==
+          state.cleanupAuthorizationDigest
+      ) {
+        return manifestPlannedFail(state, "observation_mismatch");
+      }
+      const next = Object.freeze({
+        ...state,
+        stage: "temp_removal_pending" as const,
+      });
+      return manifestPlannedStep(
+        next,
+        Object.freeze({
+          kind: "remove_manifest_temp" as const,
+          ...manifestPlannedActionBinding(binding),
+          tempObjectId: state.temp.objectId,
+          expectedTemp: state.temp.evidence,
+          authorizationDigest: state.cleanupAuthorizationDigest,
+        }),
+      );
+    }
+    case "temp_removal_pending": {
+      if (
+        observation.kind !== "manifest_temp_removed" ||
+        state.temp === null ||
+        state.stable === null ||
+        state.cleanupAuthorizationDigest === null ||
+        observation.tempObjectId !== state.temp.objectId ||
+        !evidenceEquals(observation.removedEvidence, state.temp.evidence) ||
+        observation.authorizationDigest !==
+          state.cleanupAuthorizationDigest
+      ) {
+        return manifestPlannedFail(state, "observation_mismatch");
+      }
+      const next = Object.freeze({
+        ...state,
+        stage: "manifest_published_pending" as const,
+        temp: null,
+      });
+      return manifestPlannedStep(
+        next,
+        persistManifestPublishedAction(next),
+      );
+    }
+    case "manifest_published_pending": {
+      if (
+        observation.kind !== "manifest_published_persisted" ||
+        state.stable === null ||
+        observation.stableObjectId !== state.stable.objectId ||
+        !evidenceEquals(
+          observation.stableEvidence,
+          state.stable.evidence,
+        )
+      ) {
+        return manifestPlannedFail(state, "observation_mismatch");
+      }
+      return manifestPlannedStep(
+        Object.freeze({ ...state, stage: "complete" as const }),
+        null,
+        Object.freeze({ kind: "complete" as const }),
+      );
+    }
+  }
 }

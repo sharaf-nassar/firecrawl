@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants, writeFileSync } from "node:fs";
+import { constants, readdirSync, writeFileSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -47,6 +47,7 @@ import {
 } from "./atomic-directory-publication.js";
 import {
   encodeAtomicPublishIntent,
+  parseCleanupIdentityManifest,
   parseAtomicPublishIntent,
   type AtomicPublishIntentV1,
 } from "./atomic-publication-manifest.js";
@@ -54,6 +55,7 @@ import {
   acquireAtomicPreReadyRecoveryAuthority,
   applyAtomicEffect,
   atomicHeldProfileHashImplementationIdentityForTest,
+  atomicSealedGenerationCountForTest,
   bindProfileGeneration,
   canonicalizeHeldProfileTree,
   canonicalizeReconciliationSnapshot,
@@ -68,6 +70,9 @@ import {
   reconcileBrowserStateWithAuthority,
   releaseChromiumSessionAttachment,
   retryFailedReconciliationOutcomeCleanups,
+  recoverAtomicManifestPlannedPublication,
+  recoverAtomicProtectedPublication,
+  runAtomicCanaryPrivateCleanup,
   runAtomicCanaryRecovery,
   runAtomicCreateAndPersistRecordProtocol,
   runAtomicIntentReplacementProtocol,
@@ -75,6 +80,7 @@ import {
   runAtomicPinnedPersistenceProtocol,
   runWithReconciliationFilesystemTestContext,
   syncAndCanonicalizeHeldProfileTree,
+  transitionHeldProfileGenerationAtomically,
   writeHeldProfileFixtureFile,
   type AnchoredProfileRoot,
 } from "./reconciliation.js";
@@ -190,6 +196,287 @@ async function openAtomicBundlesParent(
     throw new Error("atomic bundles parent was not pinned");
   }
   return opened;
+}
+
+async function publishAtomicScaffoldFixture(
+  canonicalRoot: string,
+  installed: Awaited<ReturnType<typeof installedProfileRoot>>,
+) {
+  const lease = await acquireAtomicPreReadyRecoveryAuthority(
+    installed.root,
+    CHECKPOINT_A,
+  );
+  const bundles = await openAtomicBundlesParent(
+    lease,
+    canonicalRoot,
+    CHECKPOINT_A,
+  );
+  const intentsEvidence = await atomicFileEvidence(
+    path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+    null,
+  );
+  const intents = await applyAtomicEffect(lease.controller, {
+    kind: "open_pin_handle",
+    effectId: atomicEffectId(),
+    operationId: CHECKPOINT_A,
+    role: "intents_parent",
+    parentId: lease.initialAuthority.stagingRootId,
+    leaf: "intents",
+    flags: "directory_nofollow",
+    expected: intentsEvidence,
+  });
+  if (intents.kind !== "existing_handle_pinned") {
+    throw new Error("atomic intents parent was not pinned");
+  }
+  await runAtomicPrivateProfilePublication(lease.controller, {
+    flightNonce: "manifest-recovery-fixture",
+    operationId: CHECKPOINT_A,
+    kind: "scaffold",
+    binding: installed.binding,
+    target: {
+      kind: "profile",
+      profileId: PROFILE,
+      leaf: PROFILE,
+      parent: {
+        dev: lease.initialAuthority.evidence.profilesParent.dev,
+        ino: lease.initialAuthority.evidence.profilesParent.ino,
+        mode: 448,
+      },
+    },
+    bundlesParentId: bundles.handleId,
+    bundlesParentEvidence: bundles.evidence,
+    intentsParentId: intents.handleId,
+    intentsParentEvidence: intents.evidence,
+    targetParentId: lease.initialAuthority.profilesParentId,
+    targetParentRole: "profiles_parent",
+    targetParentEvidence: lease.initialAuthority.evidence.profilesParent,
+  });
+  const intentsRoot = path.join(
+    canonicalRoot,
+    ".profile-publish-staging",
+    "intents",
+  );
+  const intentPath = path.join(intentsRoot, `${CHECKPOINT_A}.json`);
+  const finalIntent = parseAtomicPublishIntent(await readFile(intentPath));
+  if (finalIntent.identityManifest === null) {
+    throw new Error("fixture manifest binding is missing");
+  }
+  const manifestPath = path.join(
+    intentsRoot,
+    finalIntent.identityManifest.filename,
+  );
+  const manifestBytes = await readFile(manifestPath);
+  await writeFile(
+    intentPath,
+    encodeAtomicPublishIntent({
+      ...finalIntent,
+      phase: "manifest_planned",
+      identityManifest: {
+        ...finalIntent.identityManifest,
+        phase: "planned",
+        dev: null,
+        ino: null,
+        mode: null,
+      },
+    }).bytes,
+    { mode: 0o600 },
+  );
+  await closeAtomicEffectController(lease.controller);
+  return {
+    intentsRoot,
+    intentPath,
+    manifestPath,
+    manifestBytes,
+    tempPath: path.join(
+      intentsRoot,
+      finalIntent.identityManifest.tempFilename,
+    ),
+  };
+}
+
+async function publishAtomicPrepareContinuationFixture(
+  canonicalRoot: string,
+  installed: Awaited<ReturnType<typeof installedProfileRoot>>,
+) {
+  const sourceRoot = path.join(
+    canonicalRoot,
+    "profiles",
+    PROFILE,
+    "working",
+    CHECKPOINT_A,
+  );
+  const targetRoot = path.join(
+    canonicalRoot,
+    "profiles",
+    PROFILE,
+    "staging",
+    CHECKPOINT_A,
+  );
+  await mkdir(sourceRoot, { recursive: true, mode: 0o700 });
+  await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "staging"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "committed"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  const bytes = Buffer.from("protected-source", "utf8");
+  const sourceFile = path.join(sourceRoot, "source.bin");
+  await writeFile(sourceFile, bytes, { mode: 0o600 });
+  const tree = await canonicalizeProfileTree(
+    canonicalRoot,
+    path.relative(canonicalRoot, sourceRoot),
+    admission().value,
+  );
+  const sourceRootStat = await stat(sourceRoot, { bigint: true });
+  const sourceFileStat = await stat(sourceFile, { bigint: true });
+  const cleanupEntries = [
+    {
+      index: 0,
+      scope: "public_source" as const,
+      path: "source/source.bin",
+      type: "file" as const,
+      dev: String(sourceFileStat.dev),
+      ino: String(sourceFileStat.ino),
+      mode: Number(sourceFileStat.mode & 0o7777n),
+      size: Number(sourceFileStat.size),
+      contentSha256: sha(bytes),
+    },
+    {
+      index: 1,
+      scope: "public_source" as const,
+      path: "source",
+      type: "directory" as const,
+      dev: String(sourceRootStat.dev),
+      ino: String(sourceRootStat.ino),
+      mode: Number(sourceRootStat.mode & 0o7777n),
+      size: 0,
+      contentSha256: null,
+    },
+  ];
+  const lease = await acquireAtomicPreReadyRecoveryAuthority(
+    installed.root,
+    CHECKPOINT_A,
+  );
+  const bundles = await openAtomicBundlesParent(
+    lease,
+    canonicalRoot,
+    CHECKPOINT_A,
+  );
+  const intentsEvidence = await atomicFileEvidence(
+    path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+    null,
+  );
+  const intents = await applyAtomicEffect(lease.controller, {
+    kind: "open_pin_handle",
+    effectId: atomicEffectId(),
+    operationId: CHECKPOINT_A,
+    role: "intents_parent",
+    parentId: lease.initialAuthority.stagingRootId,
+    leaf: "intents",
+    flags: "directory_nofollow",
+    expected: intentsEvidence,
+  });
+  if (intents.kind !== "existing_handle_pinned") {
+    throw new Error("atomic intents parent was not pinned");
+  }
+  const profileEvidence = await atomicFileEvidence(
+    path.join(canonicalRoot, "profiles", PROFILE),
+    null,
+  );
+  const profile = await applyAtomicEffect(lease.controller, {
+    kind: "open_pin_handle",
+    effectId: atomicEffectId(),
+    operationId: CHECKPOINT_A,
+    role: "public_target",
+    parentId: lease.initialAuthority.profilesParentId,
+    leaf: PROFILE,
+    flags: "directory_nofollow",
+    expected: profileEvidence,
+  });
+  if (profile.kind !== "existing_handle_pinned") {
+    throw new Error("atomic profile parent was not pinned");
+  }
+  const stagingEvidence = await atomicFileEvidence(
+    path.join(canonicalRoot, "profiles", PROFILE, "staging"),
+    null,
+  );
+  const staging = await applyAtomicEffect(lease.controller, {
+    kind: "open_pin_handle",
+    effectId: atomicEffectId(),
+    operationId: CHECKPOINT_A,
+    role: "public_target",
+    parentId: profile.handleId,
+    leaf: "staging",
+    flags: "directory_nofollow",
+    expected: stagingEvidence,
+  });
+  if (staging.kind !== "existing_handle_pinned") {
+    throw new Error("atomic staging parent was not pinned");
+  }
+  await runAtomicPrivateProfilePublication(lease.controller, {
+    flightNonce: "protected-continuation-fixture",
+    operationId: CHECKPOINT_A,
+    kind: "prepare",
+    binding: installed.binding,
+    target: {
+      kind: "profile_state",
+      profileId: PROFILE,
+      state: "staging",
+      generationId: CHECKPOINT_A,
+      leaf: CHECKPOINT_A,
+      parent: {
+        dev: staging.evidence.dev,
+        ino: staging.evidence.ino,
+        mode: 448,
+      },
+    },
+    bundlesParentId: bundles.handleId,
+    bundlesParentEvidence: bundles.evidence,
+    intentsParentId: intents.handleId,
+    intentsParentEvidence: intents.evidence,
+    targetParentId: staging.handleId,
+    targetParentRole: "public_target",
+    targetParentEvidence: staging.evidence,
+    entries: [{ path: "source.bin", type: "file", bytes }],
+    publicSource: {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      dev: String(sourceRootStat.dev),
+      ino: String(sourceRootStat.ino),
+      mode: 448,
+      checksum: tree.checksum,
+      byteSize: tree.byteSize,
+      capabilityDigest: sha("prepare-continuation-authority"),
+    },
+    cleanupEntries,
+  });
+  const intentsRoot = path.join(
+    canonicalRoot,
+    ".profile-publish-staging",
+    "intents",
+  );
+  const intentPath = path.join(intentsRoot, `${CHECKPOINT_A}.json`);
+  const finalIntent = parseAtomicPublishIntent(await readFile(intentPath));
+  await closeAtomicEffectController(lease.controller);
+  return {
+    finalIntent,
+    intentPath,
+    manifestPath: path.join(
+      intentsRoot,
+      `${CHECKPOINT_A}.identities.json`,
+    ),
+    wrapperPath: path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+    ),
+    sourceRoot,
+    targetRoot,
+  };
 }
 
 async function createAtomicCanaryFixture(
@@ -7246,8 +7533,36 @@ describe("atomic publication reconciliation ownership", () => {
           privateDeletionEvidence: source.evidence,
         },
       });
-      expect(
-        await lstat(
+      if (deleting.privateDeletionObjectId === null) {
+        throw new Error("private deletion authority was not retained");
+      }
+      const cleanupProofs: AtomicCanaryProofV1[] = [];
+      const cleaned = await runAtomicCanaryPrivateCleanup(
+        lease.controller,
+        {
+          proof: deleting.proof,
+          privateDeletion: {
+            state: "present",
+            parentId: wrapper.handleId,
+            parentEvidence: wrapper.evidence,
+            objectId: deleting.privateDeletionObjectId,
+            evidence: deleting.proof.privateDeletionEvidence!,
+          },
+        },
+        async proof => {
+          cleanupProofs.push(proof);
+        },
+      );
+      expect(cleanupProofs.map(proof => proof.phase)).toEqual([
+        "deleting",
+        "cleaned",
+      ]);
+      expect(cleaned).toMatchObject({
+        phase: "cleaned",
+        cleanupNextIndex: 1,
+      });
+      await expect(
+        lstat(
           path.join(
             canonicalRoot,
             ".profile-publish-staging",
@@ -7256,7 +7571,7 @@ describe("atomic publication reconciliation ownership", () => {
             deletionLeaf,
           ),
         ),
-      ).toMatchObject({ ino: Number(source.evidence.ino) });
+      ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await closeAtomicEffectController(lease.controller).catch(() => undefined);
       await rm(path.join(canonicalRoot, "profiles", targetLeaf), {
@@ -9707,6 +10022,508 @@ describe("atomic publication reconciliation ownership", () => {
     }
   });
 
+  test.each([
+    "absent/absent",
+    "temp-only",
+    "stable-only",
+    "both",
+  ] as const)(
+    "recovers manifest_planned from a fresh controller with %s topology",
+    async topology => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const fixture = await publishAtomicScaffoldFixture(
+        canonicalRoot,
+        installed,
+      );
+      if (topology === "absent/absent") {
+        await rm(fixture.manifestPath);
+      } else if (topology === "temp-only") {
+        await rename(fixture.manifestPath, fixture.tempPath);
+      } else if (topology === "both") {
+        await writeFile(fixture.tempPath, fixture.manifestBytes, {
+          mode: 0o600,
+        });
+      }
+      const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+        installed.root,
+        CHECKPOINT_A,
+      );
+      try {
+        const result = await recoverAtomicManifestPlannedPublication(recovery);
+        expect(result.authority.intent).toMatchObject({
+          operationId: CHECKPOINT_A,
+          phase: "manifest_published",
+          identityManifest: {
+            phase: "published",
+            mode: 384,
+          },
+        });
+        await expect(readFile(fixture.manifestPath)).resolves.toEqual(
+          fixture.manifestBytes,
+        );
+        await expect(lstat(fixture.tempPath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        const durable = parseAtomicPublishIntent(
+          await readFile(fixture.intentPath),
+        );
+        const manifestStat = await stat(fixture.manifestPath, {
+          bigint: true,
+        });
+        expect(durable.identityManifest).toMatchObject({
+          phase: "published",
+          dev: String(manifestStat.dev),
+          ino: String(manifestStat.ino),
+          mode: 384,
+        });
+      } finally {
+        await closeAtomicEffectController(recovery.controller);
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+  );
+
+  test("rejects manifest_planned stable content drift before mutation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicScaffoldFixture(
+      canonicalRoot,
+      installed,
+    );
+    const drift = Buffer.from(fixture.manifestBytes);
+    drift[drift.byteLength - 2] ^= 1;
+    await writeFile(fixture.manifestPath, drift, { mode: 0o600 });
+    const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    try {
+      await expect(
+        recoverAtomicManifestPlannedPublication(recovery),
+      ).rejects.toThrow(/manifest recovery failed|binding/u);
+      expect(
+        parseAtomicPublishIntent(await readFile(fixture.intentPath)).phase,
+      ).toBe("manifest_planned");
+      await expect(readFile(fixture.manifestPath)).resolves.toEqual(drift);
+    } finally {
+      await closeAtomicEffectController(recovery.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("fresh controller resumes protected source deletion and seals target", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    expect(fixture.finalIntent.phase).toBe("manifest_published");
+    const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    try {
+      await expect(
+        recoverAtomicProtectedPublication(recovery),
+      ).resolves.toEqual({
+        sealed: true,
+        operationId: CHECKPOINT_A,
+        phase: "cleaned",
+      });
+      expect(atomicSealedGenerationCountForTest(installed.root)).toBe(1);
+      await expect(lstat(fixture.sourceRoot)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(
+        readFile(path.join(fixture.targetRoot, "source.bin"), "utf8"),
+      ).resolves.toBe("protected-source");
+      await expect(lstat(fixture.wrapperPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(fixture.manifestPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(fixture.intentPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await closeAtomicEffectController(recovery.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test.each([
+    "pending",
+    "moved_private",
+    "removing",
+    "removed",
+    "adopted",
+    "discarding",
+    "manifest_deleting",
+    "cleaned",
+  ] as const)(
+    "fresh controller resumes protected publication from %s",
+    async phase => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const fixture = await publishAtomicPrepareContinuationFixture(
+        canonicalRoot,
+        installed,
+      );
+      const manifestSha256 =
+        fixture.finalIntent.identityManifest!.sha256;
+      const sourceEntryCount = parseCleanupIdentityManifest(
+        await readFile(fixture.manifestPath),
+      ).entries.filter(
+        entry => entry.scope === "public_source",
+      ).length;
+      const privateDeletionLeaf = `delete-${CHECKPOINT_A}` as const;
+      const deletionDigest = sha(
+        JSON.stringify({
+          operationId: CHECKPOINT_A,
+          manifestSha256,
+          publicSource: fixture.finalIntent.publicSource,
+          privateDeletionLeaf,
+        }),
+      );
+      const sourceDeletion = {
+        phase:
+          phase === "pending"
+            ? ("pending" as const)
+            : phase === "moved_private"
+              ? ("moved_private" as const)
+              : phase === "removing"
+                ? ("removing" as const)
+                : ("removed" as const),
+        privateDeletionLeaf,
+        evidenceDigest: deletionDigest,
+        entryCount: sourceEntryCount,
+        nextIndex: 0,
+      };
+      if (phase === "moved_private" || phase === "removing") {
+        await rename(
+          fixture.sourceRoot,
+          path.join(fixture.wrapperPath, privateDeletionLeaf),
+        );
+      } else if (
+        phase === "removed" ||
+        phase === "adopted" ||
+        phase === "discarding" ||
+        phase === "manifest_deleting" ||
+        phase === "cleaned"
+      ) {
+        await rm(fixture.sourceRoot, { recursive: true });
+      }
+      const adoption = {
+        authority: "prepare_token" as const,
+        authorityDigest:
+          fixture.finalIntent.publicSource!.capabilityDigest,
+      };
+      const cleanup = {
+        phase:
+          phase === "manifest_deleting" || phase === "cleaned"
+            ? ("cleaned" as const)
+            : ("discarding" as const),
+        outcome: "adopted" as const,
+        evidenceDigest: sha(
+          JSON.stringify({
+            operationId: CHECKPOINT_A,
+            manifestSha256,
+            outcome: "adopted",
+            authority: adoption.authorityDigest,
+          }),
+        ),
+        suffix:
+          phase === "manifest_deleting" || phase === "cleaned"
+            ? ("done" as const)
+            : ("private_source_entries" as const),
+        nextIndex: 0,
+      };
+      const durable: AtomicPublishIntentV1 =
+        phase === "pending" ||
+        phase === "moved_private" ||
+        phase === "removing" ||
+        phase === "removed"
+          ? {
+              ...fixture.finalIntent,
+              phase: "source_deleting",
+              sourceDeletion,
+            }
+          : phase === "adopted"
+            ? {
+                ...fixture.finalIntent,
+                phase: "adopted",
+                sourceDeletion: {
+                  ...sourceDeletion,
+                  phase: "removed",
+                },
+                adoption,
+              }
+            : phase === "discarding"
+              ? {
+                  ...fixture.finalIntent,
+                  phase: "discarding",
+                  sourceDeletion: {
+                    ...sourceDeletion,
+                    phase: "removed",
+                  },
+                  adoption,
+                  cleanup,
+                }
+              : {
+                  ...fixture.finalIntent,
+                  phase,
+                  sourceDeletion: {
+                    ...sourceDeletion,
+                    phase: "removed",
+                  },
+                  adoption,
+                  cleanup,
+                  identityManifest: {
+                    ...fixture.finalIntent.identityManifest!,
+                    phase: "deleting",
+                  },
+                };
+      if (phase === "manifest_deleting" || phase === "cleaned") {
+        await rm(fixture.wrapperPath, { recursive: true });
+      }
+      if (phase === "cleaned") {
+        await rm(fixture.manifestPath);
+      }
+      await writeFile(
+        fixture.intentPath,
+        encodeAtomicPublishIntent(durable).bytes,
+        { mode: 0o600 },
+      );
+      const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+        installed.root,
+        CHECKPOINT_A,
+      );
+      try {
+        await expect(
+          recoverAtomicProtectedPublication(recovery),
+        ).resolves.toMatchObject({
+          sealed: true,
+          phase: "cleaned",
+        });
+        expect(atomicSealedGenerationCountForTest(installed.root)).toBe(1);
+        await expect(
+          readFile(
+            path.join(fixture.targetRoot, "source.bin"),
+            "utf8",
+          ),
+        ).resolves.toBe("protected-source");
+        await expect(lstat(fixture.intentPath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        await closeAtomicEffectController(recovery.controller);
+        await closeAnchoredProfileRoot(installed.root);
+      }
+    },
+  );
+
+  test("resumes manifest_deleting after manifest unlink crash", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    const manifestSha256 =
+      fixture.finalIntent.identityManifest!.sha256;
+    const authorityDigest =
+      fixture.finalIntent.publicSource!.capabilityDigest;
+    await rm(fixture.sourceRoot, { recursive: true });
+    await rm(fixture.wrapperPath, { recursive: true });
+    await rm(fixture.manifestPath);
+    await writeFile(
+      fixture.intentPath,
+      encodeAtomicPublishIntent({
+        ...fixture.finalIntent,
+        phase: "manifest_deleting",
+        sourceDeletion: {
+          phase: "removed",
+          privateDeletionLeaf: `delete-${CHECKPOINT_A}`,
+          evidenceDigest: sha("removed-source"),
+          entryCount: 2,
+          nextIndex: 0,
+        },
+        adoption: {
+          authority: "prepare_token",
+          authorityDigest,
+        },
+        cleanup: {
+          phase: "cleaned",
+          outcome: "adopted",
+          evidenceDigest: sha("cleaned-wrapper"),
+          suffix: "done",
+          nextIndex: 0,
+        },
+        identityManifest: {
+          ...fixture.finalIntent.identityManifest!,
+          phase: "deleting",
+        },
+      }).bytes,
+      { mode: 0o600 },
+    );
+    expect(
+      parseAtomicPublishIntent(await readFile(fixture.intentPath)).phase,
+    ).toBe("manifest_deleting");
+    const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    let parentSyncedBeforeCleaned = false;
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            atomicOperationCompleted(point) {
+              if (point === "atomic-fsync") {
+                parentSyncedBeforeCleaned = true;
+              }
+            },
+            beforeCall(point) {
+              if (point === "atomic-replace-intent") {
+                expect(parentSyncedBeforeCleaned).toBe(true);
+              }
+            },
+          },
+          () => recoverAtomicProtectedPublication(recovery),
+        ),
+      ).resolves.toMatchObject({ sealed: true, phase: "cleaned" });
+      expect(parentSyncedBeforeCleaned).toBe(true);
+      await expect(lstat(fixture.intentPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await closeAtomicEffectController(recovery.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("replays an authorized source removal before advancing cursor", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    const manifest = parseCleanupIdentityManifest(
+      await readFile(fixture.manifestPath),
+    );
+    const sourceFileEntry = manifest.entries.find(
+      entry =>
+        entry.scope === "public_source" &&
+        entry.path === "source/source.bin",
+    )!;
+    const sourceEntries = manifest.entries.filter(
+      entry => entry.scope === "public_source",
+    );
+    const manifestSha256 =
+      fixture.finalIntent.identityManifest!.sha256;
+    const privateDeletionLeaf = `delete-${CHECKPOINT_A}` as const;
+    await rename(
+      fixture.sourceRoot,
+      path.join(fixture.wrapperPath, privateDeletionLeaf),
+    );
+    await writeFile(
+      fixture.intentPath,
+      encodeAtomicPublishIntent({
+        ...fixture.finalIntent,
+        phase: "source_deleting",
+        sourceDeletion: {
+          phase: "removing",
+          privateDeletionLeaf,
+          evidenceDigest: sha(
+            JSON.stringify({
+              operationId: CHECKPOINT_A,
+              manifestSha256,
+              publicSource: fixture.finalIntent.publicSource,
+              privateDeletionLeaf,
+            }),
+          ),
+          entryCount: sourceEntries.length,
+          nextIndex: sourceEntries.indexOf(sourceFileEntry) + 1,
+        },
+      }).bytes,
+      { mode: 0o600 },
+    );
+    const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    try {
+      await expect(
+        recoverAtomicProtectedPublication(recovery),
+      ).resolves.toMatchObject({ sealed: true, phase: "cleaned" });
+      await expect(lstat(fixture.intentPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await closeAtomicEffectController(recovery.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("fail-stops adopted continuation while public source remains", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const fixture = await publishAtomicPrepareContinuationFixture(
+      canonicalRoot,
+      installed,
+    );
+    await writeFile(
+      fixture.intentPath,
+      encodeAtomicPublishIntent({
+        ...fixture.finalIntent,
+        phase: "adopted",
+        sourceDeletion: {
+          phase: "removed",
+          privateDeletionLeaf: `delete-${CHECKPOINT_A}`,
+          evidenceDigest: sha("forged-removed-source"),
+          entryCount: 2,
+          nextIndex: 0,
+        },
+        adoption: {
+          authority: "prepare_token",
+          authorityDigest:
+            fixture.finalIntent.publicSource!.capabilityDigest,
+        },
+      }).bytes,
+      { mode: 0o600 },
+    );
+    const recovery = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    try {
+      await expect(
+        recoverAtomicProtectedPublication(recovery),
+      ).rejects.toThrow(/source cleanup is ambiguous/u);
+      await expect(
+        readFile(path.join(fixture.sourceRoot, "source.bin"), "utf8"),
+      ).resolves.toBe("protected-source");
+    } finally {
+      await closeAtomicEffectController(recovery.controller).catch(
+        () => undefined,
+      );
+      await closeAnchoredProfileRoot(installed.root).catch(
+        () => undefined,
+      );
+    }
+  });
+
   test("admits exact disjoint entry and payload byte caps then rejects plus one", async () => {
     const canonicalRoot = await root();
     await provisionAtomicNamespaces(canonicalRoot);
@@ -10477,82 +11294,378 @@ describe("atomic publication reconciliation ownership", () => {
     const canonicalRoot = await root();
     await provisionAtomicNamespaces(canonicalRoot);
     const installed = await installedProfileRoot(canonicalRoot);
-    await mkdir(path.join(canonicalRoot, "profiles", PROFILE), {
-      mode: 0o700,
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
     });
-    const lease = await acquireAtomicPreReadyRecoveryAuthority(
-      installed.root,
+    await writeHeldProfileFixtureFile(
+      working,
+      "source.bin",
+      "source",
+    );
+    const destination = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "staging",
       CHECKPOINT_A,
     );
-    const bundles = await openAtomicBundlesParent(
-      lease,
-      canonicalRoot,
-      CHECKPOINT_A,
+    await mkdir(destination, { mode: 0o700 });
+    await writeFile(
+      path.join(destination, "destination.bin"),
+      "destination",
+      { mode: 0o600 },
     );
     try {
-      const intentsEvidence = await atomicFileEvidence(
-        path.join(
-          canonicalRoot,
-          ".profile-publish-staging",
-          "intents",
-        ),
-        null,
-      );
-      const intents = await applyAtomicEffect(lease.controller, {
-        kind: "open_pin_handle",
-        effectId: atomicEffectId(),
-        operationId: CHECKPOINT_A,
-        role: "intents_parent",
-        parentId: lease.initialAuthority.stagingRootId,
-        leaf: "intents",
-        flags: "directory_nofollow",
-        expected: intentsEvidence,
-      });
-      if (intents.kind !== "existing_handle_pinned") {
-        throw new Error("atomic intents parent was not pinned");
-      }
-      const result = await runAtomicPrivateProfilePublication(
-        lease.controller,
-        {
-          flightNonce: "private-conflict",
-          operationId: CHECKPOINT_A,
-          kind: "scaffold",
-          binding: installed.binding,
-          target: {
-            kind: "profile",
-            profileId: PROFILE,
-            leaf: PROFILE,
-            parent: {
-              dev: lease.initialAuthority.evidence.profilesParent.dev,
-              ino: lease.initialAuthority.evidence.profilesParent.ino,
-              mode: 448,
-            },
-          },
-          bundlesParentId: bundles.handleId,
-          bundlesParentEvidence: bundles.evidence,
-          intentsParentId: intents.handleId,
-          intentsParentEvidence: intents.evidence,
-          targetParentId: lease.initialAuthority.profilesParentId,
-          targetParentRole: "profiles_parent",
-          targetParentEvidence:
-            lease.initialAuthority.evidence.profilesParent,
-        },
-      );
-      expect(result.outcome).toBe("conflict");
-      expect(result.phases).toEqual([
-        "allocated",
-        "building",
-        "ready",
-        "classified",
-        "manifest_planned",
-        "manifest_published",
-      ]);
       await expect(
-        readdir(path.join(canonicalRoot, "profiles", PROFILE)),
+        transitionHeldProfileGenerationAtomically(working, {
+          binding: installed.binding,
+          kind: "prepare",
+          authorityDigest: sha("prepare-token"),
+        }),
+      ).rejects.toThrow(/destination conflicted/u);
+      await expect(
+        readFile(path.join(destination, "destination.bin"), "utf8"),
+      ).resolves.toBe("destination");
+      await expect(
+        readFile(
+          path.join(
+            canonicalRoot,
+            "profiles",
+            PROFILE,
+            "working",
+            CHECKPOINT_A,
+            "source.bin",
+          ),
+          "utf8",
+        ),
+      ).resolves.toBe("source");
+      await expect(
+        readdir(
+          path.join(canonicalRoot, ".profile-publish-staging", "bundles"),
+        ),
+      ).resolves.toEqual([]);
+      await expect(
+        readdir(
+          path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+        ),
       ).resolves.toEqual([]);
     } finally {
-      await closeAtomicEffectController(lease.controller);
+      await working.close();
       await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("rejects a mismatched conflict cleanup reducer cursor", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "source");
+    const destination = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "staging",
+      CHECKPOINT_A,
+    );
+    await mkdir(destination, { mode: 0o700 });
+    await writeFile(
+      path.join(destination, "destination.bin"),
+      "destination",
+      { mode: 0o600 },
+    );
+    let injected = false;
+
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            atomicProtectedCleanupObservation(observation) {
+              if (!injected && observation.kind === "removal_observed") {
+                injected = true;
+                return {
+                  ...observation,
+                  cursor: observation.cursor + 1,
+                };
+              }
+              return observation;
+            },
+          },
+          () =>
+            transitionHeldProfileGenerationAtomically(working, {
+              binding: installed.binding,
+              kind: "prepare",
+              authorityDigest: sha("conflict-reducer-mismatch"),
+            }),
+        ),
+      ).rejects.toThrow(/protected cleanup removal mismatch/u);
+      expect(injected).toBe(true);
+      await expect(
+        readFile(path.join(destination, "destination.bin"), "utf8"),
+      ).resolves.toBe("destination");
+      await expect(
+        readdir(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+          ),
+        ),
+      ).resolves.toHaveLength(1);
+    } finally {
+      await working.close().catch(() => undefined);
+      await closeAnchoredProfileRoot(installed.root).catch(
+        () => undefined,
+      );
+    }
+  });
+
+  test("retains a conflicted publication when unknown content blocks cleanup", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "source");
+    const destination = path.join(
+      canonicalRoot,
+      "profiles",
+      PROFILE,
+      "staging",
+      CHECKPOINT_A,
+    );
+    await mkdir(destination, { mode: 0o700 });
+    await writeFile(
+      path.join(destination, "destination.bin"),
+      "destination",
+      { mode: 0o600 },
+    );
+    const bundlesPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+    );
+    const intentsPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "intents",
+    );
+    let unknownPath: string | null = null;
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            beforeCall(point) {
+              if (
+                point !== "atomic-remove-mutate" ||
+                unknownPath !== null
+              ) {
+                return;
+              }
+              const operations = readdirSync(bundlesPath);
+              expect(operations).toHaveLength(1);
+              unknownPath = path.join(
+                bundlesPath,
+                operations[0]!,
+                "payload",
+                "unknown",
+              );
+              writeFileSync(unknownPath, "unmanifested", { mode: 0o600 });
+            },
+          },
+          () =>
+            transitionHeldProfileGenerationAtomically(working, {
+              binding: installed.binding,
+              kind: "prepare",
+              authorityDigest: sha("prepare-token"),
+            }),
+        ),
+      ).rejects.toThrow(/effect_rejected after remove_root/u);
+      expect(unknownPath).not.toBeNull();
+      await expect(readFile(unknownPath!, "utf8")).resolves.toBe(
+        "unmanifested",
+      );
+      await expect(readdir(bundlesPath)).resolves.toHaveLength(1);
+      await expect(readdir(intentsPath)).resolves.not.toEqual([]);
+      await expect(
+        readFile(path.join(destination, "destination.bin"), "utf8"),
+      ).resolves.toBe("destination");
+      await expect(
+        readFile(
+          path.join(
+            canonicalRoot,
+            "profiles",
+            PROFILE,
+            "working",
+            CHECKPOINT_A,
+            "source.bin",
+          ),
+          "utf8",
+        ),
+      ).resolves.toBe("source");
+      await expect(
+        writeHeldProfileFixtureFile(
+          working,
+          "after-fail-stop.bin",
+          "blocked",
+        ),
+      ).rejects.toThrow(/not accepting operations/u);
+    } finally {
+      await working.close().catch(() => undefined);
+      await closeAnchoredProfileRoot(installed.root).catch(() => undefined);
+    }
+  });
+
+  test("seals pre-ready adoption without exporting a generation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "source");
+
+    const result = await transitionHeldProfileGenerationAtomically(working, {
+      binding: installed.binding,
+      kind: "prepare",
+      authorityDigest: sha("pre-ready-prepare-token"),
+      adoptionMode: "pre_ready",
+    });
+
+    expect(result).toMatchObject({
+      sealed: true,
+      tree: { fileCount: 1 },
+    });
+    expect(result).not.toHaveProperty("generation");
+    expect(atomicSealedGenerationCountForTest(installed.root)).toBe(1);
+    await expect(
+      readdir(
+        path.join(canonicalRoot, ".profile-publish-staging", "bundles"),
+      ),
+    ).resolves.toEqual([]);
+    await expect(
+      readdir(
+        path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+      ),
+    ).resolves.toEqual([]);
+    await expect(
+      readFile(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "staging",
+          CHECKPOINT_A,
+          "source.bin",
+        ),
+        "utf8",
+      ),
+    ).resolves.toBe("source");
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("drives protected source and terminal cleanup through reducers", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "source");
+    const observations: string[] = [];
+
+    await runWithReconciliationFilesystemTestContext(
+      {
+        atomicProtectedCleanupObservation(observation) {
+          observations.push(observation.kind);
+          return observation;
+        },
+      },
+      () =>
+        transitionHeldProfileGenerationAtomically(working, {
+          binding: installed.binding,
+          kind: "prepare",
+          authorityDigest: sha("reducer-driven-cleanup"),
+          adoptionMode: "pre_ready",
+        }),
+    );
+
+    expect(observations).toEqual(
+      expect.arrayContaining([
+        "cursor_persisted",
+        "removal_observed",
+        "handle_closed",
+        "reservation_released",
+        "phase_persisted",
+      ]),
+    );
+    expect(
+      observations.filter(kind => kind === "phase_persisted"),
+    ).toHaveLength(2);
+    await closeAnchoredProfileRoot(installed.root);
+  });
+
+  test("rejects a mismatched protected cleanup reducer cursor", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "source");
+    let injected = false;
+
+    try {
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            atomicProtectedCleanupObservation(observation) {
+              if (!injected && observation.kind === "removal_observed") {
+                injected = true;
+                return {
+                  ...observation,
+                  cursor: observation.cursor + 1,
+                };
+              }
+              return observation;
+            },
+          },
+          () =>
+            transitionHeldProfileGenerationAtomically(working, {
+              binding: installed.binding,
+              kind: "prepare",
+              authorityDigest: sha("reducer-cursor-mismatch"),
+              adoptionMode: "pre_ready",
+            }),
+        ),
+      ).rejects.toThrow(/protected cleanup removal mismatch/u);
+      expect(injected).toBe(true);
+    } finally {
+      await working.close().catch(() => undefined);
+      await closeAnchoredProfileRoot(installed.root).catch(
+        () => undefined,
+      );
     }
   });
 });

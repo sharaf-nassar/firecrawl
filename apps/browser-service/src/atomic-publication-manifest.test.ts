@@ -155,7 +155,7 @@ function discardingIntent(): AtomicPublishIntentV1 {
       phase: "published",
       dev: "1",
       ino: "7",
-      mode: 448,
+      mode: 384,
     },
     cleanup: {
       phase: "discarding",
@@ -215,6 +215,7 @@ function sourceDeletingIntent(
       phase: "removing",
       privateDeletionLeaf: `delete-${OPERATION_ID}`,
       evidenceDigest: SHA_B,
+      entryCount: 2,
       nextIndex: 2,
     },
     identityManifest: {
@@ -226,7 +227,7 @@ function sourceDeletingIntent(
       byteSize: 100,
       dev: "1",
       ino: "7",
-      mode: 448,
+      mode: 384,
     },
   };
 }
@@ -345,7 +346,7 @@ function validIntentForPhase(
     byteSize: 100,
     dev: "1",
     ino: "7",
-    mode: 448 as const,
+    mode: 384 as const,
   };
   const published: AtomicPublishIntentV1 = {
     ...base,
@@ -412,6 +413,7 @@ function validIntentForPhase(
           phase: "pending",
           privateDeletionLeaf: `delete-${OPERATION_ID}`,
           evidenceDigest: SHA_A,
+          entryCount: 2,
           nextIndex: 0,
         },
       };
@@ -425,6 +427,7 @@ function validIntentForPhase(
                 phase: "removed",
                 privateDeletionLeaf: `delete-${OPERATION_ID}`,
                 evidenceDigest: SHA_A,
+                entryCount: 2,
                 nextIndex: 0,
               }
             : null,
@@ -450,6 +453,7 @@ function validIntentForPhase(
                 phase: "removed",
                 privateDeletionLeaf: `delete-${OPERATION_ID}`,
                 evidenceDigest: SHA_A,
+                entryCount: 2,
                 nextIndex: 0,
               }
             : null,
@@ -479,6 +483,7 @@ function validIntentForPhase(
                 phase: "removed",
                 privateDeletionLeaf: `delete-${OPERATION_ID}`,
                 evidenceDigest: SHA_A,
+                entryCount: 2,
                 nextIndex: 0,
               }
             : null,
@@ -1159,6 +1164,25 @@ describe("atomic publication durable codecs", () => {
     }
   });
 
+  it.each(["manifest_published", "manifest_deleting"] as const)(
+    "requires stable identity manifest mode 0600 in %s",
+    (phase) => {
+      const intent = validIntentForPhase("prepare", phase);
+      expect(intent.identityManifest?.mode).toBe(384);
+      expect(() => encodeAtomicPublishIntent(intent)).not.toThrow();
+
+      expect(() =>
+        encodeAtomicPublishIntent({
+          ...intent,
+          identityManifest: {
+            ...intent.identityManifest!,
+            mode: 448,
+          },
+        } as unknown as AtomicPublishIntentV1),
+      ).toThrow(/identityManifest.*mode 384/u);
+    },
+  );
+
   it("rejects kind-target, normalized-code, mode, and adoption mismatches", () => {
     const allocated = allocatedIntent();
     expect(() =>
@@ -1197,7 +1221,7 @@ describe("atomic publication durable codecs", () => {
           phase: "published",
           dev: "1",
           ino: "7",
-          mode: 448,
+          mode: 384,
         },
         adoption: {
           authority: "reconciliation_snapshot",
@@ -1565,7 +1589,7 @@ describe("atomic publication durable codecs", () => {
         phase: "published",
         dev: "1",
         ino: "7",
-        mode: 448,
+        mode: 384,
       },
     };
     expect(() =>
@@ -2032,7 +2056,7 @@ describe("atomic publication durable codecs", () => {
         phase: "published",
         dev: "1",
         ino: "7",
-        mode: 448,
+        mode: 384,
       },
       adoption: { authority: "registry", authorityDigest: SHA_C },
     };

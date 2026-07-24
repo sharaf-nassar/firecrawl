@@ -116,6 +116,7 @@ export type AtomicPublishIntentV1 = Readonly<{
     phase: "pending" | "moved_private" | "removing" | "removed";
     privateDeletionLeaf: `delete-${CanonicalUuid}`;
     evidenceDigest: Sha256;
+    entryCount: number;
     nextIndex: number;
   }> | null;
   adoption: Readonly<{
@@ -170,7 +171,7 @@ export type AtomicPublishIntentV1 = Readonly<{
     byteSize: number;
     dev: string | null;
     ino: string | null;
-    mode: 448 | null;
+    mode: 384 | null;
   }> | null;
 }>;
 
@@ -730,7 +731,13 @@ function sourceDeletion(value: unknown, operationId: string) {
   const record = asRecord(value, "sourceDeletion");
   exactKeys(
     record,
-    ["phase", "privateDeletionLeaf", "evidenceDigest", "nextIndex"],
+    [
+      "phase",
+      "privateDeletionLeaf",
+      "evidenceDigest",
+      "entryCount",
+      "nextIndex",
+    ],
     "sourceDeletion",
   );
   const leaf = `delete-${operationId}`;
@@ -747,6 +754,12 @@ function sourceDeletion(value: unknown, operationId: string) {
     evidenceDigest: sha256(
       record.evidenceDigest,
       "sourceDeletion.evidenceDigest",
+    ),
+    entryCount: integer(
+      record.entryCount,
+      0,
+      CLEANUP_IDENTITY_MANIFEST_MAX_ENTRIES,
+      "sourceDeletion.entryCount",
     ),
     nextIndex: integer(
       record.nextIndex,
@@ -964,9 +977,9 @@ function identityManifest(value: unknown, operationId: string) {
   } else if (
     record.dev === null ||
     record.ino === null ||
-    record.mode !== 448
+    record.mode !== 384
   ) {
-    invalid("published identityManifest requires inode evidence");
+    invalid("stable identityManifest requires inode evidence with mode 384");
   }
   return {
     phase,
@@ -990,7 +1003,7 @@ function identityManifest(value: unknown, operationId: string) {
       record.dev === null ? null : decimal(record.dev, "identityManifest.dev"),
     ino:
       record.ino === null ? null : decimal(record.ino, "identityManifest.ino"),
-    mode: record.mode === null ? null : (448 as const),
+    mode: record.mode === null ? null : (384 as const),
   };
 }
 
@@ -1259,7 +1272,10 @@ function validateIntentMatrix(intent: AtomicPublishIntentV1): void {
   if (
     intent.identityManifest !== null &&
     ((intent.sourceDeletion !== null &&
-      intent.sourceDeletion.nextIndex > intent.identityManifest.entryCount) ||
+      (intent.sourceDeletion.entryCount >
+        intent.identityManifest.entryCount ||
+        intent.sourceDeletion.nextIndex >
+          intent.sourceDeletion.entryCount)) ||
       (intent.cleanup !== null &&
         intent.cleanup.nextIndex > intent.identityManifest.entryCount))
   ) {
@@ -2307,6 +2323,11 @@ export function validateAtomicPublishIntentTransition(
         right.evidenceDigest,
         "sourceDeletion.evidenceDigest",
       );
+      immutableEqual(
+        left.entryCount,
+        right.entryCount,
+        "sourceDeletion.entryCount",
+      );
       const leftOrder = SOURCE_DELETION_ORDER.get(left.phase)!;
       const rightOrder = SOURCE_DELETION_ORDER.get(right.phase)!;
       if (rightOrder < leftOrder || rightOrder > leftOrder + 1) {
@@ -2323,7 +2344,7 @@ export function validateAtomicPublishIntentTransition(
       if (
         left.phase === "removing" &&
         right.phase === "removed" &&
-        left.nextIndex !== previous.identityManifest?.entryCount
+        left.nextIndex !== left.entryCount
       ) {
         invalid("sourceDeletion cannot finish before its entry cursor");
       }

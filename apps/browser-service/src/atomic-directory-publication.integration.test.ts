@@ -15,6 +15,7 @@ import {
   openSync,
   readSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -42,6 +43,8 @@ const testAddonPath = new URL(
 ).pathname;
 const tsxPath = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
 const OPERATION_ID = "11111111-1111-4111-8111-111111111111";
+const PROTECTED_PROFILE_ID = "33333333-3333-4333-8333-333333333333";
+const PROTECTED_GENERATION_ID = "44444444-4444-4444-8444-444444444444";
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
@@ -327,6 +330,258 @@ async function waitForCanaryChild(
   };
 }
 
+const protectedPublisherChild = String.raw`
+const { createHash } = require("node:crypto");
+const fs = require("node:fs");
+(async () => {
+  const reconciliation = await import("./src/reconciliation.ts");
+  const canonicalRoot = process.argv[1];
+  const fixture = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  const barrierPhase = process.argv[3];
+  const readyFd = fs.openSync(
+    process.argv[4],
+    fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+  );
+  const releaseFd = fs.openSync(
+    process.argv[5],
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+  );
+  const snapshot =
+    reconciliation.canonicalizeReconciliationSnapshot([]);
+  const request = {
+    version: 1,
+    processNonce: fixture.binding.processNonce,
+    controlGenerationNonce: fixture.binding.controlGenerationNonce,
+    snapshotDigest: snapshot.snapshotDigest,
+    references: [],
+  };
+  if (request.snapshotDigest !== fixture.binding.snapshotDigest) {
+    throw new Error("protected publisher binding digest mismatched");
+  }
+  const admission = {
+    signal: new AbortController().signal,
+    assertAdmitted() {},
+  };
+  const outcome =
+    await reconciliation.reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      request,
+      { admission },
+    );
+  let installedRoot;
+  await reconciliation.consumeInternalReconciliationOutcome(
+    outcome,
+    fixture.binding,
+    async install => {
+      installedRoot = install.root;
+    },
+  );
+  if (installedRoot === undefined) {
+    throw new Error("protected publisher root was not installed");
+  }
+  const working = await reconciliation.bindProfileGeneration(
+    installedRoot,
+    {
+      profileId: fixture.profileId,
+      state: "working",
+      generationId: fixture.generationId,
+      openMode: "create_exclusive",
+    },
+  );
+  await reconciliation.writeHeldProfileFixtureFile(
+    working,
+    "source.bin",
+    "protected-source",
+  );
+  let rendezvoused = false;
+  const rendezvous = () => {
+    rendezvoused = true;
+    try {
+      fs.writeSync(readyFd, Buffer.from([0x01]));
+      fs.readSync(releaseFd, Buffer.alloc(1), 0, 1, null);
+    } catch (error) {
+      fs.writeSync(
+        2,
+        "protected barrier failed: " +
+          String(error?.stack ?? error) +
+          "\n",
+      );
+      throw error;
+    }
+  };
+  await reconciliation.runWithReconciliationFilesystemTestContext(
+    {
+      atomicNativeBarrier(phase, move) {
+        if (
+          rendezvoused ||
+          phase !== barrierPhase ||
+          move !== "profile_source_to_private"
+        ) {
+          return;
+        }
+        rendezvous();
+      },
+      beforeCall(point) {
+        if (
+          rendezvoused ||
+          barrierPhase !== "remove" ||
+          point !== "atomic-remove-mutate"
+        ) {
+          return;
+        }
+        const intentsPath =
+          canonicalRoot + "/.profile-publish-staging/intents";
+        const removing = fs.readdirSync(intentsPath)
+          .filter(leaf => /^[0-9a-f-]{36}\.json$/.test(leaf))
+          .map(leaf =>
+            JSON.parse(
+              fs.readFileSync(intentsPath + "/" + leaf, "utf8"),
+            ),
+          )
+          .some(intent =>
+            intent.phase === "source_deleting" &&
+            intent.sourceDeletion?.phase === "removing" &&
+            intent.sourceDeletion.nextIndex > 0,
+          );
+        if (removing) rendezvous();
+      },
+    },
+    () =>
+      reconciliation.transitionHeldProfileGenerationAtomically(
+        working,
+        {
+          binding: fixture.binding,
+          kind: "prepare",
+          authorityDigest: createHash("sha256")
+            .update("protected-restart-authority")
+            .digest("hex"),
+          adoptionMode: "pre_ready",
+        },
+      ),
+  );
+  throw new Error("protected publisher escaped SIGKILL rendezvous");
+})().catch(error => {
+  process.stderr.write(String(error?.stack ?? error));
+  process.exitCode = 1;
+});
+`;
+
+function spawnProtectedPublisherBarrier(
+  canonicalRoot: string,
+  fixturePath: string,
+  phase: "before" | "after" | "remove",
+): CanaryBarrierFixture {
+  const readyPath = `${fixturePath}.ready`;
+  const releasePath = `${fixturePath}.release`;
+  const mkfifo = spawnSync(
+    "/usr/bin/mkfifo",
+    ["--mode=0600", "--", readyPath, releasePath],
+    { encoding: "utf8" },
+  );
+  if (mkfifo.status !== 0) {
+    throw new Error(`mkfifo failed: ${mkfifo.stderr}`);
+  }
+  const open = new Set<number>();
+  const remember = (descriptor: number): number => {
+    open.add(descriptor);
+    return descriptor;
+  };
+  const readyAnchor = remember(
+    openSync(
+      readyPath,
+      constants.O_RDWR |
+        constants.O_NONBLOCK |
+        constants.O_NOFOLLOW,
+    ),
+  );
+  const releaseAnchor = remember(
+    openSync(
+      releasePath,
+      constants.O_RDWR |
+        constants.O_NONBLOCK |
+        constants.O_NOFOLLOW,
+    ),
+  );
+  const readyReader = remember(
+    openSync(
+      readyPath,
+      constants.O_RDONLY |
+        constants.O_NONBLOCK |
+        constants.O_NOFOLLOW,
+    ),
+  );
+  const releaseWriter = remember(
+    openSync(
+      releasePath,
+      constants.O_WRONLY |
+        constants.O_NONBLOCK |
+        constants.O_NOFOLLOW,
+    ),
+  );
+  const closeRemembered = (descriptor: number): void => {
+    if (!open.delete(descriptor)) return;
+    closeSync(descriptor);
+  };
+  let stderr = "";
+  const child = spawn(
+    process.execPath,
+    [
+      "--import",
+      "tsx",
+      "-e",
+      protectedPublisherChild,
+      canonicalRoot,
+      fixturePath,
+      phase,
+      readyPath,
+      releasePath,
+    ],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  child.stderr?.setEncoding("utf8").on("data", chunk => {
+    stderr += chunk;
+  });
+  let spawnError: Error | undefined;
+  child.once("error", error => {
+    spawnError = error;
+  });
+  const completion = new Promise<{
+    code: number | null;
+    error?: Error;
+    signal: NodeJS.Signals | null;
+  }>(resolve => {
+    child.once("close", (code, signal) => {
+      resolve({
+        code,
+        ...(spawnError === undefined ? {} : { error: spawnError }),
+        signal,
+      });
+    });
+  });
+  let closed = false;
+  return {
+    child,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      for (const descriptor of [...open]) closeRemembered(descriptor);
+      if (existsSync(readyPath)) unlinkSync(readyPath);
+      if (existsSync(releasePath)) unlinkSync(releasePath);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      if (stderr.length > 0 && child.signalCode !== "SIGKILL") {
+        throw new Error(stderr);
+      }
+    },
+    completion,
+    readyReader,
+  };
+}
+
 const childPublisher = String.raw`
 const fs = require("node:fs");
 const moduleRecord = { exports: Object.create(null) };
@@ -553,6 +808,59 @@ function runFreshCanaryRecovery(
   };
 }
 
+const freshProtectedRecoveryChild = String.raw`
+const fs = require("node:fs");
+(async () => {
+  const reconciliation = await import("./src/reconciliation.ts");
+  const fixture = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  const admission = {
+    signal: new AbortController().signal,
+    assertAdmitted() {},
+  };
+  const result =
+    await reconciliation.recoverAtomicProtectedPublicationFromCanonicalRoot(
+      process.argv[1],
+      fixture.binding,
+      admission,
+      fixture.operationId,
+    );
+  process.stdout.write(JSON.stringify(result));
+})().catch(error => {
+  process.stderr.write(String(error?.stack ?? error));
+  process.exitCode = 1;
+});
+`;
+
+function runFreshProtectedRecovery(
+  canonicalRoot: string,
+  fixturePath: string,
+): {
+  operationId: string;
+  phase: string;
+  sealed: boolean;
+} {
+  const result = spawnSync(
+    tsxPath,
+    [
+      "-e",
+      freshProtectedRecoveryChild,
+      canonicalRoot,
+      fixturePath,
+    ],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      encoding: "utf8",
+      timeout: 10_000,
+    },
+  );
+  expect(result.status, result.stderr).toBe(0);
+  return JSON.parse(result.stdout) as {
+    operationId: string;
+    phase: string;
+    sealed: boolean;
+  };
+}
+
 describe("atomic directory publication host integration", () => {
   test("selects exactly one complete winner across concurrent processes", async () => {
     const directory = root();
@@ -679,6 +987,136 @@ describe("atomic directory publication host integration", () => {
       });
       expect(existsSync(join(wrapperPath, sourceLeaf))).toBe(false);
       expect(existsSync(join(profilesPath, targetLeaf))).toBe(true);
+    },
+  );
+
+  test.each([
+    { seam: "native-before", phase: "before" },
+    { seam: "native-after", phase: "after" },
+    { seam: "cursor-before-remove", phase: "remove" },
+  ] as const)(
+    "recovers protected source deletion after SIGKILL at $seam seam",
+    async ({ phase }) => {
+      const canonicalRoot = root();
+      const fixtureDirectory = root();
+      const stagingPath = join(
+        canonicalRoot,
+        ".profile-publish-staging",
+      );
+      mkdirSync(stagingPath, { mode: 0o700 });
+      mkdirSync(join(stagingPath, "bundles"), { mode: 0o700 });
+      mkdirSync(join(stagingPath, "intents"), { mode: 0o700 });
+      const binding = {
+        processNonce: Buffer.alloc(32, 6).toString("base64url"),
+        controlGenerationNonce:
+          Buffer.alloc(32, 7).toString("base64url"),
+        snapshotDigest: sha(
+          JSON.stringify({ version: 1, references: [] }),
+        ),
+      };
+      const fixturePath = join(
+        fixtureDirectory,
+        ".protected-publication-fixture.json",
+      );
+      writeFileSync(
+        fixturePath,
+        JSON.stringify({
+          binding,
+          profileId: PROTECTED_PROFILE_ID,
+          generationId: PROTECTED_GENERATION_ID,
+        }),
+        { flag: "wx", mode: 0o600 },
+      );
+      const fixture = spawnProtectedPublisherBarrier(
+        canonicalRoot,
+        fixturePath,
+        phase,
+      );
+      let operationId = "";
+      try {
+        await waitForCanaryBarrier(fixture);
+        const intentsPath = join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        );
+        const intentLeaves = readdirSync(intentsPath).filter(leaf =>
+          /^[0-9a-f-]{36}\.json$/u.test(leaf),
+        );
+        expect(intentLeaves).toHaveLength(1);
+        operationId = intentLeaves[0]!.slice(0, -".json".length);
+        expect(fixture.child.kill("SIGKILL")).toBe(true);
+        expect(await waitForCanaryChild(fixture)).toEqual({
+          code: null,
+          signal: "SIGKILL",
+        });
+      } finally {
+        fixture.close();
+      }
+      const intentsPath = join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "intents",
+      );
+      const bundlesPath = join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "bundles",
+      );
+      const wrapperPath = join(bundlesPath, operationId);
+      const publicSourcePath = join(
+        canonicalRoot,
+        "profiles",
+        PROTECTED_PROFILE_ID,
+        "working",
+        PROTECTED_GENERATION_ID,
+      );
+      const privateSourcePath = join(
+        wrapperPath,
+        `delete-${operationId}`,
+      );
+      const targetPath = join(
+        canonicalRoot,
+        "profiles",
+        PROTECTED_PROFILE_ID,
+        "staging",
+        PROTECTED_GENERATION_ID,
+      );
+      expect(existsSync(targetPath)).toBe(true);
+      expect({
+        publicSource: existsSync(publicSourcePath),
+        privateSource: existsSync(privateSourcePath),
+      }).toEqual(
+        phase === "before"
+          ? { publicSource: true, privateSource: false }
+          : { publicSource: false, privateSource: true },
+      );
+      writeFileSync(
+        fixturePath,
+        JSON.stringify({ binding, operationId }),
+        { flag: "w", mode: 0o600 },
+      );
+      expect(
+        runFreshProtectedRecovery(canonicalRoot, fixturePath),
+      ).toEqual({
+        operationId,
+        phase: "cleaned",
+        sealed: true,
+      });
+      expect(
+        readFileSync(join(targetPath, "source.bin"), "utf8"),
+      ).toBe("protected-source");
+      expect(existsSync(publicSourcePath)).toBe(false);
+      expect(existsSync(privateSourcePath)).toBe(false);
+      expect(existsSync(wrapperPath)).toBe(false);
+      expect(
+        existsSync(join(intentsPath, `${operationId}.identities.json`)),
+      ).toBe(false);
+      expect(existsSync(join(intentsPath, `${operationId}.json`))).toBe(
+        false,
+      );
+      expect(readdirSync(bundlesPath)).toEqual([]);
+      expect(readdirSync(intentsPath)).toEqual([]);
     },
   );
 

@@ -17,8 +17,16 @@ import {
   ATOMIC_MAX_TRACKED_IDS,
   assertAtomicProfileCopySchemaV1,
   assertAtomicProfileSchemaV1,
+  advanceAtomicManifestPlannedRecovery,
   advanceAtomicCanaryCleanup,
+  advanceAtomicProtectedCleanupEntry,
+  advanceAtomicProtectedCleanupSuffix,
+  advanceAtomicProtectedCleanupTerminal,
+  beginAtomicProtectedCleanupEntry,
+  beginAtomicProtectedCleanupTerminal,
   createAtomicCanaryReducerState,
+  createAtomicManifestPlannedRecoveryState,
+  createAtomicProtectedCleanupState,
   createAtomicReducerState,
   isAtomicCanaryProofV1,
   isAtomicControlLeafV1,
@@ -28,7 +36,12 @@ import {
   type AtomicEffectObservationV1,
   type AtomicEffectRequestDraftV1,
   type AtomicCanaryProofV1,
+  type AtomicManifestPlannedBindingV1,
+  type AtomicManifestPlannedRecoveryObservationV1,
   type AtomicObjectEvidenceV1,
+  type AtomicProtectedCleanupEntryV1,
+  type AtomicProtectedCleanupObservationV1,
+  type AtomicProtectedCleanupTerminalObservationV1,
   type AtomicReducerStepV1,
   type CanonicalLocationEvidenceV1,
   type FlightEffectId,
@@ -819,6 +832,653 @@ describe("atomic publication effect protocol", () => {
       kind: "terminal",
       result: { kind: "fail_stop", code: "unexpected_observation" },
     });
+  });
+
+  test("binds each protected removal to a durable manifest cursor", () => {
+    const parentId = semanticId();
+    const objectId = semanticId();
+    const removed = evidence({ mode: 384, size: 7, contentSha256: HASH });
+    const entryDigest = "b".repeat(64);
+    const initial = createAtomicProtectedCleanupState({
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      entryCount: 1,
+      entryCounts: {
+        privateSourceEntries: 1,
+        wrapperTemps: 0,
+        intentTemps: 0,
+      },
+      entryDigests: [entryDigest],
+      cursor: 0,
+      suffix: "private_source_entries",
+    });
+    const entry: AtomicProtectedCleanupEntryV1 = {
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      index: 0,
+      suffix: "private_source_entries",
+      scope: "private_profile_payload",
+      entryDigest,
+      requestKind: "remove_file",
+      role: "payload_entry",
+      parentId,
+      leaf: "state.bin",
+      objectId,
+      expected: removed,
+      release: {
+        reservation: "payload_entries",
+        count: 1,
+        byteSize: 7,
+      },
+    };
+    expect(() =>
+      beginAtomicProtectedCleanupEntry(initial, {
+        ...entry,
+        entryDigest: "c".repeat(64),
+      }),
+    ).toThrow(/invalid atomic protected cleanup entry/u);
+    const persist = beginAtomicProtectedCleanupEntry(initial, entry);
+    expect(persist.action).toEqual({
+      kind: "persist_cursor",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      suffix: "private_source_entries",
+      previousCursor: 0,
+      nextIndex: 1,
+      entryDigest,
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(persist.state, {
+        kind: "cursor_persisted",
+        operationId: OPERATION_ID,
+        manifestSha256: "c".repeat(64),
+        suffix: "private_source_entries",
+        previousCursor: 0,
+        nextIndex: 1,
+        entryDigest,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/cursor mismatch/u);
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(persist.state, {
+        kind: "cursor_persisted",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        suffix: "private_source_entries",
+        previousCursor: 0,
+        nextIndex: 2,
+        entryDigest,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/cursor mismatch/u);
+    const remove = advanceAtomicProtectedCleanupEntry(persist.state, {
+      kind: "cursor_persisted",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      suffix: "private_source_entries",
+      previousCursor: 0,
+      nextIndex: 1,
+      entryDigest,
+      evidenceDigest: HASH,
+    });
+    expect(remove.action).toMatchObject({
+      kind: "remove",
+      manifestSha256: HASH,
+      cursor: 1,
+      entryDigest,
+      request: {
+        kind: "remove_file",
+        role: "payload_entry",
+        objectId,
+        expected: removed,
+        manifestSha256: HASH,
+        cursor: 1,
+      },
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(remove.state, {
+        kind: "cursor_persisted",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        suffix: "private_source_entries",
+        previousCursor: 0,
+        nextIndex: 1,
+        entryDigest,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/removal mismatch/u);
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(remove.state, {
+        kind: "removal_observed",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        cursor: 1,
+        entryDigest,
+        requestKind: "remove_file",
+        objectId,
+        removedEvidence: evidence({
+          mode: 384,
+          size: 8,
+          contentSha256: HASH,
+        }),
+        state: "absent",
+        parentSynced: true,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/removal mismatch/u);
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(remove.state, {
+        kind: "removal_observed",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        cursor: 1,
+        entryDigest,
+        requestKind: "remove_file",
+        objectId,
+        removedEvidence: removed,
+        state: "absent",
+        parentSynced: false,
+        evidenceDigest: HASH,
+      } as unknown as AtomicProtectedCleanupObservationV1),
+    ).toThrow(/removal mismatch/u);
+    const close = advanceAtomicProtectedCleanupEntry(remove.state, {
+      kind: "removal_observed",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 1,
+      entryDigest,
+      requestKind: "remove_file",
+      objectId,
+      removedEvidence: removed,
+      state: "absent",
+      parentSynced: true,
+      evidenceDigest: HASH,
+    });
+    expect(close.action).toMatchObject({
+      kind: "close",
+      cursor: 1,
+      request: { kind: "close_handle", objectId, expected: removed },
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(close.state, {
+        kind: "reservation_released",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        cursor: 1,
+        entryDigest,
+        reservation: "payload_entries",
+        count: 1,
+        byteSize: 7,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/close mismatch/u);
+    const release = advanceAtomicProtectedCleanupEntry(close.state, {
+      kind: "handle_closed",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 1,
+      entryDigest,
+      role: "payload_entry",
+      objectId,
+      closedEvidence: removed,
+      evidenceDigest: HASH,
+    });
+    expect(release.action).toMatchObject({
+      kind: "release",
+      cursor: 1,
+      request: {
+        kind: "release_budget",
+        reservation: "payload_entries",
+        count: 1,
+        byteSize: 7,
+      },
+    });
+    const completed = advanceAtomicProtectedCleanupEntry(release.state, {
+      kind: "reservation_released",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 1,
+      entryDigest,
+      reservation: "payload_entries",
+      count: 1,
+      byteSize: 7,
+      evidenceDigest: HASH,
+    });
+    expect(completed).toMatchObject({
+      action: null,
+      state: { cursor: 1, stage: "ready", activeEntry: null },
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupEntry(release.state, {
+        kind: "reservation_released",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        cursor: 1,
+        entryDigest: "c".repeat(64),
+        reservation: "payload_entries",
+        count: 1,
+        byteSize: 7,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/release mismatch/u);
+  });
+
+  test("permits only manifest temp files through protected general removal", () => {
+    const parentId = semanticId();
+    const objectId = semanticId();
+    const expected = evidence({
+      mode: 384,
+      size: 7,
+      contentSha256: HASH,
+    });
+    const state = createAtomicReducerState({
+      flightNonce: "manifest-temp-removal",
+      request: {
+        kind: "remove_file",
+        operationId: OPERATION_ID,
+        role: "manifest_temp",
+        parentId,
+        leaf:
+          `${OPERATION_ID}.identities.22222222-2222-4222-8222-222222222222.tmp`,
+        objectId,
+        expected,
+        manifestSha256: HASH,
+        cursor: 0,
+      },
+      semanticIds: [parentId, objectId],
+    });
+    const effect = reduceAtomicPublication(state, null);
+    expect(effect).toMatchObject({
+      kind: "effect",
+      request: {
+        kind: "remove_file",
+        role: "manifest_temp",
+        manifestSha256: HASH,
+        cursor: 0,
+      },
+    });
+  });
+
+  test("makes public and committed-profile removal unrepresentable", () => {
+    const parentId = semanticId();
+    const objectId = semanticId();
+    for (const role of ["public_source", "public_target"] as const) {
+      expect(() =>
+        createAtomicReducerState({
+          flightNonce: `flight-forbidden-removal-${role}`,
+          request: {
+            kind: "remove_root",
+            operationId: OPERATION_ID,
+            role,
+            parentId,
+            leaf: "generation",
+            objectId,
+            expected: EVIDENCE,
+            manifestSha256: HASH,
+            cursor: 1,
+          } as unknown as AtomicEffectRequestDraftV1,
+          semanticIds: [parentId, objectId],
+        }),
+      ).toThrow(/invalid atomic effect request/u);
+    }
+    expect(() =>
+      createAtomicReducerState({
+        flightNonce: "flight-forbidden-private-file-root",
+        request: {
+          kind: "remove_file",
+          operationId: OPERATION_ID,
+          role: "private_source",
+          parentId,
+          leaf: "payload",
+          objectId,
+          expected: evidence({ mode: 384 }),
+          manifestSha256: HASH,
+          cursor: 1,
+        },
+        semanticIds: [parentId, objectId],
+      }),
+    ).toThrow(/invalid atomic effect request/u);
+  });
+
+  test("enforces cleanup suffix order, cursor ranges, and bounds", () => {
+    expect(() =>
+      createAtomicProtectedCleanupState({
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        entryCount: ATOMIC_MAX_PAYLOAD_ENTRIES + 1,
+        entryCounts: {
+          privateSourceEntries: ATOMIC_MAX_PAYLOAD_ENTRIES + 1,
+          wrapperTemps: 0,
+          intentTemps: 0,
+        },
+        entryDigests: [],
+        cursor: 0,
+        suffix: "private_source_entries",
+      }),
+    ).toThrow(/invalid atomic protected cleanup state/u);
+    expect(() =>
+      createAtomicProtectedCleanupState({
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        entryCount: 2,
+        entryCounts: {
+          privateSourceEntries: 1,
+          wrapperTemps: 0,
+          intentTemps: 0,
+        },
+        entryDigests: [HASH, HASH],
+        cursor: 0,
+        suffix: "private_source_entries",
+      }),
+    ).toThrow(/invalid atomic protected cleanup state/u);
+
+    const privateComplete = createAtomicProtectedCleanupState({
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      entryCount: 3,
+      entryCounts: {
+        privateSourceEntries: 1,
+        wrapperTemps: 1,
+        intentTemps: 1,
+      },
+      entryDigests: [HASH, "b".repeat(64), "c".repeat(64)],
+      cursor: 1,
+      suffix: "private_source_entries",
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupSuffix(
+        privateComplete,
+        "wrapper_temps",
+      ),
+    ).toThrow(/cleanup suffix/u);
+    const privateRoot = advanceAtomicProtectedCleanupSuffix(
+      privateComplete,
+      "private_source_root",
+    );
+    const wrapperTemps = advanceAtomicProtectedCleanupSuffix(
+      privateRoot,
+      "wrapper_temps",
+    );
+    expect(() =>
+      advanceAtomicProtectedCleanupSuffix(wrapperTemps, "wrapper_root"),
+    ).toThrow(/cleanup suffix/u);
+
+    const wrapperComplete = createAtomicProtectedCleanupState({
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      entryCount: 3,
+      entryCounts: {
+        privateSourceEntries: 1,
+        wrapperTemps: 1,
+        intentTemps: 1,
+      },
+      entryDigests: [HASH, "b".repeat(64), "c".repeat(64)],
+      cursor: 2,
+      suffix: "wrapper_temps",
+    });
+    const wrapperRoot = advanceAtomicProtectedCleanupSuffix(
+      wrapperComplete,
+      "wrapper_root",
+    );
+    const intentTemps = advanceAtomicProtectedCleanupSuffix(
+      wrapperRoot,
+      "intent_temps",
+    );
+    expect(() =>
+      advanceAtomicProtectedCleanupSuffix(intentTemps, "done"),
+    ).toThrow(/cleanup suffix/u);
+
+    const intentComplete = createAtomicProtectedCleanupState({
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      entryCount: 3,
+      entryCounts: {
+        privateSourceEntries: 1,
+        wrapperTemps: 1,
+        intentTemps: 1,
+      },
+      entryDigests: [HASH, "b".repeat(64), "c".repeat(64)],
+      cursor: 3,
+      suffix: "intent_temps",
+    });
+    expect(
+      advanceAtomicProtectedCleanupSuffix(intentComplete, "done"),
+    ).toMatchObject({ suffix: "done", cursor: 3 });
+  });
+
+  test("deletes stable manifest before persisting cleaned and intent last", () => {
+    let cleanup = createAtomicProtectedCleanupState({
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      entryCount: 0,
+      entryCounts: {
+        privateSourceEntries: 0,
+        wrapperTemps: 0,
+        intentTemps: 0,
+      },
+      entryDigests: [],
+      cursor: 0,
+      suffix: "private_source_entries",
+    });
+    for (const suffix of [
+      "private_source_root",
+      "wrapper_temps",
+      "wrapper_root",
+      "intent_temps",
+      "done",
+    ] as const) {
+      cleanup = advanceAtomicProtectedCleanupSuffix(cleanup, suffix);
+    }
+    const parentId = semanticId();
+    const manifestId = semanticId();
+    const intentId = semanticId();
+    const manifestEvidence = evidence({
+      mode: 384,
+      size: 20,
+      contentSha256: HASH,
+    });
+    const intentEvidence = evidence({
+      mode: 384,
+      size: 30,
+      contentSha256: HASH,
+    });
+    const intentRecord = {
+      role: "intent_stable" as const,
+      parentId,
+      leaf: `${OPERATION_ID}.json`,
+      objectId: intentId,
+      expected: intentEvidence,
+      release: {
+        reservation: "other_metadata_bytes" as const,
+        count: 1 as const,
+        byteSize: 30,
+      },
+    };
+    let current = beginAtomicProtectedCleanupTerminal(cleanup, {
+      manifest: {
+        role: "manifest_stable",
+        parentId,
+        leaf: `${OPERATION_ID}.identities.json`,
+        objectId: manifestId,
+        expected: manifestEvidence,
+        release: {
+          reservation: "manifest_bytes",
+          count: 1,
+          byteSize: 20,
+        },
+      },
+      intent: intentRecord,
+    });
+    expect(current.action).toMatchObject({
+      kind: "persist_phase",
+      phase: "manifest_deleting",
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupTerminal(current.state, {
+        kind: "phase_persisted",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        cursor: 0,
+        phase: "cleaned",
+        intent: intentRecord,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/manifest deletion was not authorized/u);
+    current = advanceAtomicProtectedCleanupTerminal(current.state, {
+      kind: "phase_persisted",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 0,
+      phase: "manifest_deleting",
+      intent: intentRecord,
+      evidenceDigest: HASH,
+    });
+    expect(current.action).toMatchObject({
+      kind: "remove_stable",
+      role: "manifest_stable",
+      request: { kind: "remove_manifest", stableObjectId: manifestId },
+    });
+
+    const stableObservation = (
+      kind: "removal_observed" | "handle_closed",
+      role: "manifest_stable" | "intent_stable",
+      objectId: FlightSemanticId,
+      itemEvidence: AtomicObjectEvidenceV1,
+    ): AtomicProtectedCleanupTerminalObservationV1 =>
+      kind === "removal_observed"
+        ? {
+            kind,
+            operationId: OPERATION_ID,
+            manifestSha256: HASH,
+            cursor: 0,
+            role,
+            objectId,
+            removedEvidence: itemEvidence,
+            state: "absent",
+            parentSynced: true,
+            evidenceDigest: HASH,
+          }
+        : {
+            kind,
+            operationId: OPERATION_ID,
+            manifestSha256: HASH,
+            cursor: 0,
+            role,
+            objectId,
+            closedEvidence: itemEvidence,
+            evidenceDigest: HASH,
+          };
+
+    expect(() =>
+      advanceAtomicProtectedCleanupTerminal(
+        current.state,
+        stableObservation(
+          "removal_observed",
+          "intent_stable",
+          intentId,
+          intentEvidence,
+        ),
+      ),
+    ).toThrow(/manifest removal mismatch/u);
+    current = advanceAtomicProtectedCleanupTerminal(
+      current.state,
+      stableObservation(
+        "removal_observed",
+        "manifest_stable",
+        manifestId,
+        manifestEvidence,
+      ),
+    );
+    expect(current.action).toMatchObject({
+      kind: "close_stable",
+      role: "manifest_stable",
+    });
+    current = advanceAtomicProtectedCleanupTerminal(
+      current.state,
+      stableObservation(
+        "handle_closed",
+        "manifest_stable",
+        manifestId,
+        manifestEvidence,
+      ),
+    );
+    expect(current.action).toMatchObject({
+      kind: "release_stable",
+      role: "manifest_stable",
+    });
+    current = advanceAtomicProtectedCleanupTerminal(current.state, {
+      kind: "reservation_released",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 0,
+      role: "manifest_stable",
+      reservation: "manifest_bytes",
+      count: 1,
+      byteSize: 20,
+      evidenceDigest: HASH,
+    });
+    expect(current.action).toMatchObject({
+      kind: "persist_phase",
+      phase: "cleaned",
+    });
+    current = advanceAtomicProtectedCleanupTerminal(current.state, {
+      kind: "phase_persisted",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 0,
+      phase: "cleaned",
+      intent: intentRecord,
+      evidenceDigest: HASH,
+    });
+    expect(current.action).toMatchObject({
+      kind: "remove_stable",
+      role: "intent_stable",
+      request: { kind: "remove_intent", stableObjectId: intentId },
+    });
+    current = advanceAtomicProtectedCleanupTerminal(
+      current.state,
+      stableObservation(
+        "removal_observed",
+        "intent_stable",
+        intentId,
+        intentEvidence,
+      ),
+    );
+    current = advanceAtomicProtectedCleanupTerminal(
+      current.state,
+      stableObservation(
+        "handle_closed",
+        "intent_stable",
+        intentId,
+        intentEvidence,
+      ),
+    );
+    current = advanceAtomicProtectedCleanupTerminal(current.state, {
+      kind: "reservation_released",
+      operationId: OPERATION_ID,
+      manifestSha256: HASH,
+      cursor: 0,
+      role: "intent_stable",
+      reservation: "other_metadata_bytes",
+      count: 1,
+      byteSize: 30,
+      evidenceDigest: HASH,
+    });
+    expect(current).toMatchObject({
+      action: null,
+      state: { stage: "complete" },
+    });
+    expect(() =>
+      advanceAtomicProtectedCleanupTerminal(current.state, {
+        kind: "phase_persisted",
+        operationId: OPERATION_ID,
+        manifestSha256: HASH,
+        cursor: 0,
+        phase: "cleaned",
+        intent: intentRecord,
+        evidenceDigest: HASH,
+      }),
+    ).toThrow(/terminal observation/u);
   });
 
   test("rejects foreign semantic IDs and duplicate discovered IDs", () => {
@@ -2505,5 +3165,402 @@ describe("atomic publication effect protocol", () => {
     expect(source).not.toMatch(
       /AnchoredRoot|BoundGeneration|PreReadyRecoveryAuthority|WeakMap|FileHandle|proc\/self\/fd|renameNoReplace/u,
     );
+  });
+});
+
+describe("manifest planned recovery", () => {
+  const MANIFEST_BYTES = new TextEncoder().encode(
+    '{"version":1,"entries":[{"index":0}]}\n',
+  );
+  const MANIFEST_SHA256 = createHash("sha256")
+    .update(MANIFEST_BYTES)
+    .digest("hex");
+  const TRANSITION_ID = "22222222-2222-4222-8222-222222222222";
+
+  function manifestBinding(): AtomicManifestPlannedBindingV1 {
+    return Object.freeze({
+      operationId: OPERATION_ID,
+      canonicalBytes: MANIFEST_BYTES,
+      manifestSha256: MANIFEST_SHA256,
+      manifestByteSize: MANIFEST_BYTES.byteLength,
+      entryCount: 1,
+      intentsParentId: semanticId(),
+      tempLeaf: `${OPERATION_ID}.identities.${TRANSITION_ID}.tmp`,
+      stableLeaf: `${OPERATION_ID}.identities.json`,
+    });
+  }
+
+  function manifestEvidence(
+    overrides: Partial<Omit<AtomicObjectEvidenceV1, "evidenceDigest">> = {},
+  ): AtomicObjectEvidenceV1 {
+    return evidence({
+      mode: 384,
+      size: MANIFEST_BYTES.byteLength,
+      contentSha256: MANIFEST_SHA256,
+      ...overrides,
+    });
+  }
+
+  function observationBinding(binding: AtomicManifestPlannedBindingV1) {
+    return {
+      operationId: binding.operationId,
+      manifestSha256: binding.manifestSha256,
+      manifestByteSize: binding.manifestByteSize,
+      entryCount: binding.entryCount,
+      intentsParentId: binding.intentsParentId,
+      tempLeaf: binding.tempLeaf,
+      stableLeaf: binding.stableLeaf,
+    };
+  }
+
+  function absent(leaf: string) {
+    return Object.freeze({
+      state: "absent" as const,
+      leaf,
+      objectId: null,
+      evidence: null,
+    });
+  }
+
+  function present(
+    leaf: string,
+    objectId: FlightSemanticId,
+    objectEvidence: AtomicObjectEvidenceV1,
+  ) {
+    return Object.freeze({
+      state: "present" as const,
+      leaf,
+      objectId,
+      evidence: objectEvidence,
+    });
+  }
+
+  function locations(
+    binding: AtomicManifestPlannedBindingV1,
+    temp: ReturnType<typeof absent> | ReturnType<typeof present>,
+    stable: ReturnType<typeof absent> | ReturnType<typeof present>,
+    options: {
+      stableParentSynced?: boolean;
+      publicationProof?: AtomicManifestPlannedRecoveryObservationV1 extends infer _T
+        ? Extract<
+            AtomicManifestPlannedRecoveryObservationV1,
+            { kind: "manifest_locations_observed" }
+          >["publicationProof"]
+        : never;
+    } = {},
+  ): Extract<
+    AtomicManifestPlannedRecoveryObservationV1,
+    { kind: "manifest_locations_observed" }
+  > {
+    return {
+      kind: "manifest_locations_observed",
+      ...observationBinding(binding),
+      temp,
+      stable,
+      stableParentSynced: options.stableParentSynced ?? false,
+      publicationProof: options.publicationProof ?? null,
+    };
+  }
+
+  test("recreates exact bytes when both locations are absent", () => {
+    const binding = manifestBinding();
+    const initial = createAtomicManifestPlannedRecoveryState(binding);
+    expect(initial.action).toEqual({
+      kind: "observe_manifest_locations",
+      ...observationBinding(binding),
+      expectedMode: 384,
+    });
+    const recreate = advanceAtomicManifestPlannedRecovery(
+      initial.state,
+      locations(
+        binding,
+        absent(binding.tempLeaf),
+        absent(binding.stableLeaf),
+      ),
+    );
+    expect(recreate.action).toMatchObject({
+      kind: "recreate_manifest_temp",
+      canonicalBytes: MANIFEST_BYTES,
+      mode: 384,
+      expectedAbsence: true,
+    });
+
+    const tempObjectId = semanticId();
+    const expected = manifestEvidence();
+    const publish = advanceAtomicManifestPlannedRecovery(recreate.state, {
+      kind: "manifest_temp_recreated",
+      ...observationBinding(binding),
+      tempObjectId,
+      tempEvidence: expected,
+      tempParentSynced: true,
+    });
+    expect(publish.action).toMatchObject({
+      kind: "publish_manifest_temp",
+      tempObjectId,
+      expectedTemp: expected,
+      expectedStable: { absent: true },
+    });
+
+    const stableObjectId = semanticId();
+    const persist = advanceAtomicManifestPlannedRecovery(publish.state, {
+      kind: "manifest_publication_observed",
+      ...observationBinding(binding),
+      tempObjectId,
+      tempEvidence: expected,
+      stableObjectId,
+      stableEvidence: expected,
+      sourceState: "absent",
+      targetState: "present",
+      stableParentSynced: true,
+    });
+    expect(persist.action).toMatchObject({
+      kind: "persist_manifest_published",
+      stableObjectId,
+      expectedStable: expected,
+      stableParentSynced: true,
+    });
+
+    const complete = advanceAtomicManifestPlannedRecovery(persist.state, {
+      kind: "manifest_published_persisted",
+      ...observationBinding(binding),
+      phase: "manifest_published",
+      stableObjectId,
+      stableEvidence: expected,
+      stableParentSynced: true,
+    });
+    expect(complete).toMatchObject({
+      action: null,
+      result: { kind: "complete" },
+      state: { stage: "complete" },
+    });
+  });
+
+  test("publishes an exact pinned temp and binds an exact stable file", () => {
+    const binding = manifestBinding();
+    const expected = manifestEvidence();
+    const tempObjectId = semanticId();
+    const tempInitial = createAtomicManifestPlannedRecoveryState(binding);
+    const publish = advanceAtomicManifestPlannedRecovery(
+      tempInitial.state,
+      locations(
+        binding,
+        present(binding.tempLeaf, tempObjectId, expected),
+        absent(binding.stableLeaf),
+      ),
+    );
+    expect(publish.action).toMatchObject({
+      kind: "publish_manifest_temp",
+      tempObjectId,
+      expectedTemp: expected,
+    });
+
+    const stableObjectId = semanticId();
+    const stableInitial = createAtomicManifestPlannedRecoveryState(binding);
+    const persist = advanceAtomicManifestPlannedRecovery(
+      stableInitial.state,
+      locations(
+        binding,
+        absent(binding.tempLeaf),
+        present(binding.stableLeaf, stableObjectId, expected),
+        { stableParentSynced: true },
+      ),
+    );
+    expect(persist.action).toMatchObject({
+      kind: "persist_manifest_published",
+      stableObjectId,
+      expectedStable: expected,
+    });
+  });
+
+  test("authorization-first removes an exact leftover temp before binding", () => {
+    const binding = manifestBinding();
+    const tempExpected = manifestEvidence({ ino: "10" });
+    const stableExpected = manifestEvidence({ ino: "11" });
+    const tempObjectId = semanticId();
+    const stableObjectId = semanticId();
+    const proof = Object.freeze({
+      operationId: OPERATION_ID,
+      tempObjectId,
+      stableObjectId,
+      tempEvidence: tempExpected,
+      stableEvidence: stableExpected,
+      sourceState: "present" as const,
+      targetState: "present" as const,
+      stableParentSynced: true as const,
+      evidenceDigest: HASH,
+    });
+    const initial = createAtomicManifestPlannedRecoveryState(binding);
+    const authorize = advanceAtomicManifestPlannedRecovery(
+      initial.state,
+      locations(
+        binding,
+        present(binding.tempLeaf, tempObjectId, tempExpected),
+        present(binding.stableLeaf, stableObjectId, stableExpected),
+        { stableParentSynced: true, publicationProof: proof },
+      ),
+    );
+    expect(authorize.action).toMatchObject({
+      kind: "authorize_manifest_temp_cleanup",
+      tempObjectId,
+      stableObjectId,
+      expectedTemp: tempExpected,
+      expectedStable: stableExpected,
+    });
+    if (authorize.action?.kind !== "authorize_manifest_temp_cleanup") {
+      throw new Error("manifest cleanup authorization was not emitted");
+    }
+    const authorizationDigest = authorize.action.authorizationDigest;
+
+    const remove = advanceAtomicManifestPlannedRecovery(authorize.state, {
+      kind: "manifest_temp_cleanup_authorized",
+      ...observationBinding(binding),
+      authorizationDigest,
+    });
+    expect(remove.action).toMatchObject({
+      kind: "remove_manifest_temp",
+      tempObjectId,
+      expectedTemp: tempExpected,
+      authorizationDigest,
+    });
+
+    const persist = advanceAtomicManifestPlannedRecovery(remove.state, {
+      kind: "manifest_temp_removed",
+      ...observationBinding(binding),
+      tempObjectId,
+      removedEvidence: tempExpected,
+      state: "absent",
+      parentSynced: true,
+      authorizationDigest,
+    });
+    expect(persist.action).toMatchObject({
+      kind: "persist_manifest_published",
+      stableObjectId,
+      expectedStable: stableExpected,
+    });
+  });
+
+  test("fails closed on both-present without stable publication proof", () => {
+    const binding = manifestBinding();
+    const expected = manifestEvidence();
+    const initial = createAtomicManifestPlannedRecoveryState(binding);
+    expect(
+      advanceAtomicManifestPlannedRecovery(
+        initial.state,
+        locations(
+          binding,
+          present(binding.tempLeaf, semanticId(), expected),
+          present(binding.stableLeaf, semanticId(), expected),
+          { stableParentSynced: true },
+        ),
+      ),
+    ).toMatchObject({
+      action: null,
+      result: { kind: "fail_stop", code: "unknown_topology" },
+      state: { stage: "fail_stop" },
+    });
+  });
+
+  test.each([
+    ["mode", manifestEvidence({ mode: 448 })],
+    ["size", manifestEvidence({ size: MANIFEST_BYTES.byteLength + 1 })],
+    ["hash", manifestEvidence({ contentSha256: "b".repeat(64) })],
+  ])("fails closed on manifest %s drift", (_name, drifted) => {
+    const binding = manifestBinding();
+    const initial = createAtomicManifestPlannedRecoveryState(binding);
+    expect(
+      advanceAtomicManifestPlannedRecovery(
+        initial.state,
+        locations(
+          binding,
+          present(binding.tempLeaf, semanticId(), drifted),
+          absent(binding.stableLeaf),
+        ),
+      ),
+    ).toMatchObject({
+      result: { kind: "fail_stop", code: "binding_mismatch" },
+      state: { stage: "fail_stop" },
+    });
+  });
+
+  test("fails closed on inode drift, unknown topology, and binding echoes", () => {
+    const binding = manifestBinding();
+    const tempObjectId = semanticId();
+    const stableObjectId = semanticId();
+    const tempEvidence = manifestEvidence({ ino: "10" });
+    const stableEvidence = manifestEvidence({ ino: "11" });
+    const driftedProofTempEvidence = manifestEvidence({ ino: "12" });
+    const proof = {
+      operationId: OPERATION_ID,
+      tempObjectId,
+      stableObjectId,
+      tempEvidence: driftedProofTempEvidence,
+      stableEvidence,
+      sourceState: "present" as const,
+      targetState: "present" as const,
+      stableParentSynced: true as const,
+      evidenceDigest: HASH,
+    };
+    let initial = createAtomicManifestPlannedRecoveryState(binding);
+    expect(
+      advanceAtomicManifestPlannedRecovery(
+        initial.state,
+        locations(
+          binding,
+          present(binding.tempLeaf, tempObjectId, tempEvidence),
+          present(binding.stableLeaf, stableObjectId, stableEvidence),
+          { stableParentSynced: true, publicationProof: proof },
+        ),
+      ),
+    ).toMatchObject({
+      result: { kind: "fail_stop", code: "binding_mismatch" },
+    });
+
+    initial = createAtomicManifestPlannedRecoveryState(binding);
+    expect(
+      advanceAtomicManifestPlannedRecovery(initial.state, {
+        ...locations(
+          binding,
+          absent(binding.tempLeaf),
+          absent(binding.stableLeaf),
+        ),
+        temp: {
+          state: "other",
+          leaf: binding.tempLeaf,
+          objectId: semanticId(),
+          evidence: manifestEvidence(),
+        },
+      }),
+    ).toMatchObject({
+      result: { kind: "fail_stop", code: "unknown_topology" },
+    });
+
+    initial = createAtomicManifestPlannedRecoveryState(binding);
+    expect(
+      advanceAtomicManifestPlannedRecovery(initial.state, {
+        ...locations(
+          binding,
+          absent(binding.tempLeaf),
+          absent(binding.stableLeaf),
+        ),
+        entryCount: 2,
+      }),
+    ).toMatchObject({
+      result: { kind: "fail_stop", code: "observation_mismatch" },
+    });
+  });
+
+  test("rejects noncanonical planned names, bytes, size, and count", () => {
+    const binding = manifestBinding();
+    for (const invalid of [
+      { ...binding, stableLeaf: "other.identities.json" },
+      { ...binding, tempLeaf: `${OPERATION_ID}.identities.not-a-uuid.tmp` },
+      { ...binding, manifestSha256: HASH },
+      { ...binding, manifestByteSize: binding.manifestByteSize + 1 },
+      { ...binding, entryCount: 0 },
+    ]) {
+      expect(() =>
+        createAtomicManifestPlannedRecoveryState(invalid),
+      ).toThrow(/invalid atomic manifest planned binding/u);
+    }
   });
 });
