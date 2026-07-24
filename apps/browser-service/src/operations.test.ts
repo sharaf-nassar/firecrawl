@@ -1423,6 +1423,12 @@ test("SessionRegistry exposes cached executeAction and closes ambiguity", async 
     browser: () => null,
     setStorageState: vi.fn(async () => undefined),
     storageState: vi.fn(async () => ({ cookies: [], origins: [] })),
+    tracing: {
+      start: vi.fn(async () => undefined),
+      startChunk: vi.fn(async () => undefined),
+      stopChunk: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+    },
   };
   const gate = {
     state: "restore_closed" as const,
@@ -1506,6 +1512,11 @@ test("SessionRegistry exposes cached executeAction and closes ambiguity", async 
     releaseChromiumSessionAttachment: async () => {
       await context.close();
     },
+    createRecordingProducer: async () => ({
+      snapshot: async () => Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3]),
+      subscribe: () => () => undefined,
+      close: async () => undefined,
+    }),
     randomUUID: () => "cccccccc-3333-4333-8333-333333333333",
   });
   const session = await registry.create({
