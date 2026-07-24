@@ -18,6 +18,7 @@ import {
   PROXY_IDLE_TIMEOUT_MS,
   PROXY_MAX_LIFETIME_MS,
   createEgressProxy,
+  createRestoreGate,
   proxyConnect,
   type EgressDial,
   type EgressProxyLimits,
@@ -173,6 +174,352 @@ describe("pinned outbound dialing", () => {
 });
 
 describe("bounded loopback proxy", () => {
+  test("enforces exact restore gate transitions and idempotent close", () => {
+    const opened = createRestoreGate();
+    opened.open();
+    expect(opened.state).toBe("open");
+    expect(() => opened.open()).toThrowError("restore_gate_invalid_state");
+    opened.close();
+    opened.close();
+    expect(opened.state).toBe("closed");
+    expect(() => opened.open()).toThrowError("restore_gate_invalid_state");
+  });
+
+  test("blocks closed ingress before DNS, policy, or dial", async () => {
+    const resolver = lookup("93.184.216.34");
+    const dial = vi.fn<EgressDial>();
+    const decisions = vi.fn();
+    const gate = createRestoreGate();
+    const proxy = await createEgressProxy({
+      lookup: resolver,
+      dial,
+      onDecision: decisions,
+      restoreGate: gate,
+    });
+    closers.push(proxy.close);
+
+    expect(
+      await sendRaw(
+        proxy.port,
+        "GET http://public.test/ HTTP/1.1\r\nHost: public.test\r\n\r\n",
+      ),
+    ).toContain("503 Service Unavailable");
+    expect(gate.snapshot()).toEqual({
+      state: "restore_closed",
+      counters: {
+        ingressAttempts: 1,
+        ingressViolations: 1,
+        dnsResolutions: 0,
+        policyDecisions: 0,
+        dials: 0,
+      },
+    });
+    expect(resolver).not.toHaveBeenCalled();
+    expect(decisions).not.toHaveBeenCalled();
+    expect(dial).not.toHaveBeenCalled();
+    expect(() => gate.open()).toThrowError("restore_ingress_violation");
+  });
+
+  test("records only allowlisted ingress categories for every proxy entry", async () => {
+    for (const fixture of [
+      {
+        request:
+          "GET http://public.test/ HTTP/1.1\r\nHost: public.test\r\n\r\n",
+        category: "http",
+      },
+      {
+        request:
+          "CONNECT public.test:443 HTTP/1.1\r\nHost: public.test:443\r\n\r\n",
+        category: "connect",
+      },
+      {
+        request:
+          "GET ws://public.test/socket HTTP/1.1\r\nHost: public.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        category: "upgrade",
+      },
+    ] as const) {
+      const gate = createRestoreGate();
+      const resolver = lookup("93.184.216.34");
+      const dial = vi.fn<EgressDial>();
+      const proxy = await createEgressProxy({
+        restoreGate: gate,
+        lookup: resolver,
+        dial,
+      });
+      closers.push(proxy.close);
+      expect(await sendRaw(proxy.port, fixture.request)).toContain(
+        "503 Service Unavailable",
+      );
+      expect(gate.recordedCategory).toBe(fixture.category);
+      expect(gate.snapshot().counters).toMatchObject({
+        ingressAttempts: 1,
+        ingressViolations: 1,
+        dnsResolutions: 0,
+        policyDecisions: 0,
+        dials: 0,
+      });
+      expect(resolver).not.toHaveBeenCalled();
+      expect(dial).not.toHaveBeenCalled();
+    }
+  });
+
+  test("fails closed atomically on every restore counter overflow", () => {
+    for (const counter of [
+      "ingressAttempts",
+      "ingressViolations",
+      "dnsResolutions",
+      "policyDecisions",
+      "dials",
+    ] as const) {
+      const gate = createRestoreGate({ [counter]: Number.MAX_SAFE_INTEGER });
+      let token: ReturnType<typeof gate.beginIngress> | undefined;
+      if (!["ingressAttempts", "ingressViolations"].includes(counter)) {
+        gate.open();
+        token = gate.beginIngress("http", "http://requested.test/");
+      }
+      const before = gate.completeCounterSnapshot();
+      const operation =
+        counter === "ingressAttempts" || counter === "ingressViolations"
+          ? () => gate.beginIngress("http")
+          : counter === "dnsResolutions"
+            ? () => gate.recordDnsResolution(token || undefined)
+            : counter === "policyDecisions"
+              ? () => gate.recordPolicyDecision(token || undefined)
+              : () => gate.recordDial(token || undefined);
+      expect(operation).toThrowError("restore_counter_overflow");
+      expect(gate.state).toBe("closed");
+      expect(gate.completeCounterSnapshot()).toEqual(before);
+    }
+  });
+
+  test("isolates restore counters and records the post-open pipeline", async () => {
+    const first = createRestoreGate();
+    const second = createRestoreGate();
+    const upstream = createHttpServer((_request, response) =>
+      response.end("ok"),
+    );
+    const port = await listen(upstream);
+    const proxy = await createEgressProxy({
+      lookup: lookup("93.184.216.34"),
+      dial: dialLocal(port),
+      restoreGate: second,
+    });
+    closers.push(proxy.close);
+    second.open();
+    const baseline = second.markPositiveControlBaseline(
+      `http://public.test:${port}/`,
+    );
+    expect(
+      await sendRaw(
+        proxy.port,
+        `GET http://public.test:${port}/ HTTP/1.1\r\nHost: public.test:${port}\r\n\r\n`,
+      ),
+    ).toContain("200 OK");
+    expect(second.snapshot().counters).toEqual({
+      ingressAttempts: 1,
+      ingressViolations: 0,
+      dnsResolutions: 1,
+      policyDecisions: 1,
+      dials: 1,
+    });
+    expect(() =>
+      second.assertPositiveControl(
+        baseline,
+        `http://public.test:${port}/`,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      second.assertPositiveControl(baseline, `http://other.test:${port}/`),
+    ).toThrowError("restore_ingress_violation");
+    expect(first.snapshot().counters).toEqual({
+      ingressAttempts: 0,
+      ingressViolations: 0,
+      dnsResolutions: 0,
+      policyDecisions: 0,
+      dials: 0,
+    });
+  });
+
+  test("cannot combine pipeline evidence across ingress attempts", () => {
+    const gate = createRestoreGate();
+    gate.open();
+    const baseline = gate.markPositiveControlBaseline(
+      "http://requested.test/",
+    );
+    const requested = gate.beginIngress("http", "http://requested.test/");
+    expect(requested).not.toBe(false);
+    gate.recordDnsResolution(requested || undefined);
+    gate.recordPolicyDecision(requested || undefined);
+
+    const unrelated = gate.beginIngress("http", "http://unrelated.test/");
+    expect(unrelated).not.toBe(false);
+    gate.recordDnsResolution(unrelated || undefined);
+    gate.recordPolicyDecision(unrelated || undefined);
+    gate.recordDial(unrelated || undefined);
+
+    expect(() =>
+      gate.assertPositiveControl(baseline, "http://requested.test/"),
+    ).toThrowError("restore_ingress_violation");
+  });
+
+  test("retains dedicated target evidence beyond the bounded attempt ring", () => {
+    const gate = createRestoreGate();
+    gate.open();
+    const baseline = gate.markPositiveControlBaseline(
+      "http://requested.test/",
+    );
+    const target = gate.beginIngress("http", "http://requested.test/");
+    expect(target).not.toBe(false);
+
+    for (let index = 0; index < 257; index += 1) {
+      const subresource = gate.beginIngress(
+        "http",
+        `http://assets.test/${index}`,
+      );
+      expect(subresource).not.toBe(false);
+      gate.recordDnsResolution(subresource || undefined);
+      gate.recordPolicyDecision(subresource || undefined);
+      gate.recordDial(subresource || undefined);
+      gate.completeIngress(subresource || undefined!);
+    }
+
+    gate.recordDnsResolution(target || undefined);
+    gate.recordPolicyDecision(target || undefined);
+    gate.recordDial(target || undefined);
+    gate.completeIngress(target || undefined!);
+
+    expect(() =>
+      gate.assertPositiveControl(baseline, "http://requested.test/"),
+    ).not.toThrow();
+  });
+
+  test("keeps a slow active token while completed history rolls over", () => {
+    const gate = createRestoreGate();
+    gate.open();
+    const slow = gate.beginIngress("http", "http://slow.test/");
+    expect(slow).not.toBe(false);
+
+    for (let index = 0; index < 257; index += 1) {
+      const completed = gate.beginIngress(
+        "http",
+        `http://completed.test/${index}`,
+      );
+      expect(completed).not.toBe(false);
+      gate.recordDnsResolution(completed || undefined);
+      gate.recordPolicyDecision(completed || undefined);
+      gate.recordDial(completed || undefined);
+      gate.completeIngress(completed || undefined!);
+    }
+
+    expect(() => gate.recordDnsResolution(slow || undefined)).not.toThrow();
+    expect(() => gate.recordPolicyDecision(slow || undefined)).not.toThrow();
+    expect(() => gate.recordDial(slow || undefined)).not.toThrow();
+    gate.completeIngress(slow || undefined!);
+  });
+
+  test("fails closed instead of evicting one of 256 active tokens", () => {
+    const gate = createRestoreGate();
+    gate.open();
+    for (let index = 0; index < 256; index += 1) {
+      expect(
+        gate.beginIngress("http", `http://active.test/${index}`),
+      ).not.toBe(false);
+    }
+    const before = gate.completeCounterSnapshot();
+
+    expect(() =>
+      gate.beginIngress("http", "http://active.test/overflow"),
+    ).toThrowError("restore_ingress_violation");
+    expect(gate.state).toBe("closed");
+    expect(gate.completeCounterSnapshot()).toEqual(before);
+  });
+
+  test("authenticates a token before mutating stage counters", () => {
+    const gate = createRestoreGate();
+    gate.open();
+    const token = gate.beginIngress("http", "http://active.test/");
+    expect(token).not.toBe(false);
+    const before = gate.completeCounterSnapshot();
+
+    expect(() =>
+      gate.recordDnsResolution({ sequence: token ? token.sequence : 0 }),
+    ).toThrowError("restore_ingress_violation");
+    expect(gate.completeCounterSnapshot()).toEqual(before);
+  });
+
+  test("latches a completed positive control before an incomplete retry", () => {
+    const gate = createRestoreGate();
+    gate.open();
+    const url = "http://requested.test/";
+    const baseline = gate.markPositiveControlBaseline(url);
+    const completed = gate.beginIngress("http", url);
+    expect(completed).not.toBe(false);
+    gate.recordDnsResolution(completed || undefined);
+    gate.recordPolicyDecision(completed || undefined);
+    gate.recordDial(completed || undefined);
+    gate.completeIngress(completed || undefined!);
+
+    const incomplete = gate.beginIngress("http", url);
+    expect(incomplete).not.toBe(false);
+    gate.recordDnsResolution(incomplete || undefined);
+
+    expect(() => gate.assertPositiveControl(baseline, url)).not.toThrow();
+  });
+
+  test("handles CONNECT policy-counter overflow before any dial", async () => {
+    const gate = createRestoreGate({
+      policyDecisions: Number.MAX_SAFE_INTEGER,
+    });
+    gate.open();
+    const dial = vi.fn<EgressDial>();
+    const proxy = await createEgressProxy({
+      restoreGate: gate,
+      lookup: lookup("93.184.216.34"),
+      dial,
+    });
+    closers.push(proxy.close);
+    const response = await sendRaw(
+      proxy.port,
+      "CONNECT public.test:443 HTTP/1.1\r\nHost: public.test:443\r\n\r\n",
+    );
+    expect(response).toContain("503 Service Unavailable");
+    expect(gate.state).toBe("closed");
+    expect(dial).not.toHaveBeenCalled();
+  });
+
+  test("audits a domain-blocked CONNECT exactly once before dial", async () => {
+    const gate = createRestoreGate();
+    gate.open();
+    const dial = vi.fn<EgressDial>();
+    const onDecision = vi.fn();
+    const proxy = await createEgressProxy({
+      restoreGate: gate,
+      allowedDomains: ["allowed.test"],
+      lookup: lookup("93.184.216.34"),
+      dial,
+      onDecision,
+    });
+    closers.push(proxy.close);
+    expect(
+      await sendRaw(
+        proxy.port,
+        "CONNECT public.test:443 HTTP/1.1\r\nHost: public.test:443\r\n\r\n",
+      ),
+    ).toContain("403 Forbidden");
+    expect(gate.snapshot().counters).toEqual({
+      ingressAttempts: 1,
+      ingressViolations: 0,
+      dnsResolutions: 1,
+      policyDecisions: 1,
+      dials: 0,
+    });
+    expect(onDecision).toHaveBeenCalledOnce();
+    expect(onDecision).toHaveBeenCalledWith({
+      outcome: "blocked",
+      hostname: "public.test",
+    });
+    expect(dial).not.toHaveBeenCalled();
+  });
   test("locks every production bound to its exact default", () => {
     expect(MAX_REQUEST_HEADER_BYTES).toBe(32 * 1024);
     expect(MAX_RESPONSE_HEADER_BYTES).toBe(64 * 1024);

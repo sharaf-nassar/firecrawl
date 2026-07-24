@@ -53,18 +53,313 @@ export type EgressProxyOptions = {
   lookup?: PublicLookup;
   dial?: EgressDial;
   signal?: AbortSignal;
-  deadlineAtMs?: number;
+  deadlineAtMs?: number | (() => number);
   maxTunnels?: number;
   limits?: EgressProxyLimits;
   tlsCa?: string | Buffer;
   onDecision?: (decision: EgressDecision) => void;
+  restoreGate?: RestoreGate;
+  allowedDomains?: readonly string[];
 };
 
 export type EgressProxy = {
   url: string;
   port: number;
+  restoreGate: RestoreGate | undefined;
+  liveSocketCount: () => number;
   close: () => Promise<void>;
 };
+
+export type RestoreGateState = "restore_closed" | "open" | "closed";
+export type RestoreIngressCategory = "http" | "connect" | "upgrade";
+export type RestoreGateCounter =
+  | "ingressAttempts"
+  | "ingressViolations"
+  | "dnsResolutions"
+  | "policyDecisions"
+  | "dials";
+export type RestoreGateCounters = Record<RestoreGateCounter, number>;
+export type RestorePositiveControlBaseline = {
+  counters: RestoreGateCounters;
+  controlId: number;
+};
+export type RestoreIngressToken = Readonly<{ sequence: number }>;
+
+export type RestoreGate = {
+  readonly state: RestoreGateState;
+  readonly counters: Readonly<RestoreGateCounters>;
+  readonly recordedCategory: RestoreIngressCategory | null;
+  beginIngress(
+    category: RestoreIngressCategory,
+    target?: string,
+  ): RestoreIngressToken | false;
+  recordDnsResolution(token?: RestoreIngressToken): void;
+  recordPolicyDecision(token?: RestoreIngressToken): void;
+  recordDial(token?: RestoreIngressToken): void;
+  completeIngress(token: RestoreIngressToken): void;
+  assertZeroViolations(): void;
+  open(): void;
+  close(): void;
+  snapshot(): {
+    state: RestoreGateState;
+    counters: RestoreGateCounters;
+  };
+  completeCounterSnapshot(): RestoreGateCounters;
+  markPositiveControlBaseline(
+    requestedUrl: string,
+  ): RestorePositiveControlBaseline;
+  assertPositiveControl(
+    baseline: RestorePositiveControlBaseline,
+    requestedUrl: string,
+  ): void;
+};
+
+export class RestoreGateError extends Error {
+  readonly category:
+    | "restore_gate_invalid_state"
+    | "restore_ingress_violation"
+    | "restore_counter_overflow";
+
+  constructor(category: RestoreGateError["category"]) {
+    super(category);
+    this.name = "RestoreGateError";
+    this.category = category;
+  }
+}
+
+export function createRestoreGate(
+  initialCounters: Partial<RestoreGateCounters> = {},
+): RestoreGate {
+  let state: RestoreGateState = "restore_closed";
+  const counters: RestoreGateCounters = {
+    ingressAttempts: 0,
+    ingressViolations: 0,
+    dnsResolutions: 0,
+    policyDecisions: 0,
+    dials: 0,
+    ...initialCounters,
+  };
+  for (const value of Object.values(counters)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(
+        "restore gate counters must be safe nonnegative integers",
+      );
+    }
+  }
+  let recordedCategory: RestoreIngressCategory | null = null;
+  type IngressAttempt = {
+    token: RestoreIngressToken;
+    category: RestoreIngressCategory;
+    target: string;
+    pipeline: string[];
+  };
+  const activeIngressAttempts = new Map<number, IngressAttempt>();
+  const completedIngressAttempts = new Map<number, IngressAttempt>();
+  const completedIngressTokens = new WeakSet<RestoreIngressToken>();
+  const positiveControls = new Map<
+    number,
+    {
+      requestedUrl: string;
+      pipeline: string[] | undefined;
+      sequence: number | undefined;
+      minimumSequence: number;
+    }
+  >();
+  let nextControlId = 1;
+
+  function incrementMany(values: readonly RestoreGateCounter[]): void {
+    if (
+      values.some((counter) => counters[counter] === Number.MAX_SAFE_INTEGER)
+    ) {
+      state = "closed";
+      throw new RestoreGateError("restore_counter_overflow");
+    }
+    for (const counter of values) counters[counter] += 1;
+  }
+
+  function increment(counter: RestoreGateCounter): void {
+    incrementMany([counter]);
+  }
+
+  function activeAttempt(
+    token: RestoreIngressToken | undefined,
+  ): IngressAttempt {
+    if (token === undefined) {
+      state = "closed";
+      throw new RestoreGateError("restore_ingress_violation");
+    }
+    const attempt = activeIngressAttempts.get(token.sequence);
+    if (attempt === undefined || attempt.token !== token) {
+      state = "closed";
+      throw new RestoreGateError("restore_ingress_violation");
+    }
+    return attempt;
+  }
+
+  function latchPositiveControls(attempt: IngressAttempt): void {
+    const completedPipeline = [
+      "ingress-linearize",
+      "dns",
+      "policy",
+      "dial",
+    ].join("\0");
+    if (attempt.pipeline.join("\0") !== completedPipeline) return;
+    for (const control of positiveControls.values()) {
+      if (
+        control.pipeline === undefined &&
+        attempt.token.sequence > control.minimumSequence &&
+        ingressTargetsMatch(attempt, control.requestedUrl)
+      ) {
+        control.pipeline = [...attempt.pipeline];
+        control.sequence = attempt.token.sequence;
+      }
+    }
+  }
+
+  function completeIngressAttempt(token: RestoreIngressToken): void {
+    if (completedIngressTokens.has(token)) return;
+    const attempt = activeAttempt(token)!;
+    activeIngressAttempts.delete(token.sequence);
+    completedIngressTokens.add(token);
+    completedIngressAttempts.set(token.sequence, attempt);
+    if (completedIngressAttempts.size > 256) {
+      const oldest = completedIngressAttempts.keys().next().value;
+      if (oldest !== undefined) completedIngressAttempts.delete(oldest);
+    }
+    latchPositiveControls(attempt);
+  }
+
+  const gate: RestoreGate = {
+    get state() {
+      return state;
+    },
+    get counters() {
+      return Object.freeze({ ...counters });
+    },
+    get recordedCategory() {
+      return recordedCategory;
+    },
+    beginIngress(category, target) {
+      if (state === "restore_closed") {
+        incrementMany(["ingressAttempts", "ingressViolations"]);
+        recordedCategory = category;
+        return false;
+      }
+      if (state !== "open") {
+        increment("ingressAttempts");
+        return false;
+      }
+      if (activeIngressAttempts.size >= 256) {
+        state = "closed";
+        throw new RestoreGateError("restore_ingress_violation");
+      }
+      increment("ingressAttempts");
+      const token = Object.freeze({ sequence: counters.ingressAttempts });
+      const normalized =
+        target === undefined ? null : normalizeIngressTarget(category, target);
+      activeIngressAttempts.set(token.sequence, {
+        token,
+        category,
+        target: normalized ?? "",
+        pipeline: ["ingress-linearize"],
+      });
+      return token;
+    },
+    recordDnsResolution(token) {
+      if (state !== "open") {
+        throw new RestoreGateError("restore_gate_invalid_state");
+      }
+      const attempt = activeAttempt(token);
+      increment("dnsResolutions");
+      attempt.pipeline.push("dns");
+    },
+    recordPolicyDecision(token) {
+      if (state !== "open") {
+        throw new RestoreGateError("restore_gate_invalid_state");
+      }
+      const attempt = activeAttempt(token);
+      increment("policyDecisions");
+      attempt.pipeline.push("policy");
+    },
+    recordDial(token) {
+      if (state !== "open") {
+        throw new RestoreGateError("restore_gate_invalid_state");
+      }
+      const attempt = activeAttempt(token);
+      increment("dials");
+      attempt.pipeline.push("dial");
+      latchPositiveControls(attempt);
+    },
+    completeIngress(token) {
+      completeIngressAttempt(token);
+    },
+    assertZeroViolations() {
+      if (counters.ingressViolations !== 0) {
+        throw new RestoreGateError("restore_ingress_violation");
+      }
+    },
+    open() {
+      if (state !== "restore_closed") {
+        throw new RestoreGateError("restore_gate_invalid_state");
+      }
+      if (counters.ingressViolations !== 0) {
+        throw new RestoreGateError("restore_ingress_violation");
+      }
+      state = "open";
+    },
+    close() {
+      state = "closed";
+    },
+    snapshot() {
+      return { state, counters: { ...counters } };
+    },
+    completeCounterSnapshot() {
+      return { ...counters };
+    },
+    markPositiveControlBaseline(requestedUrl) {
+      if (state !== "open") {
+        throw new RestoreGateError("restore_gate_invalid_state");
+      }
+      const controlId = nextControlId;
+      nextControlId += 1;
+      positiveControls.set(controlId, {
+        requestedUrl: new URL(requestedUrl).href,
+        pipeline: undefined,
+        sequence: undefined,
+        minimumSequence: counters.ingressAttempts,
+      });
+      if (positiveControls.size > 16) {
+        state = "closed";
+        throw new RestoreGateError("restore_ingress_violation");
+      }
+      return {
+        counters: { ...counters },
+        controlId,
+      };
+    },
+    assertPositiveControl(baseline, requestedUrl) {
+      const before = baseline.counters;
+      const countersMatch =
+        counters.ingressAttempts > before.ingressAttempts &&
+        counters.ingressViolations === before.ingressViolations &&
+        counters.dnsResolutions > before.dnsResolutions &&
+        counters.policyDecisions > before.policyDecisions &&
+        counters.dials > before.dials;
+      const control = positiveControls.get(baseline.controlId);
+      positiveControls.delete(baseline.controlId);
+      const controlMatches =
+        control !== undefined &&
+        control.requestedUrl === new URL(requestedUrl).href &&
+        control.pipeline?.join("\0") ===
+          ["ingress-linearize", "dns", "policy", "dial"].join("\0");
+      if (!countersMatch || !controlMatches) {
+        state = "closed";
+        throw new RestoreGateError("restore_ingress_violation");
+      }
+    },
+  };
+  return gate;
+}
 
 const defaultDial: EgressDial = ({ address, port, signal }) =>
   netConnect({ allowHalfOpen: true, host: address, port, signal });
@@ -140,6 +435,27 @@ export async function createEgressProxy(
   };
   const server = createServer(serverOptions);
 
+  const forwardOptions = (
+    restoreAttempt: RestoreIngressToken | undefined,
+  ): ForwardOptions => ({
+    lookup: async (hostname) => {
+      options.restoreGate?.recordDnsResolution(restoreAttempt);
+      return lookup(hostname);
+    },
+    dial: (dialOptions) => {
+      options.restoreGate?.recordDial(restoreAttempt);
+      return dial(dialOptions);
+    },
+    rootSignal: rootController.signal,
+    deadlineAtMs: options.deadlineAtMs,
+    onDecision: options.onDecision,
+    restoreGate: options.restoreGate,
+    restoreAttempt,
+    allowedDomains: options.allowedDomains,
+    limits,
+    tlsCa: options.tlsCa,
+  });
+
   server.on("connection", (socket) => {
     sockets.add(socket);
     socket.setTimeout(limits.idleTimeoutMs, () => socket.destroy());
@@ -155,55 +471,78 @@ export async function createEgressProxy(
   });
 
   server.on("request", (request, response) => {
-    void forwardHttpRequest(request, response, {
-      lookup,
-      dial,
-      rootSignal: rootController.signal,
-      deadlineAtMs: options.deadlineAtMs,
-      onDecision: options.onDecision,
-      limits,
-      tlsCa: options.tlsCa,
-    });
+    const ingress = admitIngress(options.restoreGate, "http", request.url);
+    if (!ingress.admitted) {
+      writeResponseError(response, 503);
+      return;
+    }
+    void forwardHttpRequest(
+      request,
+      response,
+      forwardOptions(ingress.token),
+    )
+      .catch(() => {
+        writeResponseError(response, 503);
+      })
+      .finally(() =>
+        completeAdmittedIngress(options.restoreGate, ingress.token),
+      );
   });
 
   server.on("connect", (request, client, head) => {
     const clientSocket = client as Socket;
+    const ingress = admitIngress(options.restoreGate, "connect", request.url);
+    if (!ingress.admitted) {
+      writeSocketError(clientSocket, 503, "Service Unavailable");
+      return;
+    }
     if (activeTunnels >= maxTunnels) {
+      completeAdmittedIngress(options.restoreGate, ingress.token);
       writeSocketError(clientSocket, 503, "Service Unavailable");
       return;
     }
     activeTunnels += 1;
-    void forwardConnect(request, clientSocket, head, {
-      lookup,
-      dial,
-      rootSignal: rootController.signal,
-      deadlineAtMs: options.deadlineAtMs,
-      onDecision: options.onDecision,
-      limits,
-      tlsCa: options.tlsCa,
-    }).finally(() => {
-      activeTunnels -= 1;
-    });
+    void forwardConnect(
+      request,
+      clientSocket,
+      head,
+      forwardOptions(ingress.token),
+    )
+      .catch(() => {
+        writeSocketError(clientSocket, 503, "Service Unavailable");
+      })
+      .finally(() => {
+        completeAdmittedIngress(options.restoreGate, ingress.token);
+        activeTunnels -= 1;
+      });
   });
 
   server.on("upgrade", (request, client, head) => {
     const clientSocket = client as Socket;
+    const ingress = admitIngress(options.restoreGate, "upgrade", request.url);
+    if (!ingress.admitted) {
+      writeSocketError(clientSocket, 503, "Service Unavailable");
+      return;
+    }
     if (activeTunnels >= maxTunnels) {
+      completeAdmittedIngress(options.restoreGate, ingress.token);
       writeSocketError(clientSocket, 503, "Service Unavailable");
       return;
     }
     activeTunnels += 1;
-    void forwardUpgrade(request, clientSocket, head, {
-      lookup,
-      dial,
-      rootSignal: rootController.signal,
-      deadlineAtMs: options.deadlineAtMs,
-      onDecision: options.onDecision,
-      limits,
-      tlsCa: options.tlsCa,
-    }).finally(() => {
-      activeTunnels -= 1;
-    });
+    void forwardUpgrade(
+      request,
+      clientSocket,
+      head,
+      forwardOptions(ingress.token),
+    )
+      .catch(() => {
+        writeSocketError(clientSocket, 503, "Service Unavailable");
+      })
+      .finally(() => {
+        completeAdmittedIngress(options.restoreGate, ingress.token);
+        activeTunnels -= 1;
+      });
   });
 
   rootController.signal.addEventListener(
@@ -214,43 +553,199 @@ export async function createEgressProxy(
     { once: true },
   );
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+  } catch (error) {
+    rootController.abort();
+    rootLink.unlink();
+    for (const socket of sockets) socket.destroy();
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    throw error;
+  }
   const address = server.address();
   if (address === null || typeof address === "string") {
-    server.close();
+    rootController.abort();
+    rootLink.unlink();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) =>
+        error === undefined ? resolve() : reject(error),
+      );
+    });
+    await waitForSocketSetToDrain(sockets);
     throw new Error("egress proxy did not bind TCP");
   }
+
+  let closePromise: Promise<void> | undefined;
+  let listenerClosed = false;
+  const close = (): Promise<void> => {
+    if (closed) return Promise.resolve();
+    if (closePromise !== undefined) return closePromise;
+    options.restoreGate?.close();
+    rootController.abort();
+    rootLink.unlink();
+    for (const socket of sockets) socket.destroy();
+    closePromise = (async () => {
+      if (!listenerClosed) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) =>
+            error === undefined ? resolve() : reject(error),
+          );
+        });
+        listenerClosed = true;
+      }
+      for (const socket of sockets) socket.destroy();
+      await waitForSocketSetToDrain(sockets);
+      if (sockets.size !== 0) {
+        throw new Error("egress proxy sockets did not drain");
+      }
+      closed = true;
+    })().finally(() => {
+      if (!closed) closePromise = undefined;
+    });
+    return closePromise;
+  };
 
   return {
     url: `http://127.0.0.1:${address.port}`,
     port: address.port,
-    close: async () => {
-      if (closed) return;
-      closed = true;
-      rootController.abort();
-      rootLink.unlink();
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) =>
-          error === undefined ? resolve() : reject(error),
-        );
-      });
-    },
+    restoreGate: options.restoreGate,
+    liveSocketCount: () => sockets.size,
+    close,
   };
+}
+
+async function waitForSocketSetToDrain(sockets: Set<Socket>): Promise<void> {
+  await Promise.all(
+    [...sockets].map(
+      (socket) =>
+        new Promise<void>((resolve) => socket.once("close", resolve)),
+    ),
+  );
 }
 
 type ForwardOptions = {
   lookup: PublicLookup;
   dial: EgressDial;
   rootSignal: AbortSignal;
-  deadlineAtMs: number | undefined;
+  deadlineAtMs: number | (() => number) | undefined;
   onDecision: ((decision: EgressDecision) => void) | undefined;
+  restoreGate: RestoreGate | undefined;
+  restoreAttempt: RestoreIngressToken | undefined;
+  allowedDomains: readonly string[] | undefined;
   limits: EffectiveLimits;
   tlsCa: string | Buffer | undefined;
 };
+
+function admitIngress(
+  gate: RestoreGate | undefined,
+  category: RestoreIngressCategory,
+  target: string | undefined,
+): { admitted: boolean; token: RestoreIngressToken | undefined } {
+  if (gate === undefined) return { admitted: true, token: undefined };
+  try {
+    const token = gate.beginIngress(category, target);
+    return token === false
+      ? { admitted: false, token: undefined }
+      : { admitted: true, token };
+  } catch (error) {
+    if (error instanceof RestoreGateError)
+      return { admitted: false, token: undefined };
+    throw error;
+  }
+}
+
+function completeAdmittedIngress(
+  gate: RestoreGate | undefined,
+  token: RestoreIngressToken | undefined,
+): void {
+  if (gate === undefined || token === undefined) return;
+  try {
+    gate.completeIngress(token);
+  } catch (error) {
+    if (!(error instanceof RestoreGateError)) throw error;
+  }
+}
+
+function ingressTargetsMatch(
+  observation: { category: RestoreIngressCategory; target: string },
+  requestedUrl: string,
+): boolean {
+  try {
+    const requested = new URL(requestedUrl);
+    if (observation.category === "connect") {
+      const expectedPort = Number(
+        requested.port ||
+          (requested.protocol === "https:" || requested.protocol === "wss:"
+            ? "443"
+            : "80"),
+      );
+      return (
+        observation.target ===
+        `${requested.hostname.toLowerCase()}\0${expectedPort}`
+      );
+    }
+    return observation.target === requested.href;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeIngressTarget(
+  category: RestoreIngressCategory,
+  target: string,
+): string | null {
+  if (Buffer.byteLength(target, "utf8") > MAX_REQUEST_HEADER_BYTES) return null;
+  try {
+    if (category === "connect") {
+      const authority = parseConnectAuthority(target);
+      return `${authority.hostname}\0${authority.port}`;
+    }
+    return new URL(target).href;
+  } catch {
+    return null;
+  }
+}
+
+function reportDecision(
+  options: ForwardOptions,
+  decision: EgressDecision,
+): void {
+  options.restoreGate?.recordPolicyDecision(options.restoreAttempt);
+  options.onDecision?.(decision);
+}
+
+function assertAllowedDomain(options: ForwardOptions, hostname: string): void {
+  if (options.allowedDomains === undefined) return;
+  const normalized = hostname.toLowerCase();
+  if (
+    !options.allowedDomains.some((allowed) => {
+      const domain = allowed.toLowerCase();
+      return normalized === domain || normalized.endsWith(`.${domain}`);
+    })
+  ) {
+    throw new NetworkPolicyError(
+      "target_blocked",
+      "target domain is not allowed",
+      normalized,
+    );
+  }
+}
+
+function reportBlockedDecision(
+  error: unknown,
+  target: string | undefined,
+  options: ForwardOptions,
+): void {
+  if (error instanceof RestoreGateError) return;
+  options.restoreGate?.recordPolicyDecision(options.restoreAttempt);
+  reportBlocked(error, target, options.onDecision);
+}
 
 type EffectiveLimits = {
   tunnelDirectionBytes: number;
@@ -331,9 +826,10 @@ async function forwardHttpRequest(
       resolvePlainRequestTarget(request.url, options.lookup),
       controller.signal,
     );
-    options.onDecision?.({ outcome: "allowed", hostname: target.hostname });
+    assertAllowedDomain(options, target.hostname);
+    reportDecision(options, { outcome: "allowed", hostname: target.hostname });
   } catch (error) {
-    reportBlocked(error, request.url, options.onDecision);
+    reportBlockedDecision(error, request.url, options);
     writeResponseError(response, statusForError(error));
     controller.abort();
     return;
@@ -422,7 +918,7 @@ async function forwardConnect(
     parsed = parseConnectAuthority(request.url ?? "");
     assertConnectHost(request, parsed);
   } catch (error) {
-    reportBlocked(error, request.url, options.onDecision);
+    reportBlockedDecision(error, request.url, options);
     writeSocketError(
       client,
       statusForError(error),
@@ -441,7 +937,7 @@ async function forwardConnect(
       controller.signal,
     );
   } catch (error) {
-    reportBlocked(error, parsed.hostname, options.onDecision);
+    reportBlockedDecision(error, parsed.hostname, options);
     writeSocketError(
       client,
       statusForError(error),
@@ -450,7 +946,19 @@ async function forwardConnect(
     controller.abort();
     return;
   }
-  options.onDecision?.({ outcome: "allowed", hostname: target.hostname });
+  try {
+    assertAllowedDomain(options, target.hostname);
+    reportDecision(options, { outcome: "allowed", hostname: target.hostname });
+  } catch (error) {
+    reportBlockedDecision(error, target.hostname, options);
+    writeSocketError(
+      client,
+      statusForError(error),
+      statusText(statusForError(error)),
+    );
+    controller.abort();
+    return;
+  }
   let upstream: Socket;
   try {
     upstream = await options.dial({
@@ -555,10 +1063,14 @@ async function forwardUpgrade(
         controller.abort();
         return;
       }
-      options.onDecision?.({ outcome: "allowed", hostname: target.hostname });
+      assertAllowedDomain(options, target.hostname);
+      reportDecision(options, {
+        outcome: "allowed",
+        hostname: target.hostname,
+      });
     } catch (error) {
       if (!client.destroyed && !controller.signal.aborted) {
-        reportBlocked(error, request.url, options.onDecision);
+        reportBlockedDecision(error, request.url, options);
         writeSocketError(
           client,
           statusForError(error),
@@ -850,7 +1362,11 @@ class RequestLifetime {
     this.#parent = options.rootSignal;
     this.#onParentAbort = () => this.abort(this.#parent.reason);
     const maximumEnd = Date.now() + options.limits.lifetimeMs;
-    const end = Math.min(options.deadlineAtMs ?? maximumEnd, maximumEnd);
+    const privateDeadline =
+      typeof options.deadlineAtMs === "function"
+        ? options.deadlineAtMs()
+        : options.deadlineAtMs;
+    const end = Math.min(privateDeadline ?? maximumEnd, maximumEnd);
     this.#timer = setTimeout(
       () => this.abort(new DOMException("deadline exceeded", "TimeoutError")),
       Math.max(0, end - Date.now()),
@@ -1136,6 +1652,7 @@ function reportBlocked(
 }
 
 function statusForError(error: unknown): number {
+  if (error instanceof RestoreGateError) return 503;
   if (error instanceof NetworkPolicyError) {
     return error.category === "target_invalid" ? 400 : 403;
   }
