@@ -550,15 +550,69 @@ function deriveNodeInclude() {
   return { executable, include };
 }
 
+function isLiveOwnedDirectory(status, mode) {
+  return (
+    status.isDirectory() &&
+    !status.isSymbolicLink() &&
+    status.uid === process.getuid() &&
+    (mode === undefined || (status.mode & 0o7777) === mode) &&
+    Number.isSafeInteger(status.nlink) &&
+    status.nlink >= 1
+  );
+}
+
+function matchesDirectoryIdentity(status, expected) {
+  return (
+    expected !== undefined &&
+    isLiveOwnedDirectory(status) &&
+    status.dev === expected.dev &&
+    status.ino === expected.ino &&
+    status.uid === expected.uid &&
+    status.mode === expected.mode
+  );
+}
+
+function matchesStableDirectoryIdentity(status, expected) {
+  return (
+    matchesDirectoryIdentity(status, expected) &&
+    status.nlink === expected.nlink
+  );
+}
+
+function assertBuildTestSeamAvailable(name) {
+  const sanctionedTestRunner =
+    process.env.VITEST === "true" ||
+    process.env.NODE_TEST_CONTEXT === "child-v8";
+  if (
+    !sanctionedTestRunner ||
+    resolve(process.argv[1] ?? "") !==
+      resolve(packageRoot, "scripts/build-native.test.mjs")
+  ) {
+    fail(`${name} seam is unavailable`);
+  }
+}
+
+export function evaluateDirectoryIdentityForTest(candidate, expected, mode) {
+  assertBuildTestSeamAvailable("directory identity");
+  const status = {
+    isDirectory: () => candidate.type === "directory",
+    isSymbolicLink: () => candidate.type === "symlink",
+    dev: candidate.dev,
+    ino: candidate.ino,
+    uid: candidate.uid,
+    mode: candidate.mode,
+    nlink: candidate.nlink,
+  };
+  return {
+    live: isLiveOwnedDirectory(status, mode),
+    sameIdentity: matchesDirectoryIdentity(status, expected),
+    stableIdentity: matchesStableDirectoryIdentity(status, expected),
+  };
+}
+
 function verifyOwnedDirectory(path, mode = 0o700) {
   const status = lstatSync(path);
-  if (
-    !status.isDirectory() ||
-    status.isSymbolicLink() ||
-    status.uid !== process.getuid() ||
-    (status.mode & 0o7777) !== mode ||
-    status.nlink < 2
-  ) {
+  if (!isLiveOwnedDirectory(status, mode)) {
     fail(`foreign directory ${relative(packageRoot, path)}`);
   }
 }
@@ -598,7 +652,7 @@ function inspectStaleTree(
     status.isSymbolicLink() ||
     status.uid !== process.getuid() ||
     (!knownDirectory && !knownFile) ||
-    (knownDirectory && (status.mode & 0o7777) !== 0o700) ||
+    (knownDirectory && !isLiveOwnedDirectory(status, 0o700)) ||
     (knownFile &&
       (!expectedFileModes.includes(actualMode) || status.nlink !== 1))
   ) {
@@ -704,16 +758,7 @@ function removeVerifiedStaleTree(
     );
     try {
       for (const status of [fstatSync(fd), lstatSync(absolute)]) {
-        if (
-          expected === undefined ||
-          !status.isDirectory() ||
-          status.isSymbolicLink() ||
-          status.dev !== expected.dev ||
-          status.ino !== expected.ino ||
-          status.uid !== expected.uid ||
-          status.mode !== expected.mode ||
-          status.nlink < 2
-        ) {
+        if (!matchesDirectoryIdentity(status, expected)) {
           fail("stale staging directory identity changed before cleanup");
         }
       }
@@ -761,11 +806,7 @@ function captureDirectoryIdentity(path, mode) {
   try {
     const status = fstatSync(fd);
     if (
-      !status.isDirectory() ||
-      status.isSymbolicLink() ||
-      status.uid !== process.getuid() ||
-      (mode !== undefined && (status.mode & 0o7777) !== mode) ||
-      status.nlink < 2
+      !isLiveOwnedDirectory(status, mode)
     ) {
       fail(`build directory ${relative(packageRoot, path)} is invalid`);
     }
@@ -804,16 +845,7 @@ function verifyBuildDirectoryChainAndSync(evidence) {
     try {
       const status = fstatSync(fd);
       const expected = evidence.get(path);
-      if (
-        expected === undefined ||
-        !status.isDirectory() ||
-        status.isSymbolicLink() ||
-        status.dev !== expected.dev ||
-        status.ino !== expected.ino ||
-        status.uid !== expected.uid ||
-        status.mode !== expected.mode ||
-        status.nlink !== expected.nlink
-      ) {
+      if (!matchesStableDirectoryIdentity(status, expected)) {
         fail(`build directory ${relative(packageRoot, path)} identity changed`);
       }
       fsyncSync(fd);
@@ -1924,16 +1956,7 @@ function matchesStaleTargetGrammar(observed, graph, candidateTarget) {
 }
 
 export function runBuildPublicationMatrixForTest() {
-  const sanctionedTestRunner =
-    process.env.VITEST === "true" ||
-    process.env.NODE_TEST_CONTEXT === "child-v8";
-  if (
-    !sanctionedTestRunner ||
-    resolve(process.argv[1] ?? "") !==
-      resolve(packageRoot, "scripts/build-native.test.mjs")
-  ) {
-    fail("build publication matrix seam is unavailable");
-  }
+  assertBuildTestSeamAvailable("build publication matrix");
   const graph = compileGraph("/usr/bin/gcc", "/node/include");
   const sidecars = [
     `${stage}/Release/atomic_directory_publication.inputs.sha256`,
@@ -2051,14 +2074,7 @@ export function runBuildPublicationMatrixForTest() {
       const status = lstatSync(path);
       const expected = identities.get(name);
       if (
-        expected === undefined ||
-        !status.isDirectory() ||
-        status.isSymbolicLink() ||
-        status.dev !== expected.dev ||
-        status.ino !== expected.ino ||
-        status.uid !== expected.uid ||
-        status.mode !== expected.mode ||
-        status.nlink < 2 ||
+        !matchesDirectoryIdentity(status, expected) ||
         readdirSync(path).length !== 0
       ) {
         fail("matrix recovery directory identity changed");

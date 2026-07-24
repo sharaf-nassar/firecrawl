@@ -8,6 +8,7 @@ import {
   assertExactBuildEnvironment,
   assertSupportedBuildRuntime,
   createCompilerEnvironment,
+  evaluateDirectoryIdentityForTest,
   runBuildPublicationMatrixForTest,
   validateToolchainAllowlist,
 } from "./build-native.mjs";
@@ -67,6 +68,7 @@ test("exports only closed build test seams", async () => {
     "assertExactBuildEnvironment",
     "assertSupportedBuildRuntime",
     "createCompilerEnvironment",
+    "evaluateDirectoryIdentityForTest",
     "runBuildPublicationMatrixForTest",
     "validateToolchainAllowlist",
   ]);
@@ -74,19 +76,28 @@ test("exports only closed build test seams", async () => {
   assert.equal(Object.hasOwn(module, "parseElfNeeded"), false);
 });
 
-test("keeps publication matrix seam closed outside its test entry", () => {
+test("keeps build test seams closed outside their test entry", () => {
   const moduleUrl = new URL("./build-native.mjs", import.meta.url).href;
   const testPath = new URL("./build-native.test.mjs", import.meta.url).pathname;
   const probe = `
-import { runBuildPublicationMatrixForTest } from ${JSON.stringify(moduleUrl)};
-try {
-  runBuildPublicationMatrixForTest();
-} catch (error) {
-  if (String(error?.message).includes("matrix seam is unavailable")) {
-    process.exit(0);
+import {
+  evaluateDirectoryIdentityForTest,
+  runBuildPublicationMatrixForTest,
+} from ${JSON.stringify(moduleUrl)};
+for (const invoke of [
+  () => evaluateDirectoryIdentityForTest({}, {}),
+  () => runBuildPublicationMatrixForTest(),
+]) {
+  try {
+    invoke();
+  } catch (error) {
+    if (String(error?.message).includes("seam is unavailable")) {
+      continue;
+    }
   }
+  process.exit(1);
 }
-process.exit(1);
+process.exit(0);
 `;
   for (const { argv, env } of [
     { argv: [testPath], env: {} },
@@ -100,6 +111,80 @@ process.exit(1);
     );
     assert.equal(result.status, 0, result.stderr);
   }
+});
+
+test("accepts overlay directories and rejects identity mutations", () => {
+  const baseline = {
+    type: "directory",
+    dev: 7,
+    ino: 11,
+    uid: process.getuid(),
+    mode: 0o40700,
+    nlink: 1,
+  };
+  assert.deepEqual(
+    evaluateDirectoryIdentityForTest(baseline, baseline, 0o700),
+    { live: true, sameIdentity: true, stableIdentity: true },
+  );
+  for (const mutation of [
+    { nlink: 0 },
+    { nlink: Number.NaN },
+    { type: "file" },
+    { type: "symlink" },
+    { uid: baseline.uid + 1 },
+    { mode: 0o40750 },
+  ]) {
+    const candidate = { ...baseline, ...mutation };
+    assert.deepEqual(
+      evaluateDirectoryIdentityForTest(candidate, baseline, 0o700),
+      { live: false, sameIdentity: false, stableIdentity: false },
+    );
+  }
+  for (const mutation of [
+    { dev: baseline.dev + 1 },
+    { ino: baseline.ino + 1 },
+  ]) {
+    const candidate = { ...baseline, ...mutation };
+    assert.deepEqual(
+      evaluateDirectoryIdentityForTest(candidate, baseline, 0o700),
+      { live: true, sameIdentity: false, stableIdentity: false },
+    );
+  }
+  assert.deepEqual(
+    evaluateDirectoryIdentityForTest(
+      { ...baseline, nlink: baseline.nlink + 1 },
+      baseline,
+      0o700,
+    ),
+    { live: true, sameIdentity: true, stableIdentity: false },
+  );
+});
+
+test("builds the native addon from the pinned Docker overlay", () => {
+  const result = spawnSync(
+    "docker",
+    [
+      "build",
+      "--target",
+      "browser-service-build",
+      "--progress=plain",
+      "--file",
+      "apps/browser-service/Dockerfile",
+      ".",
+    ],
+    {
+      cwd: new URL("../../..", import.meta.url),
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: 15 * 60 * 1000,
+    },
+  );
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(
+    result.status,
+    0,
+    [result.stdout, result.stderr].filter(Boolean).join("\n"),
+  );
 });
 
 test("proves concrete amd64 and arm64 dockerInit tuples", async () => {
