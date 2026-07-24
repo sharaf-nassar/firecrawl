@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -19,6 +19,7 @@ import test from "node:test";
 import {
   assertBrowserServiceRuntime,
   assertTrustedBuildInputs,
+  evaluateRuntimeDirectoryIdentityForTest,
   validateRuntimeAttestation,
 } from "./runtime-preflight.mjs";
 
@@ -72,6 +73,300 @@ test("rejects malformed or mismatched native attestations", () => {
 test("validates fixed preinstall flock and build inputs", () => {
   assert.doesNotThrow(() => assertTrustedBuildInputs());
 });
+
+test("accepts live one-link directories and rejects identity mutations", () => {
+  const baseline = {
+    type: "directory",
+    dev: 7n,
+    ino: 11n,
+    uid: BigInt(process.getuid()),
+    gid: BigInt(process.getgid()),
+    mode: 0o40700n,
+    nlink: 1n,
+  };
+  assert.deepEqual(
+    evaluateRuntimeDirectoryIdentityForTest(baseline, baseline),
+    { live: true, stable: true },
+  );
+  for (const mutation of [
+    { nlink: 0n },
+    { nlink: BigInt(Number.MAX_SAFE_INTEGER) + 1n },
+    { type: "file" },
+    { uid: baseline.uid + 1n },
+    { mode: 0o40755n },
+  ]) {
+    assert.deepEqual(
+      evaluateRuntimeDirectoryIdentityForTest(
+        { ...baseline, ...mutation },
+        baseline,
+      ),
+      { live: false, stable: false },
+    );
+  }
+  for (const mutation of [
+    { dev: baseline.dev + 1n },
+    { ino: baseline.ino + 1n },
+    { gid: baseline.gid + 1n },
+    { nlink: baseline.nlink + 1n },
+  ]) {
+    assert.deepEqual(
+      evaluateRuntimeDirectoryIdentityForTest(
+        { ...baseline, ...mutation },
+        baseline,
+      ),
+      { live: true, stable: false },
+    );
+  }
+});
+
+test(
+  "runs prestart in final amd64 and arm64 image filesystems",
+  {
+    skip: process.env.FIRECRAWL_TASK6_IMAGE_ACCEPTANCE !== "1",
+  },
+  () => {
+    const repositoryRoot = new URL("../../..", import.meta.url);
+    const runId =
+      `${process.pid}-${randomUUID().replaceAll("-", "")}`;
+    const ownershipLabel = "com.firecrawl.task6.runtime-preflight";
+    const label = `${ownershipLabel}=${runId}`;
+    const images = [];
+    const containers = [];
+    const command = (argv, options = {}) =>
+      spawnSync("docker", argv, {
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        ...options,
+      });
+    const output = (result) =>
+      [result.stdout, result.stderr].filter(Boolean).join("\n");
+    const assertAbsent = (kind, name) => {
+      const result = command([kind, "inspect", name]);
+      assert.equal(result.error, undefined, result.error?.message);
+      assert.notEqual(result.status, 0, `${kind} collision: ${name}`);
+      assert.match(
+        result.stderr,
+        /No such (?:image|object|container)/i,
+        output(result),
+      );
+    };
+    const inspectOwned = (kind, name) => {
+      const result = command([kind, "inspect", name]);
+      assert.equal(result.error, undefined, result.error?.message);
+      if (result.status !== 0) {
+        assert.match(
+          result.stderr,
+          /No such (?:image|object|container)/i,
+          output(result),
+        );
+        return false;
+      }
+      const [record] = JSON.parse(result.stdout);
+      assert.equal(
+        record?.Config?.Labels?.[ownershipLabel],
+        runId,
+        `${kind} ownership changed: ${name}`,
+      );
+      return true;
+    };
+    const metadataProbe = String.raw`
+import { lstatSync } from "node:fs";
+import { assertNativeRuntimeArtifact } from "./src/runtime-preflight.mjs";
+const paths = [
+  "build/Release",
+  "build/Release/atomic_directory_publication.node",
+  "build/Release/atomic-directory-publication.node.sha256",
+];
+assertNativeRuntimeArtifact();
+process.stdout.write(JSON.stringify({
+  accepted: true,
+  metadata: paths.map((path) => {
+    const status = lstatSync(path, { bigint: true });
+    return {
+      path,
+      type: status.isDirectory() ? "directory" : status.isFile() ? "file" : "other",
+      uid: String(status.uid),
+      gid: String(status.gid),
+      mode: (status.mode & 0o7777n).toString(8),
+      nlink: String(status.nlink),
+    };
+  }),
+}));
+`;
+    let acceptanceFailure;
+    const cleanupFailures = [];
+    const cleanupStep = (callback) => {
+      try {
+        callback();
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+    };
+    try {
+      for (const arch of ["amd64", "arm64"]) {
+        const namespace = `firecrawl-task6-preflight-${runId}-${arch}`;
+        const image = `${namespace}:test`;
+        const container = `${namespace}-run`;
+        assertAbsent("image", image);
+        assertAbsent("container", container);
+        images.push(image);
+        containers.push(container);
+        const build = command(
+          [
+            "build",
+            "--platform",
+            `linux/${arch}`,
+            "--target",
+            "browser-service-runtime",
+            "--tag",
+            image,
+            "--label",
+            label,
+            "--file",
+            "apps/browser-service/Dockerfile",
+            ".",
+          ],
+          {
+            cwd: repositoryRoot,
+            timeout: 15 * 60 * 1000,
+          },
+        );
+        assert.equal(build.error, undefined, build.error?.message);
+        assert.equal(build.status, 0, output(build));
+        assert.equal(inspectOwned("image", image), true);
+        const preflight = command(
+          [
+            "run",
+            "--rm",
+            "--name",
+            container,
+            "--label",
+            label,
+            "--platform",
+            `linux/${arch}`,
+            "--entrypoint",
+            "/usr/local/bin/node",
+            image,
+            "--input-type=module",
+            "--eval",
+            metadataProbe,
+          ],
+          { timeout: 2 * 60 * 1000 },
+        );
+        assert.equal(preflight.error, undefined, preflight.error?.message);
+        assert.equal(preflight.status, 0, output(preflight));
+        const result = JSON.parse(preflight.stdout);
+        assert.equal(result.accepted, true);
+        const expected = [
+          {
+            path: "build/Release",
+            type: "directory",
+            uid: "1000",
+            gid: "1000",
+            mode: "700",
+          },
+          {
+            path: "build/Release/atomic_directory_publication.node",
+            type: "file",
+            uid: "1000",
+            gid: "1000",
+            mode: "600",
+          },
+          {
+            path:
+              "build/Release/atomic-directory-publication.node.sha256",
+            type: "file",
+            uid: "1000",
+            gid: "1000",
+            mode: "600",
+          },
+        ];
+        assert.deepEqual(
+          result.metadata.map(({ nlink: _nlink, ...entry }) => entry),
+          expected,
+        );
+        for (const { nlink } of result.metadata) {
+          assert.ok(BigInt(nlink) >= 1n, `unlinked image path: ${nlink}`);
+          assert.ok(
+            BigInt(nlink) <= BigInt(Number.MAX_SAFE_INTEGER),
+            `unsafe image link count: ${nlink}`,
+          );
+        }
+      }
+    } catch (error) {
+      acceptanceFailure = error;
+    } finally {
+      for (const container of containers.toReversed()) {
+        cleanupStep(() => {
+          if (!inspectOwned("container", container)) return;
+          const removed = command(["container", "rm", "--force", container]);
+          assert.equal(removed.status, 0, output(removed));
+        });
+      }
+      for (const image of images.toReversed()) {
+        cleanupStep(() => {
+          if (!inspectOwned("image", image)) return;
+          const removed = command(["image", "rm", image]);
+          assert.equal(removed.status, 0, output(removed));
+        });
+      }
+      for (const [kind, argv] of [
+        [
+          "container",
+          [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            `label=${label}`,
+            "--quiet",
+          ],
+        ],
+        [
+          "image",
+          [
+            "image",
+            "ls",
+            "--filter",
+            `label=${label}`,
+            "--quiet",
+          ],
+        ],
+        [
+          "volume",
+          [
+            "volume",
+            "ls",
+            "--filter",
+            `label=${label}`,
+            "--quiet",
+          ],
+        ],
+      ]) {
+        cleanupStep(() => {
+          const inventory = command(argv);
+          assert.equal(inventory.status, 0, output(inventory));
+          assert.equal(
+            inventory.stdout.trim(),
+            "",
+            `${kind} resources leaked for ${runId}`,
+          );
+        });
+      }
+    }
+    const failures = [
+      ...(acceptanceFailure === undefined ? [] : [acceptanceFailure]),
+      ...cleanupFailures,
+    ];
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        "Task6 image acceptance or cleanup failed",
+      );
+    }
+  },
+);
 
 test("copied-package prestart rejects fixed artifact corruption", () => {
   const root = mkdtempSync(join(tmpdir(), "atomic-prestart-copy-"));

@@ -174,6 +174,88 @@ const fullIdentityKeys = [
   "mtimeNs",
   "ctimeNs",
 ];
+const runtimeDirectoryIdentityKeys = [
+  "dev",
+  "ino",
+  "mode",
+  "uid",
+  "gid",
+  "nlink",
+];
+const maximumSafeLinkCount = BigInt(Number.MAX_SAFE_INTEGER);
+
+function isLiveRuntimeDirectory(status, uid) {
+  return (
+    status.isDirectory() &&
+    status.uid === uid &&
+    (status.mode & 0o7777n) === 0o700n &&
+    status.nlink >= 1n &&
+    status.nlink <= maximumSafeLinkCount
+  );
+}
+
+function captureRuntimeDirectoryIdentity(fd) {
+  const status = fstatSync(fd, { bigint: true });
+  const uid = process.getuid?.();
+  if (
+    uid === undefined ||
+    !isLiveRuntimeDirectory(status, BigInt(uid))
+  ) {
+    throw nativeArtifactError("native directory identity");
+  }
+  return Object.freeze(
+    Object.fromEntries(
+      runtimeDirectoryIdentityKeys.map((key) => [key, status[key]]),
+    ),
+  );
+}
+
+function sameRuntimeDirectoryIdentity(fd, expected) {
+  const status = fstatSync(fd, { bigint: true });
+  return (
+    isLiveRuntimeDirectory(status, expected.uid) &&
+    runtimeDirectoryIdentityKeys.every(
+      (key) => status[key] === expected[key],
+    )
+  );
+}
+
+function assertRuntimeDirectoryTestSeamAvailable() {
+  const testEntry = fileURLToPath(
+    new URL("./runtime-preflight.test.mjs", import.meta.url),
+  );
+  if (
+    process.env.NODE_TEST_CONTEXT !== "child-v8" ||
+    resolve(process.argv[1] ?? "") !== testEntry
+  ) {
+    throw nativeArtifactError("runtime directory test seam unavailable");
+  }
+}
+
+export function evaluateRuntimeDirectoryIdentityForTest(candidate, expected) {
+  assertRuntimeDirectoryTestSeamAvailable();
+  const status = {
+    isDirectory: () => candidate.type === "directory",
+    dev: candidate.dev,
+    ino: candidate.ino,
+    size: candidate.size,
+    mode: candidate.mode,
+    uid: candidate.uid,
+    gid: candidate.gid,
+    nlink: candidate.nlink,
+    mtimeNs: candidate.mtimeNs,
+    ctimeNs: candidate.ctimeNs,
+  };
+  return {
+    live: isLiveRuntimeDirectory(status, expected.uid),
+    stable:
+      isLiveRuntimeDirectory(status, expected.uid) &&
+      runtimeDirectoryIdentityKeys.every(
+        (key) => status[key] === expected[key],
+      ),
+  };
+}
+
 function captureIdentity(fd, expectedMode, label) {
   const status = fstatSync(fd, { bigint: true });
   const uid = process.getuid?.();
@@ -352,16 +434,8 @@ export function loadAtomicDirectoryPublicationNativeHeld() {
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
     owned.push([directoryFd, "native directory"]);
-    const directoryStatus = fstatSync(directoryFd, { bigint: true });
-    const uid = process.getuid?.();
-    if (
-      uid === undefined ||
-      !directoryStatus.isDirectory() ||
-      directoryStatus.uid !== BigInt(uid) ||
-      (directoryStatus.mode & 0o7777n) !== 0o700n
-    ) {
-      throw nativeArtifactError("native directory identity");
-    }
+    const directoryIdentity =
+      captureRuntimeDirectoryIdentity(directoryFd);
     const directoryProcfd = `/proc/self/fd/${directoryFd}`;
     const addonFd = openSync(
       `${directoryProcfd}/${nativeLeaf}`,
@@ -431,16 +505,7 @@ export function loadAtomicDirectoryPublicationNativeHeld() {
     if (!sameIdentity(addonFd, addonIdentity)) {
       throw nativeArtifactError("native addon post-load identity drift");
     }
-    const directoryAfter = fstatSync(directoryFd, { bigint: true });
-    if (
-      !directoryAfter.isDirectory() ||
-      directoryAfter.dev !== directoryStatus.dev ||
-      directoryAfter.ino !== directoryStatus.ino ||
-      directoryAfter.uid !== directoryStatus.uid ||
-      directoryAfter.gid !== directoryStatus.gid ||
-      directoryAfter.mode !== directoryStatus.mode ||
-      directoryAfter.nlink !== directoryStatus.nlink
-    ) {
+    if (!sameRuntimeDirectoryIdentity(directoryFd, directoryIdentity)) {
       throw nativeArtifactError("native directory identity drift");
     }
     const wrapper = validateAtomicNativeModuleShape(moduleRecord.exports);
