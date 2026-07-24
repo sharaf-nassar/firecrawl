@@ -589,6 +589,7 @@
       "envelopeSchema": "PrivateErrorV1",
       "statusByCategory": {
         "browser_service_runtime_mismatch": 503,
+        "browser_unavailable": 503,
         "control_generation_conflict": 409,
         "control_generation_drain_failed": 503,
         "control_generation_history_exhausted": 503,

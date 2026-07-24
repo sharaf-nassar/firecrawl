@@ -6,6 +6,7 @@ import {
 
 export const BROWSER_SERVICE_ERROR_STATUS = {
   browser_service_runtime_mismatch: 503,
+  browser_unavailable: 503,
   unauthorized: 401,
   invalid_request: 400,
   request_too_large: 413,

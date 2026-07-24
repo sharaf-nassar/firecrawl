@@ -1,16 +1,25 @@
 import { createHash, randomUUID as systemRandomUUID } from "node:crypto";
+import { mkdtemp, open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { chromium, devices } from "playwright";
+import { chromium, devices, type Page } from "playwright";
 
 import {
   type BrowserActionExecutionResultV1,
   closedSessionV1Schema,
   createSessionV1Schema,
+  fetchArtifactV1Schema,
   type CreateSessionV1,
   type ClosedSessionV1,
+  type FetchArtifactV1,
   type SessionV1,
 } from "./contracts.js";
 import { SessionActionCache } from "./action-cache.js";
+import {
+  createChromiumRecordingProducer,
+  type RecordingProducer,
+} from "./recording-producer.js";
 import {
   createEgressProxy as createDefaultEgressProxy,
   createRestoreGate,
@@ -48,6 +57,47 @@ import {
   type BrowserOperationSession,
   type OperationPage,
 } from "./operations.js";
+
+const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
+
+type CdpChannelLike = {
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  on(event: string, listener: (params: unknown) => void): void;
+  off(event: string, listener: (params: unknown) => void): void;
+  detach(): Promise<void>;
+};
+
+declare const sessionRuntimeLeaseBrand: unique symbol;
+declare const sessionCdpChannelBrand: unique symbol;
+
+export type SessionRuntimeLease = Readonly<{
+  [sessionRuntimeLeaseBrand]: true;
+}>;
+
+export type SessionCdpChannel = Readonly<{
+  [sessionCdpChannelBrand]: true;
+}>;
+
+type RuntimeLeaseRecord = {
+  entry: RegistryEntry;
+  state: "active" | "revoking" | "revoked";
+  controller: AbortController;
+  channels: Set<SessionCdpChannel>;
+  revocation?: Promise<void>;
+};
+
+type CdpChannelRecord = {
+  lease: RuntimeLeaseRecord;
+  channel: CdpChannelLike;
+  state: "active" | "closing" | "closed" | "close_unverified";
+  listeners: Map<
+    (params: unknown) => void,
+    Readonly<{ event: string; subscribed: (params: unknown) => void }>
+  >;
+};
+
+const runtimeLeaseRecords = new WeakMap<object, RuntimeLeaseRecord>();
+const cdpChannelRecords = new WeakMap<object, CdpChannelRecord>();
 
 type SessionErrorCategory =
   | "invalid_request"
@@ -91,6 +141,17 @@ type ContextLike = {
   addCookies?(cookies: CreateSessionV1["settings"]["cookies"]): Promise<void>;
   setDefaultTimeout?(timeout: number): void;
   setDefaultNavigationTimeout?(timeout: number): void;
+  newCDPSession?(page: PageLike): Promise<CdpChannelLike>;
+  tracing?: {
+    start(options: {
+      screenshots: boolean;
+      snapshots: boolean;
+      sources: boolean;
+    }): Promise<void>;
+    startChunk(options?: { title?: string }): Promise<void>;
+    stopChunk(options?: { path?: string }): Promise<void>;
+    stop(): Promise<void>;
+  };
 };
 
 type Admission = Pick<
@@ -134,6 +195,11 @@ type RegistryEntry = {
   deadlineAtMs: number;
   devToolsEndpoint: string | null;
   streamHub: object;
+  runtimeLeases: Set<RuntimeLeaseRecord>;
+  runtimeLeaseFlights: Set<Promise<void>>;
+  activeEffects: Set<Promise<unknown>>;
+  recordingProducer: RecordingProducer | undefined;
+  traceStarted: boolean;
   actionCache: SessionActionCache;
   operationSession: BrowserOperationSession | undefined;
   work: WorkingProfile | undefined;
@@ -165,6 +231,8 @@ type RegistryEntry = {
   browserCloseState: "idle" | "closing" | "rejected" | "settled";
   contextCloseVerified: boolean;
   runtimeDrainStarted: boolean;
+  beginRuntimeDrain(): void;
+  observeCleanupEffect(effect: Promise<unknown>): Promise<boolean>;
   normalClose: NormalCloseDisposition | undefined;
   closeResult?: ClosedSession;
 };
@@ -179,6 +247,11 @@ export type SessionRegistry = {
     runtimeSessionId: string,
     operation: () => Promise<T>,
   ): Promise<T>;
+  withRuntime<T>(
+    runtimeSessionId: string,
+    mode: "passive" | "writer",
+    operation: (lease: SessionRuntimeLease) => Promise<T>,
+  ): Promise<T>;
   executeAction(
     runtimeSessionId: string,
     input: unknown,
@@ -189,6 +262,13 @@ export type SessionRegistry = {
   ): Promise<ClosedSession>;
   sweepExpired(): Promise<void>;
   sweepCleanupFailed(): Promise<void>;
+  drainAll(
+    reason: "handoff" | "shutdown",
+    admission?: {
+      signal: AbortSignal;
+      assertWaveActive(): void;
+    },
+  ): Promise<void>;
   entries(): Array<Record<string, unknown>>;
 };
 
@@ -206,6 +286,285 @@ function asError(
     message,
     cause === undefined ? {} : { cause },
   );
+}
+
+function requireRuntimeLease(lease: SessionRuntimeLease): RuntimeLeaseRecord {
+  const record = runtimeLeaseRecords.get(lease as object);
+  if (
+    record === undefined ||
+    record.state !== "active" ||
+    record.entry.admission !== "open" ||
+    (record.entry.state !== "ready" && record.entry.state !== "executing")
+  ) {
+    throw asError("session_not_found", "session runtime lease is invalid");
+  }
+  return record;
+}
+
+function requireCdpChannel(channel: SessionCdpChannel): CdpChannelRecord {
+  const record = cdpChannelRecords.get(channel as object);
+  if (
+    record === undefined ||
+    record.state !== "active" ||
+    record.lease.state !== "active" ||
+    record.lease.entry.admission !== "open" ||
+    (record.lease.entry.state !== "ready" &&
+      record.lease.entry.state !== "executing")
+  ) {
+    throw asError("session_not_found", "session CDP channel is invalid");
+  }
+  return record;
+}
+
+function trackBrowserEffect<T>(
+  entry: RegistryEntry,
+  effect: Promise<T>,
+): Promise<T> {
+  entry.activeEffects.add(effect);
+  void effect.then(
+    () => entry.activeEffects.delete(effect),
+    () => entry.activeEffects.delete(effect),
+  );
+  return effect;
+}
+
+export function sessionRuntimeSignal(
+  lease: SessionRuntimeLease,
+): AbortSignal {
+  return requireRuntimeLease(lease).controller.signal;
+}
+
+export async function openSessionCdpChannel(
+  lease: SessionRuntimeLease,
+): Promise<SessionCdpChannel> {
+  const leaseRecord = requireRuntimeLease(lease);
+  const { entry } = leaseRecord;
+  if (entry.context?.newCDPSession === undefined || entry.page === undefined) {
+    throw asError("browser_unavailable", "session CDP is unavailable");
+  }
+  const channel = await trackBrowserEffect(
+    entry,
+    entry.context.newCDPSession(entry.page),
+  );
+  try {
+    requireRuntimeLease(lease);
+  } catch (cause) {
+    const detached = trackBrowserEffect(entry, channel.detach());
+    if (!(await entry.observeCleanupEffect(detached))) {
+      entry.beginRuntimeDrain();
+      throw asError(
+        "browser_unavailable",
+        "late session CDP channel cleanup is unverified",
+        cause,
+      );
+    }
+    throw cause;
+  }
+  const token = Object.freeze({}) as SessionCdpChannel;
+  cdpChannelRecords.set(token, {
+    lease: leaseRecord,
+    channel,
+    state: "active",
+    listeners: new Map(),
+  });
+  leaseRecord.channels.add(token);
+  return token;
+}
+
+export async function sendSessionCdpCommand(
+  token: SessionCdpChannel,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<unknown> {
+  if (
+    typeof method !== "string" ||
+    method.length === 0 ||
+    params === null ||
+    typeof params !== "object" ||
+    Array.isArray(params)
+  ) {
+    throw asError("invalid_request", "CDP command is invalid");
+  }
+  const record = requireCdpChannel(token);
+  const result = await trackBrowserEffect(
+    record.lease.entry,
+    record.channel.send(method, params),
+  );
+  requireCdpChannel(token);
+  return result;
+}
+
+export function subscribeSessionCdpEvent(
+  token: SessionCdpChannel,
+  event: string,
+  listener: (params: unknown) => void,
+): () => void {
+  const record = requireCdpChannel(token);
+  if (
+    typeof event !== "string" ||
+    event.length === 0 ||
+    typeof listener !== "function"
+  ) {
+    throw asError("invalid_request", "CDP listener is invalid");
+  }
+  const subscribed = (params: unknown): void => {
+    if (record.state === "active" && record.lease.state === "active") {
+      listener(params);
+    }
+  };
+  record.channel.on(event, subscribed);
+  record.listeners.set(listener, Object.freeze({ event, subscribed }));
+  let active = true;
+  return Object.freeze(() => {
+    if (!active) return;
+    active = false;
+    record.channel.off(event, subscribed);
+    record.listeners.delete(listener);
+  });
+}
+
+export async function closeSessionCdpChannel(
+  token: SessionCdpChannel,
+): Promise<void> {
+  const record = cdpChannelRecords.get(token as object);
+  if (record === undefined || record.state === "closed") return;
+  if (record.state === "closing" || record.state === "close_unverified") {
+    throw asError("browser_unavailable", "CDP channel cleanup is unverified");
+  }
+  record.state = "closing";
+  try {
+    for (const [listener, subscription] of record.listeners) {
+      record.channel.off(subscription.event, subscription.subscribed);
+      record.listeners.delete(listener);
+    }
+    const detached = trackBrowserEffect(
+      record.lease.entry,
+      record.channel.detach(),
+    );
+    if (!(await record.lease.entry.observeCleanupEffect(detached))) {
+      throw new Error("CDP detach did not settle");
+    }
+    record.state = "closed";
+    record.lease.channels.delete(token);
+    cdpChannelRecords.delete(token as object);
+  } catch (cause) {
+    record.state = "close_unverified";
+    record.lease.entry.beginRuntimeDrain();
+    throw new SessionRegistryError(
+      "browser_unavailable",
+      "CDP channel cleanup is unverified",
+      { cause },
+    );
+  }
+}
+
+async function captureTrace(entry: RegistryEntry): Promise<Uint8Array> {
+  if (!entry.traceStarted || entry.context?.tracing === undefined) {
+    throw asError("browser_unavailable", "session trace is unavailable");
+  }
+  const directory = await mkdtemp(join(tmpdir(), "firecrawl-browser-trace-"));
+  const path = join(directory, "diagnostic.zip");
+  let stopped = false;
+  let restarted = false;
+  try {
+    await entry.context.tracing.stopChunk({ path });
+    stopped = true;
+    const trace = await open(path, "r");
+    let bytes: Uint8Array;
+    try {
+      const traceStat = await trace.stat();
+      if (
+        !traceStat.isFile() ||
+        traceStat.size === 0 ||
+        traceStat.size > MAX_CAPTURE_BYTES
+      ) {
+        throw asError("browser_unavailable", "session trace exceeds its limit");
+      }
+      bytes = Uint8Array.from(await trace.readFile());
+      if (bytes.byteLength !== traceStat.size) {
+        throw asError("browser_unavailable", "session trace size changed");
+      }
+    } finally {
+      await trace.close();
+    }
+    await entry.context.tracing.startChunk({ title: "diagnostic-v1" });
+    restarted = true;
+    stopped = false;
+    return bytes;
+  } catch (cause) {
+    if (stopped && !restarted) {
+      entry.traceStarted = false;
+      entry.beginRuntimeDrain();
+    }
+    throw cause;
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+export async function captureSessionArtifact(
+  lease: SessionRuntimeLease,
+  input: FetchArtifactV1,
+): Promise<Readonly<{ contentType: string; bytes: Uint8Array }>> {
+  const leaseRecord = requireRuntimeLease(lease);
+  const request = fetchArtifactV1Schema.parse(input);
+  const entry = leaseRecord.entry;
+  const capture = async (): Promise<
+    Readonly<{ contentType: string; bytes: Uint8Array }>
+  > => {
+  let contentType: string;
+  let bytes: Uint8Array;
+  if (request.kind === "screenshot") {
+    if (entry.page === undefined) {
+      throw asError("browser_unavailable", "session page is unavailable");
+    }
+    contentType = request.format === "png" ? "image/png" : "image/jpeg";
+    bytes = await entry.page.screenshot({
+      type: request.format,
+      fullPage: request.fullPage,
+    });
+  } else if (request.kind === "recording") {
+    if (entry.recordingProducer === undefined) {
+      throw asError("browser_unavailable", "session recording is unavailable");
+    }
+    contentType = "video/webm";
+    bytes = await entry.recordingProducer.snapshot();
+  } else {
+    contentType = "application/zip";
+    bytes = await captureTrace(entry);
+  }
+  requireRuntimeLease(lease);
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_CAPTURE_BYTES) {
+    throw asError("browser_unavailable", "artifact exceeds its byte limit");
+  }
+  return Object.freeze({ contentType, bytes });
+  };
+  return trackBrowserEffect(entry, capture());
+}
+
+async function revokeRuntimeLease(record: RuntimeLeaseRecord): Promise<void> {
+  if (record.revocation !== undefined) return record.revocation;
+  record.revocation = (async () => {
+    if (record.state === "revoked") return;
+    record.state = "revoking";
+    record.controller.abort();
+    const results = await Promise.allSettled(
+      [...record.channels].map((channel) => closeSessionCdpChannel(channel)),
+    );
+    record.channels.clear();
+    record.state = "revoked";
+    record.entry.runtimeLeases.delete(record);
+    const failures = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failures.length !== 0) {
+      throw new AggregateError(
+        failures.map((failure) => failure.reason),
+        "runtime lease cleanup is unverified",
+      );
+    }
+  })();
+  return record.revocation;
 }
 
 function launchOptions(
@@ -413,6 +772,17 @@ export function createSessionRegistry(options: {
   cleanupTimeoutMs?: number;
   launchTimeoutMs?: number;
   operationTimeoutMs?: number;
+  afterRuntimeLeaseSnapshot?: () => Promise<void>;
+  createRecordingProducer?: (
+    page: Page,
+    options: {
+      width: number;
+      height: number;
+      frameRate: number;
+      maximumBytes: number;
+      quality: number;
+    },
+  ) => Promise<RecordingProducer>;
 }): SessionRegistry {
   const createProxy = options.createEgressProxy ?? createDefaultEgressProxy;
   const launch =
@@ -431,6 +801,9 @@ export function createSessionRegistry(options: {
   const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 5_000;
   const launchTimeoutMs = options.launchTimeoutMs ?? 30_000;
   const operationTimeoutMs = options.operationTimeoutMs ?? 30_000;
+  const createRecordingProducer =
+    options.createRecordingProducer ?? createChromiumRecordingProducer;
+  let registryAdmissionOpen = true;
 
   if (!Number.isSafeInteger(cleanupTimeoutMs) || cleanupTimeoutMs <= 0) {
     throw new RangeError("cleanupTimeoutMs must be a positive safe integer");
@@ -446,7 +819,7 @@ export function createSessionRegistry(options: {
     entry: RegistryEntry,
     operation: () => Promise<T>,
   ): Promise<T> {
-    assertEntryAdmitted(entry);
+    assertOperationAdmitted(entry);
     const timeoutMs = Math.min(operationTimeoutMs, entry.deadlineAtMs - now());
     if (timeoutMs <= 0) throw new Error("session deadline exceeded");
     let timer: NodeJS.Timeout | undefined;
@@ -456,6 +829,11 @@ export function createSessionRegistry(options: {
     } catch (error) {
       throw error;
     }
+    entry.activeEffects.add(running);
+    void running.then(
+      () => entry.activeEffects.delete(running),
+      () => entry.activeEffects.delete(running),
+    );
     try {
       const result = await Promise.race([
         running,
@@ -466,7 +844,7 @@ export function createSessionRegistry(options: {
           );
         }),
       ]);
-      assertEntryAdmitted(entry);
+      assertOperationAdmitted(entry);
       return result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
@@ -474,9 +852,9 @@ export function createSessionRegistry(options: {
   }
 
   function runAdmitted<T>(entry: RegistryEntry, operation: () => T): T {
-    assertEntryAdmitted(entry);
+    assertOperationAdmitted(entry);
     const result = operation();
-    assertEntryAdmitted(entry);
+    assertOperationAdmitted(entry);
     return result;
   }
 
@@ -498,6 +876,9 @@ export function createSessionRegistry(options: {
   }
 
   function requireReady(): ReadyProfileRootBinding {
+    if (!registryAdmissionOpen) {
+      throw asError("browser_unavailable", "session registry is draining");
+    }
     return options.admission.requireReady(options.binding);
   }
 
@@ -508,11 +889,35 @@ export function createSessionRegistry(options: {
     return entry;
   }
 
-  function assertEntryAdmitted(entry: RegistryEntry): void {
+  function assertProvisioningAdmitted(entry: RegistryEntry): void {
     requireReady();
+    if (entry.state !== "provisional") {
+      throw asError("session_not_found", "session provisioning is closed");
+    }
     const deadline = Math.min(entry.expiresAtMs, entry.idleExpiresAtMs);
     if (now() >= deadline) throw new Error("session deadline exceeded");
     entry.deadlineAtMs = deadline;
+  }
+
+  function assertEntryAdmitted(entry: RegistryEntry): void {
+    requireReady();
+    if (
+      entry.admission !== "open" ||
+      (entry.state !== "ready" && entry.state !== "executing")
+    ) {
+      throw asError("session_not_found", "session admission is closed");
+    }
+    const deadline = Math.min(entry.expiresAtMs, entry.idleExpiresAtMs);
+    if (now() >= deadline) throw new Error("session deadline exceeded");
+    entry.deadlineAtMs = deadline;
+  }
+
+  function assertOperationAdmitted(entry: RegistryEntry): void {
+    if (entry.state === "provisional") {
+      assertProvisioningAdmitted(entry);
+    } else {
+      assertEntryAdmitted(entry);
+    }
   }
 
   function isExpired(entry: RegistryEntry): boolean {
@@ -566,6 +971,43 @@ export function createSessionRegistry(options: {
     discardProfile: boolean,
   ): Promise<readonly string[]> {
     const cleanupCodes: string[] = [];
+    const leaseSnapshot = [...entry.runtimeLeases];
+    const runtimeFlightSnapshot = [...entry.runtimeLeaseFlights];
+    await options.afterRuntimeLeaseSnapshot?.();
+    const leaseResults = await Promise.allSettled(
+      leaseSnapshot.map((lease) => revokeRuntimeLease(lease)),
+    );
+    if (leaseResults.some((result) => result.status === "rejected")) {
+      cleanupCodes.push("runtime_lease_cleanup_failed");
+      entry.beginRuntimeDrain();
+    }
+    if (runtimeFlightSnapshot.length !== 0) {
+      const settled = Promise.allSettled(runtimeFlightSnapshot).then(
+        () => undefined,
+      );
+      if (!(await observeWithin(settled))) {
+        cleanupCodes.push("runtime_lease_drain_failed");
+        entry.beginRuntimeDrain();
+      }
+    }
+    if (entry.recordingProducer !== undefined) {
+      try {
+        await entry.recordingProducer.close();
+        entry.recordingProducer = undefined;
+      } catch {
+        cleanupCodes.push("recording_cleanup_failed");
+        entry.beginRuntimeDrain();
+      }
+    }
+    if (entry.traceStarted && entry.context?.tracing !== undefined) {
+      try {
+        await entry.context.tracing.stop();
+        entry.traceStarted = false;
+      } catch {
+        cleanupCodes.push("trace_cleanup_failed");
+        entry.beginRuntimeDrain();
+      }
+    }
     if (entry.operationSession !== undefined) {
       try {
         await entry.operationSession.dispose();
@@ -581,6 +1023,18 @@ export function createSessionRegistry(options: {
       contextClosed = false;
     }
     if (!contextClosed) cleanupCodes.push("chromium_close_failed");
+    if (contextClosed && entry.activeEffects.size !== 0) {
+      const settled = Promise.allSettled([...entry.activeEffects]).then(
+        () => undefined,
+      );
+      if (!(await observeWithin(settled))) {
+        cleanupCodes.push("browser_effect_drain_failed");
+        if (!entry.runtimeDrainStarted) {
+          entry.runtimeDrainStarted = true;
+          options.admission.beginDraining();
+        }
+      }
+    }
     if (!contextClosed && !entry.runtimeDrainStarted) {
       entry.runtimeDrainStarted = true;
       options.admission.beginDraining();
@@ -814,11 +1268,24 @@ export function createSessionRegistry(options: {
         deadlineAtMs: creationDeadlineAtMs,
         devToolsEndpoint: null,
         streamHub: Object.freeze({}),
+        runtimeLeases: new Set(),
+        runtimeLeaseFlights: new Set(),
+        activeEffects: new Set(),
+        recordingProducer: undefined,
+        traceStarted: false,
         actionCache: new SessionActionCache(),
         operationSession: undefined,
         writerHeld: false,
         contextCloseVerified: false,
         runtimeDrainStarted: false,
+        beginRuntimeDrain: () => {
+          if (entry.runtimeDrainStarted) return;
+          entry.runtimeDrainStarted = true;
+          options.admission.beginDraining();
+        },
+        observeCleanupEffect: (effect) => observeWithin(
+          effect.then(() => undefined),
+        ),
         work: undefined,
         proxy: undefined,
         context: undefined,
@@ -852,14 +1319,14 @@ export function createSessionRegistry(options: {
             };
       try {
         try {
-          assertEntryAdmitted(entry);
+          assertProvisioningAdmitted(entry);
           entry.work = await options.profileStore.createWorkingCopy(
             profileId,
             base,
             mode,
             request.sessionId,
           );
-          assertEntryAdmitted(entry);
+          assertProvisioningAdmitted(entry);
         } catch (error) {
           if (
             error instanceof ProfileStoreError &&
@@ -886,14 +1353,14 @@ export function createSessionRegistry(options: {
           }
           throw error;
         }
-        assertEntryAdmitted(entry);
+        assertProvisioningAdmitted(entry);
         entry.proxy = await createProxy({
           restoreGate: createRestoreGate(),
           allowedDomains: request.allowedDomains,
           deadlineAtMs: () =>
             Math.min(entry.expiresAtMs, entry.idleExpiresAtMs),
         });
-        assertEntryAdmitted(entry);
+        assertProvisioningAdmitted(entry);
         const gate = entry.proxy.restoreGate;
         if (gate === undefined) {
           throw asError(
@@ -910,7 +1377,7 @@ export function createSessionRegistry(options: {
             "session deadline expired before Chromium launch",
           );
         }
-        assertEntryAdmitted(entry);
+        assertProvisioningAdmitted(entry);
         entry.launchAttempt = { state: "owned", publicProcessHandle: null };
         let context: ContextLike;
         try {
@@ -989,7 +1456,7 @@ export function createSessionRegistry(options: {
         entry.context = context;
         entry.launchAttempt = undefined;
         try {
-          assertEntryAdmitted(entry);
+          assertProvisioningAdmitted(entry);
           const remaining = Math.max(
             1,
             Math.min(operationTimeoutMs, entry.deadlineAtMs - now()),
@@ -1011,12 +1478,12 @@ export function createSessionRegistry(options: {
               entry,
               () => context.storageState({ indexedDB: true }),
             );
-            assertEntryAdmitted(entry);
+            assertProvisioningAdmitted(entry);
             verifySemanticallyEquivalentStorageState(
               exported,
               replayState.storageState,
             );
-            assertEntryAdmitted(entry);
+            assertProvisioningAdmitted(entry);
           }
           runAdmitted(entry, () => gate.assertZeroViolations());
           runAdmitted(entry, () => gate.open());
@@ -1076,7 +1543,30 @@ export function createSessionRegistry(options: {
             title: Array.from(title).slice(0, 4_096).join(""),
             snapshotExcerpt: Array.from(body).slice(0, 40_000).join(""),
           };
-          assertEntryAdmitted(entry);
+          if (context.tracing === undefined) {
+            throw asError(
+              "browser_unavailable",
+              "Chromium tracing is unavailable",
+            );
+          }
+          await runWithinDeadline(entry, () =>
+            context.tracing!.start({
+              screenshots: true,
+              snapshots: true,
+              sources: false,
+            }),
+          );
+          entry.traceStarted = true;
+          entry.recordingProducer = await runWithinDeadline(entry, () =>
+            createRecordingProducer(page as Page, {
+              width: Math.min(request.settings.viewport.width, 1_280),
+              height: Math.min(request.settings.viewport.height, 720),
+              frameRate: 10,
+              maximumBytes: MAX_CAPTURE_BYTES,
+              quality: 70,
+            }),
+          );
+          assertProvisioningAdmitted(entry);
           entry.state = "ready";
           entry.admission = "open";
           return publicSession(entry);
@@ -1173,6 +1663,41 @@ export function createSessionRegistry(options: {
       }
     },
 
+    async withRuntime(runtimeSessionId, mode, operation) {
+      if (mode !== "passive" && mode !== "writer") {
+        throw asError("invalid_request", "runtime lease mode is invalid");
+      }
+      const entry = requireEntry(runtimeSessionId);
+      const execute = async () => {
+        assertEntryAdmitted(entry);
+        const token = Object.freeze({}) as SessionRuntimeLease;
+        const leaseRecord: RuntimeLeaseRecord = {
+          entry,
+          state: "active",
+          controller: new AbortController(),
+          channels: new Set(),
+        };
+        runtimeLeaseRecords.set(token, leaseRecord);
+        entry.runtimeLeases.add(leaseRecord);
+        try {
+          return await operation(token);
+        } finally {
+          await revokeRuntimeLease(leaseRecord);
+        }
+      };
+      const flight =
+        mode === "writer"
+          ? registry.withWriter(runtimeSessionId, execute)
+          : execute();
+      const settlement = flight.then(
+        () => undefined,
+        () => undefined,
+      );
+      entry.runtimeLeaseFlights.add(settlement);
+      void settlement.then(() => entry.runtimeLeaseFlights.delete(settlement));
+      return flight;
+    },
+
     async executeAction(runtimeSessionId, input) {
       const entry = requireEntry(runtimeSessionId);
       assertEntryAdmitted(entry);
@@ -1254,16 +1779,9 @@ export function createSessionRegistry(options: {
             try {
               normalClose.preparedProfile ??=
                 await options.profileStore.prepareWorkingCopy(entry.work);
-              await options.profileStore.finalizePreparedGeneration(
-                normalClose.preparedProfile,
-              );
               entry.work = undefined;
             } catch {
-              cleanupCodes.push(
-                normalClose.preparedProfile === null
-                  ? "profile_prepare_failed"
-                  : "profile_finalize_failed",
-              );
+              cleanupCodes.push("profile_prepare_failed");
             }
           } else {
             try {
@@ -1340,6 +1858,54 @@ export function createSessionRegistry(options: {
           entriesByRuntime.delete(entry.runtimeSessionId);
           runtimeByRequest.delete(entry.request.sessionId);
         }
+      }
+    },
+
+    async drainAll(_reason, admission) {
+      if (!registryAdmissionOpen && entriesByRuntime.size === 0) return;
+      registryAdmissionOpen = false;
+      options.admission.beginDraining();
+      admission?.assertWaveActive();
+      for (const entry of entriesByRuntime.values()) {
+        entry.admission = "closed";
+        for (const lease of entry.runtimeLeases) lease.controller.abort();
+      }
+      const failures: unknown[] = [];
+      for (const entry of [...entriesByRuntime.values()]) {
+        admission?.assertWaveActive();
+        const runtimeSettlement = Promise.allSettled([
+          ...entry.runtimeLeaseFlights,
+        ]).then(() => undefined);
+        if (!(await observeWithin(runtimeSettlement))) {
+          failures.push(
+            new Error(`runtime lease drain timed out for ${entry.runtimeSessionId}`),
+          );
+        }
+        if (entry.writerHeld) {
+          failures.push(
+            new Error(`writer drain timed out for ${entry.runtimeSessionId}`),
+          );
+          continue;
+        }
+        try {
+          await registry.close(entry.runtimeSessionId, "shutdown");
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      admission?.assertWaveActive();
+      if (failures.length !== 0 || entriesByRuntime.size !== 0) {
+        throw new SessionRegistryError(
+          "browser_unavailable",
+          "session registry drain is unverified",
+          {
+            cause:
+              failures.length === 1
+                ? failures[0]
+                : new AggregateError(failures),
+            cleanupCodes: ["runtime_drain_failed"],
+          },
+        );
       }
     },
 

@@ -2,12 +2,14 @@ import {
   createHash,
   randomBytes as systemRandomBytes,
   randomUUID as systemRandomUUID,
+  timingSafeEqual,
 } from "node:crypto";
 
 import {
   bindProfileGeneration,
   canonicalizeHeldProfileTree,
   copyHeldProfileTree,
+  deletePreparedProfileGenerationAtomically,
   ensureAtomicPublicationNamespaces,
   isUnverifiedProfileCleanupError,
   listHeldProfileGenerations,
@@ -57,6 +59,21 @@ export type FinalizedProfileGeneration = Readonly<{
   generationId: string;
   checksum: string;
   committed: true;
+}>;
+
+export type DeletedProfileGeneration = Readonly<{
+  version: 1;
+  profileId: string;
+  generationId: string;
+  checksum: string;
+  deleted: true;
+}>;
+
+export type PreparedProfileAuthorization = Readonly<{
+  profileId: string;
+  generationId: string;
+  checksum: string;
+  prepareToken: string;
 }>;
 
 export class ProfileStoreError extends Error {
@@ -116,6 +133,16 @@ type StoreRecord = {
   works: Set<WorkRecord>;
   auxiliaryCapabilities: Set<BoundProfileGeneration>;
   finalizedHistory: Map<PreparedProfileGeneration, FinalizedProfileGeneration>;
+  preparedAuthorizations: Map<string, PreparedAuthorizationRecord>;
+};
+
+type PreparedAuthorizationRecord = {
+  prepared: PreparedProfileGeneration;
+  tokenDigest: Buffer;
+  state: "staging" | "finalized" | "deleted";
+  finalized?: FinalizedProfileGeneration;
+  deleted?: DeletedProfileGeneration;
+  tail: Promise<void>;
 };
 
 export type ProfileStore = Readonly<{
@@ -134,6 +161,12 @@ export type ProfileStore = Readonly<{
   finalizePreparedGeneration(
     prepared: PreparedProfileGeneration,
   ): Promise<FinalizedProfileGeneration>;
+  finalizePreparedGenerationByAuthorization(
+    input: unknown,
+  ): Promise<FinalizedProfileGeneration>;
+  deletePreparedGenerationByAuthorization(
+    input: unknown,
+  ): Promise<DeletedProfileGeneration>;
   hasCommitted(generationId: string): Promise<boolean>;
   listWorking(): Promise<string[]>;
   listStaging(): Promise<string[]>;
@@ -146,6 +179,9 @@ const workRecords = new WeakMap<object, WorkRecord>();
 const preparedRecords = new WeakMap<object, PreparedRecord>();
 const attachedGenerationOwners = new WeakMap<object, StoreRecord>();
 const MAX_FINALIZED_HISTORY = 256;
+const MAX_PREPARED_AUTHORIZATIONS = 256;
+const SHA256 = /^[a-f0-9]{64}$/u;
+const TOKEN = /^[A-Za-z0-9_-]{43}$/u;
 
 function assertUuid(value: string, label: string): void {
   if (!UUID.test(value)) {
@@ -165,13 +201,144 @@ function mintPrepareToken(record: StoreRecord): string {
 }
 
 function profileTransitionAuthorityDigest(
-  kind: "prepare" | "finalize",
+  kind: "prepare" | "finalize" | "delete",
   prepareToken: string,
   checksum: string,
 ): string {
   return createHash("sha256")
     .update(`${kind}\0${prepareToken}\0${checksum}`)
     .digest("hex");
+}
+
+function preparedAuthorizationKey(
+  profileId: string,
+  generationId: string,
+): string {
+  return `${profileId}\0${generationId}`;
+}
+
+function parsePreparedAuthorization(
+  value: unknown,
+  category: "profile_finalize_failed" | "profile_discard_failed",
+): PreparedProfileAuthorization {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !==
+      "checksum,generationId,prepareToken,profileId"
+  ) {
+    throw new ProfileStoreError(category, "prepared profile request is invalid");
+  }
+  const input = value as Record<string, unknown>;
+  if (
+    typeof input.profileId !== "string" ||
+    !UUID.test(input.profileId) ||
+    typeof input.generationId !== "string" ||
+    !UUID.test(input.generationId) ||
+    typeof input.checksum !== "string" ||
+    !SHA256.test(input.checksum) ||
+    typeof input.prepareToken !== "string" ||
+    !TOKEN.test(input.prepareToken)
+  ) {
+    throw new ProfileStoreError(category, "prepared profile request is invalid");
+  }
+  return Object.freeze({
+    profileId: input.profileId,
+    generationId: input.generationId,
+    checksum: input.checksum,
+    prepareToken: input.prepareToken,
+  });
+}
+
+function requirePreparedAuthorization(
+  store: ProfileStore,
+  input: unknown,
+  category: "profile_finalize_failed" | "profile_discard_failed",
+): {
+  storeRecord: StoreRecord;
+  authorization: PreparedProfileAuthorization;
+  authorizationRecord: PreparedAuthorizationRecord;
+} {
+  const storeRecord = requireStore(store);
+  const authorization = parsePreparedAuthorization(input, category);
+  const authorizationRecord = storeRecord.preparedAuthorizations.get(
+    preparedAuthorizationKey(
+      authorization.profileId,
+      authorization.generationId,
+    ),
+  );
+  const incomingDigest = createHash("sha256")
+    .update(authorization.prepareToken)
+    .digest();
+  const expectedDigest =
+    authorizationRecord?.tokenDigest ?? Buffer.alloc(incomingDigest.byteLength);
+  const tokenMatches =
+    expectedDigest.byteLength === incomingDigest.byteLength &&
+    timingSafeEqual(expectedDigest, incomingDigest);
+  if (
+    authorizationRecord === undefined ||
+    authorizationRecord.prepared.checksum !== authorization.checksum ||
+    !tokenMatches
+  ) {
+    throw new ProfileStoreError(
+      category,
+      "prepared profile authority is invalid",
+    );
+  }
+  return { storeRecord, authorization, authorizationRecord };
+}
+
+function serializePreparedAuthorization<T>(
+  record: PreparedAuthorizationRecord,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const result = record.tail.then(operation, operation);
+  record.tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+function registerPreparedAuthorization(
+  record: StoreRecord,
+  prepared: PreparedProfileGeneration,
+): void {
+  const key = preparedAuthorizationKey(
+    prepared.profileId,
+    prepared.generationId,
+  );
+  const existing = record.preparedAuthorizations.get(key);
+  if (existing !== undefined) {
+    if (existing.prepared !== prepared) {
+      throw new ProfileStoreError(
+        "profile_prepare_failed",
+        "prepared profile identity is already owned",
+      );
+    }
+    return;
+  }
+  if (record.preparedAuthorizations.size >= MAX_PREPARED_AUTHORIZATIONS) {
+    for (const [authorizationKey, authorizationRecord] of
+      record.preparedAuthorizations) {
+      if (authorizationRecord.state !== "deleted") continue;
+      record.preparedAuthorizations.delete(authorizationKey);
+      break;
+    }
+  }
+  if (record.preparedAuthorizations.size >= MAX_PREPARED_AUTHORIZATIONS) {
+    throw new ProfileStoreError(
+      "profile_prepare_failed",
+      "prepared profile authorization capacity is exhausted",
+    );
+  }
+  record.preparedAuthorizations.set(key, {
+    prepared,
+    tokenDigest: createHash("sha256").update(prepared.prepareToken).digest(),
+    state: "staging",
+    tail: Promise.resolve(),
+  });
 }
 
 function requireStore(store: ProfileStore): StoreRecord {
@@ -275,6 +442,7 @@ export async function createProfileStore(options: {
     works: new Set(),
     auxiliaryCapabilities: new Set(),
     finalizedHistory: new Map(),
+    preparedAuthorizations: new Map(),
   };
 
   const store: ProfileStore = Object.freeze({
@@ -452,6 +620,14 @@ export async function createProfileStore(options: {
         );
       }
       if (workRecord.prepared !== undefined) return workRecord.prepared;
+      if (
+        record.preparedAuthorizations.size >= MAX_PREPARED_AUTHORIZATIONS
+      ) {
+        throw new ProfileStoreError(
+          "profile_prepare_failed",
+          "prepared profile authorization capacity is exhausted",
+        );
+      }
       if (workRecord.state === "staging") {
         try {
           const stagedTree = await canonicalizeHeldProfileTree(
@@ -477,6 +653,7 @@ export async function createProfileStore(options: {
             state: "staging",
           });
           workRecord.prepared = recovered;
+          registerPreparedAuthorization(record, recovered);
           return recovered;
         } catch (cause) {
           if (cause instanceof ProfileStoreError) throw cause;
@@ -540,6 +717,7 @@ export async function createProfileStore(options: {
           state: "staging",
         });
         workRecord.prepared = prepared;
+        registerPreparedAuthorization(record, prepared);
         return prepared;
       } catch (cause) {
         if (cause instanceof ProfileStoreError) throw cause;
@@ -580,6 +758,16 @@ export async function createProfileStore(options: {
             result,
           });
           record.finalizedHistory.set(prepared, result);
+          const authorizationRecord = record.preparedAuthorizations.get(
+            preparedAuthorizationKey(
+              prepared.profileId,
+              prepared.generationId,
+            ),
+          );
+          if (authorizationRecord?.prepared === prepared) {
+            authorizationRecord.state = "finalized";
+            authorizationRecord.finalized = result;
+          }
           if (record.finalizedHistory.size > MAX_FINALIZED_HISTORY) {
             const oldest = record.finalizedHistory.keys().next().value;
             if (oldest !== undefined) {
@@ -683,6 +871,114 @@ export async function createProfileStore(options: {
       }
     },
 
+    async finalizePreparedGenerationByAuthorization(input) {
+      const { authorizationRecord } = requirePreparedAuthorization(
+        store,
+        input,
+        "profile_finalize_failed",
+      );
+      return serializePreparedAuthorization(
+        authorizationRecord,
+        async (): Promise<FinalizedProfileGeneration> => {
+          requireStore(store);
+          if (authorizationRecord.state === "deleted") {
+            throw new ProfileStoreError(
+              "profile_finalize_failed",
+              "prepared profile was deleted",
+            );
+          }
+          if (authorizationRecord.state === "finalized") {
+            return authorizationRecord.finalized!;
+          }
+          const result = await store.finalizePreparedGeneration(
+            authorizationRecord.prepared,
+          );
+          authorizationRecord.state = "finalized";
+          authorizationRecord.finalized = result;
+          return result;
+        },
+      );
+    },
+
+    async deletePreparedGenerationByAuthorization(input) {
+      const { storeRecord, authorization, authorizationRecord } =
+        requirePreparedAuthorization(store, input, "profile_discard_failed");
+      return serializePreparedAuthorization(
+        authorizationRecord,
+        async (): Promise<DeletedProfileGeneration> => {
+          requireStore(store);
+          if (authorizationRecord.state === "deleted") {
+            return authorizationRecord.deleted!;
+          }
+          let capability: BoundProfileGeneration;
+          let workRecord: WorkRecord | undefined;
+          if (authorizationRecord.state === "staging") {
+            const preparedRecord = preparedRecords.get(
+              authorizationRecord.prepared as object,
+            );
+            if (
+              preparedRecord === undefined ||
+              preparedRecord.store !== storeRecord ||
+              preparedRecord.state !== "staging"
+            ) {
+              throw new ProfileStoreError(
+                "profile_discard_failed",
+                "staged profile authority is unavailable",
+              );
+            }
+            capability = preparedRecord.work.capability;
+            workRecord = preparedRecord.work;
+          } else {
+            capability = await bindProfileGeneration(storeRecord.root, {
+              profileId: authorization.profileId,
+              state: "committed",
+              generationId: authorization.generationId,
+              openMode: "existing",
+            });
+          }
+          let consumed = false;
+          try {
+            await deletePreparedProfileGenerationAtomically(capability, {
+              binding: storeRecord.binding,
+              expectedChecksum: authorization.checksum,
+              authorityDigest: profileTransitionAuthorityDigest(
+                "delete",
+                authorization.prepareToken,
+                authorization.checksum,
+              ),
+            });
+            consumed = true;
+          } catch (cause) {
+            throw new ProfileStoreError(
+              "profile_discard_failed",
+              "prepared profile deletion failed",
+              { cause },
+            );
+          } finally {
+            if (!consumed && workRecord === undefined) {
+              await capability.close().catch(() => undefined);
+            }
+          }
+          if (workRecord !== undefined) {
+            storeRecord.works.delete(workRecord);
+            workRecords.delete(workRecord.token as object);
+          }
+          preparedRecords.delete(authorizationRecord.prepared as object);
+          storeRecord.finalizedHistory.delete(authorizationRecord.prepared);
+          const result = Object.freeze({
+            version: 1 as const,
+            profileId: authorization.profileId,
+            generationId: authorization.generationId,
+            checksum: authorization.checksum,
+            deleted: true as const,
+          });
+          authorizationRecord.state = "deleted";
+          authorizationRecord.deleted = result;
+          return result;
+        },
+      );
+    },
+
     async hasCommitted(generationId) {
       requireStore(store);
       assertUuid(generationId, "generationId");
@@ -724,6 +1020,11 @@ export async function createProfileStore(options: {
         );
       }
       live.state = "closing";
+      await Promise.allSettled(
+        [...live.preparedAuthorizations.values()].map(
+          (authorization) => authorization.tail,
+        ),
+      );
       const targets = [...live.works]
         .filter((work) => work.state !== "discarded")
         .map((work) => ({
@@ -770,6 +1071,7 @@ export async function createProfileStore(options: {
         preparedRecords.delete(prepared as object);
       }
       live.finalizedHistory.clear();
+      live.preparedAuthorizations.clear();
       live.state = "closed";
       storeRecords.delete(store as object);
     },

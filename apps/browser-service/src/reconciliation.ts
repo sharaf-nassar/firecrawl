@@ -377,6 +377,12 @@ export type BoundProfileGeneration = Readonly<{
   close(): Promise<void>;
 }>;
 
+export type DeletePreparedProfileGenerationInput = Readonly<{
+  binding: ReadyProfileRootBinding;
+  expectedChecksum: string;
+  authorityDigest: string;
+}>;
+
 export type ChromiumSessionAttachment = Readonly<{
   [chromiumSessionAttachmentBrand]: true;
   context: BrowserContext;
@@ -7121,6 +7127,9 @@ function generationToken(
     },
     remove: async () => {
       const current = requireGeneration(token);
+      if (current.locator.state !== "working") {
+        throw unsafeCapability("profile generation removal is not authorized");
+      }
       const release = await acquireGenerationOperation(current, true);
       try {
         await removeGeneration(token);
@@ -8327,7 +8336,9 @@ export async function writeHeldProfileFixtureFile(
   }
 }
 
-async function removeGeneration(token: BoundProfileGeneration): Promise<void> {
+async function removeGeneration(
+  token: BoundProfileGeneration,
+): Promise<void> {
   const record = requireGeneration(token);
   if (record.locator.state !== "working") {
     throw unsafeCapability("profile generation removal is not authorized");
@@ -8496,6 +8507,645 @@ async function removeGeneration(token: BoundProfileGeneration): Promise<void> {
       record.acceptingOperations = true;
     }
     throw error;
+  }
+}
+
+type PreparedDeletionEntryV1 = Readonly<{
+  path: string;
+  type: "directory" | "file";
+  dev: string;
+  ino: string;
+  mode: number;
+  size: number;
+  sha256: string | null;
+}>;
+
+type PreparedDeletionManifestPayloadV1 = Readonly<{
+  version: 1;
+  operationId: string;
+  binding: ReadyProfileRootBinding;
+  authorityDigest: string;
+  expectedChecksum: string;
+  profileId: string;
+  state: "staging" | "committed";
+  generationId: string;
+  source: Readonly<{ dev: string; ino: string; mode: 448 }>;
+  phase: "planned" | "moved" | "removing";
+  cursor: number;
+  entries: readonly PreparedDeletionEntryV1[];
+}>;
+
+type PreparedDeletionManifestV1 = Readonly<{
+  payload: PreparedDeletionManifestPayloadV1;
+  digest: string;
+}>;
+
+function encodePreparedDeletionManifest(
+  payload: PreparedDeletionManifestPayloadV1,
+): Buffer {
+  return Buffer.from(
+    canonicalJson({
+      payload,
+      digest: sha256(canonicalJson(payload)),
+    }),
+    "utf8",
+  );
+}
+
+function parsePreparedDeletionManifest(
+  bytes: Uint8Array,
+  operationId: string,
+): PreparedDeletionManifestV1 {
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+  } catch {
+    throw atomicFailure("prepared deletion manifest is invalid");
+  }
+  if (typeof value !== "object" || value === null) {
+    throw atomicFailure("prepared deletion manifest is invalid");
+  }
+  const manifest = value as Partial<PreparedDeletionManifestV1>;
+  const payload = manifest.payload;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    payload.version !== 1 ||
+    payload.operationId !== operationId ||
+    !UUID.test(operationId) ||
+    !UUID.test(payload.profileId ?? "") ||
+    !UUID.test(payload.generationId ?? "") ||
+    (payload.state !== "staging" && payload.state !== "committed") ||
+    !/^[a-f0-9]{64}$/u.test(payload.authorityDigest ?? "") ||
+    !/^[a-f0-9]{64}$/u.test(payload.expectedChecksum ?? "") ||
+    (payload.phase !== "planned" &&
+      payload.phase !== "moved" &&
+      payload.phase !== "removing") ||
+    !Number.isSafeInteger(payload.cursor) ||
+    payload.cursor! < 0 ||
+    !Array.isArray(payload.entries) ||
+    payload.cursor! > payload.entries.length ||
+    manifest.digest !== sha256(canonicalJson(payload))
+  ) {
+    throw atomicFailure("prepared deletion manifest is invalid");
+  }
+  for (const entry of payload.entries) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      typeof entry.path !== "string" ||
+      (entry.type !== "file" && entry.type !== "directory") ||
+      !/^[0-9]+$/u.test(entry.dev) ||
+      !/^[0-9]+$/u.test(entry.ino) ||
+      !Number.isSafeInteger(entry.mode) ||
+      !Number.isSafeInteger(entry.size) ||
+      (entry.sha256 !== null && !/^[a-f0-9]{64}$/u.test(entry.sha256))
+    ) {
+      throw atomicFailure("prepared deletion manifest entry is invalid");
+    }
+  }
+  return Object.freeze({
+    payload: payload as PreparedDeletionManifestPayloadV1,
+    digest: manifest.digest,
+  });
+}
+
+async function persistPreparedDeletionManifest(
+  anchored: AnchoredRoot,
+  wrapper: FileHandle,
+  payload: PreparedDeletionManifestPayloadV1,
+): Promise<void> {
+  const bytes = encodePreparedDeletionManifest(payload);
+  let temporary: FileHandle | null = null;
+  try {
+    temporary = await call(anchored.admission, "prepared-delete-manifest-open", () =>
+      fs.open(
+        procPath(wrapper, ".manifest.next"),
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_TRUNC |
+          constants.O_NOFOLLOW,
+        0o600,
+      ),
+    );
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-manifest-write",
+      () => anchored.revalidate(),
+      () => temporary!.writeFile(bytes),
+    );
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-manifest-sync",
+      () => anchored.revalidate(),
+      () => temporary!.sync(),
+    );
+    await closeRaw(temporary, "prepared-delete-manifest-temp");
+    temporary = null;
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-manifest-publish",
+      () => anchored.revalidate(),
+      () =>
+        fs.rename(
+          procPath(wrapper, ".manifest.next"),
+          procPath(wrapper, "manifest.json"),
+        ),
+    );
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-wrapper-sync",
+      () => anchored.revalidate(),
+      () => wrapper.sync(),
+    );
+  } finally {
+    if (temporary !== null) {
+      await temporary.close().catch(() => undefined);
+    }
+  }
+}
+
+async function readPreparedDeletionManifest(
+  anchored: AnchoredRoot,
+  wrapper: FileHandle,
+  operationId: string,
+): Promise<PreparedDeletionManifestV1> {
+  const snapshot = await readRegularFileAt(
+    anchored,
+    wrapper,
+    "manifest.json",
+    ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES,
+  );
+  return parsePreparedDeletionManifest(snapshot.bytes, operationId);
+}
+
+async function openPreparedDeletionDirectory(
+  anchored: AnchoredRoot,
+  parent: FileHandle,
+  leaf: string,
+): Promise<{ handle: FileHandle; stat: BigIntStats }> {
+  const before = await call(anchored.admission, "prepared-delete-lstat", () =>
+    fs.lstat(procPath(parent, leaf), { bigint: true }),
+  );
+  if (
+    !before.isDirectory() ||
+    before.isSymbolicLink() ||
+    before.uid !== BigInt(atomicEffectiveUid()) ||
+    lowModeBigint(before.mode) !== 0o700
+  ) {
+    throw atomicFailure("prepared deletion directory is invalid");
+  }
+  const handle = await call(anchored.admission, "prepared-delete-open", () =>
+    fs.open(
+      procPath(parent, leaf),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    ),
+  );
+  const after = await call(anchored.admission, "prepared-delete-fstat", () =>
+    handle.stat({ bigint: true }),
+  );
+  if (!sameObjectIdentity(before, after)) {
+    await handle.close().catch(() => undefined);
+    throw atomicFailure("prepared deletion directory binding changed");
+  }
+  return { handle, stat: after };
+}
+
+async function observePreparedDeletionSource(
+  anchored: AnchoredRoot,
+  parent: FileHandle,
+  leaf: string,
+  expected: PreparedDeletionManifestPayloadV1["source"],
+): Promise<{ handle: FileHandle; stat: BigIntStats } | null> {
+  let observed: BigIntStats;
+  try {
+    observed = await call(anchored.admission, "prepared-delete-source-lstat", () =>
+      fs.lstat(procPath(parent, leaf), { bigint: true }),
+    );
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (
+    !observed.isDirectory() ||
+    observed.isSymbolicLink() ||
+    String(observed.dev) !== expected.dev ||
+    String(observed.ino) !== expected.ino ||
+    lowModeBigint(observed.mode) !== expected.mode
+  ) {
+    throw atomicFailure("prepared deletion source identity changed");
+  }
+  return openPreparedDeletionDirectory(anchored, parent, leaf);
+}
+
+async function removePreparedDeletionEntry(
+  anchored: AnchoredRoot,
+  generation: FileHandle,
+  entry: PreparedDeletionEntryV1,
+): Promise<void> {
+  const opened = await openRawProfileParent(anchored, generation, entry.path);
+  let pin: FileHandle | null = null;
+  try {
+    let observed: BigIntStats;
+    try {
+      observed = await call(anchored.admission, "prepared-delete-entry-lstat", () =>
+        fs.lstat(procPath(opened.parent, opened.leaf), { bigint: true }),
+      );
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return;
+      throw error;
+    }
+    if (
+      String(observed.dev) !== entry.dev ||
+      String(observed.ino) !== entry.ino ||
+      lowModeBigint(observed.mode) !== entry.mode ||
+      (entry.type === "directory"
+        ? !observed.isDirectory()
+        : !observed.isFile() ||
+          Number(observed.size) !== entry.size)
+    ) {
+      throw atomicFailure("prepared deletion entry identity changed");
+    }
+    if (entry.type === "file") {
+      const snapshot = await readRegularFileAt(
+        anchored,
+        opened.parent,
+        opened.leaf,
+        PROFILE_FILE_MAX_BYTES,
+      );
+      if (
+        sha256(snapshot.bytes) !== entry.sha256 ||
+        String(snapshot.stat.dev) !== entry.dev ||
+        String(snapshot.stat.ino) !== entry.ino
+      ) {
+        throw atomicFailure("prepared deletion file content changed");
+      }
+    }
+    const pinned = await pinRemovalLeaf(
+      anchored,
+      opened.parent,
+      opened.leaf,
+    );
+    pin = pinned.handle;
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-entry-remove",
+      async () => {
+        await anchored.revalidate();
+        await revalidateRemovalLeaf(
+          anchored,
+          opened.parent,
+          opened.leaf,
+          observed,
+          pinned.handle,
+        );
+      },
+      () =>
+        entry.type === "directory"
+          ? fs.rmdir(procPath(opened.parent, opened.leaf))
+          : fs.unlink(procPath(opened.parent, opened.leaf)),
+      () => anchored.revalidate(),
+    );
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-entry-parent-sync",
+      () => anchored.revalidate(),
+      () => opened.parent.sync(),
+    );
+  } finally {
+    await pin?.close().catch(() => undefined);
+    await closeAllDirect(opened.owned);
+  }
+}
+
+async function executePreparedDeletionJournal(
+  anchored: AnchoredRoot,
+  bundles: FileHandle,
+  wrapper: FileHandle,
+  wrapperLeaf: string,
+  initial: PreparedDeletionManifestV1,
+): Promise<void> {
+  let payload = initial.payload;
+  const profiles = await openPreparedDeletionDirectory(
+    anchored,
+    anchored.handle,
+    "profiles",
+  );
+  let profile: { handle: FileHandle; stat: BigIntStats } | null = null;
+  let state: { handle: FileHandle; stat: BigIntStats } | null = null;
+  let publicSource: { handle: FileHandle; stat: BigIntStats } | null = null;
+  let privateSource: { handle: FileHandle; stat: BigIntStats } | null = null;
+  try {
+    profile = await openPreparedDeletionDirectory(
+      anchored,
+      profiles.handle,
+      payload.profileId,
+    );
+    state = await openPreparedDeletionDirectory(
+      anchored,
+      profile.handle,
+      payload.state,
+    );
+    publicSource = await observePreparedDeletionSource(
+      anchored,
+      state.handle,
+      payload.generationId,
+      payload.source,
+    );
+    privateSource = await observePreparedDeletionSource(
+      anchored,
+      wrapper,
+      "source",
+      payload.source,
+    );
+    if (publicSource !== null && privateSource !== null) {
+      throw atomicFailure("prepared deletion source location is ambiguous");
+    }
+    if (publicSource !== null) {
+      if (payload.phase !== "planned") {
+        throw atomicFailure("prepared deletion durable phase is inconsistent");
+      }
+      await callHeldMutation(
+        anchored.admission,
+        "prepared-delete-source-move",
+        async () => {
+          await anchored.revalidate();
+          const rebound = await fs.lstat(
+            procPath(state!.handle, payload.generationId),
+            { bigint: true },
+          );
+          if (!sameObjectIdentity(publicSource!.stat, rebound)) {
+            throw atomicFailure("prepared deletion source binding changed");
+          }
+          try {
+            await fs.lstat(procPath(wrapper, "source"), { bigint: true });
+            throw atomicFailure(
+              "prepared deletion private destination already exists",
+            );
+          } catch (error) {
+            if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+          }
+        },
+        async () => {
+          loadAtomicDirectoryPublicationNative().renameNoReplace(
+            state!.handle.fd,
+            payload.generationId,
+            wrapper.fd,
+            "source",
+          );
+        },
+        () => anchored.revalidate(),
+      );
+      await callHeldMutation(
+        anchored.admission,
+        "prepared-delete-source-parent-sync",
+        () => anchored.revalidate(),
+        () => state!.handle.sync(),
+      );
+      await callHeldMutation(
+        anchored.admission,
+        "prepared-delete-private-parent-sync",
+        () => anchored.revalidate(),
+        () => wrapper.sync(),
+      );
+      privateSource = publicSource;
+      publicSource = null;
+      payload = Object.freeze({ ...payload, phase: "moved" as const });
+      await persistPreparedDeletionManifest(anchored, wrapper, payload);
+    }
+    if (privateSource === null) {
+      if (payload.cursor !== payload.entries.length) {
+        throw atomicFailure("prepared deletion private source is missing");
+      }
+    } else {
+      if (payload.phase === "planned") {
+        payload = Object.freeze({ ...payload, phase: "moved" as const });
+        await persistPreparedDeletionManifest(anchored, wrapper, payload);
+      }
+      if (payload.phase === "moved") {
+        payload = Object.freeze({ ...payload, phase: "removing" as const });
+        await persistPreparedDeletionManifest(anchored, wrapper, payload);
+      }
+      for (
+        let cursor = payload.cursor;
+        cursor < payload.entries.length;
+        cursor += 1
+      ) {
+        await removePreparedDeletionEntry(
+          anchored,
+          privateSource.handle,
+          payload.entries[cursor]!,
+        );
+        payload = Object.freeze({ ...payload, cursor: cursor + 1 });
+        await persistPreparedDeletionManifest(anchored, wrapper, payload);
+      }
+      const rebound = await call(
+        anchored.admission,
+        "prepared-delete-private-root-stat",
+        () => privateSource!.handle.stat({ bigint: true }),
+      );
+      if (
+        String(rebound.dev) !== payload.source.dev ||
+        String(rebound.ino) !== payload.source.ino
+      ) {
+        throw atomicFailure("prepared deletion private root changed");
+      }
+      await privateSource.handle.close();
+      privateSource = null;
+      await callHeldMutation(
+        anchored.admission,
+        "prepared-delete-private-root-remove",
+        () => anchored.revalidate(),
+        () => fs.rmdir(procPath(wrapper, "source")),
+      );
+      await callHeldMutation(
+        anchored.admission,
+        "prepared-delete-private-root-parent-sync",
+        () => anchored.revalidate(),
+        () => wrapper.sync(),
+      );
+    }
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-manifest-remove",
+      () => anchored.revalidate(),
+      () => fs.unlink(procPath(wrapper, "manifest.json")),
+    );
+    await fs.unlink(procPath(wrapper, ".manifest.next")).catch(error => {
+      if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+    });
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-wrapper-final-sync",
+      () => anchored.revalidate(),
+      () => wrapper.sync(),
+    );
+    await wrapper.close();
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-wrapper-remove",
+      () => anchored.revalidate(),
+      () => fs.rmdir(procPath(bundles, wrapperLeaf)),
+    );
+    await callHeldMutation(
+      anchored.admission,
+      "prepared-delete-bundles-sync",
+      () => anchored.revalidate(),
+      () => bundles.sync(),
+    );
+  } finally {
+    await privateSource?.handle.close().catch(() => undefined);
+    await publicSource?.handle.close().catch(() => undefined);
+    await state?.handle.close().catch(() => undefined);
+    await profile?.handle.close().catch(() => undefined);
+    await profiles.handle.close().catch(() => undefined);
+  }
+}
+
+export async function deletePreparedProfileGenerationAtomically(
+  source: BoundProfileGeneration,
+  input: DeletePreparedProfileGenerationInput,
+): Promise<void> {
+  const record = requireGeneration(source);
+  if (
+    (record.locator.state !== "staging" &&
+      record.locator.state !== "committed") ||
+    !sameReadyBinding(record.root.binding, input.binding) ||
+    !/^[a-f0-9]{64}$/u.test(input.expectedChecksum) ||
+    !/^[a-f0-9]{64}$/u.test(input.authorityDigest)
+  ) {
+    throw unsafeCapability(
+      "prepared profile generation deletion authority is invalid",
+    );
+  }
+  const release = await acquireGenerationOperation(record, true);
+  let staging: { handle: FileHandle; stat: BigIntStats } | null = null;
+  let bundles: { handle: FileHandle; stat: BigIntStats } | null = null;
+  let wrapper: FileHandle | null = null;
+  let durable = false;
+  try {
+    const before = await heldProfileHash(record);
+    if (before.checksum !== input.expectedChecksum) {
+      throw unsafeCapability("prepared profile generation checksum changed");
+    }
+    const operationId = atomicUuidFromDigest(
+      canonicalJson({
+        authorityDigest: input.authorityDigest,
+        checksum: input.expectedChecksum,
+        profileId: record.locator.profileId,
+        state: record.locator.state,
+        generationId: record.locator.generationId,
+        dev: String(record.identities[3]!.dev),
+        ino: String(record.identities[3]!.ino),
+      }),
+    );
+    const wrapperLeaf = `delete-${operationId}`;
+    staging = await openPreparedDeletionDirectory(
+      record.root.anchored,
+      record.root.anchored.handle,
+      ".profile-publish-staging",
+    );
+    bundles = await openPreparedDeletionDirectory(
+      record.root.anchored,
+      staging.handle,
+      "bundles",
+    );
+    await callHeldMutation(
+      record.root.anchored.admission,
+      "prepared-delete-wrapper-create",
+      () => record.root.anchored.revalidate(),
+      () => fs.mkdir(procPath(bundles!.handle, wrapperLeaf), { mode: 0o700 }),
+    );
+    wrapper = (
+      await openPreparedDeletionDirectory(
+        record.root.anchored,
+        bundles.handle,
+        wrapperLeaf,
+      )
+    ).handle;
+    const entries = Object.freeze(
+      before.evidence
+        .filter(entry => entry.path !== "")
+        .sort((left, right) => {
+          const depth =
+            right.path.split("/").length - left.path.split("/").length;
+          if (depth !== 0) return depth;
+          if (left.type !== right.type) return left.type === "file" ? -1 : 1;
+          return rawCompare(left.path, right.path);
+        })
+        .map(entry =>
+          Object.freeze({
+            path: entry.path,
+            type: entry.type,
+            dev: String(entry.stat.dev),
+            ino: String(entry.stat.ino),
+            mode: lowModeBigint(entry.stat.mode),
+            size: entry.type === "file" ? Number(entry.stat.size) : 0,
+            sha256: entry.sha256,
+          }),
+        ),
+    );
+    const payload: PreparedDeletionManifestPayloadV1 = Object.freeze({
+      version: 1,
+      operationId,
+      binding: Object.freeze({ ...input.binding }),
+      authorityDigest: input.authorityDigest,
+      expectedChecksum: input.expectedChecksum,
+      profileId: record.locator.profileId,
+      state: record.locator.state,
+      generationId: record.locator.generationId,
+      source: Object.freeze({
+        dev: String(record.identities[3]!.dev),
+        ino: String(record.identities[3]!.ino),
+        mode: 448 as const,
+      }),
+      phase: "planned",
+      cursor: 0,
+      entries,
+    });
+    await persistPreparedDeletionManifest(
+      record.root.anchored,
+      wrapper,
+      payload,
+    );
+    await callHeldMutation(
+      record.root.anchored.admission,
+      "prepared-delete-planned-bundles-sync",
+      () => record.root.anchored.revalidate(),
+      () => bundles!.handle.sync(),
+    );
+    durable = true;
+    await executePreparedDeletionJournal(
+      record.root.anchored,
+      bundles.handle,
+      wrapper,
+      wrapperLeaf,
+      parsePreparedDeletionManifest(
+        encodePreparedDeletionManifest(payload),
+        operationId,
+      ),
+    );
+    wrapper = null;
+    await closeAll([
+      [record.generation, "prepared-delete-generation"],
+      [record.stateHandle, "prepared-delete-state"],
+      [record.profile, "prepared-delete-profile"],
+      [record.profiles, "prepared-delete-profiles"],
+    ]);
+    record.state = "consumed";
+    record.root.children.delete(record);
+    signalRootChildDrain(record.root);
+    generationCapabilityRecords.delete(source as object);
+  } catch (error) {
+    record.state = durable ? "close_unverified" : "live";
+    record.acceptingOperations = !durable;
+    if (durable) record.root.acceptingOperations = false;
+    throw error;
+  } finally {
+    await wrapper?.close().catch(() => undefined);
+    await bundles?.handle.close().catch(() => undefined);
+    await staging?.handle.close().catch(() => undefined);
+    release();
   }
 }
 
@@ -19338,12 +19988,109 @@ async function closeAtomicOwnedRecordsThroughReducer(
   }
 }
 
+async function recoverPreparedDeletionJournals(
+  root: AnchoredProfileRoot,
+): Promise<void> {
+  const record = requireRoot(root);
+  let staging: { handle: FileHandle; stat: BigIntStats } | null = null;
+  let bundles: { handle: FileHandle; stat: BigIntStats } | null = null;
+  try {
+    try {
+      staging = await openPreparedDeletionDirectory(
+        record.anchored,
+        record.anchored.handle,
+        ".profile-publish-staging",
+      );
+      bundles = await openPreparedDeletionDirectory(
+        record.anchored,
+        staging.handle,
+        "bundles",
+      );
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return;
+      throw error;
+    }
+    const leaves = await call(
+      record.anchored.admission,
+      "prepared-delete-journal-enumerate",
+      () => fs.readdir(procPath(bundles!.handle)),
+    );
+    for (const leaf of leaves.sort(rawCompare)) {
+      const match =
+        /^delete-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12})$/u.exec(
+          leaf,
+        );
+      if (match === null) continue;
+      const operationId = match[1]!;
+      const opened = await openPreparedDeletionDirectory(
+        record.anchored,
+        bundles.handle,
+        leaf,
+      );
+      let handedOff = false;
+      try {
+        let manifest: PreparedDeletionManifestV1;
+        try {
+          manifest = await readPreparedDeletionManifest(
+            record.anchored,
+            opened.handle,
+            operationId,
+          );
+        } catch (error) {
+          if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+          const entries = await fs.readdir(procPath(opened.handle));
+          if (
+            entries.some(
+              entry =>
+                entry !== ".manifest.next" && entry !== "manifest.json",
+            )
+          ) {
+            throw atomicFailure(
+              "prepared deletion journal authority is missing",
+            );
+          }
+          await fs.unlink(procPath(opened.handle, ".manifest.next")).catch(
+            unlinkError => {
+              if (
+                !isNodeError(unlinkError) ||
+                unlinkError.code !== "ENOENT"
+              ) {
+                throw unlinkError;
+              }
+            },
+          );
+          await opened.handle.close();
+          await fs.rmdir(procPath(bundles.handle, leaf));
+          await bundles.handle.sync();
+          continue;
+        }
+        handedOff = true;
+        await executePreparedDeletionJournal(
+          record.anchored,
+          bundles.handle,
+          opened.handle,
+          leaf,
+          manifest,
+        );
+      } finally {
+        if (!handedOff) {
+          await opened.handle.close().catch(() => undefined);
+        }
+      }
+    }
+  } finally {
+    await bundles?.handle.close().catch(() => undefined);
+    await staging?.handle.close().catch(() => undefined);
+  }
+}
+
 async function recoverAtomicDurablePublicationsBeforeTask3(
   root: AnchoredProfileRoot,
   request: ReconciliationRequestV1,
   deps: ReconciliationDependencies,
   observability: AtomicPublicationObservability | null,
 ): Promise<void> {
+  await recoverPreparedDeletionJournals(root);
   const binding: ReadyProfileRootBinding = Object.freeze({
     processNonce: request.processNonce,
     controlGenerationNonce: request.controlGenerationNonce,

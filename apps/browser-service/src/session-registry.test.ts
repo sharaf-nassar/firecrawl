@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,7 +20,13 @@ import {
 } from "./reconciliation.js";
 import {
   TrustedPreSpawnLaunchError,
+  captureSessionArtifact,
+  closeSessionCdpChannel,
   createSessionRegistry,
+  openSessionCdpChannel,
+  sendSessionCdpCommand,
+  subscribeSessionCdpEvent,
+  sessionRuntimeSignal,
 } from "./session-registry.js";
 
 const IDS = [
@@ -68,6 +81,12 @@ function harness(
     cleanupTimeoutMs?: number;
     launchTimeoutMs?: number;
     operationTimeoutMs?: number;
+    afterRuntimeLeaseSnapshot?: () => Promise<void>;
+    createRecordingProducer?: () => Promise<{
+      snapshot(): Promise<Uint8Array>;
+      subscribe(listener: (frame: unknown) => void): () => void;
+      close(): Promise<void>;
+    }>;
   } = {},
 ) {
   let now = 1_700_000_000_000;
@@ -81,6 +100,19 @@ function harness(
     url: vi.fn(() => pageUrl),
     title: vi.fn(async () => ""),
     textContent: vi.fn(async () => ""),
+    screenshot: vi.fn(async () => Buffer.from("image")),
+  };
+  const cdp = {
+    send: vi.fn(async () => ({ ok: true })),
+    on: vi.fn(),
+    off: vi.fn(),
+    detach: vi.fn(async () => undefined),
+  };
+  const tracing = {
+    start: vi.fn(async () => undefined),
+    startChunk: vi.fn(async () => undefined),
+    stopChunk: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
   };
   const context = {
     pages: vi.fn(() => [page]),
@@ -89,6 +121,8 @@ function harness(
     browser: vi.fn(() => null),
     setStorageState: vi.fn(async () => undefined),
     storageState: vi.fn(async () => ({ cookies: [], origins: [] })),
+    newCDPSession: vi.fn(async () => cdp),
+    tracing,
   };
   const gate = {
     state: "restore_closed" as "restore_closed" | "open" | "closed",
@@ -208,6 +242,14 @@ function harness(
   const beginDraining = vi.fn(() => {
     ready = false;
   });
+  const recordingProducer = {
+    snapshot: vi.fn(async () => Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3])),
+    subscribe: vi.fn(() => () => undefined),
+    close: vi.fn(async () => undefined),
+  };
+  const createRecordingProducer =
+    registryOptions.createRecordingProducer ??
+    vi.fn(async () => recordingProducer);
   const registry = createSessionRegistry({
     admission: {
       processNonce: "process",
@@ -229,6 +271,7 @@ function harness(
     createEgressProxy: proxyFactory,
     launchPersistentChromiumForWorking: launchPersistentContext,
     releaseChromiumSessionAttachment,
+    createRecordingProducer,
     ...(afterChromiumAttachment === undefined
       ? {}
       : { afterChromiumAttachment }),
@@ -246,6 +289,10 @@ function harness(
     proxyFactory,
     launchPersistentContext,
     releaseChromiumSessionAttachment,
+    createRecordingProducer,
+    recordingProducer,
+    cdp,
+    tracing,
     beginDraining,
     setReady: (value: boolean) => (ready = value),
     advance: (ms: number) => (now += ms),
@@ -384,6 +431,188 @@ describe("persistent session registry", () => {
     await first;
   });
 
+  test("runtime leases expose only authenticated bounded browser operations", async () => {
+    const h = harness();
+    const session = await h.registry.create(request());
+    let retainedLease: unknown;
+    let retainedChannel: unknown;
+
+    await h.registry.withRuntime(
+      session.runtimeSessionId,
+      "passive",
+      async (lease) => {
+        retainedLease = lease;
+        expect(Object.keys(lease)).toEqual([]);
+        expect(sessionRuntimeSignal(lease).aborted).toBe(false);
+        const channel = await openSessionCdpChannel(lease);
+        retainedChannel = channel;
+        expect(Object.keys(channel)).toEqual([]);
+        await expect(
+          sendSessionCdpCommand(channel, "Runtime.enable", {}),
+        ).resolves.toEqual({ ok: true });
+        const eventListener = vi.fn();
+        const unsubscribe = subscribeSessionCdpEvent(
+          channel,
+          "Runtime.consoleAPICalled",
+          eventListener,
+        );
+        expect(h.cdp.on).toHaveBeenCalledWith(
+          "Runtime.consoleAPICalled",
+          expect.any(Function),
+        );
+        const subscribed = h.cdp.on.mock.calls[0]![1] as (
+          params: unknown,
+        ) => void;
+        subscribed({ type: "log" });
+        expect(eventListener).toHaveBeenCalledWith({ type: "log" });
+        unsubscribe();
+        expect(h.cdp.off).toHaveBeenCalledWith(
+          "Runtime.consoleAPICalled",
+          expect.any(Function),
+        );
+        await expect(
+          captureSessionArtifact(lease, {
+            version: 1,
+            artifactId: IDS[2]!,
+            kind: "recording",
+            preset: "diagnostic-v1",
+          }),
+        ).resolves.toEqual({
+          contentType: "video/webm",
+          bytes: Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3]),
+        });
+        await closeSessionCdpChannel(channel);
+      },
+    );
+
+    expect(() => sessionRuntimeSignal(retainedLease as never)).toThrow();
+    await expect(
+      sendSessionCdpCommand(
+        retainedChannel as never,
+        "Runtime.enable",
+        {},
+      ),
+    ).rejects.toBeDefined();
+    await h.registry.close(session.runtimeSessionId, "requested");
+  });
+
+  test("a CDP detach timeout fail-stops admission", async () => {
+    const h = harness(undefined, undefined, {
+      cleanupTimeoutMs: 25,
+    });
+    h.cdp.detach.mockImplementationOnce(
+      () => new Promise<void>(() => undefined),
+    );
+    const session = await h.registry.create(request());
+    await expect(
+      h.registry.withRuntime(
+        session.runtimeSessionId,
+        "passive",
+        async (lease) => {
+          await openSessionCdpChannel(lease);
+        },
+      ),
+    ).rejects.toBeDefined();
+    expect(h.cdp.detach).toHaveBeenCalledOnce();
+    expect(h.beginDraining).toHaveBeenCalledOnce();
+  });
+
+  test("trace capture reads a bounded completed chunk and resumes tracing", async () => {
+    const h = harness();
+    const traceBytes = Buffer.from("PK\u0003\u0004trace");
+    h.tracing.stopChunk.mockImplementationOnce(
+      async ({ path }: { path: string }) => writeFile(path, traceBytes),
+    );
+    const session = await h.registry.create(request());
+    await expect(
+      h.registry.withRuntime(
+        session.runtimeSessionId,
+        "passive",
+        (lease) =>
+          captureSessionArtifact(lease, {
+            version: 1,
+            artifactId: IDS[2]!,
+            kind: "trace",
+            preset: "diagnostic-v1",
+          }),
+      ),
+    ).resolves.toEqual({
+      contentType: "application/zip",
+      bytes: Uint8Array.from(traceBytes),
+    });
+    expect(h.tracing.startChunk).toHaveBeenCalledWith({
+      title: "diagnostic-v1",
+    });
+    await h.registry.close(session.runtimeSessionId, "requested");
+  });
+
+  test("oversized trace is rejected before reading and fail-stops admission", async () => {
+    const h = harness();
+    h.tracing.stopChunk.mockImplementationOnce(
+      async ({ path }: { path: string }) => {
+        await writeFile(path, "");
+        await truncate(path, 16 * 1024 * 1024 + 1);
+      },
+    );
+    const session = await h.registry.create(request());
+    await expect(
+      h.registry.withRuntime(
+        session.runtimeSessionId,
+        "passive",
+        (lease) =>
+          captureSessionArtifact(lease, {
+            version: 1,
+            artifactId: IDS[2]!,
+            kind: "trace",
+            preset: "diagnostic-v1",
+          }),
+      ),
+    ).rejects.toMatchObject({ category: "browser_unavailable" });
+    expect(h.tracing.startChunk).not.toHaveBeenCalled();
+    expect(h.beginDraining).toHaveBeenCalledOnce();
+  });
+
+  test.each(["passive", "writer"] as const)(
+    "full drain aborts %s runtime leases before closing browser resources",
+    async (mode) => {
+    const h = harness();
+    const session = await h.registry.create(request());
+    let observedAbort = false;
+    const runtime = h.registry.withRuntime(
+      session.runtimeSessionId,
+      mode,
+      async (lease) => {
+        const signal = sessionRuntimeSignal(lease);
+        await new Promise<void>((resolve) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              observedAbort = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      },
+    );
+
+    await h.registry.drainAll("shutdown");
+    if (mode === "writer") {
+      await expect(runtime).rejects.toMatchObject({
+        category: "browser_unavailable",
+      });
+    } else {
+      await runtime;
+    }
+    expect(observedAbort).toBe(true);
+    expect(h.recordingProducer.close).toHaveBeenCalledOnce();
+    expect(h.context.close).toHaveBeenCalledOnce();
+    await expect(h.registry.create(request())).rejects.toMatchObject({
+      category: "browser_unavailable",
+    });
+    },
+  );
+
   test("close is idempotent and snapshot work never publishes", async () => {
     const h = harness();
     const session = await h.registry.create(request());
@@ -393,6 +622,46 @@ describe("persistent session registry", () => {
     ).toEqual(first);
     expect(h.profileStore.discardWorkingCopy).toHaveBeenCalledOnce();
     expect(h.profileStore.prepareWorkingCopy).not.toHaveBeenCalled();
+  });
+
+  test("close linearizes admission before its runtime cleanup snapshot", async () => {
+    let snapshotReached!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      snapshotReached = resolve;
+    });
+    let releaseSnapshot!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const h = harness(undefined, undefined, {
+      afterRuntimeLeaseSnapshot: async () => {
+        snapshotReached();
+        await held;
+      },
+    });
+    const session = await h.registry.create(request());
+    const close = h.registry.close(session.runtimeSessionId, "requested");
+    await reached;
+    const runtimeEffect = vi.fn(async () => undefined);
+
+    await expect(
+      h.registry.withRuntime(
+        session.runtimeSessionId,
+        "passive",
+        runtimeEffect,
+      ),
+    ).rejects.toMatchObject({ category: "session_not_found" });
+    expect(runtimeEffect).not.toHaveBeenCalled();
+    expect(h.context.newCDPSession).not.toHaveBeenCalled();
+    expect(h.page.screenshot).not.toHaveBeenCalled();
+    expect(h.recordingProducer.snapshot).not.toHaveBeenCalled();
+
+    releaseSnapshot();
+    await expect(close).resolves.toMatchObject({
+      runtimeSessionId: session.runtimeSessionId,
+      closed: true,
+    });
+    expect(h.context.close).toHaveBeenCalledOnce();
   });
 
   test("serializes concurrent close and rejects close during a writer", async () => {
@@ -429,7 +698,7 @@ describe("persistent session registry", () => {
     expect(second).toEqual(first);
     expect(h.context.close).toHaveBeenCalledOnce();
     expect(h.profileStore.prepareWorkingCopy).toHaveBeenCalledOnce();
-    expect(h.profileStore.finalizePreparedGeneration).toHaveBeenCalledOnce();
+    expect(h.profileStore.finalizePreparedGeneration).not.toHaveBeenCalled();
   });
 
   test("generic launch rejection retains fail-stop ownership", async () => {
@@ -790,7 +1059,7 @@ describe("persistent session registry", () => {
     },
   );
 
-  test("operation timeout cleans Chromium proxy sockets and working profile", async () => {
+  test("operation timeout fail-stops when the underlying effect never settles", async () => {
     vi.useFakeTimers();
     try {
       const h = harness(undefined, undefined, { operationTimeoutMs: 25 });
@@ -798,15 +1067,17 @@ describe("persistent session registry", () => {
       const creating = h.registry.create(request());
       const rejected = expect(creating).rejects.toMatchObject({
         category: "browser_unavailable",
-        cleanupCodes: [],
+        cleanupCodes: ["browser_effect_drain_failed"],
       });
       await vi.advanceTimersByTimeAsync(25);
+      await vi.advanceTimersByTimeAsync(5_000);
       await rejected;
       expect(h.releaseChromiumSessionAttachment).toHaveBeenCalledOnce();
       expect(h.proxy.close).toHaveBeenCalledOnce();
       expect(h.proxy.liveSocketCount()).toBe(0);
       expect(h.profileStore.discardWorkingCopy).toHaveBeenCalledOnce();
-      expect(h.registry.entries()).toEqual([]);
+      expect(h.beginDraining).toHaveBeenCalledOnce();
+      expect(h.registry.entries()).toMatchObject([{ state: "cleanup_failed" }]);
     } finally {
       vi.useRealTimers();
     }
@@ -1364,7 +1635,7 @@ describe("persistent session registry", () => {
     expect(h.context.close).toHaveBeenCalledOnce();
     expect(h.proxy.close).toHaveBeenCalledTimes(2);
     expect(h.profileStore.prepareWorkingCopy).toHaveBeenCalledOnce();
-    expect(h.profileStore.finalizePreparedGeneration).toHaveBeenCalledOnce();
+    expect(h.profileStore.finalizePreparedGeneration).not.toHaveBeenCalled();
     expect(h.profileStore.discardWorkingCopy).not.toHaveBeenCalled();
     expect(h.registry.entries()).toEqual([]);
   });
@@ -1399,12 +1670,12 @@ describe("persistent session registry", () => {
     expect(h.context.close).toHaveBeenCalledOnce();
     expect(h.proxy.close).toHaveBeenCalledOnce();
     expect(h.profileStore.prepareWorkingCopy).toHaveBeenCalledTimes(2);
-    expect(h.profileStore.finalizePreparedGeneration).toHaveBeenCalledOnce();
+    expect(h.profileStore.finalizePreparedGeneration).not.toHaveBeenCalled();
     expect(h.profileStore.discardWorkingCopy).not.toHaveBeenCalled();
     expect(h.registry.entries()).toEqual([]);
   });
 
-  test("retains prepared authority across transient finalize failure", async () => {
+  test("returns prepared authority without invoking finalize", async () => {
     const h = harness();
     h.profileStore.finalizePreparedGeneration.mockRejectedValueOnce(
       new Error("finalize failed"),
@@ -1421,29 +1692,21 @@ describe("persistent session registry", () => {
       }),
     );
 
-    await expect(
-      h.registry.close(session.runtimeSessionId, "requested"),
-    ).rejects.toMatchObject({ cleanupCodes: ["profile_finalize_failed"] });
-    const prepared =
-      h.profileStore.prepareWorkingCopy.mock.results[0]!.value;
-    await h.registry.sweepCleanupFailed();
     const closed = await h.registry.close(
       session.runtimeSessionId,
       "requested",
     );
-
+    const prepared =
+      h.profileStore.prepareWorkingCopy.mock.results[0]!.value;
     expect(closed).toMatchObject({ closed: true });
     expect(closed.preparedProfile).toEqual(await prepared);
     expect(h.profileStore.prepareWorkingCopy).toHaveBeenCalledOnce();
-    expect(h.profileStore.finalizePreparedGeneration).toHaveBeenCalledTimes(2);
-    expect(
-      h.profileStore.finalizePreparedGeneration.mock.calls[0]![0],
-    ).toBe(h.profileStore.finalizePreparedGeneration.mock.calls[1]![0]);
+    expect(h.profileStore.finalizePreparedGeneration).not.toHaveBeenCalled();
     expect(h.profileStore.discardWorkingCopy).not.toHaveBeenCalled();
     expect(h.registry.entries()).toEqual([]);
   });
 
-  test("publishes a writer only after verified normal resource shutdown", async () => {
+  test("prepares a writer only after verified normal resource shutdown", async () => {
     const h = harness();
     const session = await h.registry.create(
       request({
@@ -1464,7 +1727,7 @@ describe("persistent session registry", () => {
       h.profileStore.prepareWorkingCopy.mock.invocationCallOrder[0]!,
     );
     expect(h.profileStore.prepareWorkingCopy).toHaveBeenCalledOnce();
-    expect(h.profileStore.finalizePreparedGeneration).toHaveBeenCalledOnce();
+    expect(h.profileStore.finalizePreparedGeneration).not.toHaveBeenCalled();
     expect(h.profileStore.discardWorkingCopy).not.toHaveBeenCalled();
   });
 });

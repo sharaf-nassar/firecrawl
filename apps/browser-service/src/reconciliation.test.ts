@@ -65,6 +65,7 @@ import {
   consumeInternalReconciliationOutcome,
   consumeInternalReconciliationOutcomeForStartup,
   copyHeldProfileTree,
+  deletePreparedProfileGenerationAtomically,
   listHeldProfileGenerations,
   launchPersistentChromiumForWorking,
   reconcileBrowserState,
@@ -12225,6 +12226,414 @@ describe("atomic publication reconciliation ownership", () => {
       await working.close();
       await closeAnchoredProfileRoot(installed.root);
     }
+  });
+
+  test.each([
+    { generationId: CHECKPOINT_A, state: "staging" as const },
+    { generationId: CHECKPOINT_B, state: "committed" as const },
+  ])(
+    "only dedicated deletion removes a prepared $state generation",
+    async ({ generationId, state }) => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const working = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId,
+        openMode: "create_exclusive",
+      });
+      await writeHeldProfileFixtureFile(working, "source.bin", state);
+      const prepareDigest = sha(`prepare-${state}`);
+      const prepared = await transitionHeldProfileGenerationAtomically(
+        working,
+        {
+          binding: installed.binding,
+          kind: "prepare",
+          authorityDigest: prepareDigest,
+        },
+      );
+      const published =
+        state === "committed"
+          ? await transitionHeldProfileGenerationAtomically(
+              prepared.generation,
+              {
+                binding: installed.binding,
+                kind: "finalize",
+                authorityDigest: sha("finalize-committed"),
+              },
+            )
+          : prepared;
+      const generation = published.generation;
+      const generationPath = path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        state,
+        generationId,
+      );
+      try {
+        await expect(generation.remove()).rejects.toThrow(
+          /removal is not authorized/u,
+        );
+        await expect(readFile(path.join(generationPath, "source.bin"), "utf8"))
+          .resolves.toBe(state);
+        await deletePreparedProfileGenerationAtomically(generation, {
+          binding: installed.binding,
+          expectedChecksum: published.tree.checksum,
+          authorityDigest: sha(`delete-${state}`),
+        });
+        await expect(stat(generationPath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        await generation.close().catch(() => undefined);
+        await closeAnchoredProfileRoot(installed.root).catch(
+          () => undefined,
+        );
+      }
+    },
+  );
+
+  test.each([
+    ["prepared-delete-wrapper-create", 1, false],
+    ["prepared-delete-manifest-publish", 1, true],
+    ["prepared-delete-planned-bundles-sync", 1, true],
+    ["prepared-delete-source-move", 1, true],
+    ["prepared-delete-source-parent-sync", 1, true],
+    ["prepared-delete-manifest-publish", 2, true],
+    ["prepared-delete-manifest-publish", 3, true],
+    ["prepared-delete-entry-remove", 1, true],
+    ["prepared-delete-private-root-remove", 1, true],
+    ["prepared-delete-manifest-remove", 1, true],
+    ["prepared-delete-wrapper-remove", 1, true],
+  ] as const)(
+    "recovers prepared deletion after %s occurrence %i",
+    async (failurePoint, failureOccurrence, expectDeleted) => {
+      const canonicalRoot = await root();
+      await provisionAtomicNamespaces(canonicalRoot);
+      const installed = await installedProfileRoot(canonicalRoot);
+      const working = await bindProfileGeneration(installed.root, {
+        profileId: PROFILE,
+        state: "working",
+        generationId: CHECKPOINT_A,
+        openMode: "create_exclusive",
+      });
+      await writeHeldProfileFixtureFile(working, "source.bin", "delete-me");
+      const prepared = await transitionHeldProfileGenerationAtomically(
+        working,
+        {
+          binding: installed.binding,
+          kind: "prepare",
+          authorityDigest: sha("prepare-delete-crash"),
+        },
+      );
+      const generationPath = path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "staging",
+        CHECKPOINT_A,
+      );
+      let occurrence = 0;
+      let injected = false;
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            afterCall(point) {
+              if (point !== failurePoint || injected) return;
+              occurrence += 1;
+              if (occurrence !== failureOccurrence) return;
+              injected = true;
+              throw new Error(
+                `injected:${failurePoint}:${failureOccurrence}`,
+              );
+            },
+          },
+          () =>
+            deletePreparedProfileGenerationAtomically(
+              prepared.generation,
+              {
+                binding: installed.binding,
+                expectedChecksum: prepared.tree.checksum,
+                authorityDigest: sha("delete-crash"),
+              },
+            ),
+        ),
+      ).rejects.toThrow(
+        `injected:${failurePoint}:${failureOccurrence}`,
+      );
+      expect(injected).toBe(true);
+      await prepared.generation.close().catch(() => undefined);
+      await closeAnchoredProfileRoot(installed.root).catch(() => undefined);
+
+      const recovered = await installedProfileRoot(canonicalRoot);
+      try {
+        if (expectDeleted) {
+          await expect(stat(generationPath)).rejects.toMatchObject({
+            code: "ENOENT",
+          });
+        } else {
+          await expect(stat(generationPath)).resolves.toBeDefined();
+        }
+        const bundles = await readdir(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "bundles",
+          ),
+        );
+        expect(
+          bundles.filter(leaf => leaf.startsWith("delete-")),
+        ).toEqual([]);
+      } finally {
+        await closeAnchoredProfileRoot(recovered.root);
+      }
+    },
+    20_000,
+  );
+
+  test("serializes competing prepared deletion callers before effects", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "delete-race");
+    const prepared = await transitionHeldProfileGenerationAtomically(
+      working,
+      {
+        binding: installed.binding,
+        kind: "prepare",
+        authorityDigest: sha("prepare-delete-race"),
+      },
+    );
+    const input = {
+      binding: installed.binding,
+      expectedChecksum: prepared.tree.checksum,
+      authorityDigest: sha("delete-race"),
+    };
+    try {
+      const first = deletePreparedProfileGenerationAtomically(
+        prepared.generation,
+        input,
+      );
+      await expect(
+        deletePreparedProfileGenerationAtomically(
+          prepared.generation,
+          input,
+        ),
+      ).rejects.toThrow(/not accepting operations/u);
+      await first;
+    } finally {
+      await prepared.generation.close().catch(() => undefined);
+      await closeAnchoredProfileRoot(installed.root).catch(() => undefined);
+    }
+  });
+
+  test("rejects a canonical root swap before prepared source relocation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "delete-root-swap");
+    const prepared = await transitionHeldProfileGenerationAtomically(
+      working,
+      {
+        binding: installed.binding,
+        kind: "prepare",
+        authorityDigest: sha("prepare-delete-root-swap"),
+      },
+    );
+    const heldRoot = `${canonicalRoot}-held`;
+    let swapped = false;
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            if (point !== "prepared-delete-source-move" || swapped) return;
+            swapped = true;
+            await rename(canonicalRoot, heldRoot);
+            await mkdir(canonicalRoot, { mode: 0o700 });
+            await writeFile(
+              path.join(canonicalRoot, "replacement"),
+              "safe",
+              { mode: 0o600 },
+            );
+          },
+        },
+        () =>
+          deletePreparedProfileGenerationAtomically(
+            prepared.generation,
+            {
+              binding: installed.binding,
+              expectedChecksum: prepared.tree.checksum,
+              authorityDigest: sha("delete-root-swap"),
+            },
+          ),
+      ),
+    ).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(swapped).toBe(true);
+    await expect(
+      readFile(path.join(canonicalRoot, "replacement"), "utf8"),
+    ).resolves.toBe("safe");
+    await prepared.generation.close().catch(() => undefined);
+    await closeAnchoredProfileRoot(installed.root).catch(() => undefined);
+    await rm(canonicalRoot, { recursive: true, force: true });
+    await rename(heldRoot, canonicalRoot);
+    const recovered = await installedProfileRoot(canonicalRoot);
+    await closeAnchoredProfileRoot(recovered.root);
+  });
+
+  test("never replaces a raced private prepared deletion destination", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "delete-race");
+    const prepared = await transitionHeldProfileGenerationAtomically(
+      working,
+      {
+        binding: installed.binding,
+        kind: "prepare",
+        authorityDigest: sha("prepare-private-race"),
+      },
+    );
+    let racedSource = "";
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          async beforeCall(point) {
+            if (point !== "prepared-delete-source-move" || racedSource !== "") {
+              return;
+            }
+            const bundles = path.join(
+              canonicalRoot,
+              ".profile-publish-staging",
+              "bundles",
+            );
+            const wrapper = (await readdir(bundles)).find(leaf =>
+              leaf.startsWith("delete-"),
+            );
+            if (wrapper === undefined) throw new Error("journal missing");
+            racedSource = path.join(bundles, wrapper, "source");
+            await mkdir(racedSource, { mode: 0o700 });
+            await writeFile(
+              path.join(racedSource, "replacement"),
+              "safe",
+              { mode: 0o600 },
+            );
+          },
+        },
+        () =>
+          deletePreparedProfileGenerationAtomically(
+            prepared.generation,
+            {
+              binding: installed.binding,
+              expectedChecksum: prepared.tree.checksum,
+              authorityDigest: sha("delete-private-race"),
+            },
+          ),
+      ),
+    ).rejects.toBeDefined();
+    expect(racedSource).not.toBe("");
+    await expect(
+      readFile(path.join(racedSource, "replacement"), "utf8"),
+    ).resolves.toBe("safe");
+    await prepared.generation.close().catch(() => undefined);
+    await closeAnchoredProfileRoot(installed.root).catch(() => undefined);
+    await rm(racedSource, { recursive: true, force: true });
+    const recovered = await installedProfileRoot(canonicalRoot);
+    await closeAnchoredProfileRoot(recovered.root);
+  });
+
+  test("fail-stops startup on a partial prepared deletion manifest", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const working = await bindProfileGeneration(installed.root, {
+      profileId: PROFILE,
+      state: "working",
+      generationId: CHECKPOINT_A,
+      openMode: "create_exclusive",
+    });
+    await writeHeldProfileFixtureFile(working, "source.bin", "delete-partial");
+    const prepared = await transitionHeldProfileGenerationAtomically(
+      working,
+      {
+        binding: installed.binding,
+        kind: "prepare",
+        authorityDigest: sha("prepare-delete-partial"),
+      },
+    );
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          afterCall(point) {
+            if (point === "prepared-delete-planned-bundles-sync") {
+              throw new Error("injected:durable-delete-manifest");
+            }
+          },
+        },
+        () =>
+          deletePreparedProfileGenerationAtomically(
+            prepared.generation,
+            {
+              binding: installed.binding,
+              expectedChecksum: prepared.tree.checksum,
+              authorityDigest: sha("delete-partial"),
+            },
+          ),
+      ),
+    ).rejects.toThrow("injected:durable-delete-manifest");
+    await prepared.generation.close().catch(() => undefined);
+    await closeAnchoredProfileRoot(installed.root).catch(() => undefined);
+    const bundles = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+    );
+    const wrapper = (await readdir(bundles)).find(leaf =>
+      leaf.startsWith("delete-"),
+    );
+    if (wrapper === undefined) throw new Error("journal missing");
+    await writeFile(
+      path.join(bundles, wrapper, "manifest.json"),
+      "{",
+      { mode: 0o600 },
+    );
+    await expect(installedProfileRoot(canonicalRoot)).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    await expect(
+      readFile(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "staging",
+          CHECKPOINT_A,
+          "source.bin",
+        ),
+        "utf8",
+      ),
+    ).resolves.toBe("delete-partial");
   });
 
   test("rejects a mismatched conflict cleanup reducer cursor", async () => {

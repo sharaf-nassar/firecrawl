@@ -1985,6 +1985,7 @@ describe("private V1 contracts", () => {
   test("error taxonomy includes every reconciliation failure status", () => {
     expect(BROWSER_SERVICE_ERROR_STATUS).toMatchObject({
       browser_service_runtime_mismatch: 503,
+      browser_unavailable: 503,
       reconciliation_snapshot_invalid: 400,
       reconciliation_snapshot_too_large: 413,
       reconciliation_reference_missing: 409,

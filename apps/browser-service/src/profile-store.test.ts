@@ -232,6 +232,103 @@ describe("held profile publication", () => {
     await closeAnchoredProfileRoot(root);
   });
 
+  test("redeems a transport-shaped prepared authorization exactly once", async () => {
+    const { root, store } = await harness();
+    const work = await store.createWorkingCopy(PROFILE, null, "writer", SESSION);
+    await writeProfileFixtureFile(work, "Cookies", "state");
+    const prepared = await store.prepareWorkingCopy(work);
+    const authorization = {
+      profileId: prepared.profileId,
+      generationId: prepared.generationId,
+      checksum: prepared.checksum,
+      prepareToken: prepared.prepareToken,
+    };
+
+    const [first, second] = await Promise.all([
+      store.finalizePreparedGenerationByAuthorization({ ...authorization }),
+      store.finalizePreparedGenerationByAuthorization({ ...authorization }),
+    ]);
+    expect(second).toBe(first);
+    expect(first).toMatchObject({ committed: true, checksum: prepared.checksum });
+    expect(await store.hasCommitted(prepared.generationId)).toBe(true);
+
+    await store.close();
+    await closeAnchoredProfileRoot(root);
+  });
+
+  test("rejects forged transport authorization before publication", async () => {
+    const { root, store } = await harness();
+    const work = await store.createWorkingCopy(PROFILE, null, "writer", SESSION);
+    await writeProfileFixtureFile(work, "Cookies", "state");
+    const prepared = await store.prepareWorkingCopy(work);
+
+    await expect(
+      store.finalizePreparedGenerationByAuthorization({
+        profileId: prepared.profileId,
+        generationId: prepared.generationId,
+        checksum: prepared.checksum,
+        prepareToken: Buffer.alloc(32, 99).toString("base64url"),
+      }),
+    ).rejects.toMatchObject({ category: "profile_finalize_failed" });
+    expect(await store.hasCommitted(prepared.generationId)).toBe(false);
+    expect(await store.listStaging()).toEqual([prepared.generationId]);
+
+    await store.close();
+    await closeAnchoredProfileRoot(root);
+  });
+
+  test("deletes exact staged and finalized generations through authorization", async () => {
+    const { root, store } = await harness();
+    const stagedWork = await store.createWorkingCopy(
+      PROFILE,
+      null,
+      "writer",
+      SESSION,
+    );
+    await writeProfileFixtureFile(stagedWork, "Cookies", "staged");
+    const staged = await store.prepareWorkingCopy(stagedWork);
+    const stagedAuthorization = {
+      profileId: staged.profileId,
+      generationId: staged.generationId,
+      checksum: staged.checksum,
+      prepareToken: staged.prepareToken,
+    };
+    const stagedDeleted =
+      await store.deletePreparedGenerationByAuthorization(stagedAuthorization);
+    expect(stagedDeleted).toMatchObject({ deleted: true });
+    expect(
+      await store.deletePreparedGenerationByAuthorization(stagedAuthorization),
+    ).toBe(stagedDeleted);
+    expect(await store.listStaging()).toEqual([]);
+
+    const committedWork = await store.createWorkingCopy(
+      PROFILE,
+      null,
+      "writer",
+      SESSION,
+    );
+    await writeProfileFixtureFile(committedWork, "Cookies", "committed");
+    const committed = await store.prepareWorkingCopy(committedWork);
+    const committedAuthorization = {
+      profileId: committed.profileId,
+      generationId: committed.generationId,
+      checksum: committed.checksum,
+      prepareToken: committed.prepareToken,
+    };
+    await store.finalizePreparedGenerationByAuthorization(
+      committedAuthorization,
+    );
+    const committedDeleted =
+      await store.deletePreparedGenerationByAuthorization(
+        committedAuthorization,
+      );
+    expect(committedDeleted).toMatchObject({ deleted: true });
+    expect(await store.listCommitted()).toEqual([]);
+
+    await store.close();
+    await closeAnchoredProfileRoot(root);
+  });
+
   test("moves prepare and finalize sources private before returning", async () => {
     const { root, stateRoot, store } = await harness();
     const work = await store.createWorkingCopy(PROFILE, null, "writer", SESSION);
