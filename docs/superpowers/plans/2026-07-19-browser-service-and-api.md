@@ -4629,8 +4629,13 @@ reference attributes to DOM.
 
 Dispatch all 12 approved operations under the session writer. Direct
 `navigate` requires current origin or validated `allowedDomains`. Before
-click, inspect link target; only a validated clicked-link destination may add
-an origin. Validate redirects before following. Cap navigation origins at 8.
+click, inspect the link target and require its origin to already be
+authorized; click never learns or reserves an origin. Only explicit
+`navigate` may add one validated target origin. Atomically commit that target
+origin before browser dispatch, then treat every later dispatch or
+serialization failure as ambiguous. Reject uncommitted redirect origins
+before following. Track committed plus reserved origins atomically and cap
+the total at 8.
 Validate frames, workers, WebSockets, downloads, and subrequests through the
 egress boundary; public CDN/API subrequests never gain navigation authority.
 Cancel downloads by default.

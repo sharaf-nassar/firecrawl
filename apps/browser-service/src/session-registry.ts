@@ -3,12 +3,14 @@ import { createHash, randomUUID as systemRandomUUID } from "node:crypto";
 import { chromium, devices } from "playwright";
 
 import {
+  type BrowserActionExecutionResultV1,
   closedSessionV1Schema,
   createSessionV1Schema,
   type CreateSessionV1,
   type ClosedSessionV1,
   type SessionV1,
 } from "./contracts.js";
+import { SessionActionCache } from "./action-cache.js";
 import {
   createEgressProxy as createDefaultEgressProxy,
   createRestoreGate,
@@ -40,6 +42,12 @@ import type {
   ControlGenerationBinding,
   StartupAdmission,
 } from "./startup-state.js";
+import {
+  createBrowserOperationSession,
+  executeCachedAction,
+  type BrowserOperationSession,
+  type OperationPage,
+} from "./operations.js";
 
 type SessionErrorCategory =
   | "invalid_request"
@@ -70,12 +78,7 @@ export class TrustedPreSpawnLaunchError extends Error {
   readonly trustedLaunchFailureProof = "preSpawn" as const;
 }
 
-type PageLike = {
-  goto(url: string, options?: { timeout?: number }): Promise<unknown>;
-  url(): string;
-  title(): Promise<string>;
-  textContent(selector: string): Promise<string | null>;
-};
+type PageLike = OperationPage;
 
 type ContextLike = {
   pages(): PageLike[];
@@ -131,6 +134,8 @@ type RegistryEntry = {
   deadlineAtMs: number;
   devToolsEndpoint: string | null;
   streamHub: object;
+  actionCache: SessionActionCache;
+  operationSession: BrowserOperationSession | undefined;
   work: WorkingProfile | undefined;
   proxy: EgressProxy | undefined;
   context: ContextLike | undefined;
@@ -174,6 +179,10 @@ export type SessionRegistry = {
     runtimeSessionId: string,
     operation: () => Promise<T>,
   ): Promise<T>;
+  executeAction(
+    runtimeSessionId: string,
+    input: unknown,
+  ): Promise<BrowserActionExecutionResultV1>;
   close(
     runtimeSessionId: string,
     reason: "requested" | "expired" | "error" | "shutdown",
@@ -557,6 +566,14 @@ export function createSessionRegistry(options: {
     discardProfile: boolean,
   ): Promise<readonly string[]> {
     const cleanupCodes: string[] = [];
+    if (entry.operationSession !== undefined) {
+      try {
+        await entry.operationSession.dispose();
+        entry.operationSession = undefined;
+      } catch {
+        cleanupCodes.push("operation_session_dispose_failed");
+      }
+    }
     let contextClosed = false;
     try {
       contextClosed = await closeContext(entry);
@@ -797,6 +814,8 @@ export function createSessionRegistry(options: {
         deadlineAtMs: creationDeadlineAtMs,
         devToolsEndpoint: null,
         streamHub: Object.freeze({}),
+        actionCache: new SessionActionCache(),
+        operationSession: undefined,
         writerHeld: false,
         contextCloseVerified: false,
         runtimeDrainStarted: false,
@@ -1152,6 +1171,60 @@ export function createSessionRegistry(options: {
         entry.writerHeld = false;
         if (entry.state === "executing") entry.state = "ready";
       }
+    },
+
+    async executeAction(runtimeSessionId, input) {
+      const entry = requireEntry(runtimeSessionId);
+      assertEntryAdmitted(entry);
+      return executeCachedAction({
+        cache: entry.actionCache,
+        request: input,
+        withWriter: (operation) =>
+          registry.withWriter(runtimeSessionId, operation),
+        executeOperation: (operation) =>
+          runWithinDeadline(entry, async () => {
+            if (entry.operationSession === undefined) {
+              if (entry.page === undefined) {
+                throw asError(
+                  "session_not_found",
+                  "session has no active page",
+                );
+              }
+              entry.operationSession = createBrowserOperationSession({
+                page: entry.page,
+                allowedDomains: entry.allowedDomains,
+                initialOrigin: entry.initialOrigin,
+              });
+            }
+            return entry.operationSession.execute(operation);
+          }),
+        currentSessionVersion: () => entry.sessionVersion,
+        currentPage: () => {
+          if (entry.pageState === undefined) {
+            throw asError(
+              "session_not_found",
+              "session has no public page state",
+            );
+          }
+          return { ...entry.pageState };
+        },
+        commitSuccess: (execution) => {
+          entry.pageState = { ...execution.page };
+          entry.sessionVersion += 1;
+          entry.idleExpiresAtMs = Math.min(
+            entry.expiresAtMs,
+            now() + entry.request.activityTtlSeconds * 1_000,
+          );
+          entry.deadlineAtMs = Math.min(
+            entry.expiresAtMs,
+            entry.idleExpiresAtMs,
+          );
+          return entry.sessionVersion;
+        },
+        closeAmbiguous: async () => {
+          await registry.close(runtimeSessionId, "error");
+        },
+      });
     },
 
     async close(runtimeSessionId, reason) {
