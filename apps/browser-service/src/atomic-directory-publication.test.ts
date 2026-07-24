@@ -5,9 +5,18 @@ import { describe, expect, test } from "vitest";
 
 import {
   ATOMIC_MAX_DIRECTORY_ENTRIES,
+  ATOMIC_MAX_ACTIVE_STABLE_INTENTS,
+  ATOMIC_MAX_MANIFEST_BYTES,
+  ATOMIC_MAX_METADATA_FILES,
   ATOMIC_MAX_OBSERVATION_BYTES,
   ATOMIC_MAX_PARTIAL_CREATE_IDS,
+  ATOMIC_MAX_PAYLOAD_BYTES,
+  ATOMIC_MAX_PAYLOAD_ENTRIES,
+  ATOMIC_MAX_RECOVERY_RECORDS,
+  ATOMIC_MAX_SCRATCH_ENTRIES,
   ATOMIC_MAX_TRACKED_IDS,
+  assertAtomicProfileCopySchemaV1,
+  assertAtomicProfileSchemaV1,
   advanceAtomicCanaryCleanup,
   createAtomicCanaryReducerState,
   createAtomicReducerState,
@@ -15,6 +24,7 @@ import {
   isAtomicControlLeafV1,
   isAtomicPayloadLeafV1,
   reduceAtomicPublication,
+  validateAtomicInventoryBoundsV1,
   type AtomicEffectObservationV1,
   type AtomicEffectRequestDraftV1,
   type AtomicCanaryProofV1,
@@ -130,6 +140,88 @@ function plannedCanaryProof(
 }
 
 describe("atomic publication effect protocol", () => {
+  test("enforces every independent and aggregate inventory maximum", () => {
+    const maximum = {
+      activeStableIntents: ATOMIC_MAX_ACTIVE_STABLE_INTENTS,
+      recoveryRecords: ATOMIC_MAX_RECOVERY_RECORDS,
+      payloadEntries: ATOMIC_MAX_PAYLOAD_ENTRIES,
+      payloadBytes: ATOMIC_MAX_PAYLOAD_BYTES,
+      scratchEntries: ATOMIC_MAX_SCRATCH_ENTRIES,
+      stableMetadataFiles: 3_072,
+      scratchMetadataFiles: 1_024,
+      stableManifestBytes: 100_663_296,
+      scratchManifestBytes: 33_554_432,
+      stableOtherMetadataBytes: 12_582_912,
+      scratchOtherMetadataBytes: 4_194_304,
+    };
+    expect(validateAtomicInventoryBoundsV1(maximum)).toEqual(maximum);
+    expect(
+      maximum.payloadEntries +
+        maximum.scratchEntries +
+        maximum.stableMetadataFiles +
+        maximum.scratchMetadataFiles,
+    ).toBe(30_120);
+    expect(
+      maximum.stableMetadataFiles + maximum.scratchMetadataFiles,
+    ).toBe(ATOMIC_MAX_METADATA_FILES);
+    expect(
+      maximum.stableManifestBytes + maximum.scratchManifestBytes,
+    ).toBe(ATOMIC_MAX_MANIFEST_BYTES);
+    for (const key of Object.keys(maximum) as Array<keyof typeof maximum>) {
+      expect(() =>
+        validateAtomicInventoryBoundsV1({
+          ...maximum,
+          [key]: maximum[key] + 1,
+        }),
+      ).toThrow(/budget exceeded/u);
+    }
+  });
+
+  test("permits internal empty payloads but rejects aggregate-empty writers", () => {
+    expect(() => assertAtomicProfileSchemaV1("scaffold", 3, 0)).not.toThrow();
+    expect(() => assertAtomicProfileSchemaV1("canary", 0, 0)).not.toThrow();
+    expect(() =>
+      assertAtomicProfileSchemaV1("initial_working", 0, 0),
+    ).not.toThrow();
+    expect(() => assertAtomicProfileSchemaV1("writer", 1, 0)).toThrow(
+      /profile_schema_empty/u,
+    );
+    expect(() => assertAtomicProfileSchemaV1("writer", 20, 0)).toThrow(
+      /profile_schema_empty/u,
+    );
+    expect(() => assertAtomicProfileSchemaV1("writer", 1, 1)).not.toThrow();
+    expect(() =>
+      assertAtomicProfileCopySchemaV1(
+        "committed",
+        "working",
+        false,
+        1,
+        1,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertAtomicProfileCopySchemaV1("staging", "working", false, 1, 1),
+    ).toThrow(/copy authority/u);
+    expect(() =>
+      assertAtomicProfileCopySchemaV1(
+        "committed",
+        "staging",
+        false,
+        1,
+        1,
+      ),
+    ).toThrow(/copy authority/u);
+    expect(() =>
+      assertAtomicProfileCopySchemaV1(
+        "committed",
+        "working",
+        true,
+        1,
+        1,
+      ),
+    ).toThrow(/copy authority/u);
+  });
+
   test("enforces canonical UUID and exact control/payload leaf grammars", () => {
     expect(isAtomicControlLeafV1("a")).toBe(true);
     expect(isAtomicControlLeafV1(`a${".".repeat(126)}z`)).toBe(true);
@@ -851,6 +943,156 @@ describe("atomic publication effect protocol", () => {
     ).toMatchObject({
       kind: "terminal",
       result: { kind: "fail_stop", code: "unexpected_observation" },
+    });
+  });
+
+  test("rejects invalid persistence phase discriminators before effects", () => {
+    const tempParentId = semanticId();
+    const tempObjectId = semanticId();
+    const stableParentId = semanticId();
+    const canonicalBytes = new TextEncoder().encode("{}\n");
+    const contentDigest = createHash("sha256")
+      .update(canonicalBytes)
+      .digest("hex");
+    const common = {
+      operationId: OPERATION_ID,
+      canonicalBytes,
+      contentDigest,
+      tempParentId,
+      tempLeaf: `${OPERATION_ID}.allocated.${OPERATION_ID}.tmp`,
+      tempObjectId,
+      expectedTemp: evidence({
+        mode: 384,
+        size: canonicalBytes.byteLength,
+        contentSha256: contentDigest,
+      }),
+      stableParentId,
+      stableLeaf: `${OPERATION_ID}.json`,
+      expectedStable: { absent: true as const },
+    };
+    for (const request of [
+      {
+        ...common,
+        kind: "persist_intent",
+        expectedPhase: "building",
+      },
+      {
+        ...common,
+        kind: "persist_manifest",
+        expectedPhase: null,
+      },
+    ]) {
+      expect(() =>
+        createAtomicReducerState({
+          flightNonce: "flight-invalid-persistence-phase",
+          request: request as unknown as AtomicEffectRequestDraftV1,
+          semanticIds: [tempParentId, tempObjectId, stableParentId],
+        }),
+      ).toThrow(/invalid atomic effect request/u);
+    }
+  });
+
+  test("requires exact persistence location proof after native resolution", () => {
+    const tempParentId = semanticId();
+    const tempObjectId = semanticId();
+    const stableParentId = semanticId();
+    const targetObjectId = semanticId();
+    const canonicalBytes = new TextEncoder().encode("{}\n");
+    const contentDigest = createHash("sha256")
+      .update(canonicalBytes)
+      .digest("hex");
+    const expectedTemp = evidence({
+      mode: 384,
+      size: canonicalBytes.byteLength,
+      contentSha256: contentDigest,
+    });
+    const state = createAtomicReducerState({
+      flightNonce: "flight-persistence-locations",
+      request: {
+        kind: "persist_manifest",
+        operationId: OPERATION_ID,
+        expectedPhase: "manifest_planned",
+        canonicalBytes,
+        contentDigest,
+        tempParentId,
+        tempLeaf: `${OPERATION_ID}.identities.${OPERATION_ID}.tmp`,
+        tempObjectId,
+        expectedTemp,
+        stableParentId,
+        stableLeaf: `${OPERATION_ID}.identities.json`,
+        expectedStable: { absent: true },
+      },
+      semanticIds: [tempParentId, tempObjectId, stableParentId],
+    });
+    const native = emittedEffect(reduceAtomicPublication(state, null));
+    const observing = reduceAtomicPublication(state, {
+      kind: "native_resolved",
+      effectId: native.request.effectId,
+      requestKind: "persist_manifest",
+      operationId: OPERATION_ID,
+      move: "manifest_publish",
+      sourceObjectId: tempObjectId,
+      sourceEvidence: expectedTemp,
+      rawCode: "success",
+      nativePrecheckEvidenceDigest: HASH,
+      evidenceDigest: HASH,
+    });
+    expect(observing).toMatchObject({
+      kind: "effect",
+      request: {
+        kind: "observe_locations",
+        requestKind: "persist_manifest",
+        move: "manifest_publish",
+        tempObjectId,
+        expectedTemp,
+        expectedTargetBefore: { absent: true },
+        expectedTargetAfter: expectedTemp,
+      },
+    });
+    if (observing.kind !== "effect") {
+      throw new Error("persistence location effect missing");
+    }
+    const completed = reduceAtomicPublication(observing.state, {
+      kind: "locations_observed",
+      effectId: observing.request.effectId,
+      requestKind: "persist_manifest",
+      operationId: OPERATION_ID,
+      move: "manifest_publish",
+      tempParentId,
+      tempLeaf: `${OPERATION_ID}.identities.${OPERATION_ID}.tmp`,
+      stableParentId,
+      stableLeaf: `${OPERATION_ID}.identities.json`,
+      requestedSourceObjectId: tempObjectId,
+      sourceObjectId: null,
+      targetObjectId,
+      source: location("absent", null, null),
+      target: location("match", targetObjectId, expectedTemp),
+      evidenceDigest: HASH,
+    });
+    expect(completed).toMatchObject({
+      kind: "terminal",
+      result: { kind: "protocol_complete" },
+    });
+    const wrongAssociation = reduceAtomicPublication(observing.state, {
+      kind: "locations_observed",
+      effectId: observing.request.effectId,
+      requestKind: "persist_manifest",
+      operationId: OPERATION_ID,
+      move: "manifest_publish",
+      tempParentId,
+      tempLeaf: `${OPERATION_ID}.identities.${OPERATION_ID}.tmp`,
+      stableParentId,
+      stableLeaf: `${OPERATION_ID}.identities.json`,
+      requestedSourceObjectId: semanticId(),
+      sourceObjectId: null,
+      targetObjectId,
+      source: location("absent", null, null),
+      target: location("match", targetObjectId, expectedTemp),
+      evidenceDigest: HASH,
+    });
+    expect(wrongAssociation).toMatchObject({
+      kind: "terminal",
+      result: { kind: "fail_stop", code: "observation_mismatch" },
     });
   });
 

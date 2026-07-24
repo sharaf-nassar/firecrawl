@@ -8,6 +8,110 @@ export const ATOMIC_MAX_TRACKED_IDS = 4_096;
 export const ATOMIC_MAX_PARTIAL_CREATE_IDS = 1_024;
 export const ATOMIC_MAX_DIRECTORY_ENTRIES = 256;
 export const ATOMIC_MAX_OBSERVATION_BYTES = 65_536;
+export const ATOMIC_MAX_ACTIVE_STABLE_INTENTS = 512;
+export const ATOMIC_MAX_RECOVERY_RECORDS = 1_024;
+export const ATOMIC_MAX_PAYLOAD_ENTRIES = 25_000;
+export const ATOMIC_MAX_PAYLOAD_BYTES = 1_073_741_824;
+export const ATOMIC_MAX_SCRATCH_ENTRIES = 1_024;
+export const ATOMIC_MAX_STABLE_METADATA_FILES = 3_072;
+export const ATOMIC_MAX_SCRATCH_METADATA_FILES = 1_024;
+export const ATOMIC_MAX_METADATA_FILES = 4_096;
+export const ATOMIC_MAX_STABLE_MANIFEST_BYTES = 100_663_296;
+export const ATOMIC_MAX_SCRATCH_MANIFEST_BYTES = 33_554_432;
+export const ATOMIC_MAX_MANIFEST_BYTES = 134_217_728;
+export const ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES = 12_582_912;
+export const ATOMIC_MAX_SCRATCH_OTHER_METADATA_BYTES = 4_194_304;
+export const ATOMIC_MAX_OTHER_METADATA_BYTES = 16_777_216;
+export const ATOMIC_MAX_TOTAL_ENTRIES = 30_120;
+
+export type AtomicInventoryBoundsV1 = Readonly<{
+  activeStableIntents: number;
+  recoveryRecords: number;
+  payloadEntries: number;
+  payloadBytes: number;
+  scratchEntries: number;
+  stableMetadataFiles: number;
+  scratchMetadataFiles: number;
+  stableManifestBytes: number;
+  scratchManifestBytes: number;
+  stableOtherMetadataBytes: number;
+  scratchOtherMetadataBytes: number;
+}>;
+
+export function validateAtomicInventoryBoundsV1(
+  value: AtomicInventoryBoundsV1,
+): AtomicInventoryBoundsV1 {
+  const values = Object.values(value);
+  const metadataFiles =
+    value.stableMetadataFiles + value.scratchMetadataFiles;
+  const manifestBytes =
+    value.stableManifestBytes + value.scratchManifestBytes;
+  const otherMetadataBytes =
+    value.stableOtherMetadataBytes +
+    value.scratchOtherMetadataBytes;
+  const totalEntries =
+    value.payloadEntries + value.scratchEntries + metadataFiles;
+  if (
+    values.some(item => !Number.isSafeInteger(item) || item < 0) ||
+    value.activeStableIntents > ATOMIC_MAX_ACTIVE_STABLE_INTENTS ||
+    value.recoveryRecords > ATOMIC_MAX_RECOVERY_RECORDS ||
+    value.payloadEntries > ATOMIC_MAX_PAYLOAD_ENTRIES ||
+    value.payloadBytes > ATOMIC_MAX_PAYLOAD_BYTES ||
+    value.scratchEntries > ATOMIC_MAX_SCRATCH_ENTRIES ||
+    value.stableMetadataFiles > ATOMIC_MAX_STABLE_METADATA_FILES ||
+    value.scratchMetadataFiles > ATOMIC_MAX_SCRATCH_METADATA_FILES ||
+    metadataFiles > ATOMIC_MAX_METADATA_FILES ||
+    value.stableManifestBytes > ATOMIC_MAX_STABLE_MANIFEST_BYTES ||
+    value.scratchManifestBytes > ATOMIC_MAX_SCRATCH_MANIFEST_BYTES ||
+    manifestBytes > ATOMIC_MAX_MANIFEST_BYTES ||
+    value.stableOtherMetadataBytes >
+      ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES ||
+    value.scratchOtherMetadataBytes >
+      ATOMIC_MAX_SCRATCH_OTHER_METADATA_BYTES ||
+    otherMetadataBytes > ATOMIC_MAX_OTHER_METADATA_BYTES ||
+    totalEntries > ATOMIC_MAX_TOTAL_ENTRIES
+  ) {
+    throw new RangeError("atomic publication budget exceeded");
+  }
+  return Object.freeze({ ...value });
+}
+
+export function assertAtomicProfileSchemaV1(
+  kind: "scaffold" | "canary" | "initial_working" | "writer",
+  entryCount: number,
+  byteSize: number,
+): void {
+  if (
+    !Number.isSafeInteger(entryCount) ||
+    entryCount < 0 ||
+    entryCount > ATOMIC_MAX_PAYLOAD_ENTRIES ||
+    !Number.isSafeInteger(byteSize) ||
+    byteSize < 0 ||
+    byteSize > 268_435_456
+  ) {
+    throw new RangeError("atomic profile schema is out of bounds");
+  }
+  if (kind === "writer" && byteSize === 0) {
+    throw new TypeError("profile_schema_empty");
+  }
+}
+
+export function assertAtomicProfileCopySchemaV1(
+  sourceState: "working" | "staging" | "committed",
+  destinationState: "working" | "staging" | "committed",
+  destinationExists: boolean,
+  entryCount: number,
+  byteSize: number,
+): void {
+  assertAtomicProfileSchemaV1("writer", entryCount, byteSize);
+  if (
+    sourceState !== "committed" ||
+    destinationState !== "working" ||
+    destinationExists
+  ) {
+    throw new TypeError("atomic profile copy authority is invalid");
+  }
+}
 
 export type CanonicalUuid = string;
 export type Sha256 = string;
@@ -142,6 +246,7 @@ export type AtomicEffectRequestV1 =
       reservation:
         | "payload_entries"
         | "payload_bytes"
+        | "scratch_entries"
         | "stable_files"
         | "scratch_files"
         | "manifest_bytes"
@@ -252,10 +357,25 @@ export type AtomicEffectRequestV1 =
       expected: AtomicObjectEvidenceV1;
     }>
   | Readonly<{
-      kind: "persist_intent" | "persist_manifest";
+      kind: "persist_intent";
       effectId: FlightEffectId;
       operationId: CanonicalUuid;
-      expectedPhase: AtomicPublishPhaseV1 | null;
+      expectedPhase: null;
+      canonicalBytes: Uint8Array;
+      contentDigest: Sha256;
+      tempParentId: FlightSemanticId;
+      tempLeaf: string;
+      tempObjectId: FlightSemanticId;
+      expectedTemp: AtomicObjectEvidenceV1;
+      stableParentId: FlightSemanticId;
+      stableLeaf: string;
+      expectedStable: Readonly<{ absent: true }>;
+    }>
+  | Readonly<{
+      kind: "persist_manifest";
+      effectId: FlightEffectId;
+      operationId: CanonicalUuid;
+      expectedPhase: "manifest_planned";
       canonicalBytes: Uint8Array;
       contentDigest: Sha256;
       tempParentId: FlightSemanticId;
@@ -278,6 +398,7 @@ export type AtomicEffectRequestV1 =
       tempObjectId: FlightSemanticId;
       expectedTemp: AtomicObjectEvidenceV1;
       stableParentId: FlightSemanticId;
+      stableObjectId: FlightSemanticId;
       stableLeaf: string;
       expectedStable: AtomicObjectEvidenceV1;
     }>
@@ -809,6 +930,15 @@ type PendingAtomicNativeResolutionV1 = Readonly<{
   nativePrecheckEvidenceDigest: Sha256;
 }>;
 
+type PendingAtomicPersistenceResolutionV1 = Readonly<{
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "persist_intent" | "persist_manifest" }
+  >;
+  rawCode: AtomicRawNativeCodeV1;
+  nativePrecheckEvidenceDigest: Sha256;
+}>;
+
 export type AtomicTerminalResultV1 =
   | Readonly<{ kind: "protocol_complete" }>
   | Readonly<{
@@ -848,6 +978,7 @@ export type AtomicReducerStateV1 = Readonly<{
   canaryWorkflow: AtomicCanaryWorkflowV1 | null;
   canaryReplayAuthority: AtomicCanaryReplayAuthorityV1 | null;
   pendingNativeResolution: PendingAtomicNativeResolutionV1 | null;
+  pendingPersistenceResolution: PendingAtomicPersistenceResolutionV1 | null;
   nativeClassification: AtomicNativeClassificationV1 | null;
   pendingNativeFailure: AtomicProtocolFailureV1 | null;
   terminalResult: AtomicTerminalResultV1 | null;
@@ -1354,6 +1485,7 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
         isOneOf(request.reservation, [
           "payload_entries",
           "payload_bytes",
+          "scratch_entries",
           "stable_files",
           "scratch_files",
           "manifest_bytes",
@@ -1599,17 +1731,25 @@ function validRequest(value: unknown): value is AtomicEffectRequestV1 {
           "tempObjectId",
           "expectedTemp",
           "stableParentId",
+          ...(request.kind === "replace_intent"
+            ? ["stableObjectId" as const]
+            : []),
           "stableLeaf",
           "expectedStable",
         ]) &&
-        (request.expectedPhase === null ||
-          isOneOf(request.expectedPhase, ATOMIC_PUBLISH_PHASES)) &&
+        (request.kind === "persist_intent"
+          ? request.expectedPhase === null
+          : request.kind === "persist_manifest"
+            ? request.expectedPhase === "manifest_planned"
+            : isOneOf(request.expectedPhase, ATOMIC_PUBLISH_PHASES)) &&
         request.canonicalBytes instanceof Uint8Array &&
         isSha256(request.contentDigest) &&
         sha256(request.canonicalBytes) === request.contentDigest &&
         isFlightId(request.tempParentId) &&
         isFlightId(request.tempObjectId) &&
         isFlightId(request.stableParentId) &&
+        (request.kind !== "replace_intent" ||
+          isFlightId(request.stableObjectId)) &&
         isAtomicControlLeafV1(request.tempLeaf) &&
         isAtomicControlLeafV1(request.stableLeaf) &&
         isEvidence(request.expectedTemp) &&
@@ -1892,6 +2032,7 @@ export function createAtomicReducerState(
                   ),
           }),
     pendingNativeResolution: null,
+    pendingPersistenceResolution: null,
     nativeClassification: null,
     pendingNativeFailure: null,
     terminalResult: null,
@@ -2965,7 +3106,8 @@ function observationSpecificMismatch(
         (request.kind === "persist_intent" ||
           request.kind === "persist_manifest") &&
         (observation.sourceObjectId !== request.tempObjectId ||
-          !evidenceEquals(observation.sourceEvidence, request.expectedTemp))
+          !evidenceEquals(observation.sourceEvidence, request.expectedTemp) ||
+          state.pendingPersistenceResolution !== null)
       ) {
         return "observation_mismatch";
       }
@@ -3032,7 +3174,20 @@ function observationSpecificMismatch(
         request.requestKind !== "native_no_replace" &&
         observation.requestKind !== "native_no_replace"
       ) {
-        return observation.tempParentId === request.tempParentId &&
+        const pending = state.pendingPersistenceResolution;
+        return pending !== null &&
+          pending.request.kind === request.requestKind &&
+          pending.request.operationId === request.operationId &&
+          pending.request.tempParentId === request.tempParentId &&
+          pending.request.tempLeaf === request.tempLeaf &&
+          pending.request.tempObjectId === request.tempObjectId &&
+          evidenceEquals(
+            pending.request.expectedTemp,
+            request.expectedTemp,
+          ) &&
+          pending.request.stableParentId === request.stableParentId &&
+          pending.request.stableLeaf === request.stableLeaf &&
+          observation.tempParentId === request.tempParentId &&
           observation.tempLeaf === request.tempLeaf &&
           observation.stableParentId === request.stableParentId &&
           observation.stableLeaf === request.stableLeaf &&
@@ -3175,11 +3330,17 @@ function requestSemanticIds(
         : [request.sourceFileId, request.destinationFileId];
     case "persist_intent":
     case "persist_manifest":
+      return [
+        request.tempParentId,
+        request.tempObjectId,
+        request.stableParentId,
+      ];
     case "replace_intent":
       return [
         request.tempParentId,
         request.tempObjectId,
         request.stableParentId,
+        request.stableObjectId,
       ];
     case "remove_intent":
     case "remove_manifest":
@@ -3583,6 +3744,35 @@ function validPendingNativeResolution(
   );
 }
 
+function validPendingPersistenceResolution(
+  value: PendingAtomicPersistenceResolutionV1 | null,
+): boolean {
+  return (
+    value === null ||
+    (isRecord(value) &&
+      hasExactKeys(value, [
+        "request",
+        "rawCode",
+        "nativePrecheckEvidenceDigest",
+      ]) &&
+      validRequest(value.request) &&
+      (value.request.kind === "persist_intent" ||
+        value.request.kind === "persist_manifest") &&
+      isOneOf(value.rawCode, [
+        "success",
+        "atomic_publish_exists",
+        "atomic_publish_source_missing",
+        "atomic_publish_unsupported",
+        "atomic_publish_cross_device",
+        "atomic_publish_binding_invalid",
+        "atomic_publish_denied",
+        "atomic_publish_invalid_argument",
+        "atomic_publish_io",
+      ]) &&
+      isSha256(value.nativePrecheckEvidenceDigest))
+  );
+}
+
 function validNativeFailure(value: AtomicProtocolFailureV1 | null): boolean {
   return (
     value === null ||
@@ -3618,6 +3808,7 @@ function validateState(state: AtomicReducerStateV1): boolean {
       "canaryWorkflow",
       "canaryReplayAuthority",
       "pendingNativeResolution",
+      "pendingPersistenceResolution",
       "nativeClassification",
       "pendingNativeFailure",
       "terminalResult",
@@ -3662,6 +3853,7 @@ function validateState(state: AtomicReducerStateV1): boolean {
     validCanaryWorkflow(state.canaryWorkflow) &&
     validCanaryReplayAuthority(state.canaryReplayAuthority) &&
     validPendingNativeResolution(state.pendingNativeResolution) &&
+    validPendingPersistenceResolution(state.pendingPersistenceResolution) &&
     validNativeClassification(state.nativeClassification) &&
     validNativeFailure(state.pendingNativeFailure) &&
     (state.terminalResult === null ||
@@ -4347,6 +4539,132 @@ export function reduceAtomicPublication(
   }
   if (
     observation.kind === "native_resolved" &&
+    (request.kind === "persist_intent" ||
+      request.kind === "persist_manifest")
+  ) {
+    const locationDraft: AtomicEffectRequestDraftV1 =
+      request.kind === "persist_intent"
+        ? {
+            kind: "observe_locations",
+            requestKind: "persist_intent",
+            operationId: request.operationId,
+            move: "intent_publish",
+            tempParentId: request.tempParentId,
+            tempLeaf: request.tempLeaf,
+            tempObjectId: request.tempObjectId,
+            expectedTemp: request.expectedTemp,
+            stableParentId: request.stableParentId,
+            stableLeaf: request.stableLeaf,
+            expectedTargetBefore: request.expectedStable,
+            expectedTargetAfter: request.expectedTemp,
+            evidenceDigest: sha256(
+              new TextEncoder().encode(
+                JSON.stringify({
+                  requestKind: request.kind,
+                  operationId: request.operationId,
+                  contentDigest: request.contentDigest,
+                  tempEvidence: request.expectedTemp.evidenceDigest,
+                  nativePrecheck:
+                    observation.nativePrecheckEvidenceDigest,
+                  rawCode: observation.rawCode,
+                }),
+              ),
+            ),
+          }
+        : {
+            kind: "observe_locations",
+            requestKind: "persist_manifest",
+            operationId: request.operationId,
+            move: "manifest_publish",
+            tempParentId: request.tempParentId,
+            tempLeaf: request.tempLeaf,
+            tempObjectId: request.tempObjectId,
+            expectedTemp: request.expectedTemp,
+            stableParentId: request.stableParentId,
+            stableLeaf: request.stableLeaf,
+            expectedTargetBefore: request.expectedStable,
+            expectedTargetAfter: request.expectedTemp,
+            evidenceDigest: sha256(
+              new TextEncoder().encode(
+                JSON.stringify({
+                  requestKind: request.kind,
+                  operationId: request.operationId,
+                  contentDigest: request.contentDigest,
+                  tempEvidence: request.expectedTemp.evidenceDigest,
+                  nativePrecheck:
+                    observation.nativePrecheckEvidenceDigest,
+                  rawCode: observation.rawCode,
+                }),
+              ),
+            ),
+          };
+    return scheduleAtomicEffect(
+      accepted,
+      locationDraft,
+      {
+        pendingPersistenceResolution: Object.freeze({
+          request,
+          rawCode: observation.rawCode,
+          nativePrecheckEvidenceDigest:
+            observation.nativePrecheckEvidenceDigest,
+        }),
+      },
+    );
+  }
+  if (
+    observation.kind === "locations_observed" &&
+    observation.requestKind !== "native_no_replace" &&
+    request.kind === "observe_locations" &&
+    request.requestKind !== "native_no_replace"
+  ) {
+    const pending = accepted.pendingPersistenceResolution;
+    if (pending === null) return fail(accepted, "observation_mismatch");
+    const sourceAbsent =
+      observation.source.state === "absent" &&
+      observation.sourceObjectId === null;
+    const targetMatches =
+      observation.targetObjectId !== null &&
+      exactLocationMatch(
+        observation.target,
+        pending.request.expectedTemp,
+      );
+    if (
+      pending.rawCode === "success" &&
+      sourceAbsent &&
+      targetMatches
+    ) {
+      return completed(
+        Object.freeze({
+          ...accepted,
+          pendingPersistenceResolution: null,
+        }),
+      );
+    }
+    return scheduleAtomicEffect(
+      accepted,
+      {
+        kind: "close_admission",
+        operationId: request.operationId,
+        reason: "binding_invalid",
+        evidenceDigest: sha256(
+          new TextEncoder().encode(
+            JSON.stringify({
+              requestKind: request.requestKind,
+              rawCode: pending.rawCode,
+              precheck: pending.nativePrecheckEvidenceDigest,
+              locations: observation.evidenceDigest,
+            }),
+          ),
+        ),
+      },
+      {
+        pendingPersistenceResolution: null,
+        pendingNativeFailure: "native_binding_invalid",
+      },
+    );
+  }
+  if (
+    observation.kind === "native_resolved" &&
     request.kind === "native_no_replace"
   ) {
     return scheduleAtomicEffect(
@@ -4462,7 +4780,9 @@ export function reduceAtomicPublication(
           );
     if (
       classification !== null &&
-      classification.outcome === "conflict"
+      classification.outcome === "conflict" &&
+      (pending.request.move === "canary_publish" ||
+        pending.request.move === "canary_source_to_private")
     ) {
       const evidenceDigest = sha256(
         new TextEncoder().encode(

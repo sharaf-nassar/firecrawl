@@ -17,10 +17,12 @@ import { chromium, type Browser, type BrowserContext } from "playwright";
 import type {
   AtomicEffectObservationV1,
   AtomicEffectRequestV1,
+  AtomicEffectRequestDraftV1,
   AtomicCanaryProofV1,
   AtomicCanaryRecoveryInputV1,
   AtomicTerminalResultV1,
   AtomicLocationMoveV1,
+  AtomicNativeClassificationV1,
   AtomicObjectEvidenceV1,
   AtomicObjectRoleV1,
   FlightEffectId,
@@ -28,6 +30,21 @@ import type {
   FlightSemanticId,
 } from "./atomic-directory-publication.js";
 import {
+  ATOMIC_MAX_ACTIVE_STABLE_INTENTS,
+  ATOMIC_MAX_MANIFEST_BYTES,
+  ATOMIC_MAX_METADATA_FILES,
+  ATOMIC_MAX_OTHER_METADATA_BYTES,
+  ATOMIC_MAX_PAYLOAD_BYTES,
+  ATOMIC_MAX_PAYLOAD_ENTRIES,
+  ATOMIC_MAX_RECOVERY_RECORDS,
+  ATOMIC_MAX_SCRATCH_ENTRIES,
+  ATOMIC_MAX_SCRATCH_METADATA_FILES,
+  ATOMIC_MAX_SCRATCH_MANIFEST_BYTES,
+  ATOMIC_MAX_SCRATCH_OTHER_METADATA_BYTES,
+  ATOMIC_MAX_STABLE_MANIFEST_BYTES,
+  ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES,
+  assertAtomicProfileSchemaV1,
+  createAtomicReducerState,
   createAtomicCanaryReducerState,
   isAtomicControlLeafV1,
   isAtomicCanaryProofV1,
@@ -35,6 +52,20 @@ import {
   reduceAtomicPublication,
 } from "./atomic-directory-publication.js";
 import { loadAtomicDirectoryPublicationNative } from "./atomic-directory-publication-native.js";
+import {
+  encodeAtomicPublishIntent,
+  encodeCleanupIdentityManifest,
+  parseAtomicPublicationIntentLeaf,
+  parseAtomicPublishIntent,
+  parseCleanupIdentityManifest,
+  publicationTargetLocatorDigest,
+  validateCleanupIdentityManifestBinding,
+  validateAtomicPublishIntentTransition,
+  type AtomicPublishIntentV1,
+  type CleanupIdentityEntryV1,
+  type CleanupIdentityManifestV1,
+  type PublicationTargetV1,
+} from "./atomic-publication-manifest.js";
 import {
   MAX_RECONCILIATION_REFERENCES,
   canonicalJson,
@@ -130,6 +161,10 @@ export type ReconciliationFilesystemTestContext = {
       AtomicEffectRequestV1,
       { kind: "native_no_replace" }
     >["move"],
+  ) => void;
+  atomicPersistenceNative?: (
+    phase: "before" | "after",
+    move: "intent_publish" | "manifest_publish",
   ) => void;
   atomicOpenFlags?: (point: string, flags: number, mode?: number) => void;
   atomicOperationCompleted?: (point: string) => void;
@@ -8401,6 +8436,23 @@ type AtomicHeldRecord = Readonly<{
   owned: boolean;
 }>;
 
+type AtomicPinnedContentState = {
+  size: number;
+  contentSha256: string;
+  synced: boolean;
+};
+
+type AtomicPersistenceResolution = Readonly<{
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "persist_intent" | "persist_manifest" }
+  >;
+  rawCode: Extract<
+    AtomicEffectObservationV1,
+    { kind: "native_resolved" }
+  >["rawCode"];
+}>;
+
 type AtomicPartialCreateRecord = {
   operationId: string;
   parentId: FlightSemanticId;
@@ -8417,6 +8469,7 @@ type AtomicPartialCreateRecord = {
 type AtomicReservationKind =
   | "payload_entries"
   | "payload_bytes"
+  | "scratch_entries"
   | "stable_files"
   | "scratch_files"
   | "manifest_bytes"
@@ -8429,9 +8482,13 @@ type AtomicEffectFlightRecord = {
   root: RootCapabilityRecord;
   releaseRootOperation: () => void;
   registry: WeakMap<object, AtomicHeldRecord>;
+  recordTokens: WeakMap<AtomicHeldRecord, FlightSemanticId>;
   records: Set<AtomicHeldRecord>;
   removedRecords: WeakSet<AtomicHeldRecord>;
   enumerationCursors: WeakMap<object, number>;
+  populationCursors: WeakMap<object, number>;
+  canonicalizationCursors: WeakMap<object, number>;
+  profileEntries: WeakMap<object, AtomicHeldRecord[]>;
   partials: WeakMap<object, AtomicPartialCreateRecord>;
   livePartials: Set<AtomicPartialCreateRecord>;
   transientHandles: Set<{
@@ -8451,10 +8508,65 @@ type AtomicEffectFlightRecord = {
       >["filesystem"];
     }>
   >;
+  contentStates: WeakMap<object, AtomicPinnedContentState>;
+  persistenceResolution: AtomicPersistenceResolution | null;
   semanticCount: number;
   partialCount: number;
   effectCount: number;
+  activeStableIntents: number;
+  recoveryRecords: number;
   reservations: Record<AtomicReservationKind, { count: number; byteSize: number }>;
+  releaseCountCredits: Record<
+    "payload_entries" | "scratch_entries" | "stable_files" | "scratch_files",
+    number
+  >;
+  releaseByteCredits: Record<
+    "payload_bytes" | "manifest_bytes" | "other_metadata_bytes",
+    number
+  >;
+  claimedBytes: Record<
+    "payload_bytes" | "manifest_bytes" | "other_metadata_bytes",
+    number
+  >;
+  claimedScopedBytes: Record<
+    | "stable_manifest"
+    | "scratch_manifest"
+    | "stable_other"
+    | "scratch_other",
+    number
+  >;
+  claimedCounts: Record<
+    "payload_entries" | "scratch_entries" | "stable_files" | "scratch_files",
+    number
+  >;
+  recordReservations: WeakMap<
+    object,
+    "payload_entries" | "scratch_entries" | "stable_files" | "scratch_files"
+  >;
+  recordByteReservations: WeakMap<
+    object,
+    Readonly<{
+      reservation:
+        | "payload_bytes"
+        | "manifest_bytes"
+        | "other_metadata_bytes";
+      byteSize: number;
+      scope:
+        | "stable_manifest"
+        | "scratch_manifest"
+        | "stable_other"
+        | "scratch_other"
+        | null;
+    }>
+  >;
+  intents: WeakMap<object, AtomicPublishIntentV1>;
+  stableIntents: Map<
+    string,
+    Readonly<{
+      contentSha256: string;
+      intent: AtomicPublishIntentV1;
+    }>
+  >;
 };
 
 type PreReadyRecoveryAuthorityRecord = Readonly<{
@@ -8475,12 +8587,34 @@ const preReadyRecoveryAuthorityRecords = new WeakMap<
 const ATOMIC_RESERVATION_LIMITS: Readonly<
   Record<AtomicReservationKind, Readonly<{ count: number; byteSize: number }>>
 > = Object.freeze({
-  payload_entries: Object.freeze({ count: 25_000, byteSize: 0 }),
-  payload_bytes: Object.freeze({ count: 0, byteSize: 1_073_741_824 }),
-  stable_files: Object.freeze({ count: 3_072, byteSize: 0 }),
-  scratch_files: Object.freeze({ count: 1_024, byteSize: 0 }),
-  manifest_bytes: Object.freeze({ count: 0, byteSize: 134_217_728 }),
-  other_metadata_bytes: Object.freeze({ count: 0, byteSize: 16_777_216 }),
+  payload_entries: Object.freeze({
+    count: ATOMIC_MAX_PAYLOAD_ENTRIES,
+    byteSize: 0,
+  }),
+  payload_bytes: Object.freeze({
+    count: 0,
+    byteSize: ATOMIC_MAX_PAYLOAD_BYTES,
+  }),
+  scratch_entries: Object.freeze({
+    count: ATOMIC_MAX_SCRATCH_ENTRIES,
+    byteSize: 0,
+  }),
+  stable_files: Object.freeze({
+    count: ATOMIC_MAX_METADATA_FILES - ATOMIC_MAX_SCRATCH_METADATA_FILES,
+    byteSize: 0,
+  }),
+  scratch_files: Object.freeze({
+    count: ATOMIC_MAX_SCRATCH_METADATA_FILES,
+    byteSize: 0,
+  }),
+  manifest_bytes: Object.freeze({
+    count: 0,
+    byteSize: ATOMIC_MAX_MANIFEST_BYTES,
+  }),
+  other_metadata_bytes: Object.freeze({
+    count: 0,
+    byteSize: ATOMIC_MAX_OTHER_METADATA_BYTES,
+  }),
 });
 
 function atomicFailure(message: string): BrowserServiceError {
@@ -8763,7 +8897,11 @@ async function atomicVerifiedClose(
 }
 
 type AtomicReservationRequirement = Readonly<{
-  entry: "payload_entries" | "stable_files" | "scratch_files";
+  entry:
+    | "payload_entries"
+    | "scratch_entries"
+    | "stable_files"
+    | "scratch_files";
   bytes: "payload_bytes" | "manifest_bytes" | "other_metadata_bytes";
 }>;
 
@@ -8772,27 +8910,53 @@ function atomicReservationRequirement(
 ): AtomicReservationRequirement {
   switch (role) {
     case "payload_entry":
-    case "private_source":
     case "public_source":
     case "public_target":
-    case "wrapper":
       return { entry: "payload_entries", bytes: "payload_bytes" };
+    case "wrapper":
+    case "private_source":
+    case "private_deletion":
+      return { entry: "scratch_entries", bytes: "other_metadata_bytes" };
     case "manifest_stable":
-    case "bundles_parent":
       return { entry: "stable_files", bytes: "manifest_bytes" };
     case "intent_stable":
-    case "intents_parent":
-    case "state_root":
-    case "profiles_parent":
       return { entry: "stable_files", bytes: "other_metadata_bytes" };
     case "manifest_temp":
       return { entry: "scratch_files", bytes: "manifest_bytes" };
     case "intent_temp":
-    case "private_deletion":
+      return { entry: "scratch_files", bytes: "other_metadata_bytes" };
+    case "bundles_parent":
+      return { entry: "stable_files", bytes: "manifest_bytes" };
+    case "intents_parent":
+    case "state_root":
+    case "profiles_parent":
+      return { entry: "stable_files", bytes: "other_metadata_bytes" };
     case "staging_root":
     case "trusted_parent":
       return { entry: "scratch_files", bytes: "other_metadata_bytes" };
   }
+}
+
+function atomicRoleClaimsReservation(role: AtomicObjectRoleV1): boolean {
+  return (
+    role !== "trusted_parent" &&
+    role !== "state_root" &&
+    role !== "profiles_parent" &&
+    role !== "staging_root" &&
+    role !== "intents_parent" &&
+    role !== "bundles_parent" &&
+    role !== "public_source" &&
+    role !== "public_target"
+  );
+}
+
+function atomicRoleIsRecoveryRecord(role: AtomicObjectRoleV1): boolean {
+  return (
+    role === "intent_temp" ||
+    role === "intent_stable" ||
+    role === "manifest_temp" ||
+    role === "manifest_stable"
+  );
 }
 
 function atomicReservationAvailable(
@@ -8807,19 +8971,177 @@ function atomicReservationAvailable(
   );
 }
 
+function atomicByteReservation(
+  role: AtomicObjectRoleV1,
+): "payload_bytes" | "manifest_bytes" | "other_metadata_bytes" | null {
+  const reservation = atomicReservationRequirement(role).bytes;
+  return reservation === "payload_bytes" ||
+    reservation === "manifest_bytes" ||
+    reservation === "other_metadata_bytes"
+    ? reservation
+    : null;
+}
+
+type AtomicMetadataByteScope =
+  | "stable_manifest"
+  | "scratch_manifest"
+  | "stable_other"
+  | "scratch_other";
+
+function atomicMetadataByteScope(
+  role: AtomicObjectRoleV1,
+): AtomicMetadataByteScope | null {
+  switch (role) {
+    case "manifest_stable":
+      return "stable_manifest";
+    case "manifest_temp":
+      return "scratch_manifest";
+    case "intent_stable":
+      return "stable_other";
+    case "intent_temp":
+      return "scratch_other";
+    default:
+      return null;
+  }
+}
+
+function atomicMetadataByteScopeLimit(
+  scope: AtomicMetadataByteScope,
+): number {
+  switch (scope) {
+    case "stable_manifest":
+      return ATOMIC_MAX_STABLE_MANIFEST_BYTES;
+    case "scratch_manifest":
+      return ATOMIC_MAX_SCRATCH_MANIFEST_BYTES;
+    case "stable_other":
+      return ATOMIC_MAX_STABLE_OTHER_METADATA_BYTES;
+    case "scratch_other":
+      return ATOMIC_MAX_SCRATCH_OTHER_METADATA_BYTES;
+  }
+}
+
+function atomicRecordBytesClaimAvailable(
+  flight: AtomicEffectFlightRecord,
+  objectId: FlightSemanticId,
+  role: AtomicObjectRoleV1,
+  byteSize: number,
+): boolean {
+  const reservation = atomicByteReservation(role);
+  if (reservation === null) return true;
+  const scope = atomicMetadataByteScope(role);
+  const previous =
+    flight.recordByteReservations.get(objectId as object)?.byteSize ?? 0;
+  return (
+    flight.claimedBytes[reservation] - previous + byteSize <=
+      flight.reservations[reservation].byteSize &&
+    (scope === null ||
+      flight.claimedScopedBytes[scope] - previous + byteSize <=
+        atomicMetadataByteScopeLimit(scope))
+  );
+}
+
+function claimAtomicRecordBytes(
+  flight: AtomicEffectFlightRecord,
+  objectId: FlightSemanticId,
+  role: AtomicObjectRoleV1,
+  byteSize: number,
+): void {
+  const reservation = atomicByteReservation(role);
+  if (reservation === null) return;
+  const scope = atomicMetadataByteScope(role);
+  const previous =
+    flight.recordByteReservations.get(objectId as object)?.byteSize ?? 0;
+  if (
+    flight.claimedBytes[reservation] - previous + byteSize >
+      flight.reservations[reservation].byteSize ||
+    (scope !== null &&
+      flight.claimedScopedBytes[scope] - previous + byteSize >
+        atomicMetadataByteScopeLimit(scope))
+  ) {
+    throw atomicFailure("atomic publication byte reservation is exhausted");
+  }
+  const increase = Math.max(0, byteSize - previous);
+  flight.releaseByteCredits[reservation] = Math.max(
+    0,
+    flight.releaseByteCredits[reservation] - increase,
+  );
+  flight.claimedBytes[reservation] =
+    flight.claimedBytes[reservation] - previous + byteSize;
+  if (scope !== null) {
+    flight.claimedScopedBytes[scope] =
+      flight.claimedScopedBytes[scope] - previous + byteSize;
+  }
+  flight.recordByteReservations.set(
+    objectId as object,
+    Object.freeze({ reservation, byteSize, scope }),
+  );
+}
+
+function creditAtomicTransientBytes(
+  flight: AtomicEffectFlightRecord,
+  reservation: "payload_bytes" | "manifest_bytes" | "other_metadata_bytes",
+  byteSize: number,
+): void {
+  flight.releaseByteCredits[reservation] = Math.min(
+    flight.releaseByteCredits[reservation] + byteSize,
+    Math.max(
+      0,
+      flight.reservations[reservation].byteSize -
+        flight.claimedBytes[reservation],
+    ),
+  );
+}
+
 function mintAtomicSemanticId(
   flight: AtomicEffectFlightRecord,
   record: AtomicHeldRecord,
+  claimReservation = false,
 ): FlightSemanticId {
   if (
     flight.semanticCount + flight.partialCount >= ATOMIC_SEMANTIC_ID_LIMIT
   ) {
     throw atomicFailure("atomic publication semantic ID limit exceeded");
   }
+  const reservation = atomicReservationRequirement(record.role).entry;
+  if (
+    claimReservation &&
+    flight.claimedCounts[reservation] + 1 >
+      flight.reservations[reservation].count
+  ) {
+    throw atomicFailure("atomic publication reservation is exhausted");
+  }
+  if (
+    claimReservation &&
+    record.role === "intent_stable" &&
+    flight.activeStableIntents >= ATOMIC_MAX_ACTIVE_STABLE_INTENTS
+  ) {
+    throw atomicFailure("atomic stable intent limit exceeded");
+  }
+  if (
+    claimReservation &&
+    atomicRoleIsRecoveryRecord(record.role) &&
+    flight.recoveryRecords >= ATOMIC_MAX_RECOVERY_RECORDS
+  ) {
+    throw atomicFailure("atomic recovery record limit exceeded");
+  }
   const token = Object.freeze({}) as FlightSemanticId;
   flight.registry.set(token as object, record);
+  flight.recordTokens.set(record, token);
   flight.records.add(record);
   flight.semanticCount += 1;
+  if (claimReservation) {
+    if (flight.releaseCountCredits[reservation] > 0) {
+      flight.releaseCountCredits[reservation] -= 1;
+    }
+    flight.claimedCounts[reservation] += 1;
+    if (record.role === "intent_stable") {
+      flight.activeStableIntents += 1;
+    }
+    if (atomicRoleIsRecoveryRecord(record.role)) {
+      flight.recoveryRecords += 1;
+    }
+    flight.recordReservations.set(token as object, reservation);
+  }
   return token;
 }
 
@@ -8838,6 +9160,22 @@ function mintAtomicPartialId(
   flight.livePartials.add(record);
   flight.partialCount += 1;
   return token;
+}
+
+function atomicPrivateSourceRootId(
+  flight: AtomicEffectFlightRecord,
+  record: AtomicHeldRecord,
+): FlightSemanticId | null {
+  let current = record;
+  const seen = new Set<AtomicHeldRecord>();
+  while (current.role !== "private_source") {
+    if (seen.has(current) || current.parentId === null) return null;
+    seen.add(current);
+    const parent = flight.registry.get(current.parentId as object);
+    if (parent === undefined) return null;
+    current = parent;
+  }
+  return flight.recordTokens.get(current) ?? null;
 }
 
 function atomicObservationDigest(
@@ -9146,26 +9484,67 @@ export async function acquireAtomicPreReadyRecoveryAuthority(
       root: rootRecord,
       releaseRootOperation,
       registry: new WeakMap(),
+      recordTokens: new WeakMap(),
       records: new Set(),
       removedRecords: new WeakSet(),
       enumerationCursors: new WeakMap(),
+      populationCursors: new WeakMap(),
+      canonicalizationCursors: new WeakMap(),
+      profileEntries: new WeakMap(),
       partials: new WeakMap(),
       livePartials: new Set(),
       transientHandles: new Set(),
       seenEffects: new WeakSet(),
       revalidatedHandles: new WeakSet(),
       statfsHandles: new WeakMap(),
+      contentStates: new WeakMap(),
+      persistenceResolution: null,
       semanticCount: 0,
       partialCount: 0,
       effectCount: 0,
+      activeStableIntents: 0,
+      recoveryRecords: 0,
       reservations: {
         payload_entries: { count: 0, byteSize: 0 },
         payload_bytes: { count: 0, byteSize: 0 },
+        scratch_entries: { count: 0, byteSize: 0 },
         stable_files: { count: 0, byteSize: 0 },
         scratch_files: { count: 0, byteSize: 0 },
         manifest_bytes: { count: 0, byteSize: 0 },
         other_metadata_bytes: { count: 0, byteSize: 0 },
       },
+      releaseCountCredits: {
+        payload_entries: 0,
+        scratch_entries: 0,
+        stable_files: 0,
+        scratch_files: 0,
+      },
+      releaseByteCredits: {
+        payload_bytes: 0,
+        manifest_bytes: 0,
+        other_metadata_bytes: 0,
+      },
+      claimedBytes: {
+        payload_bytes: 0,
+        manifest_bytes: 0,
+        other_metadata_bytes: 0,
+      },
+      claimedScopedBytes: {
+        stable_manifest: 0,
+        scratch_manifest: 0,
+        stable_other: 0,
+        scratch_other: 0,
+      },
+      claimedCounts: {
+        payload_entries: 0,
+        scratch_entries: 0,
+        stable_files: 0,
+        scratch_files: 0,
+      },
+      recordReservations: new WeakMap(),
+      recordByteReservations: new WeakMap(),
+      intents: new WeakMap(),
+      stableIntents: new Map(),
     };
     atomicEffectFlightRecords.set(controller as object, flight);
     const binding = rootRecord.binding;
@@ -9358,10 +9737,20 @@ async function applyAtomicReservation(
   const current = flight.reservations[request.reservation];
   const limit = ATOMIC_RESERVATION_LIMITS[request.reservation];
   if (request.kind === "reserve_budget") {
+    const nextTotalEntries =
+      flight.reservations.payload_entries.count +
+      flight.reservations.scratch_entries.count +
+      flight.reservations.stable_files.count +
+      flight.reservations.scratch_files.count +
+      request.count;
     if (
       (limit.count > 0 && current.count + request.count > limit.count) ||
       (limit.byteSize > 0 &&
-        current.byteSize + request.byteSize > limit.byteSize)
+        current.byteSize + request.byteSize > limit.byteSize) ||
+      nextTotalEntries >
+        ATOMIC_MAX_PAYLOAD_ENTRIES +
+          ATOMIC_MAX_SCRATCH_ENTRIES +
+          ATOMIC_MAX_METADATA_FILES
     ) {
       return atomicRejected(flight, request, "budget_exceeded");
     }
@@ -9370,12 +9759,44 @@ async function applyAtomicReservation(
   } else {
     if (
       request.count > current.count ||
-      request.byteSize > current.byteSize
+      request.byteSize > current.byteSize ||
+      (request.byteSize > 0 &&
+        (request.reservation === "payload_bytes" ||
+          request.reservation === "manifest_bytes" ||
+          request.reservation === "other_metadata_bytes") &&
+        request.byteSize >
+          flight.releaseByteCredits[request.reservation]) ||
+      (request.count > 0 &&
+        (request.reservation === "payload_bytes" ||
+          request.reservation === "manifest_bytes" ||
+          request.reservation === "other_metadata_bytes" ||
+          request.count >
+            flight.releaseCountCredits[request.reservation]))
     ) {
       return atomicRejected(flight, request, "binding_invalid");
     }
     current.count -= request.count;
     current.byteSize -= request.byteSize;
+    if (
+      request.byteSize > 0 &&
+      (request.reservation === "payload_bytes" ||
+        request.reservation === "manifest_bytes" ||
+        request.reservation === "other_metadata_bytes")
+    ) {
+      flight.releaseByteCredits[request.reservation] -= request.byteSize;
+      flight.releaseByteCredits[request.reservation] = Math.min(
+        flight.releaseByteCredits[request.reservation],
+        current.byteSize - flight.claimedBytes[request.reservation],
+      );
+    }
+    if (
+      request.count > 0 &&
+      request.reservation !== "payload_bytes" &&
+      request.reservation !== "manifest_bytes" &&
+      request.reservation !== "other_metadata_bytes"
+    ) {
+      flight.releaseCountCredits[request.reservation] -= request.count;
+    }
   }
   return Object.freeze({
     kind: "effect_completed",
@@ -9531,7 +9952,23 @@ async function applyAtomicCreate(
       stat,
       owned: true,
     });
-    const handleId = mintAtomicSemanticId(flight, held);
+    const handleId = mintAtomicSemanticId(flight, held, true);
+    if (!directory) {
+      flight.contentStates.set(handleId as object, {
+        size: 0,
+        contentSha256: sha256(Buffer.alloc(0)),
+        synced: false,
+      });
+    }
+    if (request.role === "private_source") {
+      flight.profileEntries.set(handleId as object, []);
+    } else if (request.role === "payload_entry") {
+      const rootId = atomicPrivateSourceRootId(flight, held);
+      if (rootId !== null) {
+        const entries = flight.profileEntries.get(rootId as object);
+        entries?.push(held);
+      }
+    }
     return Object.freeze({
       kind: "create_and_pin_completed",
       effectId: request.effectId,
@@ -9921,7 +10358,10 @@ async function applyAtomicOpen(
     return atomicRejected(flight, request, "budget_exceeded");
   }
   const openRequirement = atomicReservationRequirement(request.role);
-  if (!atomicReservationAvailable(flight, openRequirement, 1, 0)) {
+  if (
+    atomicRoleClaimsReservation(request.role) &&
+    !atomicReservationAvailable(flight, openRequirement, 1, 0)
+  ) {
     return atomicRejected(flight, request, "budget_exceeded");
   }
   if (
@@ -9932,6 +10372,24 @@ async function applyAtomicOpen(
       0,
       request.expected.size,
     )
+  ) {
+    return atomicRejected(flight, request, "budget_exceeded");
+  }
+  const openByteReservation = atomicByteReservation(request.role);
+  const openByteScope = atomicMetadataByteScope(request.role);
+  if (
+    !directory &&
+    openByteReservation !== null &&
+    flight.claimedBytes[openByteReservation] + request.expected.size >
+      flight.reservations[openByteReservation].byteSize
+  ) {
+    return atomicRejected(flight, request, "budget_exceeded");
+  }
+  if (
+    !directory &&
+    openByteScope !== null &&
+    flight.claimedScopedBytes[openByteScope] + request.expected.size >
+      atomicMetadataByteScopeLimit(openByteScope)
   ) {
     return atomicRejected(flight, request, "budget_exceeded");
   }
@@ -10003,7 +10461,33 @@ async function applyAtomicOpen(
       stat,
       owned: true,
     });
-    const handleId = mintAtomicSemanticId(flight, held);
+    const handleId = mintAtomicSemanticId(
+      flight,
+      held,
+      atomicRoleClaimsReservation(held.role),
+    );
+    if (!directory && contentSha256 !== null) {
+      flight.contentStates.set(handleId as object, {
+        size: Number(stat.size),
+        contentSha256,
+        synced: true,
+      });
+      claimAtomicRecordBytes(
+        flight,
+        handleId,
+        request.role,
+        Number(stat.size),
+      );
+      if (request.role === "intent_stable") {
+        const stable = flight.stableIntents.get(request.leaf);
+        if (
+          stable !== undefined &&
+          stable.contentSha256 === contentSha256
+        ) {
+          flight.intents.set(handleId as object, stable.intent);
+        }
+      }
+    }
     return Object.freeze({
       kind: "existing_handle_pinned",
       effectId: request.effectId,
@@ -10072,6 +10556,12 @@ async function applyAtomicRevalidateOrSync(
       await atomicAwait(flight, [record], "atomic-fsync", () =>
         record.handle.sync(),
       );
+      if (request.kind === "fsync_file") {
+        const content = flight.contentStates.get(
+          request.objectId as object,
+        );
+        if (content !== undefined) content.synced = true;
+      }
     }
     return Object.freeze({
       kind: "effect_completed",
@@ -10143,10 +10633,16 @@ async function applyAtomicClose(
   let record: AtomicHeldRecord;
   try {
     record = resolveAtomicRecord(flight, request.objectId);
+    const content = flight.contentStates.get(request.objectId as object);
+    const currentEvidence =
+      record.stat.isFile()
+        ? atomicPinnedContentEvidence(flight, request.objectId, record) ??
+          record.evidence
+        : record.evidence;
     if (
       !record.owned ||
       record.role !== request.role ||
-      !sameAtomicEvidence(record.evidence, request.expected)
+      !sameAtomicEvidence(currentEvidence, request.expected)
     ) {
       return atomicRejected(flight, request, "binding_invalid");
     }
@@ -10161,7 +10657,36 @@ async function applyAtomicClose(
       () => record.handle.close(),
       () => {
         flight.registry.delete(request.objectId as object);
+        flight.recordTokens.delete(record);
         flight.records.delete(record);
+        flight.contentStates.delete(request.objectId as object);
+        const entry = flight.recordReservations.get(
+          request.objectId as object,
+        );
+        if (entry !== undefined) {
+          flight.recordReservations.delete(request.objectId as object);
+          flight.claimedCounts[entry] -= 1;
+          flight.releaseCountCredits[entry] += 1;
+          if (record.role === "intent_stable") {
+            flight.activeStableIntents -= 1;
+          }
+          if (atomicRoleIsRecoveryRecord(record.role)) {
+            flight.recoveryRecords -= 1;
+          }
+        }
+        const byteClaim = flight.recordByteReservations.get(
+          request.objectId as object,
+        );
+        if (byteClaim !== undefined) {
+          flight.recordByteReservations.delete(request.objectId as object);
+          flight.claimedBytes[byteClaim.reservation] -= byteClaim.byteSize;
+          if (byteClaim.scope !== null) {
+            flight.claimedScopedBytes[byteClaim.scope] -=
+              byteClaim.byteSize;
+          }
+          flight.releaseByteCredits[byteClaim.reservation] +=
+            byteClaim.byteSize;
+        }
       },
     );
     return Object.freeze({
@@ -10217,6 +10742,11 @@ async function applyAtomicRead(
       record.handle.read(bytes, 0, bytes.length, request.cursor),
     );
     const chunk = bytes.subarray(0, read.bytesRead);
+    creditAtomicTransientBytes(
+      flight,
+      atomicReservationRequirement(record.role).bytes,
+      request.byteLength,
+    );
     return Object.freeze({
       kind: "file_chunk_observed",
       effectId: request.effectId,
@@ -10269,6 +10799,11 @@ async function applyAtomicHashChunk(
       record.handle.read(bytes, 0, bytes.length, request.offset),
     );
     const chunk = bytes.subarray(0, read.bytesRead);
+    creditAtomicTransientBytes(
+      flight,
+      atomicReservationRequirement(record.role).bytes,
+      request.byteLength,
+    );
     return Object.freeze({
       kind: "content_observed",
       effectId: request.effectId,
@@ -10277,6 +10812,147 @@ async function applyAtomicHashChunk(
       byteSize: chunk.byteLength,
       contentDigest: sha256(chunk),
       evidenceDigest: atomicObservationDigest(flight, request, "hash"),
+    });
+  } catch (error) {
+    return rejectAtomicFilesystemError(flight, request, error);
+  }
+}
+
+async function applyAtomicPopulatePayloadEntry(
+  flight: AtomicEffectFlightRecord,
+  request: AtomicEffectRequestV1 & { kind: "populate_payload_entry" },
+): Promise<AtomicEffectObservationV1> {
+  let root: AtomicHeldRecord;
+  try {
+    root = resolveAtomicRecord(flight, request.rootId);
+    const expectedCursor =
+      flight.populationCursors.get(request.rootId as object) ?? 0;
+    if (
+      (root.role !== "private_source" &&
+        root.role !== "payload_entry") ||
+      !root.stat.isDirectory() ||
+      request.cursor !== expectedCursor
+    ) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    const current = await atomicAwait(
+      flight,
+      [root],
+      "atomic-populate-entry-step",
+      () => root.handle.stat({ bigint: true }),
+    );
+    assertAtomicStat(
+      root.stat,
+      current,
+      "atomic publication population root changed",
+    );
+    flight.populationCursors.set(
+      request.rootId as object,
+      request.cursor + 1,
+    );
+    return Object.freeze({
+      kind: "effect_completed",
+      effectId: request.effectId,
+      requestKind: request.kind,
+      evidenceDigest: atomicObservationDigest(
+        flight,
+        request,
+        request.evidenceDigest,
+      ),
+      count: 1,
+      byteSize: 0,
+    });
+  } catch (error) {
+    return rejectAtomicFilesystemError(flight, request, error);
+  }
+}
+
+async function applyAtomicCanonicalizeTreeStep(
+  flight: AtomicEffectFlightRecord,
+  request: AtomicEffectRequestV1 & { kind: "canonicalize_tree_step" },
+): Promise<AtomicEffectObservationV1> {
+  let root: AtomicHeldRecord;
+  try {
+    root = resolveAtomicRecord(flight, request.rootId);
+    const entries = flight.profileEntries.get(request.rootId as object);
+    const expectedCursor =
+      flight.canonicalizationCursors.get(request.rootId as object) ?? 0;
+    if (
+      root.role !== "private_source" ||
+      !root.stat.isDirectory() ||
+      entries === undefined ||
+      request.cursor !== expectedCursor
+    ) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    const selected =
+      request.cursor === 0 ? root : entries[request.cursor - 1];
+    if (selected === undefined) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    const current = await atomicAwait(
+      flight,
+      selected === root ? [root] : [root, selected],
+      "atomic-canonicalize-tree-step",
+      () => selected.handle.stat({ bigint: true }),
+    );
+    assertAtomicStat(
+      selected.stat,
+      current,
+      "atomic publication canonical entry changed",
+    );
+    const segments: string[] = [];
+    let cursorRecord = selected;
+    while (cursorRecord !== root) {
+      if (cursorRecord.leaf === null || cursorRecord.parentId === null) {
+        return atomicRejected(flight, request, "binding_invalid");
+      }
+      segments.push(cursorRecord.leaf);
+      const parent = flight.registry.get(cursorRecord.parentId as object);
+      if (parent === undefined) {
+        return atomicRejected(flight, request, "binding_invalid");
+      }
+      cursorRecord = parent;
+    }
+    const content = flight.contentStates.get(
+      (flight.recordTokens.get(selected) ?? request.rootId) as object,
+    );
+    const canonicalEntry = {
+      path: segments.reverse().join("/"),
+      type: selected.stat.isDirectory()
+        ? ("directory" as const)
+        : ("file" as const),
+      mode: lowModeBigint(current.mode),
+      size: selected.stat.isDirectory()
+        ? 0
+        : (content?.size ?? Number(current.size)),
+      sha256: selected.stat.isDirectory()
+        ? null
+        : (content?.contentSha256 ?? null),
+    };
+    const canonicalDigest = sha256(JSON.stringify(canonicalEntry));
+    if (
+      canonicalDigest !== request.evidenceDigest ||
+      (canonicalEntry.type === "file" && canonicalEntry.sha256 === null)
+    ) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    flight.canonicalizationCursors.set(
+      request.rootId as object,
+      request.cursor + 1,
+    );
+    return Object.freeze({
+      kind: "content_observed",
+      effectId: request.effectId,
+      requestKind: request.kind,
+      cursor: request.cursor,
+      byteSize: 1,
+      contentDigest: canonicalDigest,
+      evidenceDigest: atomicObservationDigest(
+        flight,
+        request,
+        request.evidenceDigest,
+      ),
     });
   } catch (error) {
     return rejectAtomicFilesystemError(flight, request, error);
@@ -10369,6 +11045,12 @@ async function applyAtomicWrite(
         atomicReservationRequirement(destination.role),
         0,
         expectedResultSize,
+      ) ||
+      !atomicRecordBytesClaimAvailable(
+        flight,
+        request.destinationFileId,
+        destination.role,
+        expectedResultSize,
       )
     ) {
       return atomicRejected(flight, request, "budget_exceeded");
@@ -10431,6 +11113,17 @@ async function applyAtomicWrite(
       flight.root.acceptingOperations = false;
       return atomicRejected(flight, request, "binding_invalid");
     }
+    flight.contentStates.set(request.destinationFileId as object, {
+      size: expectedResultSize,
+      contentSha256: result.contentSha256,
+      synced: false,
+    });
+    claimAtomicRecordBytes(
+      flight,
+      request.destinationFileId,
+      destination.role,
+      expectedResultSize,
+    );
     return Object.freeze({
       kind: "effect_completed",
       effectId: request.effectId,
@@ -10488,7 +11181,14 @@ async function applyAtomicEnumerate(
     if (request.cursor !== expectedCursor) {
       return atomicRejected(flight, request, "binding_invalid");
     }
-    const requirement = atomicReservationRequirement(directory.role);
+    const requirement =
+      directory.role === "private_source" ||
+      directory.role === "payload_entry"
+        ? ({
+            entry: "payload_entries",
+            bytes: "payload_bytes",
+          } as const)
+        : atomicReservationRequirement(directory.role);
     const discoveryCapacity =
       flight.reservations[requirement.entry].count;
     if (
@@ -10704,6 +11404,7 @@ async function applyAtomicEnumerate(
           stat: opened.stat,
           owned: true,
         }),
+        true,
       );
       flight.transientHandles.delete(opened.retained);
       entries.push({
@@ -10723,6 +11424,11 @@ async function applyAtomicEnumerate(
         request.cursor + entries.length,
       );
     }
+    creditAtomicTransientBytes(
+      flight,
+      requirement.bytes,
+      request.byteLength,
+    );
     return Object.freeze({
       kind: "directory_observed",
       effectId: request.effectId,
@@ -10986,6 +11692,355 @@ function atomicNativeCode(error: unknown): Extract<
     }
   }
   return "atomic_publish_io";
+}
+
+function atomicPinnedContentEvidence(
+  flight: AtomicEffectFlightRecord,
+  objectId: FlightSemanticId,
+  record: AtomicHeldRecord,
+): AtomicObjectEvidenceV1 | null {
+  const content = flight.contentStates.get(objectId as object);
+  if (content === undefined || !content.synced) return null;
+  const value = {
+    dev: String(record.stat.dev),
+    ino: String(record.stat.ino),
+    mode: lowModeBigint(record.stat.mode),
+    size: content.size,
+    contentSha256: content.contentSha256,
+  };
+  return Object.freeze({
+    ...value,
+    evidenceDigest: sha256(JSON.stringify(value)),
+  });
+}
+
+function atomicPersistenceRequestValid(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "persist_intent" | "persist_manifest" | "replace_intent" }
+  >,
+  tempParent: AtomicHeldRecord,
+  temp: AtomicHeldRecord,
+  stableParent: AtomicHeldRecord,
+): boolean {
+  const expectedTempRole =
+    request.kind === "persist_manifest" ? "manifest_temp" : "intent_temp";
+  const tempRequirement = atomicReservationRequirement(expectedTempRole);
+  const stableRequirement = atomicReservationRequirement(
+    request.kind === "persist_manifest"
+      ? "manifest_stable"
+      : "intent_stable",
+  );
+  if (
+    tempParent.role !== "intents_parent" ||
+    stableParent.role !== "intents_parent" ||
+    temp.role !== expectedTempRole ||
+    flight.removedRecords.has(temp) ||
+    temp.parentId !== request.tempParentId ||
+    temp.leaf !== request.tempLeaf ||
+    request.canonicalBytes.byteLength !== request.expectedTemp.size ||
+    request.contentDigest !== sha256(request.canonicalBytes) ||
+    request.expectedTemp.contentSha256 !== request.contentDigest ||
+    !atomicReservationAvailable(flight, tempRequirement, 1, 0) ||
+    !atomicReservationAvailable(flight, stableRequirement, 1, 0) ||
+    tempRequirement.bytes !== stableRequirement.bytes ||
+    flight.reservations[tempRequirement.bytes].byteSize <
+      (request.kind === "replace_intent"
+        ? flight.claimedBytes[tempRequirement.bytes]
+        : request.canonicalBytes.byteLength * 2)
+  ) {
+    return false;
+  }
+  const current = atomicPinnedContentEvidence(
+    flight,
+    request.tempObjectId,
+    temp,
+  );
+  if (
+    current === null ||
+    !sameAtomicEvidence(current, request.expectedTemp)
+  ) {
+    return false;
+  }
+  try {
+    const tempLeaf = parseAtomicPublicationIntentLeaf(request.tempLeaf);
+    const stableLeaf = parseAtomicPublicationIntentLeaf(request.stableLeaf);
+    if (request.kind === "persist_manifest") {
+      const manifest = parseCleanupIdentityManifest(request.canonicalBytes);
+      const intentLeaf = `${request.operationId}.json`;
+      const durableIntent = flight.stableIntents.get(intentLeaf);
+      const heldDurableIntent = [...flight.records].some(
+        record =>
+          !flight.removedRecords.has(record) &&
+          record.role === "intent_stable" &&
+          record.leaf === intentLeaf &&
+          record.evidence.contentSha256 === durableIntent?.contentSha256,
+      );
+      if (durableIntent === undefined) return false;
+      validateCleanupIdentityManifestBinding(
+        durableIntent.intent,
+        manifest,
+      );
+      return (
+        tempLeaf.kind === "identity_temp" &&
+        stableLeaf.kind === "identity_stable" &&
+        tempLeaf.operationId === request.operationId &&
+        stableLeaf.operationId === request.operationId &&
+        manifest.operationId === request.operationId &&
+        request.expectedPhase === "manifest_planned" &&
+        durableIntent.intent.phase === "manifest_planned" &&
+        heldDurableIntent
+      );
+    }
+    const intent = parseAtomicPublishIntent(request.canonicalBytes);
+    return (
+      tempLeaf.kind === "intent_temp" &&
+      stableLeaf.kind === "intent_stable" &&
+      tempLeaf.operationId === request.operationId &&
+      stableLeaf.operationId === request.operationId &&
+      tempLeaf.phase === intent.phase &&
+      intent.operationId === request.operationId &&
+      (request.kind === "replace_intent" ||
+        (request.expectedPhase === null && intent.phase === "allocated"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function withAtomicNativeOperands(
+  sourceParent: AtomicHeldRecord,
+  sourceLeaf: string,
+  targetParent: AtomicHeldRecord,
+  targetLeaf: string,
+  callback: (
+    sourceDirectoryFd: number,
+    sourceLeaf: string,
+    targetDirectoryFd: number,
+    targetLeaf: string,
+  ) => void,
+): void {
+  callback(
+    sourceParent.handle.fd,
+    sourceLeaf,
+    targetParent.handle.fd,
+    targetLeaf,
+  );
+}
+
+async function applyAtomicPersistence(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<
+    AtomicEffectRequestV1,
+    { kind: "persist_intent" | "persist_manifest" }
+  >,
+): Promise<AtomicEffectObservationV1> {
+  let tempParent: AtomicHeldRecord;
+  let temp: AtomicHeldRecord;
+  let stableParent: AtomicHeldRecord;
+  try {
+    if (flight.persistenceResolution !== null) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    tempParent = resolveAtomicRecord(flight, request.tempParentId);
+    temp = resolveAtomicRecord(flight, request.tempObjectId);
+    stableParent = resolveAtomicRecord(flight, request.stableParentId);
+    if (
+      !("absent" in request.expectedStable) ||
+      !atomicPersistenceRequestValid(
+        flight,
+        request,
+        tempParent,
+        temp,
+        stableParent,
+      )
+    ) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    assertAtomicMountPair(tempParent, stableParent);
+  } catch {
+    return atomicRejected(flight, request, "binding_invalid");
+  }
+  let rawCode: Extract<
+    AtomicEffectObservationV1,
+    { kind: "native_resolved" }
+  >["rawCode"] = "success";
+  const nativePrecheckEvidenceDigest = sha256(
+    JSON.stringify({
+      requestKind: request.kind,
+      operationId: request.operationId,
+      sourceParent: tempParent.evidence.evidenceDigest,
+      source: request.expectedTemp.evidenceDigest,
+      targetParent: stableParent.evidence.evidenceDigest,
+      contentDigest: request.contentDigest,
+    }),
+  );
+  let renamed = false;
+  try {
+    atomicGate(
+      flight,
+      [tempParent, stableParent],
+      "before",
+      "atomic-persist-no-replace",
+    );
+    withAtomicNativeOperands(
+      tempParent,
+      request.tempLeaf,
+      stableParent,
+      request.stableLeaf,
+      (sourceDirectoryFd, sourceLeaf, targetDirectoryFd, targetLeaf) => {
+        filesystemTestContext.getStore()?.atomicPersistenceNative?.(
+          "before",
+          request.kind === "persist_intent"
+            ? "intent_publish"
+            : "manifest_publish",
+        );
+        loadAtomicDirectoryPublicationNative().renameNoReplace(
+          sourceDirectoryFd,
+          sourceLeaf,
+          targetDirectoryFd,
+          targetLeaf,
+        );
+        filesystemTestContext.getStore()?.atomicPersistenceNative?.(
+          "after",
+          request.kind === "persist_intent"
+            ? "intent_publish"
+            : "manifest_publish",
+        );
+      },
+    );
+    renamed = true;
+    flight.removedRecords.add(temp);
+  } catch (error) {
+    if (renamed) flight.removedRecords.add(temp);
+    rawCode = atomicNativeCode(error);
+  } finally {
+    try {
+      atomicGate(
+        flight,
+        [tempParent, stableParent],
+        "after",
+        "atomic-persist-no-replace",
+      );
+    } catch {
+      rawCode = "atomic_publish_binding_invalid";
+    }
+  }
+  flight.persistenceResolution = Object.freeze({ request, rawCode });
+  const evidenceDigest = atomicObservationDigest(
+    flight,
+    request,
+    `${rawCode}:${nativePrecheckEvidenceDigest}`,
+  );
+  return request.kind === "persist_intent"
+    ? Object.freeze({
+        kind: "native_resolved",
+        effectId: request.effectId,
+        requestKind: "persist_intent",
+        operationId: request.operationId,
+        move: "intent_publish",
+        sourceObjectId: request.tempObjectId,
+        sourceEvidence: request.expectedTemp,
+        rawCode,
+        nativePrecheckEvidenceDigest,
+        evidenceDigest,
+      })
+    : Object.freeze({
+        kind: "native_resolved",
+        effectId: request.effectId,
+        requestKind: "persist_manifest",
+        operationId: request.operationId,
+        move: "manifest_publish",
+        sourceObjectId: request.tempObjectId,
+        sourceEvidence: request.expectedTemp,
+        rawCode,
+        nativePrecheckEvidenceDigest,
+        evidenceDigest,
+      });
+}
+
+async function applyAtomicReplaceIntent(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<AtomicEffectRequestV1, { kind: "replace_intent" }>,
+): Promise<AtomicEffectObservationV1> {
+  let tempParent: AtomicHeldRecord;
+  let temp: AtomicHeldRecord;
+  let stableParent: AtomicHeldRecord;
+  let stable: AtomicHeldRecord | undefined;
+  let stableId: FlightSemanticId | undefined;
+  try {
+    if (flight.persistenceResolution !== null) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    tempParent = resolveAtomicRecord(flight, request.tempParentId);
+    temp = resolveAtomicRecord(flight, request.tempObjectId);
+    stableParent = resolveAtomicRecord(flight, request.stableParentId);
+    stable = resolveAtomicRecord(flight, request.stableObjectId);
+    stableId = flight.recordTokens.get(stable);
+    if (
+      stable === undefined ||
+      stableId === undefined ||
+      flight.removedRecords.has(stable) ||
+      stable.role !== "intent_stable" ||
+      stable.parentId !== request.stableParentId ||
+      stable.leaf !== request.stableLeaf ||
+      !sameAtomicEvidence(stable.evidence, request.expectedStable) ||
+      flight.intents.get(stableId as object)?.phase !==
+        request.expectedPhase ||
+      !atomicPersistenceRequestValid(
+        flight,
+        request,
+        tempParent,
+        temp,
+        stableParent,
+      )
+    ) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    const previousIntent = flight.intents.get(stableId as object);
+    if (previousIntent === undefined) {
+      return atomicRejected(flight, request, "binding_invalid");
+    }
+    const nextIntent = validateAtomicPublishIntentTransition(
+      previousIntent,
+      parseAtomicPublishIntent(request.canonicalBytes),
+    );
+    await atomicAwait(
+      flight,
+      [tempParent, temp, stableParent, stable],
+      "atomic-replace-intent",
+      async () => {
+        await fs.rename(
+          procPath(tempParent.handle, request.tempLeaf),
+          procPath(stableParent.handle, request.stableLeaf),
+        );
+        flight.removedRecords.add(temp);
+        flight.removedRecords.add(stable!);
+      },
+    );
+    flight.stableIntents.set(
+      request.stableLeaf,
+      Object.freeze({
+        contentSha256: request.contentDigest,
+        intent: nextIntent,
+      }),
+    );
+    return Object.freeze({
+      kind: "effect_completed",
+      effectId: request.effectId,
+      requestKind: request.kind,
+      evidenceDigest: atomicObservationDigest(
+        flight,
+        request,
+        "replaced",
+      ),
+      count: 1,
+      byteSize: request.canonicalBytes.byteLength,
+    });
+  } catch (error) {
+    return rejectAtomicFilesystemError(flight, request, error);
+  }
 }
 
 function atomicNativeMoveValid(
@@ -11322,13 +12377,58 @@ async function observeAtomicChild(
         }),
       });
     }
+    const observedRole: AtomicObjectRoleV1 = sourceSide
+      ? "public_source"
+      : request.move === "profile_source_to_private" ||
+          request.move === "canary_source_to_private"
+        ? "private_deletion"
+        : "public_target";
+    const existing = [...flight.records].find(
+      record =>
+        !flight.removedRecords.has(record) &&
+        record.role === observedRole &&
+        record.parentId === parentId &&
+        record.leaf === leaf &&
+        sameAtomicEvidence(record.evidence, evidence),
+    );
+    if (existing !== undefined) {
+      const existingId = flight.recordTokens.get(existing);
+      if (existingId === undefined) {
+        throw atomicFailure("atomic publication held token is missing");
+      }
+      const retained = handle;
+      await atomicVerifiedClose(
+        flight,
+        [parent],
+        "atomic-observe-existing-close",
+        () => retained.close(),
+        () => {
+          handle = null;
+        },
+      );
+      const value = {
+        state: matches ? ("match" as const) : ("other" as const),
+        objectId: existingId,
+        dev: evidence.dev,
+        ino: evidence.ino,
+        mode: evidence.mode,
+        evidence,
+      };
+      return Object.freeze({
+        objectId: existingId,
+        location: Object.freeze({
+          ...value,
+          evidenceDigest: sha256(
+            JSON.stringify({
+              ...value,
+              objectId: matches ? "observed-match" : "observed-other",
+            }),
+          ),
+        }),
+      });
+    }
     const held: AtomicHeldRecord = Object.freeze({
-      role: sourceSide
-        ? "public_source"
-        : request.move === "profile_source_to_private" ||
-            request.move === "canary_source_to_private"
-          ? "private_deletion"
-          : "public_target",
+      role: observedRole,
       operationId: request.operationId,
       parentId,
       leaf,
@@ -11338,7 +12438,7 @@ async function observeAtomicChild(
       stat,
       owned: true,
     });
-    const objectId = mintAtomicSemanticId(flight, held);
+    const objectId = mintAtomicSemanticId(flight, held, true);
     handle = null;
     const value = {
       state: matches ? ("match" as const) : ("other" as const),
@@ -11436,6 +12536,317 @@ async function applyAtomicObserveLocations(
   }
 }
 
+async function observeAtomicPersistenceChild(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<
+    AtomicEffectRequestV1,
+    {
+      kind: "observe_locations";
+      requestKind: "persist_intent" | "persist_manifest";
+    }
+  >,
+  parent: AtomicHeldRecord,
+  parentId: FlightSemanticId,
+  leaf: string,
+  sourceSide: boolean,
+): Promise<AtomicObservedLocation> {
+  let before: BigIntStats;
+  try {
+    before = await atomicAwait(
+      flight,
+      [parent],
+      `atomic-persist-observe-${sourceSide ? "source" : "target"}-lstat`,
+      () => fs.lstat(procPath(parent.handle, leaf), { bigint: true }),
+    );
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      const value = {
+        state: "absent" as const,
+        objectId: null,
+        dev: null,
+        ino: null,
+        mode: null,
+        evidence: null,
+      };
+      return Object.freeze({
+        objectId: null,
+        location: Object.freeze({
+          ...value,
+          evidenceDigest: sha256(JSON.stringify(value)),
+        }),
+      });
+    }
+    throw error;
+  }
+  let handle: FileHandle | null = await atomicAwait(
+    flight,
+    [parent],
+    `atomic-persist-observe-${sourceSide ? "source" : "target"}-open`,
+    () =>
+      fs.open(
+        procPath(parent.handle, leaf),
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      ),
+  );
+  try {
+    const stat = await atomicAwait(
+      flight,
+      [parent],
+      `atomic-persist-observe-${sourceSide ? "source" : "target"}-fstat`,
+      () => handle!.stat({ bigint: true }),
+    );
+    assertAtomicStat(
+      before,
+      stat,
+      "atomic persistence observed location changed",
+    );
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1n ||
+      lowModeBigint(stat.mode) !== 0o600
+    ) {
+      throw atomicFailure("atomic persistence target is invalid");
+    }
+    const contentSha256 = await atomicHeldFileContentSha256(
+      flight,
+      [parent],
+      handle,
+      stat,
+      "atomic-persist-observe-hash",
+    );
+    const evidence = atomicEvidenceFromStat(stat, contentSha256);
+    const matches = sameAtomicEvidence(evidence, request.expectedTemp);
+    if (sourceSide && matches) {
+      const retained = handle;
+      await atomicVerifiedClose(
+        flight,
+        [parent],
+        "atomic-persist-observe-source-close",
+        () => retained.close(),
+        () => {
+          handle = null;
+        },
+      );
+      const value = {
+        state: "match" as const,
+        objectId: request.tempObjectId,
+        dev: evidence.dev,
+        ino: evidence.ino,
+        mode: evidence.mode,
+        evidence,
+      };
+      return Object.freeze({
+        objectId: request.tempObjectId,
+        location: Object.freeze({
+          ...value,
+          evidenceDigest: sha256(
+            JSON.stringify({
+              ...value,
+              objectId: "requested-source",
+            }),
+          ),
+        }),
+      });
+    }
+    const observedRole =
+      request.requestKind === "persist_intent"
+        ? ("intent_stable" as const)
+        : ("manifest_stable" as const);
+    const byteReservation = atomicByteReservation(observedRole);
+    const byteScope = atomicMetadataByteScope(observedRole);
+    if (
+      byteReservation !== null &&
+      flight.claimedBytes[byteReservation] + Number(stat.size) >
+        flight.reservations[byteReservation].byteSize
+    ) {
+      throw atomicFailure("atomic publication byte reservation is exhausted");
+    }
+    if (
+      byteScope !== null &&
+      flight.claimedScopedBytes[byteScope] + Number(stat.size) >
+        atomicMetadataByteScopeLimit(byteScope)
+    ) {
+      throw atomicFailure("atomic publication byte scope is exhausted");
+    }
+    const held: AtomicHeldRecord = Object.freeze({
+      role: observedRole,
+      operationId: request.operationId,
+      parentId,
+      leaf,
+      handle,
+      binding: parent.binding,
+      evidence,
+      stat,
+      owned: true,
+    });
+    const objectId = mintAtomicSemanticId(flight, held, true);
+    flight.contentStates.set(objectId as object, {
+      size: Number(stat.size),
+      contentSha256,
+      synced: true,
+    });
+    claimAtomicRecordBytes(
+      flight,
+      objectId,
+      observedRole,
+      Number(stat.size),
+    );
+    handle = null;
+    const value = {
+      state: matches ? ("match" as const) : ("other" as const),
+      objectId,
+      dev: evidence.dev,
+      ino: evidence.ino,
+      mode: evidence.mode,
+      evidence,
+    };
+    return Object.freeze({
+      objectId,
+      location: Object.freeze({
+        ...value,
+        evidenceDigest: sha256(
+          JSON.stringify({
+            ...value,
+            objectId: matches ? "observed-match" : "observed-other",
+          }),
+        ),
+      }),
+    });
+  } finally {
+    if (handle !== null) {
+      const retained = handle;
+      await atomicVerifiedClose(
+        flight,
+        [parent],
+        "atomic-persist-observe-failed-close",
+        () => retained.close(),
+        () => {
+          handle = null;
+        },
+      );
+    }
+  }
+}
+
+async function applyAtomicObservePersistence(
+  flight: AtomicEffectFlightRecord,
+  request: Extract<
+    AtomicEffectRequestV1,
+    {
+      kind: "observe_locations";
+      requestKind: "persist_intent" | "persist_manifest";
+    }
+  >,
+): Promise<AtomicEffectObservationV1> {
+  const pending = flight.persistenceResolution;
+  if (
+    pending === null ||
+    pending.request.kind !== request.requestKind ||
+    pending.request.operationId !== request.operationId ||
+    pending.request.tempParentId !== request.tempParentId ||
+    pending.request.tempLeaf !== request.tempLeaf ||
+    pending.request.tempObjectId !== request.tempObjectId ||
+    !sameAtomicEvidence(
+      pending.request.expectedTemp,
+      request.expectedTemp,
+    ) ||
+    pending.request.stableParentId !== request.stableParentId ||
+    pending.request.stableLeaf !== request.stableLeaf ||
+    !("absent" in pending.request.expectedStable) ||
+    !("absent" in request.expectedTargetBefore) ||
+    !sameAtomicEvidence(
+      request.expectedTargetAfter,
+      request.expectedTemp,
+    )
+  ) {
+    return atomicRejected(flight, request, "binding_invalid");
+  }
+  try {
+    const tempParent = resolveAtomicRecord(flight, request.tempParentId);
+    const stableParent = resolveAtomicRecord(flight, request.stableParentId);
+    assertAtomicMountPair(tempParent, stableParent);
+    const source = await observeAtomicPersistenceChild(
+      flight,
+      request,
+      tempParent,
+      request.tempParentId,
+      request.tempLeaf,
+      true,
+    );
+    const target = await observeAtomicPersistenceChild(
+      flight,
+      request,
+      stableParent,
+      request.stableParentId,
+      request.stableLeaf,
+      false,
+    );
+    if (
+      request.requestKind === "persist_intent" &&
+      target.objectId !== null &&
+      target.location.state === "match"
+    ) {
+      const intent = parseAtomicPublishIntent(
+        pending.request.canonicalBytes,
+      );
+      flight.intents.set(target.objectId as object, intent);
+      flight.stableIntents.set(
+        request.stableLeaf,
+        Object.freeze({
+          contentSha256: pending.request.contentDigest,
+          intent,
+        }),
+      );
+    }
+    flight.persistenceResolution = null;
+    const evidenceDigest = sha256(
+      JSON.stringify({
+        requestKind: request.requestKind,
+        move: request.move,
+        source: source.location.evidenceDigest,
+        target: target.location.evidenceDigest,
+      }),
+    );
+    return request.requestKind === "persist_intent"
+      ? Object.freeze({
+          kind: "locations_observed",
+          effectId: request.effectId,
+          requestKind: "persist_intent",
+          operationId: request.operationId,
+          move: "intent_publish",
+          tempParentId: request.tempParentId,
+          tempLeaf: request.tempLeaf,
+          stableParentId: request.stableParentId,
+          stableLeaf: request.stableLeaf,
+          requestedSourceObjectId: request.tempObjectId,
+          sourceObjectId: source.objectId,
+          targetObjectId: target.objectId,
+          source: source.location,
+          target: target.location,
+          evidenceDigest,
+        })
+      : Object.freeze({
+          kind: "locations_observed",
+          effectId: request.effectId,
+          requestKind: "persist_manifest",
+          operationId: request.operationId,
+          move: "manifest_publish",
+          tempParentId: request.tempParentId,
+          tempLeaf: request.tempLeaf,
+          stableParentId: request.stableParentId,
+          stableLeaf: request.stableLeaf,
+          requestedSourceObjectId: request.tempObjectId,
+          sourceObjectId: source.objectId,
+          targetObjectId: target.objectId,
+          source: source.location,
+          target: target.location,
+          evidenceDigest,
+        });
+  } catch (error) {
+    return rejectAtomicFilesystemError(flight, request, error);
+  }
+}
+
 export async function applyAtomicEffect(
   controller: AtomicEffectControllerV1,
   request: AtomicEffectRequestV1,
@@ -11499,7 +12910,12 @@ export async function applyAtomicEffect(
     case "hash_content_chunk":
       return applyAtomicHashChunk(flight, request);
     case "canonicalize_tree_step":
-      return atomicRejected(flight, request, "unsupported");
+      return applyAtomicCanonicalizeTreeStep(
+        flight,
+        request as AtomicEffectRequestV1 & {
+          kind: "canonicalize_tree_step";
+        },
+      );
     case "remove_intent":
     case "remove_manifest":
     case "remove_file":
@@ -11507,7 +12923,12 @@ export async function applyAtomicEffect(
     case "remove_root":
       return applyAtomicRemove(flight, request);
     case "populate_payload_entry":
-      return atomicRejected(flight, request, "unsupported");
+      return applyAtomicPopulatePayloadEntry(
+        flight,
+        request as AtomicEffectRequestV1 & {
+          kind: "populate_payload_entry";
+        },
+      );
     case "close_admission": {
       flight.root.acceptingOperations = false;
       const observation: AtomicEffectObservationV1 = Object.freeze({
@@ -11526,20 +12947,1977 @@ export async function applyAtomicEffect(
       return observation;
     }
     case "persist_intent":
-    case "replace_intent":
     case "persist_manifest":
-      return atomicRejected(flight, request, "unsupported");
+      return applyAtomicPersistence(flight, request);
+    case "replace_intent":
+      return applyAtomicReplaceIntent(flight, request);
     case "native_no_replace":
       return applyAtomicNativeNoReplace(flight, request);
     case "observe_locations":
       return request.requestKind === "native_no_replace"
         ? applyAtomicObserveLocations(flight, request)
-        : atomicRejected(flight, request, "unsupported");
+        : applyAtomicObservePersistence(flight, request);
     case "resolve_adoption":
     case "adopt_generation":
     case "release_publication":
       return atomicRejected(flight, request, "unsupported");
   }
+}
+
+type AtomicProtocolRunResult = Readonly<{
+  observations: readonly AtomicEffectObservationV1[];
+  classification: AtomicNativeClassificationV1 | null;
+}>;
+
+async function runAtomicReducerRequest(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  request: AtomicEffectRequestDraftV1,
+  semanticIds: readonly FlightSemanticId[],
+): Promise<AtomicProtocolRunResult> {
+  const uniqueSemanticIds = [...new Set(semanticIds)];
+  let step = reduceAtomicPublication(
+    createAtomicReducerState({
+      flightNonce,
+      request,
+      semanticIds: uniqueSemanticIds,
+      ...((request.kind === "canonicalize_tree_step"
+        ? { cursors: { content: request.cursor } }
+        : request.kind === "hash_content_chunk"
+          ? { cursors: { content: request.offset } }
+          : request.kind === "enumerate_directory"
+            ? { cursors: { directory: request.cursor } }
+            : request.kind === "read_file_chunk"
+              ? { cursors: { file: request.cursor } }
+              : {}) satisfies Partial<
+        Parameters<typeof createAtomicReducerState>[0]
+      >),
+    }),
+    null,
+  );
+  const observations: AtomicEffectObservationV1[] = [];
+  for (let count = 0; count < 8; count += 1) {
+    if (step.kind === "terminal") {
+      if (step.result.kind !== "protocol_complete") {
+        throw atomicFailure(
+          `atomic publication protocol failed: ${
+            step.result.kind === "fail_stop"
+              ? step.result.code
+              : step.result.kind
+          } after ${request.kind} (${observations
+            .map(observation =>
+              observation.kind === "native_resolved"
+                ? `${observation.kind}:${observation.rawCode}`
+                : observation.kind === "locations_observed"
+                  ? `${observation.kind}:${observation.source.state}/${observation.target.state}`
+                  : observation.kind,
+            )
+            .join(",")})`,
+        );
+      }
+      return Object.freeze({
+        observations: Object.freeze([...observations]),
+        classification: step.state.nativeClassification,
+      });
+    }
+    const observation = await applyAtomicEffect(
+      controller,
+      step.request,
+    );
+    observations.push(observation);
+    step = reduceAtomicPublication(step.state, observation);
+  }
+  throw atomicFailure("atomic publication protocol exceeded effect bound");
+}
+
+export type AtomicPinnedPersistenceProtocolInputV1 = Readonly<{
+  flightNonce: string;
+  request: Extract<
+    AtomicEffectRequestDraftV1,
+    { kind: "persist_intent" | "persist_manifest" }
+  >;
+  stableParentRole: "intents_parent";
+  stableParentEvidence: AtomicObjectEvidenceV1;
+}>;
+
+export type AtomicPinnedPersistenceProtocolResultV1 = Readonly<{
+  stableObjectId: FlightSemanticId;
+  stableEvidence: AtomicObjectEvidenceV1;
+}>;
+
+export async function runAtomicPinnedPersistenceProtocol(
+  controller: AtomicEffectControllerV1,
+  input: AtomicPinnedPersistenceProtocolInputV1,
+): Promise<AtomicPinnedPersistenceProtocolResultV1> {
+  const semanticIds = [
+    input.request.tempParentId,
+    input.request.tempObjectId,
+    input.request.stableParentId,
+  ];
+  const persisted = await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:persist`,
+    input.request,
+    semanticIds,
+  );
+  const locations = persisted.observations.find(
+    (
+      observation,
+    ): observation is Extract<
+      AtomicEffectObservationV1,
+      {
+        kind: "locations_observed";
+        requestKind: "persist_intent" | "persist_manifest";
+      }
+    > =>
+      observation.kind === "locations_observed" &&
+      observation.requestKind !== "native_no_replace",
+  );
+  if (
+    locations === undefined ||
+    locations.source.state !== "absent" ||
+    locations.sourceObjectId !== null ||
+    locations.target.state !== "match" ||
+    locations.targetObjectId === null ||
+    locations.target.evidence === null ||
+    !sameAtomicEvidence(
+      locations.target.evidence,
+      input.request.expectedTemp,
+    )
+  ) {
+    throw atomicFailure("atomic persistence location proof is invalid");
+  }
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:sync-parent`,
+    {
+      kind: "fsync_parent",
+      operationId: input.request.operationId,
+      role: input.stableParentRole,
+      objectId: input.request.stableParentId,
+      expected: input.stableParentEvidence,
+    },
+    [input.request.stableParentId],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:close-temp`,
+    {
+      kind: "close_handle",
+      operationId: input.request.operationId,
+      role:
+        input.request.kind === "persist_manifest"
+          ? "manifest_temp"
+          : "intent_temp",
+      objectId: input.request.tempObjectId,
+      cursor: 0,
+      byteLength: 0,
+      expected: input.request.expectedTemp,
+    },
+    [input.request.tempObjectId],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:release-temp-file`,
+    {
+      kind: "release_budget",
+      operationId: input.request.operationId,
+      reservation: "scratch_files",
+      count: 1,
+      byteSize: 0,
+    },
+    [],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:release-temp-bytes`,
+    {
+      kind: "release_budget",
+      operationId: input.request.operationId,
+      reservation:
+        input.request.kind === "persist_manifest"
+          ? "manifest_bytes"
+          : "other_metadata_bytes",
+      count: 0,
+      byteSize: input.request.canonicalBytes.byteLength,
+    },
+    [],
+  );
+  return Object.freeze({
+    stableObjectId: locations.targetObjectId,
+    stableEvidence: locations.target.evidence,
+  });
+}
+
+export type AtomicCreateAndPersistRecordProtocolInputV1 = Readonly<{
+  flightNonce: string;
+  operationId: string;
+  publication:
+    | Readonly<{
+        kind: "persist_intent";
+        expectedPhase: null;
+      }>
+    | Readonly<{
+        kind: "persist_manifest";
+        expectedPhase: "manifest_planned";
+      }>;
+  canonicalBytes: Uint8Array;
+  contentDigest: string;
+  tempParentId: FlightSemanticId;
+  tempParentEvidence: AtomicObjectEvidenceV1;
+  tempLeaf: string;
+  stableParentId: FlightSemanticId;
+  stableParentEvidence: AtomicObjectEvidenceV1;
+  stableLeaf: string;
+}>;
+
+export async function runAtomicCreateAndPersistRecordProtocol(
+  controller: AtomicEffectControllerV1,
+  input: AtomicCreateAndPersistRecordProtocolInputV1,
+): Promise<AtomicPinnedPersistenceProtocolResultV1> {
+  if (
+    input.canonicalBytes.byteLength === 0 ||
+    sha256(input.canonicalBytes) !== input.contentDigest
+  ) {
+    throw atomicFailure("canonical persistence bytes are invalid");
+  }
+  const byteReservation =
+    input.publication.kind === "persist_manifest"
+      ? "manifest_bytes"
+      : "other_metadata_bytes";
+  const reservations: ReadonlyArray<
+    Readonly<{
+      reservation: AtomicReservationKind;
+      count: number;
+      byteSize: number;
+    }>
+  > = [
+    ...(input.publication.kind === "persist_manifest"
+      ? [
+          {
+            reservation: "stable_files" as const,
+            count: 1,
+            byteSize: 0,
+          },
+        ]
+      : []),
+    {
+      reservation: "scratch_files" as const,
+      count: 1,
+      byteSize: 0,
+    },
+    {
+      reservation: byteReservation,
+      count: 0,
+      byteSize: input.canonicalBytes.byteLength * 2,
+    },
+  ];
+  for (const reservation of reservations) {
+    await runAtomicReducerRequest(
+      controller,
+      `${input.flightNonce}:reserve:${reservation.reservation}`,
+      {
+        kind: "reserve_budget",
+        operationId: input.operationId,
+        ...reservation,
+      },
+      [],
+    );
+  }
+  const tempRole =
+    input.publication.kind === "persist_manifest"
+      ? ("manifest_temp" as const)
+      : ("intent_temp" as const);
+  const created = await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:create-temp`,
+    {
+      kind: "create_and_pin_temp_file",
+      operationId: input.operationId,
+      role: tempRole,
+      parentId: input.tempParentId,
+      leaf: input.tempLeaf,
+      parentEvidenceDigest: input.tempParentEvidence.evidenceDigest,
+      mode: 384,
+      expectedAbsence: true,
+    },
+    [input.tempParentId],
+  );
+  const temp = created.observations.find(
+    (
+      observation,
+    ): observation is Extract<
+      AtomicEffectObservationV1,
+      { kind: "create_and_pin_completed" }
+    > => observation.kind === "create_and_pin_completed",
+  );
+  if (temp === undefined) {
+    throw atomicFailure("atomic persistence temp creation is invalid");
+  }
+  for (
+    let offset = 0;
+    offset < input.canonicalBytes.byteLength;
+    offset += ATOMIC_OBSERVATION_BYTE_LIMIT
+  ) {
+    const end = Math.min(
+      input.canonicalBytes.byteLength,
+      offset + ATOMIC_OBSERVATION_BYTE_LIMIT,
+    );
+    const chunk = input.canonicalBytes.slice(offset, end);
+    await runAtomicReducerRequest(
+      controller,
+      `${input.flightNonce}:write-temp:${offset}`,
+      {
+        kind: "write_file_chunk",
+        operationId: input.operationId,
+        sourceFileId: null,
+        inlineBytes: chunk,
+        destinationFileId: temp.handleId,
+        offset,
+        byteLength: chunk.byteLength,
+        expectedChunkSha256: sha256(chunk),
+        expectedResultSha256: sha256(input.canonicalBytes.slice(0, end)),
+      },
+      [temp.handleId],
+    );
+  }
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:sync-temp`,
+    {
+      kind: "fsync_file",
+      operationId: input.operationId,
+      role: tempRole,
+      objectId: temp.handleId,
+      expected: temp.evidence,
+    },
+    [temp.handleId],
+  );
+  const tempValue = {
+    dev: temp.evidence.dev,
+    ino: temp.evidence.ino,
+    mode: temp.evidence.mode,
+    size: input.canonicalBytes.byteLength,
+    contentSha256: input.contentDigest,
+  };
+  const expectedTemp = Object.freeze({
+    ...tempValue,
+    evidenceDigest: sha256(JSON.stringify(tempValue)),
+  });
+  const request =
+    input.publication.kind === "persist_manifest"
+      ? ({
+          kind: "persist_manifest",
+          operationId: input.operationId,
+          expectedPhase: "manifest_planned",
+          canonicalBytes: input.canonicalBytes,
+          contentDigest: input.contentDigest,
+          tempParentId: input.tempParentId,
+          tempLeaf: input.tempLeaf,
+          tempObjectId: temp.handleId,
+          expectedTemp,
+          stableParentId: input.stableParentId,
+          stableLeaf: input.stableLeaf,
+          expectedStable: { absent: true as const },
+        } satisfies Extract<
+          AtomicEffectRequestDraftV1,
+          { kind: "persist_manifest" }
+        >)
+      : ({
+          kind: "persist_intent",
+          operationId: input.operationId,
+          expectedPhase: null,
+          canonicalBytes: input.canonicalBytes,
+          contentDigest: input.contentDigest,
+          tempParentId: input.tempParentId,
+          tempLeaf: input.tempLeaf,
+          tempObjectId: temp.handleId,
+          expectedTemp,
+          stableParentId: input.stableParentId,
+          stableLeaf: input.stableLeaf,
+          expectedStable: { absent: true as const },
+        } satisfies Extract<
+          AtomicEffectRequestDraftV1,
+          { kind: "persist_intent" }
+        >);
+  return runAtomicPinnedPersistenceProtocol(controller, {
+    flightNonce: `${input.flightNonce}:publish`,
+    request,
+    stableParentRole: "intents_parent",
+    stableParentEvidence: input.stableParentEvidence,
+  });
+}
+
+export type AtomicIntentReplacementProtocolInputV1 = Readonly<{
+  flightNonce: string;
+  request: Extract<
+    AtomicEffectRequestDraftV1,
+    { kind: "replace_intent" }
+  >;
+  stableParentRole: "intents_parent";
+  stableParentEvidence: AtomicObjectEvidenceV1;
+}>;
+
+export type AtomicIntentReplacementProtocolResultV1 = Readonly<{
+  stableObjectId: FlightSemanticId;
+  stableEvidence: AtomicObjectEvidenceV1;
+}>;
+
+export async function runAtomicIntentReplacementProtocol(
+  controller: AtomicEffectControllerV1,
+  input: AtomicIntentReplacementProtocolInputV1,
+): Promise<AtomicIntentReplacementProtocolResultV1> {
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:replace`,
+    input.request,
+    [
+      input.request.tempParentId,
+      input.request.tempObjectId,
+      input.request.stableParentId,
+      input.request.stableObjectId,
+    ],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:close-old-stable`,
+    {
+      kind: "close_handle",
+      operationId: input.request.operationId,
+      role: "intent_stable",
+      objectId: input.request.stableObjectId,
+      cursor: 0,
+      byteLength: 0,
+      expected: input.request.expectedStable,
+    },
+    [input.request.stableObjectId],
+  );
+  const opened = await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:open-new-stable`,
+    {
+      kind: "open_pin_handle",
+      operationId: input.request.operationId,
+      role: "intent_stable",
+      parentId: input.request.stableParentId,
+      leaf: input.request.stableLeaf,
+      flags: "file_read_nofollow",
+      expected: input.request.expectedTemp,
+    },
+    [input.request.stableParentId],
+  );
+  const stable = opened.observations.find(
+    (
+      observation,
+    ): observation is Extract<
+      AtomicEffectObservationV1,
+      { kind: "existing_handle_pinned" }
+    > => observation.kind === "existing_handle_pinned",
+  );
+  if (
+    stable === undefined ||
+    !sameAtomicEvidence(stable.evidence, input.request.expectedTemp)
+  ) {
+    throw atomicFailure("replacement stable intent proof is invalid");
+  }
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:sync-parent`,
+    {
+      kind: "fsync_parent",
+      operationId: input.request.operationId,
+      role: input.stableParentRole,
+      objectId: input.request.stableParentId,
+      expected: input.stableParentEvidence,
+    },
+    [input.request.stableParentId],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:close-temp`,
+    {
+      kind: "close_handle",
+      operationId: input.request.operationId,
+      role: "intent_temp",
+      objectId: input.request.tempObjectId,
+      cursor: 0,
+      byteLength: 0,
+      expected: input.request.expectedTemp,
+    },
+    [input.request.tempObjectId],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:release-temp-file`,
+    {
+      kind: "release_budget",
+      operationId: input.request.operationId,
+      reservation: "scratch_files",
+      count: 1,
+      byteSize: 0,
+    },
+    [],
+  );
+  await runAtomicReducerRequest(
+    controller,
+    `${input.flightNonce}:release-temp-bytes`,
+    {
+      kind: "release_budget",
+      operationId: input.request.operationId,
+      reservation: "other_metadata_bytes",
+      count: 0,
+      byteSize: input.request.expectedStable.size,
+    },
+    [],
+  );
+  return Object.freeze({
+    stableObjectId: stable.handleId,
+    stableEvidence: stable.evidence,
+  });
+}
+
+export type AtomicPrivateProfileEntryV1 =
+  | Readonly<{
+      path: string;
+      type: "directory";
+    }>
+  | Readonly<{
+      path: string;
+      type: "file";
+      bytes: Uint8Array;
+      sourceFileId?: FlightSemanticId;
+      sourceEvidence?: AtomicObjectEvidenceV1;
+    }>;
+
+export type AtomicPrivateProfilePublicationInputV1 = Readonly<{
+  flightNonce: string;
+  operationId: string;
+  kind: "scaffold" | "working";
+  binding: ReadyProfileRootBinding;
+  target: PublicationTargetV1;
+  bundlesParentId: FlightSemanticId;
+  bundlesParentEvidence: AtomicObjectEvidenceV1;
+  intentsParentId: FlightSemanticId;
+  intentsParentEvidence: AtomicObjectEvidenceV1;
+  targetParentId: FlightSemanticId;
+  targetParentRole: "profiles_parent" | "public_target";
+  targetParentEvidence: AtomicObjectEvidenceV1;
+  entries?: readonly AtomicPrivateProfileEntryV1[];
+}>;
+
+export type AtomicPrivateProfilePublicationResultV1 = Readonly<{
+  outcome: "published" | "conflict";
+  phases: readonly (
+    | "allocated"
+    | "building"
+    | "ready"
+    | "classified"
+    | "renamed"
+    | "manifest_planned"
+    | "manifest_published"
+  )[];
+  tree: CanonicalProfileTreeEvidence;
+  targetObjectId: FlightSemanticId | null;
+  targetEvidence: AtomicObjectEvidenceV1 | null;
+  intentObjectId: FlightSemanticId;
+  intentEvidence: AtomicObjectEvidenceV1;
+  manifestObjectId: FlightSemanticId;
+  manifestEvidence: AtomicObjectEvidenceV1;
+}>;
+
+type AtomicPublishedIntentRecord = {
+  intent: AtomicPublishIntentV1;
+  objectId: FlightSemanticId;
+  evidence: AtomicObjectEvidenceV1;
+};
+
+type AtomicConstructedEntry = {
+  path: string;
+  type: "directory" | "file";
+  objectId: FlightSemanticId;
+  evidence: AtomicObjectEvidenceV1;
+  mode: 384 | 448;
+  size: number;
+  contentSha256: string | null;
+};
+
+function atomicTransitionId(operationId: string, label: string): string {
+  const value = sha256(`${operationId}\n${label}`).slice(0, 32).split("");
+  value[12] = "4";
+  value[16] = "8";
+  const hex = value.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function atomicIntentTempLeaf(
+  operationId: string,
+  phase: AtomicPublishIntentV1["phase"],
+): string {
+  return `${operationId}.${phase}.${atomicTransitionId(operationId, `intent:${phase}`)}.tmp`;
+}
+
+function normalizeAtomicPrivateEntries(
+  kind: "scaffold" | "working",
+  supplied: readonly AtomicPrivateProfileEntryV1[] | undefined,
+): readonly AtomicPrivateProfileEntryV1[] {
+  const entries =
+    kind === "scaffold"
+      ? ([
+          { path: "committed", type: "directory" },
+          { path: "staging", type: "directory" },
+          { path: "working", type: "directory" },
+        ] as const)
+      : (supplied ?? []);
+  if (kind === "scaffold" && supplied !== undefined) {
+    throw atomicFailure("atomic scaffold schema is fixed");
+  }
+  const normalized = [...entries].sort((left, right) =>
+    rawCompare(left.path, right.path),
+  );
+  const seen = new Set<string>();
+  const types = new Map<string, "directory" | "file">();
+  for (const entry of normalized) {
+    if (
+      typeof entry.path !== "string" ||
+      entry.path.normalize("NFC") !== entry.path ||
+      entry.path === "" ||
+      Buffer.byteLength(entry.path, "utf8") > 1_024
+    ) {
+      throw atomicFailure("atomic profile path is invalid");
+    }
+    const segments = entry.path.split("/");
+    if (
+      segments.length > PROFILE_MAX_DEPTH ||
+      segments.some(segment => !isAtomicPayloadLeafV1(segment))
+    ) {
+      throw atomicFailure("atomic profile path is invalid");
+    }
+    if (seen.has(entry.path)) {
+      throw atomicFailure("atomic profile path is duplicated");
+    }
+    seen.add(entry.path);
+    const parent = segments.slice(0, -1).join("/");
+    if (parent !== "" && types.get(parent) !== "directory") {
+      throw atomicFailure("atomic profile parent is missing");
+    }
+    if (
+      entry.type === "file" &&
+      (!(entry.bytes instanceof Uint8Array) ||
+        entry.bytes.byteLength > PROFILE_FILE_MAX_BYTES ||
+        ((entry.sourceFileId === undefined) !==
+          (entry.sourceEvidence === undefined)) ||
+        (entry.sourceEvidence !== undefined &&
+          (entry.sourceEvidence.size !== entry.bytes.byteLength ||
+            entry.sourceEvidence.contentSha256 !== sha256(entry.bytes))))
+    ) {
+      throw atomicFailure("atomic profile file schema is invalid");
+    }
+    types.set(entry.path, entry.type);
+  }
+  const byteSize = normalized.reduce(
+    (total, entry) =>
+      total + (entry.type === "file" ? entry.bytes.byteLength : 0),
+    0,
+  );
+  assertAtomicProfileSchemaV1(
+    kind === "scaffold" ? "scaffold" : "initial_working",
+    normalized.length + 1,
+    byteSize,
+  );
+  return Object.freeze(normalized.map(entry => Object.freeze({ ...entry })));
+}
+
+async function runAtomicRequest(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  request: AtomicEffectRequestDraftV1,
+  semanticIds: readonly FlightSemanticId[],
+): Promise<AtomicProtocolRunResult> {
+  return runAtomicReducerRequest(
+    controller,
+    flightNonce,
+    request,
+    semanticIds,
+  );
+}
+
+function atomicCreatedObservation(
+  result: AtomicProtocolRunResult,
+): Extract<
+  AtomicEffectObservationV1,
+  { kind: "create_and_pin_completed" }
+> {
+  const created = result.observations.find(
+    (
+      observation,
+    ): observation is Extract<
+      AtomicEffectObservationV1,
+      { kind: "create_and_pin_completed" }
+    > => observation.kind === "create_and_pin_completed",
+  );
+  if (created === undefined) {
+    throw atomicFailure("atomic publication create did not complete");
+  }
+  return created;
+}
+
+async function reserveAtomicBudget(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  operationId: string,
+  reservation: AtomicReservationKind,
+  count: number,
+  byteSize: number,
+): Promise<void> {
+  await runAtomicRequest(
+    controller,
+    flightNonce,
+    {
+      kind: "reserve_budget",
+      operationId,
+      reservation,
+      count,
+      byteSize,
+    },
+    [],
+  );
+}
+
+async function releaseAtomicBudget(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  operationId: string,
+  reservation: AtomicReservationKind,
+  count: number,
+  byteSize: number,
+): Promise<void> {
+  await runAtomicRequest(
+    controller,
+    flightNonce,
+    {
+      kind: "release_budget",
+      operationId,
+      reservation,
+      count,
+      byteSize,
+    },
+    [],
+  );
+}
+
+async function syncAtomicHeld(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  operationId: string,
+  kind: "fsync_file" | "fsync_directory" | "fsync_parent",
+  role: AtomicObjectRoleV1,
+  objectId: FlightSemanticId,
+  expected: AtomicObjectEvidenceV1,
+): Promise<void> {
+  await runAtomicRequest(
+    controller,
+    flightNonce,
+    { kind, operationId, role, objectId, expected },
+    [objectId],
+  );
+}
+
+function atomicContentEvidence(
+  evidence: AtomicObjectEvidenceV1,
+  size: number,
+  contentSha256: string,
+): AtomicObjectEvidenceV1 {
+  const value = {
+    dev: evidence.dev,
+    ino: evidence.ino,
+    mode: evidence.mode,
+    size,
+    contentSha256,
+  };
+  return Object.freeze({
+    ...value,
+    evidenceDigest: sha256(JSON.stringify(value)),
+  });
+}
+
+async function createAndReplaceAtomicIntent(
+  controller: AtomicEffectControllerV1,
+  flightNonce: string,
+  current: AtomicPublishedIntentRecord,
+  next: AtomicPublishIntentV1,
+  intentsParentId: FlightSemanticId,
+  intentsParentEvidence: AtomicObjectEvidenceV1,
+): Promise<AtomicPublishedIntentRecord> {
+  const encoded = encodeAtomicPublishIntent(next);
+  const growthReservation = Math.max(
+    0,
+    encoded.bytes.byteLength - current.evidence.size,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${flightNonce}:reserve-file`,
+    next.operationId,
+    "scratch_files",
+    1,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${flightNonce}:reserve-bytes`,
+    next.operationId,
+    "other_metadata_bytes",
+    0,
+    encoded.bytes.byteLength + growthReservation,
+  );
+  const tempLeaf = atomicIntentTempLeaf(next.operationId, next.phase);
+  const temp = atomicCreatedObservation(
+    await runAtomicRequest(
+      controller,
+      `${flightNonce}:create`,
+      {
+        kind: "create_and_pin_temp_file",
+        operationId: next.operationId,
+        role: "intent_temp",
+        parentId: intentsParentId,
+        leaf: tempLeaf,
+        parentEvidenceDigest: intentsParentEvidence.evidenceDigest,
+        mode: 384,
+        expectedAbsence: true,
+      },
+      [intentsParentId],
+    ),
+  );
+  for (
+    let offset = 0;
+    offset < encoded.bytes.byteLength;
+    offset += ATOMIC_OBSERVATION_BYTE_LIMIT
+  ) {
+    const chunk = encoded.bytes.subarray(
+      offset,
+      Math.min(encoded.bytes.byteLength, offset + ATOMIC_OBSERVATION_BYTE_LIMIT),
+    );
+    await runAtomicRequest(
+      controller,
+      `${flightNonce}:write:${offset}`,
+      {
+        kind: "write_file_chunk",
+        operationId: next.operationId,
+        sourceFileId: null,
+        inlineBytes: chunk,
+        destinationFileId: temp.handleId,
+        offset,
+        byteLength: chunk.byteLength,
+        expectedChunkSha256: sha256(chunk),
+        expectedResultSha256: sha256(encoded.bytes.subarray(0, offset + chunk.byteLength)),
+      },
+      [temp.handleId],
+    );
+  }
+  await syncAtomicHeld(
+    controller,
+    `${flightNonce}:sync`,
+    next.operationId,
+    "fsync_file",
+    "intent_temp",
+    temp.handleId,
+    temp.evidence,
+  );
+  const expectedTemp = atomicContentEvidence(
+    temp.evidence,
+    encoded.bytes.byteLength,
+    encoded.sha256,
+  );
+  const replaced = await runAtomicIntentReplacementProtocol(controller, {
+    flightNonce: `${flightNonce}:replace`,
+    request: {
+      kind: "replace_intent",
+      operationId: next.operationId,
+      expectedPhase: current.intent.phase,
+      canonicalBytes: encoded.bytes,
+      contentDigest: encoded.sha256,
+      tempParentId: intentsParentId,
+      tempLeaf,
+      tempObjectId: temp.handleId,
+      expectedTemp,
+      stableParentId: intentsParentId,
+      stableLeaf: `${next.operationId}.json`,
+      stableObjectId: current.objectId,
+      expectedStable: current.evidence,
+    },
+    stableParentRole: "intents_parent",
+    stableParentEvidence: intentsParentEvidence,
+  });
+  if (growthReservation > 0) {
+    await releaseAtomicBudget(
+      controller,
+      `${flightNonce}:release-growth`,
+      next.operationId,
+      "other_metadata_bytes",
+      0,
+      growthReservation,
+    );
+  }
+  return {
+    intent: next,
+    objectId: replaced.stableObjectId,
+    evidence: replaced.stableEvidence,
+  };
+}
+
+function requireAtomicParentRecord(
+  flight: AtomicEffectFlightRecord,
+  record: AtomicHeldRecord,
+): AtomicHeldRecord {
+  if (record.parentId === null) {
+    throw atomicFailure("atomic profile held ancestry is invalid");
+  }
+  return resolveAtomicRecord(flight, record.parentId);
+}
+
+function assertAtomicPrivateControlAuthority(
+  flight: AtomicEffectFlightRecord,
+  input: AtomicPrivateProfilePublicationInputV1,
+): AtomicHeldRecord {
+  if (!sameReadyBinding(input.binding, flight.root.binding)) {
+    throw atomicFailure("atomic private publication binding is invalid");
+  }
+  const bundlesParent = resolveAtomicRecord(flight, input.bundlesParentId);
+  const intentsParent = resolveAtomicRecord(flight, input.intentsParentId);
+  const targetParent = resolveAtomicRecord(flight, input.targetParentId);
+  if (
+    bundlesParent.role !== "bundles_parent" ||
+    bundlesParent.leaf !== "bundles" ||
+    !bundlesParent.stat.isDirectory() ||
+    !sameAtomicEvidence(
+      bundlesParent.evidence,
+      input.bundlesParentEvidence,
+    ) ||
+    intentsParent.role !== "intents_parent" ||
+    intentsParent.leaf !== "intents" ||
+    !intentsParent.stat.isDirectory() ||
+    !sameAtomicEvidence(
+      intentsParent.evidence,
+      input.intentsParentEvidence,
+    ) ||
+    targetParent.role !== input.targetParentRole ||
+    !targetParent.stat.isDirectory() ||
+    !sameAtomicEvidence(
+      targetParent.evidence,
+      input.targetParentEvidence,
+    )
+  ) {
+    throw atomicFailure("atomic private publication control authority is invalid");
+  }
+  const bundlesStaging = requireAtomicParentRecord(flight, bundlesParent);
+  const intentsStaging = requireAtomicParentRecord(flight, intentsParent);
+  if (
+    bundlesStaging !== intentsStaging ||
+    bundlesStaging.role !== "staging_root" ||
+    bundlesStaging.leaf !== ".profile-publish-staging" ||
+    !bundlesStaging.stat.isDirectory()
+  ) {
+    throw atomicFailure("atomic private publication control ancestry is invalid");
+  }
+  const controlStateRoot = requireAtomicParentRecord(
+    flight,
+    bundlesStaging,
+  );
+  if (
+    controlStateRoot.role !== "state_root" ||
+    controlStateRoot.parentId !== null ||
+    controlStateRoot.leaf !== null ||
+    !controlStateRoot.stat.isDirectory()
+  ) {
+    throw atomicFailure("atomic private publication control ancestry is invalid");
+  }
+
+  let targetProfilesParent: AtomicHeldRecord;
+  if (input.kind === "scaffold") {
+    targetProfilesParent = targetParent;
+  } else {
+    const profileParent = requireAtomicParentRecord(flight, targetParent);
+    targetProfilesParent = requireAtomicParentRecord(flight, profileParent);
+  }
+  if (
+    targetProfilesParent.role !== "profiles_parent" ||
+    targetProfilesParent.leaf !== "profiles" ||
+    !targetProfilesParent.stat.isDirectory() ||
+    requireAtomicParentRecord(flight, targetProfilesParent) !==
+      controlStateRoot
+  ) {
+    throw atomicFailure("atomic private publication target ancestry is invalid");
+  }
+  for (const record of [bundlesParent, intentsParent, targetParent]) {
+    assertAtomicHeldChain(flight, record);
+  }
+  return controlStateRoot;
+}
+
+function assertAtomicPrivateProfileHeldAuthority(
+  flight: AtomicEffectFlightRecord,
+  input: AtomicPrivateProfilePublicationInputV1,
+  entries: readonly AtomicPrivateProfileEntryV1[],
+  stateRoot: AtomicHeldRecord,
+): void {
+  if (input.kind === "working") {
+    const targetParent = resolveAtomicRecord(flight, input.targetParentId);
+    const profileParent = requireAtomicParentRecord(flight, targetParent);
+    const profilesParent = requireAtomicParentRecord(flight, profileParent);
+    if (
+      input.target.kind !== "profile_state" ||
+      input.target.state !== "working" ||
+      targetParent.role !== "public_target" ||
+      targetParent.leaf !== "working" ||
+      !targetParent.stat.isDirectory() ||
+      !sameAtomicEvidence(targetParent.evidence, input.targetParentEvidence) ||
+      profileParent.role !== "public_target" ||
+      profileParent.leaf !== input.target.profileId ||
+      !profileParent.stat.isDirectory() ||
+      profilesParent.role !== "profiles_parent" ||
+      profilesParent.leaf !== "profiles" ||
+      requireAtomicParentRecord(flight, profilesParent) !== stateRoot
+    ) {
+      throw atomicFailure("atomic working target authority is invalid");
+    }
+  }
+
+  for (const entry of entries) {
+    if (
+      entry.type !== "file" ||
+      entry.sourceFileId === undefined ||
+      entry.sourceEvidence === undefined
+    ) {
+      continue;
+    }
+    const source = resolveAtomicRecord(flight, entry.sourceFileId);
+    if (
+      source.role !== "public_source" ||
+      !source.stat.isFile() ||
+      !sameAtomicEvidence(source.evidence, entry.sourceEvidence)
+    ) {
+      throw atomicFailure("atomic committed copy authority is invalid");
+    }
+    let cursor = source;
+    let committedParent: AtomicHeldRecord | null = null;
+    const seen = new Set<AtomicHeldRecord>();
+    while (cursor.parentId !== null) {
+      if (seen.has(cursor)) {
+        throw atomicFailure("atomic committed copy authority is invalid");
+      }
+      seen.add(cursor);
+      const parent = resolveAtomicRecord(flight, cursor.parentId);
+      if (parent.role === "public_target" && parent.leaf === "committed") {
+        committedParent = parent;
+        break;
+      }
+      if (parent.role !== "public_source") {
+        throw atomicFailure("atomic committed copy authority is invalid");
+      }
+      cursor = parent;
+    }
+    if (committedParent === null || !committedParent.stat.isDirectory()) {
+      throw atomicFailure("atomic committed copy authority is invalid");
+    }
+    const profileParent = requireAtomicParentRecord(flight, committedParent);
+    const profilesParent = requireAtomicParentRecord(flight, profileParent);
+    if (
+      input.target.kind !== "profile_state" ||
+      profileParent.role !== "public_target" ||
+      profileParent.leaf !== input.target.profileId ||
+      !profileParent.stat.isDirectory() ||
+      profilesParent.role !== "profiles_parent" ||
+      profilesParent.leaf !== "profiles" ||
+      requireAtomicParentRecord(flight, profilesParent) !== stateRoot
+    ) {
+      throw atomicFailure("atomic committed copy authority is invalid");
+    }
+  }
+}
+
+async function proveAtomicPrivateProfileTree(
+  flight: AtomicEffectFlightRecord,
+  objectId: FlightSemanticId,
+  evidence: AtomicObjectEvidenceV1,
+  role: "private_source" | "public_target",
+  expected: CanonicalProfileTreeEvidence,
+): Promise<void> {
+  const record = resolveAtomicRecord(flight, objectId);
+  if (
+    record.role !== role ||
+    !record.stat.isDirectory() ||
+    !sameAtomicEvidence(record.evidence, evidence)
+  ) {
+    throw atomicFailure("atomic published profile tree authority is invalid");
+  }
+  assertAtomicHeldChain(flight, record);
+  const budget = new Budget(MAX_RECONCILIATION_REFERENCES);
+  budget.take();
+  const first = await hashProfileTreeAt(
+    flight.root.anchored,
+    record.handle,
+    budget,
+  );
+  const final = await validateProfileEvidenceRaw(
+    flight.root.anchored,
+    record.handle,
+    first.evidence,
+  );
+  if (
+    first.checksum !== final.checksum ||
+    first.byteSize !== final.byteSize
+  ) {
+    throw atomicFailure("atomic published profile tree changed during proof");
+  }
+  assertAtomicHeldChain(flight, record);
+  const observed = publicTreeEvidence({ ...final, evidence: first.evidence });
+  if (
+    observed.canonicalJson !== expected.canonicalJson ||
+    observed.checksum !== expected.checksum ||
+    observed.byteSize !== expected.byteSize ||
+    observed.fileCount !== expected.fileCount ||
+    observed.entries.length !== expected.entries.length
+  ) {
+    throw atomicFailure("atomic published profile tree proof is invalid");
+  }
+  const observedByPath = new Map(
+    observed.entries.map(entry => [entry.path, entry] as const),
+  );
+  for (const entry of expected.entries) {
+    const actual = observedByPath.get(entry.path);
+    if (
+      actual === undefined ||
+      actual.type !== entry.type ||
+      actual.dev !== entry.dev ||
+      actual.ino !== entry.ino ||
+      actual.mode !== entry.mode ||
+      actual.sha256 !== entry.sha256 ||
+      (entry.type === "file" &&
+        (actual.size !== entry.size || actual.nlink !== "1"))
+    ) {
+      throw atomicFailure("atomic published profile tree proof is invalid");
+    }
+  }
+}
+
+export async function runAtomicPrivateProfilePublication(
+  controller: AtomicEffectControllerV1,
+  input: AtomicPrivateProfilePublicationInputV1,
+): Promise<AtomicPrivateProfilePublicationResultV1> {
+  const flight = requireAtomicFlight(controller);
+  if (
+    input.operationId !== flight.operationId ||
+    !UUID.test(input.operationId) ||
+    input.target.parent.dev !== input.targetParentEvidence.dev ||
+    input.target.parent.ino !== input.targetParentEvidence.ino ||
+    input.target.parent.mode !== input.targetParentEvidence.mode ||
+    (input.kind === "scaffold" &&
+      (input.target.kind !== "profile" ||
+        input.targetParentRole !== "profiles_parent" ||
+        input.target.leaf !== input.target.profileId)) ||
+    (input.kind === "working" &&
+      (input.target.kind !== "profile_state" ||
+        input.targetParentRole !== "public_target" ||
+        input.target.state !== "working" ||
+        input.target.leaf !== input.target.generationId))
+  ) {
+    throw atomicFailure("atomic private publication authority is invalid");
+  }
+  const entries = normalizeAtomicPrivateEntries(input.kind, input.entries);
+  const stateRoot = assertAtomicPrivateControlAuthority(flight, input);
+  assertAtomicPrivateProfileHeldAuthority(
+    flight,
+    input,
+    entries,
+    stateRoot,
+  );
+  const totalBytes = entries.reduce(
+    (total, entry) =>
+      total + (entry.type === "file" ? entry.bytes.byteLength : 0),
+    0,
+  );
+  const phases: AtomicPrivateProfilePublicationResultV1["phases"][number][] =
+    [];
+  const baseIntent: AtomicPublishIntentV1 = {
+    version: 1,
+    operationId: input.operationId,
+    kind: input.kind,
+    phase: "allocated",
+    binding: input.binding,
+    target: input.target,
+    wrapper: null,
+    privateSource: null,
+    publicSource: null,
+    classification: null,
+    sourceDeletion: null,
+    adoption: null,
+    cleanup: null,
+    canaryProof: null,
+    prepublicationAbort: null,
+    identityManifest: null,
+  };
+  const allocatedBytes = encodeAtomicPublishIntent(baseIntent);
+  await reserveAtomicBudget(
+    controller,
+    `${input.flightNonce}:allocated:stable`,
+    input.operationId,
+    "stable_files",
+    1,
+    0,
+  );
+  const allocatedRecord = await runAtomicCreateAndPersistRecordProtocol(
+    controller,
+    {
+      flightNonce: `${input.flightNonce}:allocated`,
+      operationId: input.operationId,
+      publication: { kind: "persist_intent", expectedPhase: null },
+      canonicalBytes: allocatedBytes.bytes,
+      contentDigest: allocatedBytes.sha256,
+      tempParentId: input.intentsParentId,
+      tempParentEvidence: input.intentsParentEvidence,
+      tempLeaf: atomicIntentTempLeaf(input.operationId, "allocated"),
+      stableParentId: input.intentsParentId,
+      stableParentEvidence: input.intentsParentEvidence,
+      stableLeaf: `${input.operationId}.json`,
+    },
+  );
+  let stableIntent: AtomicPublishedIntentRecord = {
+    intent: baseIntent,
+    objectId: allocatedRecord.stableObjectId,
+    evidence: allocatedRecord.stableEvidence,
+  };
+  phases.push("allocated");
+
+  await reserveAtomicBudget(
+    controller,
+    `${input.flightNonce}:reserve:scratch`,
+    input.operationId,
+    "scratch_entries",
+    2,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${input.flightNonce}:reserve:entries`,
+    input.operationId,
+    "payload_entries",
+    entries.length + 1,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${input.flightNonce}:reserve:bytes`,
+    input.operationId,
+    "payload_bytes",
+    0,
+    totalBytes,
+  );
+
+  const wrapper = atomicCreatedObservation(
+    await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:wrapper:create`,
+      {
+        kind: "create_and_pin_wrapper",
+        operationId: input.operationId,
+        role: "wrapper",
+        parentId: input.bundlesParentId,
+        leaf: input.operationId,
+        parentEvidenceDigest: input.bundlesParentEvidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      },
+      [input.bundlesParentId],
+    ),
+  );
+  await syncAtomicHeld(
+    controller,
+    `${input.flightNonce}:wrapper:parent-sync`,
+    input.operationId,
+    "fsync_parent",
+    "bundles_parent",
+    input.bundlesParentId,
+    input.bundlesParentEvidence,
+  );
+  const buildingIntent: AtomicPublishIntentV1 = {
+    ...stableIntent.intent,
+    phase: "building",
+    wrapper: {
+      dev: wrapper.evidence.dev,
+      ino: wrapper.evidence.ino,
+      mode: 448,
+    },
+  };
+  stableIntent = await createAndReplaceAtomicIntent(
+    controller,
+    `${input.flightNonce}:building`,
+    stableIntent,
+    buildingIntent,
+    input.intentsParentId,
+    input.intentsParentEvidence,
+  );
+  phases.push("building");
+
+  const source = atomicCreatedObservation(
+    await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:source:create`,
+      {
+        kind: "create_and_pin_directory",
+        operationId: input.operationId,
+        role: "private_source",
+        parentId: wrapper.handleId,
+        leaf: "payload",
+        parentEvidenceDigest: wrapper.evidence.evidenceDigest,
+        mode: 448,
+        expectedAbsence: true,
+      },
+      [wrapper.handleId],
+    ),
+  );
+  await syncAtomicHeld(
+    controller,
+    `${input.flightNonce}:source:parent-sync`,
+    input.operationId,
+    "fsync_parent",
+    "wrapper",
+    wrapper.handleId,
+    wrapper.evidence,
+  );
+
+  const constructed = new Map<string, AtomicConstructedEntry>();
+  constructed.set("", {
+    path: "",
+    type: "directory",
+    objectId: source.handleId,
+    evidence: source.evidence,
+    mode: 448,
+    size: 0,
+    contentSha256: null,
+  });
+  for (const [cursor, entry] of entries.entries()) {
+    await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:populate:${cursor}`,
+      {
+        kind: "populate_payload_entry",
+        operationId: input.operationId,
+        rootId: source.handleId,
+        cursor,
+        evidenceDigest: sha256(
+          JSON.stringify({
+            path: entry.path,
+            type: entry.type,
+            size: entry.type === "file" ? entry.bytes.byteLength : 0,
+          }),
+        ),
+      },
+      [source.handleId],
+    );
+    const separator = entry.path.lastIndexOf("/");
+    const parentPath = separator === -1 ? "" : entry.path.slice(0, separator);
+    const leaf = separator === -1 ? entry.path : entry.path.slice(separator + 1);
+    const parent = constructed.get(parentPath);
+    if (parent === undefined || parent.type !== "directory") {
+      throw atomicFailure("atomic profile construction parent is invalid");
+    }
+    const created = atomicCreatedObservation(
+      await runAtomicRequest(
+        controller,
+        `${input.flightNonce}:entry:${cursor}:create`,
+        {
+          kind:
+            entry.type === "directory"
+              ? "create_and_pin_directory"
+              : "create_and_pin_file",
+          operationId: input.operationId,
+          role: "payload_entry",
+          parentId: parent.objectId,
+          leaf,
+          parentEvidenceDigest: parent.evidence.evidenceDigest,
+          mode: entry.type === "directory" ? 448 : 384,
+          expectedAbsence: true,
+        },
+        [parent.objectId],
+      ),
+    );
+    await syncAtomicHeld(
+      controller,
+      `${input.flightNonce}:entry:${cursor}:parent-sync`,
+      input.operationId,
+      "fsync_parent",
+      parentPath === "" ? "private_source" : "payload_entry",
+      parent.objectId,
+      parent.evidence,
+    );
+    if (entry.type === "directory") {
+      constructed.set(entry.path, {
+        path: entry.path,
+        type: "directory",
+        objectId: created.handleId,
+        evidence: created.evidence,
+        mode: 448,
+        size: 0,
+        contentSha256: null,
+      });
+      continue;
+    }
+    for (
+      let offset = 0;
+      offset < entry.bytes.byteLength;
+      offset += ATOMIC_OBSERVATION_BYTE_LIMIT
+    ) {
+      const chunk = entry.bytes.subarray(
+        offset,
+        Math.min(entry.bytes.byteLength, offset + ATOMIC_OBSERVATION_BYTE_LIMIT),
+      );
+      if (
+        entry.sourceFileId !== undefined &&
+        entry.sourceEvidence !== undefined
+      ) {
+        const sourceHash = await runAtomicRequest(
+          controller,
+          `${input.flightNonce}:entry:${cursor}:source-hash:${offset}`,
+          {
+            kind: "hash_content_chunk",
+            operationId: input.operationId,
+            objectId: entry.sourceFileId,
+            offset,
+            byteLength: chunk.byteLength,
+            evidenceDigest: entry.sourceEvidence.evidenceDigest,
+          },
+          [entry.sourceFileId],
+        );
+        const sourceContent = sourceHash.observations.find(
+          observation => observation.kind === "content_observed",
+        );
+        if (
+          sourceContent?.kind !== "content_observed" ||
+          sourceContent.contentDigest !== sha256(chunk)
+        ) {
+          throw atomicFailure("atomic profile copy source proof is invalid");
+        }
+      }
+      await runAtomicRequest(
+        controller,
+        `${input.flightNonce}:entry:${cursor}:write:${offset}`,
+        {
+          kind:
+            entry.sourceFileId === undefined
+              ? "write_file_chunk"
+              : "copy_payload_chunk",
+          operationId: input.operationId,
+          sourceFileId: entry.sourceFileId ?? null,
+          inlineBytes: entry.sourceFileId === undefined ? chunk : null,
+          destinationFileId: created.handleId,
+          offset,
+          byteLength: chunk.byteLength,
+          expectedChunkSha256: sha256(chunk),
+          expectedResultSha256: sha256(
+            entry.bytes.subarray(0, offset + chunk.byteLength),
+          ),
+        },
+        entry.sourceFileId === undefined
+          ? [created.handleId]
+          : [entry.sourceFileId, created.handleId],
+      );
+      const hashed = await runAtomicRequest(
+        controller,
+        `${input.flightNonce}:entry:${cursor}:hash:${offset}`,
+        {
+          kind: "hash_content_chunk",
+          operationId: input.operationId,
+          objectId: created.handleId,
+          offset,
+          byteLength: chunk.byteLength,
+          evidenceDigest: created.evidence.evidenceDigest,
+        },
+        [created.handleId],
+      );
+      const content = hashed.observations.find(
+        observation => observation.kind === "content_observed",
+      );
+      if (
+        content?.kind !== "content_observed" ||
+        content.contentDigest !== sha256(chunk)
+      ) {
+        throw atomicFailure("atomic profile content proof is invalid");
+      }
+    }
+    await syncAtomicHeld(
+      controller,
+      `${input.flightNonce}:entry:${cursor}:file-sync`,
+      input.operationId,
+      "fsync_file",
+      "payload_entry",
+      created.handleId,
+      created.evidence,
+    );
+    const contentSha256 = sha256(entry.bytes);
+    constructed.set(entry.path, {
+      path: entry.path,
+      type: "file",
+      objectId: created.handleId,
+      evidence: created.evidence,
+      mode: 384,
+      size: entry.bytes.byteLength,
+      contentSha256,
+    });
+  }
+
+  const postorderDirectories = [...constructed.values()]
+    .filter(
+      (entry): entry is AtomicConstructedEntry & { type: "directory" } =>
+        entry.type === "directory",
+    )
+    .sort((left, right) => {
+      const depth =
+        right.path.split("/").length - left.path.split("/").length;
+      return depth !== 0 ? depth : rawCompare(left.path, right.path);
+    });
+  for (const [index, directory] of postorderDirectories.entries()) {
+    await syncAtomicHeld(
+      controller,
+      `${input.flightNonce}:directory-sync:${index}`,
+      input.operationId,
+      "fsync_directory",
+      directory.path === "" ? "private_source" : "payload_entry",
+      directory.objectId,
+      directory.evidence,
+    );
+  }
+
+  const canonicalEntries = [...constructed.values()]
+    .map(entry =>
+      Object.freeze({
+        path: entry.path,
+        type: entry.type,
+        mode: entry.mode,
+        size: entry.size,
+        sha256: entry.contentSha256,
+      }),
+    )
+    .sort((left, right) => rawCompare(left.path, right.path));
+  for (const [cursor, entry] of canonicalEntries.entries()) {
+    const entryDigest = sha256(JSON.stringify(entry));
+    const canonical = await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:canonical:${cursor}`,
+      {
+        kind: "canonicalize_tree_step",
+        operationId: input.operationId,
+        rootId: source.handleId,
+        cursor,
+        evidenceDigest: entryDigest,
+      },
+      [source.handleId],
+    );
+    const content = canonical.observations.find(
+      observation => observation.kind === "content_observed",
+    );
+    if (
+      content?.kind !== "content_observed" ||
+      content.contentDigest !== entryDigest
+    ) {
+      throw atomicFailure("atomic profile canonical step is invalid");
+    }
+  }
+  const closeOrder = [...constructed.values()]
+    .filter(entry => entry.path !== "")
+    .sort((left, right) => {
+      const leftDepth = left.path.split("/").length;
+      const rightDepth = right.path.split("/").length;
+      if (leftDepth !== rightDepth) return rightDepth - leftDepth;
+      if (left.type !== right.type) return left.type === "file" ? -1 : 1;
+      return rawCompare(left.path, right.path);
+    });
+  for (const [index, entry] of closeOrder.entries()) {
+    await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:close-entry:${index}`,
+      {
+        kind: "close_handle",
+        operationId: input.operationId,
+        role: "payload_entry",
+        objectId: entry.objectId,
+        cursor: 0,
+        byteLength: 0,
+        expected:
+          entry.type === "file" && entry.contentSha256 !== null
+            ? atomicContentEvidence(
+                entry.evidence,
+                entry.size,
+                entry.contentSha256,
+              )
+            : entry.evidence,
+      },
+      [entry.objectId],
+    );
+    await releaseAtomicBudget(
+      controller,
+      `${input.flightNonce}:release-entry:${index}`,
+      input.operationId,
+      "payload_entries",
+      1,
+      0,
+    );
+    if (entry.type === "file" && entry.size > 0) {
+      await releaseAtomicBudget(
+        controller,
+        `${input.flightNonce}:release-entry-bytes:${index}`,
+        input.operationId,
+        "payload_bytes",
+        0,
+        entry.size,
+      );
+    }
+  }
+  const canonicalJson = JSON.stringify({
+    version: 1,
+    entries: canonicalEntries,
+  });
+  const tree: CanonicalProfileTreeEvidence = Object.freeze({
+    canonicalJson,
+    checksum: sha256(canonicalJson),
+    byteSize: totalBytes,
+    maxMtimeMs: 0,
+    entries: Object.freeze(
+      [...constructed.values()]
+        .sort((left, right) => rawCompare(left.path, right.path))
+        .map(entry =>
+          Object.freeze({
+            path: entry.path,
+            type: entry.type,
+            dev: entry.evidence.dev,
+            ino: entry.evidence.ino,
+            nlink: "1",
+            mode: entry.mode,
+            size: entry.size,
+            sha256: entry.contentSha256,
+          }),
+        ),
+    ),
+    fileCount: entries.filter(entry => entry.type === "file").length,
+  });
+  const readyIntent: AtomicPublishIntentV1 = {
+    ...stableIntent.intent,
+    phase: "ready",
+    privateSource: {
+      dev: source.evidence.dev,
+      ino: source.evidence.ino,
+      mode: 448,
+      checksum: tree.checksum,
+      byteSize: tree.byteSize,
+    },
+  };
+  stableIntent = await createAndReplaceAtomicIntent(
+    controller,
+    `${input.flightNonce}:ready`,
+    stableIntent,
+    readyIntent,
+    input.intentsParentId,
+    input.intentsParentEvidence,
+  );
+  phases.push("ready");
+
+  for (const [label, role, objectId, evidence] of [
+    ["source-parent", "wrapper", wrapper.handleId, wrapper.evidence],
+    [
+      "target-parent",
+      input.targetParentRole,
+      input.targetParentId,
+      input.targetParentEvidence,
+    ],
+  ] as const) {
+    await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:native:${label}:revalidate`,
+      {
+        kind: "revalidate_handle",
+        operationId: input.operationId,
+        role,
+        objectId,
+        cursor: 0,
+        byteLength: 0,
+        expected: evidence,
+      },
+      [objectId],
+    );
+    await runAtomicRequest(
+      controller,
+      `${input.flightNonce}:native:${label}:statfs`,
+      {
+        kind: "statfs_parent",
+        operationId: input.operationId,
+        role,
+        objectId,
+        expected: evidence,
+      },
+      [objectId],
+    );
+  }
+  const native = await runAtomicRequest(
+    controller,
+    `${input.flightNonce}:native`,
+    {
+      kind: "native_no_replace",
+      operationId: input.operationId,
+      move: "profile_publish",
+      sourceParentId: wrapper.handleId,
+      sourceId: source.handleId,
+      sourceLeaf: "payload",
+      targetParentId: input.targetParentId,
+      targetLeaf: (
+        input.target as Extract<
+          PublicationTargetV1,
+          { kind: "profile" | "profile_state" }
+        >
+      ).leaf,
+      expectedSource: source.evidence,
+      expectedTarget: { absent: true },
+      evidenceDigest: sha256(
+        JSON.stringify({
+          source: source.evidence.evidenceDigest,
+          target: input.targetParentEvidence.evidenceDigest,
+        }),
+      ),
+    },
+    [wrapper.handleId, source.handleId, input.targetParentId],
+  );
+  const classification = native.classification;
+  if (
+    classification === null ||
+    (classification.outcome !== "published" &&
+      classification.outcome !== "conflict")
+  ) {
+    throw atomicFailure("atomic profile publication was not classified");
+  }
+  const locations = native.observations.find(
+    (
+      observation,
+    ): observation is Extract<
+      AtomicEffectObservationV1,
+      { kind: "locations_observed"; requestKind: "native_no_replace" }
+    > =>
+      observation.kind === "locations_observed" &&
+      observation.requestKind === "native_no_replace",
+  );
+  if (locations === undefined) {
+    throw atomicFailure("atomic profile location proof is missing");
+  }
+  if (classification.outcome === "published") {
+    if (
+      locations.targetObjectId === null ||
+      locations.target.evidence === null ||
+      locations.target.state !== "match"
+    ) {
+      throw atomicFailure("atomic profile target proof is invalid");
+    }
+    await proveAtomicPrivateProfileTree(
+      flight,
+      locations.targetObjectId,
+      locations.target.evidence,
+      "public_target",
+      tree,
+    );
+  } else {
+    if (
+      locations.sourceObjectId === null ||
+      locations.source.evidence === null ||
+      locations.source.state !== "match"
+    ) {
+      throw atomicFailure("atomic profile source proof is invalid");
+    }
+    await proveAtomicPrivateProfileTree(
+      flight,
+      locations.sourceObjectId,
+      locations.source.evidence,
+      "private_source",
+      tree,
+    );
+  }
+  const durableClassification: NonNullable<
+    AtomicPublishIntentV1["classification"]
+  > = {
+    outcome: classification.outcome,
+    nativeCode: classification.nativeCode,
+    sourceMatches: classification.sourceMatches,
+    targetMatches: classification.targetMatches,
+    targetOther: classification.targetOther,
+    evidenceDigest: sha256(
+      JSON.stringify({
+        precheck: classification.nativePrecheckEvidenceDigest,
+        locations: classification.locationEvidenceDigest,
+      }),
+    ),
+  };
+  const classifiedIntent: AtomicPublishIntentV1 = {
+    ...stableIntent.intent,
+    phase: "classified",
+    classification: durableClassification,
+  };
+  stableIntent = await createAndReplaceAtomicIntent(
+    controller,
+    `${input.flightNonce}:classified`,
+    stableIntent,
+    classifiedIntent,
+    input.intentsParentId,
+    input.intentsParentEvidence,
+  );
+  phases.push("classified");
+
+  let targetObjectId: FlightSemanticId | null = null;
+  let targetEvidence: AtomicObjectEvidenceV1 | null = null;
+  if (classification.outcome === "published") {
+    if (
+      locations.targetObjectId === null ||
+      locations.target.evidence === null
+    ) {
+      throw atomicFailure("atomic profile target proof is invalid");
+    }
+    targetObjectId = locations.targetObjectId;
+    targetEvidence = locations.target.evidence;
+    await syncAtomicHeld(
+      controller,
+      `${input.flightNonce}:renamed:source-parent`,
+      input.operationId,
+      "fsync_parent",
+      "wrapper",
+      wrapper.handleId,
+      wrapper.evidence,
+    );
+    await syncAtomicHeld(
+      controller,
+      `${input.flightNonce}:renamed:target-parent`,
+      input.operationId,
+      "fsync_parent",
+      input.targetParentRole,
+      input.targetParentId,
+      input.targetParentEvidence,
+    );
+    stableIntent = await createAndReplaceAtomicIntent(
+      controller,
+      `${input.flightNonce}:renamed`,
+      stableIntent,
+      {
+        ...stableIntent.intent,
+        phase: "renamed",
+      },
+      input.intentsParentId,
+      input.intentsParentEvidence,
+    );
+    phases.push("renamed");
+  }
+
+  const cleanupEntries: CleanupIdentityEntryV1[] = [...constructed.values()]
+    .sort((left, right) => {
+      const leftDepth = left.path === "" ? 0 : left.path.split("/").length;
+      const rightDepth =
+        right.path === "" ? 0 : right.path.split("/").length;
+      return rightDepth !== leftDepth
+        ? rightDepth - leftDepth
+        : rawCompare(left.path, right.path);
+    })
+    .map((entry, index) => ({
+      index,
+      scope: "private_profile_payload",
+      path: entry.path === "" ? "payload" : `payload/${entry.path}`,
+      type: entry.type,
+      dev: entry.evidence.dev,
+      ino: entry.evidence.ino,
+      mode: entry.mode,
+      size: entry.size,
+      contentSha256: entry.contentSha256,
+    }));
+  const manifest: CleanupIdentityManifestV1 = {
+    version: 1,
+    operationId: input.operationId,
+    binding: input.binding,
+    targetLocatorDigest: publicationTargetLocatorDigest(input.target),
+    entries: cleanupEntries,
+  };
+  const manifestBytes = encodeCleanupIdentityManifest(manifest);
+  const manifestTransitionId = atomicTransitionId(
+    input.operationId,
+    "manifest",
+  );
+  const manifestTempLeaf =
+    `${input.operationId}.identities.${manifestTransitionId}.tmp` as
+      `${string}.identities.${string}.tmp`;
+  const manifestBinding: NonNullable<
+    AtomicPublishIntentV1["identityManifest"]
+  > = {
+    phase: "planned",
+    filename: `${input.operationId}.identities.json`,
+    tempFilename: manifestTempLeaf,
+    sha256: manifestBytes.sha256,
+    entryCount: manifestBytes.entryCount,
+    byteSize: manifestBytes.bytes.byteLength,
+    dev: null,
+    ino: null,
+    mode: null,
+  };
+  stableIntent = await createAndReplaceAtomicIntent(
+    controller,
+    `${input.flightNonce}:manifest-planned`,
+    stableIntent,
+    {
+      ...stableIntent.intent,
+      phase: "manifest_planned",
+      identityManifest: manifestBinding,
+    },
+    input.intentsParentId,
+    input.intentsParentEvidence,
+  );
+  phases.push("manifest_planned");
+  const publishedManifest = await runAtomicCreateAndPersistRecordProtocol(
+    controller,
+    {
+      flightNonce: `${input.flightNonce}:manifest`,
+      operationId: input.operationId,
+      publication: {
+        kind: "persist_manifest",
+        expectedPhase: "manifest_planned",
+      },
+      canonicalBytes: manifestBytes.bytes,
+      contentDigest: manifestBytes.sha256,
+      tempParentId: input.intentsParentId,
+      tempParentEvidence: input.intentsParentEvidence,
+      tempLeaf: manifestTempLeaf,
+      stableParentId: input.intentsParentId,
+      stableParentEvidence: input.intentsParentEvidence,
+      stableLeaf: `${input.operationId}.identities.json`,
+    },
+  );
+  stableIntent = await createAndReplaceAtomicIntent(
+    controller,
+    `${input.flightNonce}:manifest-published`,
+    stableIntent,
+    {
+      ...stableIntent.intent,
+      phase: "manifest_published",
+      identityManifest: {
+        ...manifestBinding,
+        phase: "published",
+        dev: publishedManifest.stableEvidence.dev,
+        ino: publishedManifest.stableEvidence.ino,
+        mode: 448,
+      },
+    },
+    input.intentsParentId,
+    input.intentsParentEvidence,
+  );
+  phases.push("manifest_published");
+  return Object.freeze({
+    outcome: classification.outcome,
+    phases: Object.freeze(phases),
+    tree,
+    targetObjectId,
+    targetEvidence,
+    intentObjectId: stableIntent.objectId,
+    intentEvidence: stableIntent.evidence,
+    manifestObjectId: publishedManifest.stableObjectId,
+    manifestEvidence: publishedManifest.stableEvidence,
+  });
 }
 
 export type AtomicCanaryRecoveryRunnerInputV1 = Omit<

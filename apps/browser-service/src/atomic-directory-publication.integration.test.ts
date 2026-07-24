@@ -410,6 +410,7 @@ const { constants, existsSync, readFileSync, statSync } = require("node:fs");
     for (const reservation of [
       { reservation: "stable_files", count: 1, byteSize: 0 },
       { reservation: "payload_entries", count: 257, byteSize: 0 },
+      { reservation: "scratch_entries", count: 257, byteSize: 0 },
     ]) {
       const observed = await reconciliation.applyAtomicEffect(
         lease.controller,

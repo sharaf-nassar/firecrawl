@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, writeFileSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -39,6 +39,18 @@ import type {
   FlightSemanticId,
 } from "./atomic-directory-publication.js";
 import {
+  ATOMIC_MAX_PAYLOAD_BYTES,
+  ATOMIC_MAX_PAYLOAD_ENTRIES,
+  ATOMIC_MAX_SCRATCH_ENTRIES,
+  ATOMIC_MAX_SCRATCH_METADATA_FILES,
+  ATOMIC_MAX_STABLE_METADATA_FILES,
+} from "./atomic-directory-publication.js";
+import {
+  encodeAtomicPublishIntent,
+  parseAtomicPublishIntent,
+  type AtomicPublishIntentV1,
+} from "./atomic-publication-manifest.js";
+import {
   acquireAtomicPreReadyRecoveryAuthority,
   applyAtomicEffect,
   atomicHeldProfileHashImplementationIdentityForTest,
@@ -57,6 +69,10 @@ import {
   releaseChromiumSessionAttachment,
   retryFailedReconciliationOutcomeCleanups,
   runAtomicCanaryRecovery,
+  runAtomicCreateAndPersistRecordProtocol,
+  runAtomicIntentReplacementProtocol,
+  runAtomicPrivateProfilePublication,
+  runAtomicPinnedPersistenceProtocol,
   runWithReconciliationFilesystemTestContext,
   syncAndCanonicalizeHeldProfileTree,
   writeHeldProfileFixtureFile,
@@ -73,6 +89,7 @@ const STATE = { cookies: [], origins: [] };
 const STATE_BYTES = Buffer.from('{"cookies":[],"origins":[]}', "utf8");
 const OLD = new Date("2026-07-21T11:00:00.000Z");
 const NOW = new Date("2026-07-21T12:00:00.000Z");
+const ATOMIC_TEST_PAYLOAD_ENTRY_RESERVATION = 257;
 const roots: string[] = [];
 const execFileAsync = promisify(execFile);
 
@@ -82,6 +99,23 @@ function sha(bytes: Uint8Array | string): string {
 
 function atomicEffectId(): FlightEffectId {
   return Object.freeze({}) as FlightEffectId;
+}
+
+function atomicContentEvidence(
+  initial: AtomicObjectEvidenceV1,
+  bytes: Uint8Array,
+): AtomicObjectEvidenceV1 {
+  const value = {
+    dev: initial.dev,
+    ino: initial.ino,
+    mode: initial.mode,
+    size: bytes.byteLength,
+    contentSha256: sha(bytes),
+  };
+  return Object.freeze({
+    ...value,
+    evidenceDigest: sha(JSON.stringify(value)),
+  });
 }
 
 async function atomicFileEvidence(
@@ -115,6 +149,11 @@ async function openAtomicBundlesParent(
     },
     {
       reservation: "payload_entries" as const,
+      count: ATOMIC_TEST_PAYLOAD_ENTRY_RESERVATION,
+      byteSize: 0,
+    },
+    {
+      reservation: "scratch_entries" as const,
       count: 257,
       byteSize: 0,
     },
@@ -159,6 +198,17 @@ async function createAtomicCanaryFixture(
   operationId: typeof CHECKPOINT_A | typeof CHECKPOINT_B,
   targetParentLocatorDigest = sha("profiles-parent-locator"),
 ) {
+  const scratch = await applyAtomicEffect(lease.controller, {
+    kind: "reserve_budget",
+    effectId: atomicEffectId(),
+    operationId,
+    reservation: "scratch_files",
+    count: 1,
+    byteSize: 0,
+  });
+  if (scratch.kind !== "effect_completed") {
+    throw new Error("atomic canary scratch reservation failed");
+  }
   const wrapper = await applyAtomicEffect(lease.controller, {
     kind: "create_and_pin_wrapper",
     effectId: atomicEffectId(),
@@ -6767,6 +6817,14 @@ describe("atomic publication reconciliation ownership", () => {
       CHECKPOINT_A,
     );
     const bundles = await openAtomicBundlesParent(lease, canonicalRoot);
+    await applyAtomicEffect(lease.controller, {
+      kind: "reserve_budget",
+      effectId: atomicEffectId(),
+      operationId: CHECKPOINT_A,
+      reservation: "scratch_files",
+      count: 1,
+      byteSize: 0,
+    });
     const sourceLeaf = `proof-${CHECKPOINT_A}-0`;
     const targetLeaf = `canary-${CHECKPOINT_A}-0`;
     let wrapper:
@@ -7823,7 +7881,7 @@ describe("atomic publication reconciliation ownership", () => {
         operationId: CHECKPOINT_A,
         reservation: "payload_bytes",
         count: 0,
-        byteSize: bytes.byteLength,
+        byteSize: bytes.byteLength * leaves.length,
       });
       expect(reserved.kind).toBe("effect_completed");
 
@@ -7932,6 +7990,484 @@ describe("atomic publication reconciliation ownership", () => {
           { force: true },
         );
       }
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("publishes only the pinned synced intent temp without rediscovery", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const intent: AtomicPublishIntentV1 = {
+      version: 1,
+      operationId: CHECKPOINT_A,
+      kind: "scaffold",
+      phase: "allocated",
+      binding: {
+        processNonce: PROCESS,
+        controlGenerationNonce: GENERATION,
+        snapshotDigest: sha("snapshot"),
+      },
+      target: {
+        kind: "profile",
+        profileId: PROFILE,
+        leaf: PROFILE,
+        parent: {
+          dev: lease.initialAuthority.evidence.profilesParent.dev,
+          ino: lease.initialAuthority.evidence.profilesParent.ino,
+          mode: 448,
+        },
+      },
+      wrapper: null,
+      privateSource: null,
+      publicSource: null,
+      classification: null,
+      sourceDeletion: null,
+      adoption: null,
+      cleanup: null,
+      canaryProof: null,
+      prepublicationAbort: null,
+      identityManifest: null,
+    };
+    const encoded = encodeAtomicPublishIntent(intent);
+    const intentsEvidence = await atomicFileEvidence(
+      path.join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "intents",
+      ),
+      null,
+    );
+    try {
+      for (const reservation of [
+        {
+          reservation: "stable_files" as const,
+          count: 1,
+          byteSize: 0,
+        },
+        {
+          reservation: "scratch_files" as const,
+          count: 1,
+          byteSize: 0,
+        },
+        {
+          reservation: "other_metadata_bytes" as const,
+          count: 0,
+          byteSize: encoded.bytes.byteLength * 2,
+        },
+      ]) {
+        expect(
+          await applyAtomicEffect(lease.controller, {
+            kind: "reserve_budget",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            ...reservation,
+          }),
+        ).toMatchObject({ kind: "effect_completed" });
+      }
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const tempLeaf =
+        `${CHECKPOINT_A}.allocated.${CHECKPOINT_B}.tmp`;
+      const temp = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_temp_file",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intent_temp",
+        parentId: intents.handleId,
+        leaf: tempLeaf,
+        parentEvidenceDigest: intents.evidence.evidenceDigest,
+        mode: 384,
+        expectedAbsence: true,
+      });
+      if (temp.kind !== "create_and_pin_completed") {
+        throw new Error("atomic intent temp was not created");
+      }
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "write_file_chunk",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          sourceFileId: null,
+          inlineBytes: encoded.bytes,
+          destinationFileId: temp.handleId,
+          offset: 0,
+          byteLength: encoded.bytes.byteLength,
+          expectedChunkSha256: encoded.sha256,
+          expectedResultSha256: encoded.sha256,
+        }),
+      ).toMatchObject({ kind: "effect_completed" });
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "fsync_file",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role: "intent_temp",
+          objectId: temp.handleId,
+          expected: temp.evidence,
+        }),
+      ).toMatchObject({ kind: "effect_completed" });
+      const expectedTemp = atomicContentEvidence(
+        temp.evidence,
+        encoded.bytes,
+      );
+      const persistenceCalls: string[] = [];
+      const persistenceNative: string[] = [];
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "release_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "scratch_files",
+          count: 1,
+          byteSize: 0,
+        }),
+      ).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "release_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "other_metadata_bytes",
+          count: 0,
+          byteSize: encoded.bytes.byteLength,
+        }),
+      ).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+      const persisted = await runWithReconciliationFilesystemTestContext(
+        {
+          beforeCall(point) {
+            persistenceCalls.push(point);
+          },
+          atomicPersistenceNative(phase, move) {
+            persistenceNative.push(`${phase}:${move}`);
+          },
+        },
+        () =>
+          runAtomicPinnedPersistenceProtocol(lease.controller, {
+            flightNonce: "initial-intent",
+            request: {
+              kind: "persist_intent",
+              operationId: CHECKPOINT_A,
+              expectedPhase: null,
+              canonicalBytes: encoded.bytes,
+              contentDigest: encoded.sha256,
+              tempParentId: intents.handleId,
+              tempLeaf,
+              tempObjectId: temp.handleId,
+              expectedTemp,
+              stableParentId: intents.handleId,
+              stableLeaf: `${CHECKPOINT_A}.json`,
+              expectedStable: { absent: true },
+            },
+            stableParentRole: "intents_parent",
+            stableParentEvidence: intents.evidence,
+          }),
+      );
+      expect(persistenceNative).toEqual([
+        "before:intent_publish",
+        "after:intent_publish",
+      ]);
+      expect(persistenceCalls.length).toBeGreaterThan(0);
+      expect(persisted.stableEvidence).toEqual(expectedTemp);
+      await expect(
+        readFile(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+            `${CHECKPOINT_A}.json`,
+          ),
+        ),
+      ).resolves.toEqual(encoded.bytes);
+      const building = encodeAtomicPublishIntent({
+        ...intent,
+        phase: "building",
+        wrapper: {
+          dev: "9",
+          ino: "10",
+          mode: 448,
+        },
+      });
+      for (const reservation of [
+        {
+          reservation: "scratch_files" as const,
+          count: 1,
+          byteSize: 0,
+        },
+        {
+          reservation: "other_metadata_bytes" as const,
+          count: 0,
+          byteSize: Math.max(
+            0,
+            building.bytes.byteLength * 2 - encoded.bytes.byteLength,
+          ),
+        },
+      ]) {
+        expect(
+          await applyAtomicEffect(lease.controller, {
+            kind: "reserve_budget",
+            effectId: atomicEffectId(),
+            operationId: CHECKPOINT_A,
+            ...reservation,
+          }),
+        ).toMatchObject({
+          kind: "effect_completed",
+          requestKind: "reserve_budget",
+        });
+      }
+
+      const replacementLeaf =
+        `${CHECKPOINT_A}.building.${PROFILE}.tmp`;
+      const replacement = await applyAtomicEffect(lease.controller, {
+        kind: "create_and_pin_temp_file",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intent_temp",
+        parentId: intents.handleId,
+        leaf: replacementLeaf,
+        parentEvidenceDigest: intents.evidence.evidenceDigest,
+        mode: 384,
+        expectedAbsence: true,
+      });
+      if (replacement.kind !== "create_and_pin_completed") {
+        throw new Error("replacement intent temp was not created");
+      }
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "write_file_chunk",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          sourceFileId: null,
+          inlineBytes: building.bytes,
+          destinationFileId: replacement.handleId,
+          offset: 0,
+          byteLength: building.bytes.byteLength,
+          expectedChunkSha256: building.sha256,
+          expectedResultSha256: building.sha256,
+        }),
+      ).toMatchObject({ kind: "effect_completed" });
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "fsync_file",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role: "intent_temp",
+          objectId: replacement.handleId,
+          expected: replacement.evidence,
+        }),
+      ).toMatchObject({ kind: "effect_completed" });
+      const replacementEvidence = atomicContentEvidence(
+        replacement.evidence,
+        building.bytes,
+      );
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "replace_intent",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          expectedPhase: "building",
+          canonicalBytes: building.bytes,
+          contentDigest: building.sha256,
+          tempParentId: intents.handleId,
+          tempLeaf: replacementLeaf,
+          tempObjectId: replacement.handleId,
+          expectedTemp: replacementEvidence,
+          stableParentId: intents.handleId,
+          stableObjectId: persisted.stableObjectId,
+          stableLeaf: `${CHECKPOINT_A}.json`,
+          expectedStable: persisted.stableEvidence,
+        }),
+      ).toMatchObject({
+        kind: "effect_rejected",
+        code: "binding_invalid",
+      });
+      const nativeMoves: string[] = [];
+      const replaced = await runWithReconciliationFilesystemTestContext(
+        {
+          atomicNativeBarrier(_phase, move) {
+            nativeMoves.push(move);
+          },
+        },
+        () =>
+          runAtomicIntentReplacementProtocol(lease.controller, {
+            flightNonce: "building-intent",
+            request: {
+              kind: "replace_intent",
+              operationId: CHECKPOINT_A,
+              expectedPhase: "allocated",
+              canonicalBytes: building.bytes,
+              contentDigest: building.sha256,
+              tempParentId: intents.handleId,
+              tempLeaf: replacementLeaf,
+              tempObjectId: replacement.handleId,
+              expectedTemp: replacementEvidence,
+              stableParentId: intents.handleId,
+              stableObjectId: persisted.stableObjectId,
+              stableLeaf: `${CHECKPOINT_A}.json`,
+              expectedStable: persisted.stableEvidence,
+            },
+            stableParentRole: "intents_parent",
+            stableParentEvidence: intents.evidence,
+          }),
+      );
+      expect(replaced.stableEvidence).toEqual(replacementEvidence);
+      expect(nativeMoves).toEqual([]);
+      expect(
+        await atomicFileEvidence(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+            `${CHECKPOINT_A}.json`,
+          ),
+          building.sha256,
+        ),
+      ).toEqual(replacementEvidence);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("runs the complete initial intent creation and publication protocol", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const intentsEvidence = await atomicFileEvidence(
+      path.join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "intents",
+      ),
+      null,
+    );
+    try {
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "stable_files",
+          count: 1,
+          byteSize: 0,
+        }),
+      ).toMatchObject({ kind: "effect_completed" });
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const intent = encodeAtomicPublishIntent({
+        version: 1,
+        operationId: CHECKPOINT_A,
+        kind: "scaffold",
+        phase: "allocated",
+        binding: {
+          processNonce: PROCESS,
+          controlGenerationNonce: GENERATION,
+          snapshotDigest: sha("snapshot"),
+        },
+        target: {
+          kind: "profile",
+          profileId: PROFILE,
+          leaf: PROFILE,
+          parent: {
+            dev: lease.initialAuthority.evidence.profilesParent.dev,
+            ino: lease.initialAuthority.evidence.profilesParent.ino,
+            mode: 448,
+          },
+        },
+        wrapper: null,
+        privateSource: null,
+        publicSource: null,
+        classification: null,
+        sourceDeletion: null,
+        adoption: null,
+        cleanup: null,
+        canaryProof: null,
+        prepublicationAbort: null,
+        identityManifest: null,
+      });
+      const persisted = await runAtomicCreateAndPersistRecordProtocol(
+        lease.controller,
+        {
+          flightNonce: "complete-initial-intent",
+          operationId: CHECKPOINT_A,
+          publication: {
+            kind: "persist_intent",
+            expectedPhase: null,
+          },
+          canonicalBytes: intent.bytes,
+          contentDigest: intent.sha256,
+          tempParentId: intents.handleId,
+          tempParentEvidence: intents.evidence,
+          tempLeaf: `${CHECKPOINT_A}.allocated.${CHECKPOINT_B}.tmp`,
+          stableParentId: intents.handleId,
+          stableParentEvidence: intents.evidence,
+          stableLeaf: `${CHECKPOINT_A}.json`,
+        },
+      );
+      expect(persisted.stableEvidence.contentSha256).toBe(intent.sha256);
+      expect(
+        await applyAtomicEffect(lease.controller, {
+          kind: "open_pin_handle",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role: "intent_stable",
+          parentId: intents.handleId,
+          leaf: `${CHECKPOINT_A}.json`,
+          flags: "file_read_nofollow",
+          expected: persisted.stableEvidence,
+        }),
+      ).toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+      await expect(
+        readFile(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+            `${CHECKPOINT_A}.json`,
+          ),
+        ),
+      ).resolves.toEqual(intent.bytes);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
       await closeAnchoredProfileRoot(installed.root);
     }
   });
@@ -9065,4 +9601,958 @@ describe("atomic publication reconciliation ownership", () => {
       }
     },
   );
+
+  test("publishes a complete private scaffold through durable phases", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(
+      lease,
+      canonicalRoot,
+      CHECKPOINT_A,
+    );
+    const intentsEvidence = await atomicFileEvidence(
+      path.join(
+        canonicalRoot,
+        ".profile-publish-staging",
+        "intents",
+      ),
+      null,
+    );
+    try {
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const result = await runAtomicPrivateProfilePublication(
+        lease.controller,
+        {
+          flightNonce: "private-scaffold",
+          operationId: CHECKPOINT_A,
+          kind: "scaffold",
+          binding: installed.binding,
+          target: {
+            kind: "profile",
+            profileId: PROFILE,
+            leaf: PROFILE,
+            parent: {
+              dev: lease.initialAuthority.evidence.profilesParent.dev,
+              ino: lease.initialAuthority.evidence.profilesParent.ino,
+              mode: 448,
+            },
+          },
+          bundlesParentId: bundles.handleId,
+          bundlesParentEvidence: bundles.evidence,
+          intentsParentId: intents.handleId,
+          intentsParentEvidence: intents.evidence,
+          targetParentId: lease.initialAuthority.profilesParentId,
+          targetParentRole: "profiles_parent",
+          targetParentEvidence:
+            lease.initialAuthority.evidence.profilesParent,
+        },
+      );
+      expect(result).toMatchObject({
+        outcome: "published",
+        phases: [
+          "allocated",
+          "building",
+          "ready",
+          "classified",
+          "renamed",
+          "manifest_planned",
+          "manifest_published",
+        ],
+        tree: { byteSize: 0, fileCount: 0 },
+      });
+      await expect(
+        readdir(path.join(canonicalRoot, "profiles", PROFILE)),
+      ).resolves.toEqual(["committed", "staging", "working"]);
+      const durable = parseAtomicPublishIntent(
+        await readFile(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+            `${CHECKPOINT_A}.json`,
+          ),
+        ),
+      );
+      expect(durable.phase).toBe("manifest_published");
+      await expect(
+        readFile(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+            `${CHECKPOINT_A}.identities.json`,
+          ),
+        ),
+      ).resolves.toEqual(expect.any(Buffer));
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("admits exact disjoint entry and payload byte caps then rejects plus one", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    try {
+      for (const reservation of [
+        {
+          reservation: "payload_entries" as const,
+          count: ATOMIC_MAX_PAYLOAD_ENTRIES,
+          byteSize: 0,
+        },
+        {
+          reservation: "scratch_entries" as const,
+          count: ATOMIC_MAX_SCRATCH_ENTRIES,
+          byteSize: 0,
+        },
+        {
+          reservation: "stable_files" as const,
+          count: ATOMIC_MAX_STABLE_METADATA_FILES,
+          byteSize: 0,
+        },
+        {
+          reservation: "scratch_files" as const,
+          count: ATOMIC_MAX_SCRATCH_METADATA_FILES,
+          byteSize: 0,
+        },
+        {
+          reservation: "payload_bytes" as const,
+          count: 0,
+          byteSize: ATOMIC_MAX_PAYLOAD_BYTES,
+        },
+      ]) {
+        const observation = await applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          ...reservation,
+        });
+        expect(observation, reservation.reservation).toMatchObject({
+          kind: "effect_completed",
+        });
+      }
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_entries",
+          count: 1,
+          byteSize: 0,
+        }),
+      ).resolves.toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: 1,
+        }),
+      ).resolves.toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("writes and publishes a nested private working payload", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const bytes = Buffer.from("profile-state", "utf8");
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "working"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "staging"), {
+      mode: 0o700,
+    });
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "committed"), {
+      mode: 0o700,
+    });
+    await writeFile(
+      path.join(canonicalRoot, "profiles", PROFILE, "committed", "source.bin"),
+      bytes,
+      { mode: 0o600 },
+    );
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(
+      lease,
+      canonicalRoot,
+      CHECKPOINT_A,
+    );
+    try {
+      const intentsEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        ),
+        null,
+      );
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const profileEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles", PROFILE),
+        null,
+      );
+      const profile = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_target",
+        parentId: lease.initialAuthority.profilesParentId,
+        leaf: PROFILE,
+        flags: "directory_nofollow",
+        expected: profileEvidence,
+      });
+      if (profile.kind !== "existing_handle_pinned") {
+        throw new Error("atomic profile parent was not pinned");
+      }
+      const committedEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles", PROFILE, "committed"),
+        null,
+      );
+      const committed = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_target",
+        parentId: profile.handleId,
+        leaf: "committed",
+        flags: "directory_nofollow",
+        expected: committedEvidence,
+      });
+      if (committed.kind !== "existing_handle_pinned") {
+        throw new Error("atomic committed parent was not pinned");
+      }
+      const sourceEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "committed",
+          "source.bin",
+        ),
+        sha(bytes),
+      );
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: bytes.byteLength,
+        }),
+      ).resolves.toMatchObject({ kind: "effect_completed" });
+      const source = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_source",
+        parentId: committed.handleId,
+        leaf: "source.bin",
+        flags: "file_read_nofollow",
+        expected: sourceEvidence,
+      });
+      if (source.kind !== "existing_handle_pinned") {
+        throw new Error("atomic committed source was not pinned");
+      }
+      const workingEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles", PROFILE, "working"),
+        null,
+      );
+      const working = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_target",
+        parentId: profile.handleId,
+        leaf: "working",
+        flags: "directory_nofollow",
+        expected: workingEvidence,
+      });
+      if (working.kind !== "existing_handle_pinned") {
+        throw new Error("atomic working parent was not pinned");
+      }
+      const result = await runAtomicPrivateProfilePublication(
+        lease.controller,
+        {
+          flightNonce: "private-working",
+          operationId: CHECKPOINT_A,
+          kind: "working",
+          binding: installed.binding,
+          target: {
+            kind: "profile_state",
+            profileId: PROFILE,
+            state: "working",
+            generationId: CHECKPOINT_B,
+            leaf: CHECKPOINT_B,
+            parent: {
+              dev: working.evidence.dev,
+              ino: working.evidence.ino,
+              mode: 448,
+            },
+          },
+          bundlesParentId: bundles.handleId,
+          bundlesParentEvidence: bundles.evidence,
+          intentsParentId: intents.handleId,
+          intentsParentEvidence: intents.evidence,
+          targetParentId: working.handleId,
+          targetParentRole: "public_target",
+          targetParentEvidence: working.evidence,
+          entries: [
+            { path: "nested", type: "directory" },
+            {
+              path: "nested/state.bin",
+              type: "file",
+              bytes,
+              sourceFileId: source.handleId,
+              sourceEvidence: source.evidence,
+            },
+          ],
+        },
+      );
+      expect(result).toMatchObject({
+        outcome: "published",
+        tree: { byteSize: bytes.byteLength, fileCount: 1 },
+      });
+      await expect(
+        readFile(
+          path.join(
+            canonicalRoot,
+            "profiles",
+            PROFILE,
+            "working",
+            CHECKPOINT_B,
+            "nested",
+            "state.bin",
+          ),
+        ),
+      ).resolves.toEqual(bytes);
+      if (result.targetObjectId === null || result.targetEvidence === null) {
+        throw new Error("atomic published target authority was not returned");
+      }
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "close_handle",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          objectId: result.targetObjectId,
+          role: "public_target",
+          expected: result.targetEvidence,
+        }),
+      ).resolves.toMatchObject({ kind: "effect_completed" });
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "release_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_entries",
+          count: 1,
+          byteSize: 0,
+        }),
+      ).resolves.toMatchObject({ kind: "effect_completed" });
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "close_handle",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          objectId: source.handleId,
+          role: "public_source",
+          expected: source.evidence,
+        }),
+      ).resolves.toMatchObject({ kind: "effect_completed" });
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "release_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: bytes.byteLength,
+        }),
+      ).resolves.toMatchObject({ kind: "effect_completed" });
+      for (const reservation of [
+        {
+          reservation: "payload_entries" as const,
+          count:
+            ATOMIC_MAX_PAYLOAD_ENTRIES -
+            ATOMIC_TEST_PAYLOAD_ENTRY_RESERVATION,
+          byteSize: 0,
+        },
+        {
+          reservation: "payload_bytes" as const,
+          count: 0,
+          byteSize: ATOMIC_MAX_PAYLOAD_BYTES,
+        },
+      ]) {
+        const observation = await applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          ...reservation,
+        });
+        expect(observation, reservation.reservation).toMatchObject({
+          kind: "effect_completed",
+        });
+      }
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_entries",
+          count: 1,
+          byteSize: 0,
+        }),
+      ).resolves.toMatchObject({
+        kind: "effect_rejected",
+        code: "budget_exceeded",
+      });
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("rejects a post-native payload change before durable classification", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const bytes = Buffer.from("profile-state", "utf8");
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE, "working"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    for (const state of ["staging", "committed"] as const) {
+      await mkdir(path.join(canonicalRoot, "profiles", PROFILE, state), {
+        mode: 0o700,
+      });
+    }
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(
+      lease,
+      canonicalRoot,
+      CHECKPOINT_A,
+    );
+    try {
+      const intentsEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        ),
+        null,
+      );
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const profileEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles", PROFILE),
+        null,
+      );
+      const profile = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_target",
+        parentId: lease.initialAuthority.profilesParentId,
+        leaf: PROFILE,
+        flags: "directory_nofollow",
+        expected: profileEvidence,
+      });
+      if (profile.kind !== "existing_handle_pinned") {
+        throw new Error("atomic profile parent was not pinned");
+      }
+      const workingEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles", PROFILE, "working"),
+        null,
+      );
+      const working = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_target",
+        parentId: profile.handleId,
+        leaf: "working",
+        flags: "directory_nofollow",
+        expected: workingEvidence,
+      });
+      if (working.kind !== "existing_handle_pinned") {
+        throw new Error("atomic working parent was not pinned");
+      }
+      const targetFile = path.join(
+        canonicalRoot,
+        "profiles",
+        PROFILE,
+        "working",
+        CHECKPOINT_B,
+        "state.bin",
+      );
+      await expect(
+        runWithReconciliationFilesystemTestContext(
+          {
+            atomicNativeBarrier(phase, move) {
+              if (phase === "after" && move === "profile_publish") {
+                writeFileSync(targetFile, Buffer.from("tampered-data", "utf8"));
+              }
+            },
+          },
+          () =>
+            runAtomicPrivateProfilePublication(lease.controller, {
+              flightNonce: "private-post-native-tamper",
+              operationId: CHECKPOINT_A,
+              kind: "working",
+              binding: installed.binding,
+              target: {
+                kind: "profile_state",
+                profileId: PROFILE,
+                state: "working",
+                generationId: CHECKPOINT_B,
+                leaf: CHECKPOINT_B,
+                parent: {
+                  dev: working.evidence.dev,
+                  ino: working.evidence.ino,
+                  mode: 448,
+                },
+              },
+              bundlesParentId: bundles.handleId,
+              bundlesParentEvidence: bundles.evidence,
+              intentsParentId: intents.handleId,
+              intentsParentEvidence: intents.evidence,
+              targetParentId: working.handleId,
+              targetParentRole: "public_target",
+              targetParentEvidence: working.evidence,
+              entries: [{ path: "state.bin", type: "file", bytes }],
+            }),
+        ),
+      ).rejects.toThrow(/profile tree proof/u);
+      const durable = parseAtomicPublishIntent(
+        await readFile(
+          path.join(
+            canonicalRoot,
+            ".profile-publish-staging",
+            "intents",
+            `${CHECKPOINT_A}.json`,
+          ),
+        ),
+      );
+      expect(durable.phase).toBe("ready");
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("rejects noncommitted copy and nonworking target authority before mutation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    const bytes = Buffer.from("profile-state", "utf8");
+    for (const state of ["working", "staging", "committed"] as const) {
+      await mkdir(path.join(canonicalRoot, "profiles", PROFILE, state), {
+        recursive: state === "working",
+        mode: 0o700,
+      });
+    }
+    await writeFile(
+      path.join(canonicalRoot, "profiles", PROFILE, "staging", "source.bin"),
+      bytes,
+      { mode: 0o600 },
+    );
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(
+      lease,
+      canonicalRoot,
+      CHECKPOINT_A,
+    );
+    try {
+      const intentsEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        ),
+        null,
+      );
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const profileEvidence = await atomicFileEvidence(
+        path.join(canonicalRoot, "profiles", PROFILE),
+        null,
+      );
+      const profile = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_target",
+        parentId: lease.initialAuthority.profilesParentId,
+        leaf: PROFILE,
+        flags: "directory_nofollow",
+        expected: profileEvidence,
+      });
+      if (profile.kind !== "existing_handle_pinned") {
+        throw new Error("atomic profile parent was not pinned");
+      }
+      const stateHandles = new Map<
+        "working" | "staging",
+        Extract<
+          Awaited<ReturnType<typeof applyAtomicEffect>>,
+          { kind: "existing_handle_pinned" }
+        >
+      >();
+      for (const state of ["working", "staging"] as const) {
+        const evidence = await atomicFileEvidence(
+          path.join(canonicalRoot, "profiles", PROFILE, state),
+          null,
+        );
+        const opened = await applyAtomicEffect(lease.controller, {
+          kind: "open_pin_handle",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          role: "public_target",
+          parentId: profile.handleId,
+          leaf: state,
+          flags: "directory_nofollow",
+          expected: evidence,
+        });
+        if (opened.kind !== "existing_handle_pinned") {
+          throw new Error(`atomic ${state} parent was not pinned`);
+        }
+        stateHandles.set(state, opened);
+      }
+      const staging = stateHandles.get("staging")!;
+      const working = stateHandles.get("working")!;
+      const sourceEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "staging",
+          "source.bin",
+        ),
+        sha(bytes),
+      );
+      await expect(
+        applyAtomicEffect(lease.controller, {
+          kind: "reserve_budget",
+          effectId: atomicEffectId(),
+          operationId: CHECKPOINT_A,
+          reservation: "payload_bytes",
+          count: 0,
+          byteSize: bytes.byteLength,
+        }),
+      ).resolves.toMatchObject({ kind: "effect_completed" });
+      const source = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "public_source",
+        parentId: staging.handleId,
+        leaf: "source.bin",
+        flags: "file_read_nofollow",
+        expected: sourceEvidence,
+      });
+      if (source.kind !== "existing_handle_pinned") {
+        throw new Error("atomic staging source was not pinned");
+      }
+      const base = {
+        flightNonce: "private-authority-negative",
+        operationId: CHECKPOINT_A,
+        kind: "working" as const,
+        binding: installed.binding,
+        bundlesParentId: bundles.handleId,
+        bundlesParentEvidence: bundles.evidence,
+        intentsParentId: intents.handleId,
+        intentsParentEvidence: intents.evidence,
+        targetParentRole: "public_target" as const,
+      };
+      const validTarget = {
+        kind: "profile_state" as const,
+        profileId: PROFILE,
+        state: "working" as const,
+        generationId: CHECKPOINT_B,
+        leaf: CHECKPOINT_B,
+        parent: {
+          dev: working.evidence.dev,
+          ino: working.evidence.ino,
+          mode: 448,
+        },
+      };
+      await expect(
+        runAtomicPrivateProfilePublication(lease.controller, {
+          ...base,
+          binding: {
+            ...base.binding,
+            snapshotDigest: sha("wrong-snapshot"),
+          },
+          target: validTarget,
+          targetParentId: working.handleId,
+          targetParentEvidence: working.evidence,
+          entries: [],
+        }),
+      ).rejects.toThrow(/publication binding/u);
+      await mkdir(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "working",
+          "bundles",
+        ),
+        { mode: 0o700 },
+      );
+      const wrongBundlesEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          "profiles",
+          PROFILE,
+          "working",
+          "bundles",
+        ),
+        null,
+      );
+      const wrongBundles = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "bundles_parent",
+        parentId: working.handleId,
+        leaf: "bundles",
+        flags: "directory_nofollow",
+        expected: wrongBundlesEvidence,
+      });
+      if (wrongBundles.kind !== "existing_handle_pinned") {
+        throw new Error("atomic wrong bundles parent was not pinned");
+      }
+      await expect(
+        runAtomicPrivateProfilePublication(lease.controller, {
+          ...base,
+          bundlesParentId: wrongBundles.handleId,
+          bundlesParentEvidence: wrongBundles.evidence,
+          target: validTarget,
+          targetParentId: working.handleId,
+          targetParentEvidence: working.evidence,
+          entries: [],
+        }),
+      ).rejects.toThrow(/control ancestry/u);
+      await expect(
+        runAtomicPrivateProfilePublication(lease.controller, {
+          ...base,
+          target: {
+            kind: "profile_state",
+            profileId: PROFILE,
+            state: "working",
+            generationId: CHECKPOINT_B,
+            leaf: CHECKPOINT_B,
+            parent: {
+              dev: working.evidence.dev,
+              ino: working.evidence.ino,
+              mode: 448,
+            },
+          },
+          targetParentId: working.handleId,
+          targetParentEvidence: working.evidence,
+          entries: [
+            {
+              path: "state.bin",
+              type: "file",
+              bytes,
+              sourceFileId: source.handleId,
+              sourceEvidence: source.evidence,
+            },
+          ],
+        }),
+      ).rejects.toThrow(/committed copy authority/u);
+      await expect(
+        runAtomicPrivateProfilePublication(lease.controller, {
+          ...base,
+          target: {
+            kind: "profile_state",
+            profileId: PROFILE,
+            state: "working",
+            generationId: CHECKPOINT_B,
+            leaf: CHECKPOINT_B,
+            parent: {
+              dev: staging.evidence.dev,
+              ino: staging.evidence.ino,
+              mode: 448,
+            },
+          },
+          targetParentId: staging.handleId,
+          targetParentEvidence: staging.evidence,
+          entries: [{ path: "state.bin", type: "file", bytes }],
+        }),
+      ).rejects.toThrow(/working target authority/u);
+      await expect(
+        readdir(
+          path.join(canonicalRoot, ".profile-publish-staging", "bundles"),
+        ),
+      ).resolves.toEqual([]);
+      await expect(
+        readdir(
+          path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+        ),
+      ).resolves.toEqual([]);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
+
+  test("durably classifies a no-replace profile conflict", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const installed = await installedProfileRoot(canonicalRoot);
+    await mkdir(path.join(canonicalRoot, "profiles", PROFILE), {
+      mode: 0o700,
+    });
+    const lease = await acquireAtomicPreReadyRecoveryAuthority(
+      installed.root,
+      CHECKPOINT_A,
+    );
+    const bundles = await openAtomicBundlesParent(
+      lease,
+      canonicalRoot,
+      CHECKPOINT_A,
+    );
+    try {
+      const intentsEvidence = await atomicFileEvidence(
+        path.join(
+          canonicalRoot,
+          ".profile-publish-staging",
+          "intents",
+        ),
+        null,
+      );
+      const intents = await applyAtomicEffect(lease.controller, {
+        kind: "open_pin_handle",
+        effectId: atomicEffectId(),
+        operationId: CHECKPOINT_A,
+        role: "intents_parent",
+        parentId: lease.initialAuthority.stagingRootId,
+        leaf: "intents",
+        flags: "directory_nofollow",
+        expected: intentsEvidence,
+      });
+      if (intents.kind !== "existing_handle_pinned") {
+        throw new Error("atomic intents parent was not pinned");
+      }
+      const result = await runAtomicPrivateProfilePublication(
+        lease.controller,
+        {
+          flightNonce: "private-conflict",
+          operationId: CHECKPOINT_A,
+          kind: "scaffold",
+          binding: installed.binding,
+          target: {
+            kind: "profile",
+            profileId: PROFILE,
+            leaf: PROFILE,
+            parent: {
+              dev: lease.initialAuthority.evidence.profilesParent.dev,
+              ino: lease.initialAuthority.evidence.profilesParent.ino,
+              mode: 448,
+            },
+          },
+          bundlesParentId: bundles.handleId,
+          bundlesParentEvidence: bundles.evidence,
+          intentsParentId: intents.handleId,
+          intentsParentEvidence: intents.evidence,
+          targetParentId: lease.initialAuthority.profilesParentId,
+          targetParentRole: "profiles_parent",
+          targetParentEvidence:
+            lease.initialAuthority.evidence.profilesParent,
+        },
+      );
+      expect(result.outcome).toBe("conflict");
+      expect(result.phases).toEqual([
+        "allocated",
+        "building",
+        "ready",
+        "classified",
+        "manifest_planned",
+        "manifest_published",
+      ]);
+      await expect(
+        readdir(path.join(canonicalRoot, "profiles", PROFILE)),
+      ).resolves.toEqual([]);
+    } finally {
+      await closeAtomicEffectController(lease.controller);
+      await closeAnchoredProfileRoot(installed.root);
+    }
+  });
 });
