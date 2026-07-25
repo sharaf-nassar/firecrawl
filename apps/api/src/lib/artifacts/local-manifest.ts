@@ -1,12 +1,45 @@
 import { sql } from "drizzle-orm";
 import { db } from "../../db/connection";
 import { logger } from "../logger";
+import type { BrowserStateMutationLease } from "../browser-runtime/startup-gate";
 import type { ArtifactStore } from "./types";
 import {
   putArtifactWithManifest,
   type ArtifactManifestRecord,
   type ManifestArtifactInput,
 } from "./manifest";
+
+/** @public Browser artifacts persist through the caller's fenced transaction. */
+export async function persistBrowserArtifactManifestWithLease(
+  lease: BrowserStateMutationLease,
+  record: ArtifactManifestRecord,
+): Promise<void> {
+  if (record.checksum === null) {
+    throw new Error("Browser artifact checksum is required");
+  }
+  const inserted = await lease.transaction.query(
+    `INSERT INTO local_artifacts (
+       object_key, owner_id, request_id, job_id, kind, content_type,
+       byte_size, checksum, delete_after
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (object_key) DO NOTHING
+     RETURNING object_key`,
+    [
+      record.objectKey,
+      record.ownerId,
+      record.requestId,
+      record.jobId,
+      record.kind,
+      record.contentType,
+      record.byteSize,
+      record.checksum,
+      record.deleteAfter,
+    ],
+  );
+  if (inserted.rows.length !== 1) {
+    throw new Error("Browser artifact manifest key already exists");
+  }
+}
 
 export async function putLocalArtifactWithManifest(
   store: ArtifactStore,
@@ -44,6 +77,7 @@ export async function putLocalArtifactWithManifest(
                   kind,
                   content_type,
                   byte_size,
+                  checksum,
                   delete_after
                 ) VALUES (
                   ${record.objectKey},
@@ -53,6 +87,7 @@ export async function putLocalArtifactWithManifest(
                   ${record.kind},
                   ${record.contentType},
                   ${record.byteSize},
+                  ${record.checksum},
                   ${record.deleteAfter}
                 )
                 ON CONFLICT (object_key) DO UPDATE SET
@@ -62,6 +97,7 @@ export async function putLocalArtifactWithManifest(
                   kind = EXCLUDED.kind,
                   content_type = EXCLUDED.content_type,
                   byte_size = EXCLUDED.byte_size,
+                  checksum = EXCLUDED.checksum,
                   delete_after = EXCLUDED.delete_after
               `);
             },

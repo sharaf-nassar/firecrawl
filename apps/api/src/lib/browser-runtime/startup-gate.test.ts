@@ -41,6 +41,132 @@ function pool() {
 }
 
 describe("BrowserStartupGate", () => {
+  async function openedGateForCommit(
+    commit: () => Promise<{ rows: never[]; command: string }>,
+  ) {
+    const release = vi.fn();
+    const query = vi.fn(async (text: string) => {
+      if (text === "BEGIN") return { rows: [], command: "BEGIN" };
+      if (text.includes("SELECT database_control_epoch")) {
+        return {
+          rows: [
+            {
+              database_control_epoch: "7",
+              api_instance_id: binding.apiInstanceId,
+              process_nonce: binding.processNonce,
+              control_generation_nonce: binding.controlGenerationNonce,
+            },
+          ],
+          command: "SELECT",
+        };
+      }
+      if (text === "COMMIT") return commit();
+      if (text === "ROLLBACK") return { rows: [], command: "ROLLBACK" };
+      throw new Error(`Unexpected query: ${text}`);
+    });
+    const gate = createBrowserStartupGate({
+      pool: {
+        connect: vi.fn(async () => ({ query, release })),
+      } as never,
+    });
+    const initial = gate.close("startup");
+    await initial.drained;
+    gate.open(initial, binding);
+    return { gate, query, release };
+  }
+
+  it("reports an acknowledged COMMIT and reuses the client", async () => {
+    const { gate, release } = await openedGateForCommit(async () => ({
+      rows: [],
+      command: "COMMIT",
+    }));
+    let outcome: Promise<"committed" | "rolled_back" | "unknown"> | undefined;
+
+    await expect(
+      gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        async lease => {
+          outcome = lease.transaction.commitOutcome;
+          return "done";
+        },
+      ),
+    ).resolves.toBe("done");
+    await expect(outcome).resolves.toBe("committed");
+    expect(release).toHaveBeenCalledWith();
+  });
+
+  it("reports an explicit server ROLLBACK without destroying the client", async () => {
+    const { gate, release } = await openedGateForCommit(async () => ({
+      rows: [],
+      command: "ROLLBACK",
+    }));
+    let outcome: Promise<"committed" | "rolled_back" | "unknown"> | undefined;
+
+    await expect(
+      gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        async lease => {
+          outcome = lease.transaction.commitOutcome;
+        },
+      ),
+    ).rejects.toMatchObject({ category: "browser_state_unavailable" });
+    await expect(outcome).resolves.toBe("rolled_back");
+    expect(release).toHaveBeenCalledWith();
+  });
+
+  it("reports a rejected COMMIT as unknown and destroys the client", async () => {
+    const rejected = new Error("connection lost during COMMIT");
+    const { gate, release } = await openedGateForCommit(async () => {
+      throw rejected;
+    });
+    let outcome: Promise<"committed" | "rolled_back" | "unknown"> | undefined;
+
+    await expect(
+      gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        async lease => {
+          outcome = lease.transaction.commitOutcome;
+        },
+      ),
+    ).rejects.toBe(rejected);
+    await expect(outcome).resolves.toBe("unknown");
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
+  it("bounds a hanging COMMIT, destroys the client, and completes drain", async () => {
+    let reachedCommit!: () => void;
+    const commitReached = new Promise<void>(resolve => {
+      reachedCommit = resolve;
+    });
+    const { gate, release } = await openedGateForCommit(async () => {
+      reachedCommit();
+      return new Promise<never>(() => undefined);
+    });
+    let outcome: Promise<"committed" | "rolled_back" | "unknown"> | undefined;
+    const mutation = gate.withBrowserStateMutationLease(
+      "filesystem_and_database",
+      async lease => {
+        outcome = lease.transaction.commitOutcome;
+      },
+      { commitTimeoutMs: 10 },
+    );
+    await commitReached;
+    const drain = gate.close("restart");
+    let drained = false;
+    void drain.drained.then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    await expect(mutation).rejects.toMatchObject({
+      category: "browser_state_unavailable",
+    });
+    await expect(outcome).resolves.toBe("unknown");
+    await drain.drained;
+    expect(release).toHaveBeenCalledWith(true);
+  });
+
   it("closes synchronously and waits for admitted mutations", async () => {
     const gate = createBrowserStartupGate({ pool: pool() as never });
     expect(() => gate.assertOpen()).toThrow(

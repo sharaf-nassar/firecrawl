@@ -700,6 +700,8 @@ export type ActiveBrowserRunAuthority = {
   adapterSupervisorId: string;
   adapterProcessId: number;
   deadline: Date;
+  perOperationTimeoutMs: number;
+  zeroDataRetention: false;
 };
 
 /** @public */
@@ -724,11 +726,39 @@ export async function getActiveBrowserRunAuthority(
       currentRunId: schema.browser_sessions.current_run_id,
       sessionOwnerId: schema.browser_sessions.owner_id,
       absoluteDeadline: schema.browser_sessions.absolute_deadline_at,
+      perOperationTimeoutMs:
+        schema.browser_capabilities.per_operation_timeout_ms,
+      capabilityActivatedAt: schema.browser_capabilities.activated_at,
+      capabilityRevokedAt: schema.browser_capabilities.revoked_at,
+      capabilityExpiresAt: schema.browser_capabilities.expires_at,
+      capabilityWallDeadlineAt: schema.browser_capabilities.wall_deadline_at,
+      requestTargetHint: schema.requests.target_hint,
     })
     .from(schema.browser_interact_runs)
     .innerJoin(
       schema.browser_sessions,
       eq(schema.browser_sessions.id, schema.browser_interact_runs.session_id),
+    )
+    .innerJoin(
+      schema.browser_capabilities,
+      and(
+        eq(schema.browser_capabilities.run_id, schema.browser_interact_runs.id),
+        eq(
+          schema.browser_capabilities.owner_id,
+          schema.browser_interact_runs.owner_id,
+        ),
+        eq(
+          schema.browser_capabilities.session_id,
+          schema.browser_interact_runs.session_id,
+        ),
+      ),
+    )
+    .innerJoin(
+      schema.requests,
+      and(
+        eq(schema.requests.id, schema.browser_interact_runs.request_id),
+        eq(schema.requests.team_id, schema.browser_interact_runs.owner_id),
+      ),
     )
     .where(eq(schema.browser_interact_runs.id, parsedRunId.data))
     .limit(1);
@@ -742,8 +772,13 @@ export async function getActiveBrowserRunAuthority(
     row.adapterJobId === null ||
     row.adapterSupervisorId === null ||
     row.adapterProcessId === null ||
+    row.capabilityActivatedAt === null ||
+    row.capabilityRevokedAt !== null ||
+    row.requestTargetHint === "<redacted due to zero data retention>" ||
     new Date(row.deadline).getTime() <= Date.now() ||
-    new Date(row.absoluteDeadline).getTime() <= Date.now()
+    new Date(row.absoluteDeadline).getTime() <= Date.now() ||
+    new Date(row.capabilityExpiresAt).getTime() <= Date.now() ||
+    new Date(row.capabilityWallDeadlineAt).getTime() <= Date.now()
   ) {
     return null;
   }
@@ -757,6 +792,11 @@ export async function getActiveBrowserRunAuthority(
     adapterSupervisorId: row.adapterSupervisorId,
     adapterProcessId: row.adapterProcessId,
     deadline: new Date(row.deadline),
+    perOperationTimeoutMs: row.perOperationTimeoutMs,
+    // Request logging persists this exact redaction sentinel for ZDR. Reject
+    // it above before returning the narrow non-ZDR proof consumed before
+    // artifact bytes are read.
+    zeroDataRetention: false,
   };
 }
 

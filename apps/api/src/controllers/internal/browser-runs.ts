@@ -6,6 +6,7 @@ import express from "express";
 import type WebSocket from "ws";
 import { z } from "zod";
 
+import { getArtifactStore, type ArtifactStore } from "../../lib/artifacts";
 import {
   CapabilityDeniedError,
   createCapabilityStore,
@@ -18,6 +19,12 @@ import {
   BrowserActionCoordinatorError,
   createBrowserActionCoordinator,
 } from "../../lib/browser-runtime/action-coordinator";
+import {
+  BrowserArtifactError,
+  createBrowserArtifactService,
+  parseBrowserArtifactHeaders,
+  readBrowserArtifactBody,
+} from "../../lib/browser-runtime/artifacts";
 import type { BrowserStartupGate } from "../../lib/browser-runtime/startup-gate";
 import type { BrowserStateMutationLease } from "../../lib/browser-runtime/startup-gate";
 import { canonicalUuidSchema } from "../../lib/scrape-interact/browser-service-contracts";
@@ -55,6 +62,8 @@ export type InternalBrowserRunsDependencies = {
     headers: AdapterHeaders,
   ) => Promise<void>;
   now?: () => Date;
+  getArtifactStore?: () => ArtifactStore | null;
+  createArtifactService?: typeof createBrowserArtifactService;
 };
 
 type AdapterHeaders = {
@@ -199,6 +208,72 @@ function sanitizedError(
   response.status(status).json({ success: false, error: category, message });
 }
 
+function browserArtifactErrorStatus(category: string): number {
+  if (category === "capability_denied") return 403;
+  if (category === "artifact_too_large") return 413;
+  if (
+    category === "artifact_duplicate" ||
+    category === "artifact_budget_exceeded"
+  ) {
+    return 409;
+  }
+  if (
+    category === "artifact_invalid_headers" ||
+    category === "artifact_length_mismatch" ||
+    category === "artifact_checksum_mismatch" ||
+    category === "artifact_upload_interrupted"
+  ) {
+    return 400;
+  }
+  return 503;
+}
+
+function createArtifactCancellation(
+  request: Request,
+  response: Response,
+  authority: ActiveBrowserRunAuthority,
+  now: Date,
+): {
+  signal: AbortSignal;
+  markSuccessfulResponse(): void;
+} {
+  const controller = new AbortController();
+  let successfulResponseExpected = false;
+  let completed = false;
+  const abort = () => {
+    if (!completed) controller.abort();
+  };
+  const cleanup = () => {
+    clearTimeout(timer);
+    request.off("aborted", abort);
+    response.off("close", abort);
+    request.socket.off("close", abort);
+    response.off("finish", finish);
+  };
+  const finish = () => {
+    if (successfulResponseExpected) completed = true;
+    else controller.abort();
+    cleanup();
+  };
+  const remainingRunMs = authority.deadline.getTime() - now.getTime();
+  const remainingMs = Math.max(
+    1,
+    Math.min(remainingRunMs, authority.perOperationTimeoutMs),
+  );
+  const timer = setTimeout(abort, remainingMs);
+  timer.unref?.();
+  request.once("aborted", abort);
+  response.once("close", abort);
+  request.socket.once("close", abort);
+  response.once("finish", finish);
+  return {
+    signal: controller.signal,
+    markSuccessfulResponse() {
+      successfulResponseExpected = true;
+    },
+  };
+}
+
 /** @public Sanitized internal callback status mapping. */
 export function browserActionErrorStatus(category: string): number {
   if (
@@ -256,6 +331,9 @@ export function createBrowserRunsInternalRouter(
   const readToken =
     deps.readAdapterToken ?? (() => defaultReadToken(deps.adapterTokenFile));
   const getAuthority = deps.getAuthority ?? getActiveBrowserRunAuthority;
+  const resolveArtifactStore = deps.getArtifactStore ?? getArtifactStore;
+  const buildArtifactService =
+    deps.createArtifactService ?? createBrowserArtifactService;
   const now = deps.now ?? (() => new Date());
   const authenticate = async (request: Request) => {
     const authorization = exactSingleRawHeader(request, "authorization");
@@ -281,7 +359,8 @@ export function createBrowserRunsInternalRouter(
       authority === null ||
       authority.adapterJobId !== headers.adapterJobId ||
       authority.adapterSupervisorId !== headers.adapterSupervisorId ||
-      authority.adapterProcessId !== headers.adapterProcessId
+      authority.adapterProcessId !== headers.adapterProcessId ||
+      authority.zeroDataRetention !== false
     ) {
       throw new CapabilityDeniedError();
     }
@@ -423,18 +502,62 @@ export function createBrowserRunsInternalRouter(
     },
   );
 
-  // Task 11 installs bounded artifact ingestion behind this authenticated
-  // binding. Keeping the route private and fail-closed prevents accidental
-  // unauthenticated uploads before that store exists.
   router.post(
     "/internal/browser-runs/:runId/artifacts",
-    (_request, response) => {
-      sanitizedError(
+    async (request, response) => {
+      const runtime = deps.getRuntime();
+      const authority = authorityByRequest.get(request);
+      const store = resolveArtifactStore();
+      if (!runtime || !authority || !store) {
+        sanitizedError(
+          response,
+          503,
+          "browser_unavailable",
+          "Browser artifact ingestion is unavailable",
+        );
+        return;
+      }
+      const cancellation = createArtifactCancellation(
+        request,
         response,
-        503,
-        "browser_unavailable",
-        "Browser artifact ingestion is unavailable",
+        authority,
+        now(),
       );
+      try {
+        const headers = parseBrowserArtifactHeaders(request.rawHeaders);
+        const body = await readBrowserArtifactBody(
+          request,
+          headers,
+          cancellation.signal,
+        );
+        const artifact = await buildArtifactService({
+          gate: runtime.gate,
+          store,
+        }).ingest(authority, headers, body, cancellation.signal);
+        cancellation.markSuccessfulResponse();
+        response.status(201).json({
+          version: 1,
+          artifactId: artifact.artifactId,
+          kind: artifact.kind,
+          contentType: artifact.contentType,
+          byteSize: artifact.byteSize,
+          sha256: artifact.sha256,
+        });
+      } catch (error) {
+        const category =
+          error instanceof BrowserArtifactError
+            ? error.category
+            : ((error as { category?: string }).category ??
+              "artifact_store_unavailable");
+        sanitizedError(
+          response,
+          browserArtifactErrorStatus(category),
+          category,
+          category === "capability_denied"
+            ? "Browser capability was denied"
+            : "Browser artifact ingestion failed",
+        );
+      }
     },
   );
 

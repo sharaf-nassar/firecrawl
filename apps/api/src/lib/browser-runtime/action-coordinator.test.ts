@@ -18,6 +18,8 @@ const run: ActiveBrowserRunAuthority = {
   adapterSupervisorId: ID(6),
   adapterProcessId: 42,
   deadline: new Date(Date.now() + 60_000),
+  perOperationTimeoutMs: 30_000,
+  zeroDataRetention: false,
 };
 
 function proposal(): SubmitBrowserActionV1 {

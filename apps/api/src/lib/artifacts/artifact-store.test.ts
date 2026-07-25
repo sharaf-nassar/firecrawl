@@ -546,6 +546,7 @@ describe("local artifact manifest coordination", () => {
       kind: "scrape",
       contentType: "application/json",
       byteSize: 2,
+      checksum: null,
       deleteAfter: new Date("2026-08-17T00:00:00Z"),
     });
   });

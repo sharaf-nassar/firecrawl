@@ -41,6 +41,29 @@ export type BrowserMutationDrain = {
 /** @public */
 export type BrowserControlFenceTransaction = Pick<PoolClient, "query"> & {
   readonly databaseControlEpoch: number;
+  /**
+   * Settles only when PostgreSQL's transaction outcome is safe to act on.
+   * A rejected COMMIT is ambiguous because the response can be lost after
+   * PostgreSQL made the commit durable.
+   */
+  readonly commitOutcome?: Promise<BrowserMutationCommitOutcome>;
+};
+
+/** @public */
+export type BrowserMutationCommitOutcome =
+  | "committed"
+  | "rolled_back"
+  | "unknown";
+
+/** @public */
+export type BrowserMutationTransactionOptions = {
+  /**
+   * Bounds only the COMMIT acknowledgement wait. Values above the gate's
+   * safety ceiling are capped.
+   */
+  readonly commitTimeoutMs?: number;
+  /** Aborts only the COMMIT acknowledgement wait after COMMIT is sent. */
+  readonly signal?: AbortSignal;
 };
 
 /** @public */
@@ -60,10 +83,12 @@ export type BrowserStartupGate = {
   withBrowserStateMutationLease<T>(
     scope: "filesystem_and_database",
     operation: (lease: BrowserStateMutationLease) => Promise<T>,
+    options?: BrowserMutationTransactionOptions,
   ): Promise<T>;
   withDrainedBrowserStateMutation<T>(
     drain: BrowserMutationDrain,
     operation: (lease: BrowserStateMutationLease) => Promise<T>,
+    options?: BrowserMutationTransactionOptions,
   ): Promise<T>;
 };
 
@@ -80,6 +105,8 @@ type DrainRecord = {
   settled: boolean;
   recoveryClaimed: boolean;
 };
+
+const MAX_COMMIT_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000;
 
 function unavailable(): BrowserStartupGateError {
   return new BrowserStartupGateError("browser_state_unavailable");
@@ -161,9 +188,34 @@ export function createBrowserStartupGate(deps: {
     leaseEpoch: number,
     expected: BrowserStartupBinding | undefined,
     operation: (lease: BrowserStateMutationLease) => Promise<T>,
+    options?: BrowserMutationTransactionOptions,
   ): Promise<T> => {
+    const requestedCommitTimeoutMs =
+      options?.commitTimeoutMs ?? MAX_COMMIT_ACKNOWLEDGEMENT_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(requestedCommitTimeoutMs) ||
+      requestedCommitTimeoutMs <= 0
+    ) {
+      throw unavailable();
+    }
+    const commitTimeoutMs = Math.min(
+      requestedCommitTimeoutMs,
+      MAX_COMMIT_ACKNOWLEDGEMENT_TIMEOUT_MS,
+    );
     const client = await deps.pool.connect();
     let begun = false;
+    let commitStarted = false;
+    let destroyClient = false;
+    let outcomeSettled = false;
+    let settleOutcome!: (outcome: BrowserMutationCommitOutcome) => void;
+    const commitOutcome = new Promise<BrowserMutationCommitOutcome>(resolve => {
+      settleOutcome = resolve;
+    });
+    const settleCommitOutcome = (outcome: BrowserMutationCommitOutcome) => {
+      if (outcomeSettled) return;
+      outcomeSettled = true;
+      settleOutcome(outcome);
+    };
     try {
       await client.query("BEGIN");
       begun = true;
@@ -182,6 +234,7 @@ export function createBrowserStartupGate(deps: {
       const transaction: BrowserControlFenceTransaction = {
         query: client.query.bind(client),
         databaseControlEpoch: durable.databaseControlEpoch,
+        commitOutcome,
       };
       const value = await operation({
         epoch: leaseEpoch,
@@ -189,20 +242,82 @@ export function createBrowserStartupGate(deps: {
         binding: expected ?? durable,
         transaction,
       });
-      await client.query("COMMIT");
+      commitStarted = true;
+      let committed;
+      try {
+        const commit = client.query("COMMIT");
+        committed = await new Promise<Awaited<typeof commit>>(
+          (resolve, reject) => {
+            let settled = false;
+            const finish = (
+              callback: (value: Awaited<typeof commit>) => void,
+              value: Awaited<typeof commit>,
+            ) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              options?.signal?.removeEventListener("abort", abort);
+              callback(value);
+            };
+            const fail = (error: unknown) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              options?.signal?.removeEventListener("abort", abort);
+              reject(error);
+            };
+            const abort = () => fail(options?.signal?.reason ?? unavailable());
+            const timer = setTimeout(
+              () => fail(unavailable()),
+              commitTimeoutMs,
+            );
+            timer.unref?.();
+            options?.signal?.addEventListener("abort", abort, { once: true });
+            if (options?.signal?.aborted) {
+              abort();
+            }
+            commit.then(
+              result => finish(resolve, result),
+              error => fail(error),
+            );
+          },
+        );
+      } catch (error) {
+        // A transport failure can arrive after PostgreSQL durably committed.
+        // Do not issue ROLLBACK or reuse this connection as either action would
+        // incorrectly turn an ambiguous outcome into an asserted rollback.
+        begun = false;
+        destroyClient = true;
+        settleCommitOutcome("unknown");
+        throw error;
+      }
       begun = false;
+      if (committed.command === "ROLLBACK") {
+        settleCommitOutcome("rolled_back");
+        throw unavailable();
+      }
+      settleCommitOutcome("committed");
       return value;
     } catch (error) {
-      if (begun) {
+      if (begun && !commitStarted) {
         try {
           await client.query("ROLLBACK");
         } catch {
-          // Preserve the mutation failure; the broken client is released below.
+          destroyClient = true;
+          // COMMIT was never sent, so disconnecting still guarantees rollback.
         }
+        begun = false;
+        settleCommitOutcome("rolled_back");
+      } else if (!outcomeSettled) {
+        settleCommitOutcome("unknown");
       }
       throw error;
     } finally {
-      client.release();
+      if (destroyClient) {
+        client.release(true);
+      } else {
+        client.release();
+      }
     }
   };
 
@@ -270,7 +385,7 @@ export function createBrowserStartupGate(deps: {
       });
     },
 
-    async withBrowserStateMutationLease(scope, operation) {
+    async withBrowserStateMutationLease(scope, operation, options) {
       if (scope !== "filesystem_and_database" || binding === undefined) {
         throw unavailable();
       }
@@ -278,14 +393,19 @@ export function createBrowserStartupGate(deps: {
       const admittedEpoch = epoch;
       activeMutations += 1;
       try {
-        return await transact(admittedEpoch, admittedBinding, operation);
+        return await transact(
+          admittedEpoch,
+          admittedBinding,
+          operation,
+          options,
+        );
       } finally {
         activeMutations -= 1;
         settleDrains();
       }
     },
 
-    async withDrainedBrowserStateMutation(drain, operation) {
+    async withDrainedBrowserStateMutation(drain, operation, options) {
       if (
         currentDrain?.token !== drain ||
         drain.epoch !== epoch ||
@@ -299,7 +419,7 @@ export function createBrowserStartupGate(deps: {
       currentDrain.recoveryClaimed = true;
       activeMutations += 1;
       try {
-        return await transact(epoch, undefined, operation);
+        return await transact(epoch, undefined, operation, options);
       } finally {
         activeMutations -= 1;
         settleDrains();

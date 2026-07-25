@@ -1,5 +1,7 @@
 import { EventEmitter, once } from "node:events";
+import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createHash } from "node:crypto";
 
 import express from "express";
 import expressWs from "express-ws";
@@ -53,6 +55,8 @@ function fixture() {
     adapterSupervisorId: ID(6),
     adapterProcessId: 42,
     deadline: new Date(Date.now() + 60_000),
+    perOperationTimeoutMs: 30_000,
+    zeroDataRetention: false as const,
   };
   const app = expressWs(express()).app;
   app.use(
@@ -153,7 +157,251 @@ describe("internal browser run callbacks", () => {
         "x-firecrawl-adapter-process-id",
         String(authority.adapterProcessId),
       );
-    expect([403, 503]).toContain(response.status);
+    expect([400, 403, 503]).toContain(response.status);
+  });
+
+  it("streams one strictly bounded artifact after binding authentication", async () => {
+    const { authority, inspectBinding } = fixture();
+    const body = Buffer.from("verified artifact");
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    const ingest = vi.fn().mockResolvedValue({
+      artifactId: ID(7),
+      kind: "screenshot",
+      contentType: "image/png",
+      byteSize: body.byteLength,
+      sha256,
+    });
+    const callbackApp = expressWs(express()).app;
+    callbackApp.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () =>
+          ({
+            gate: {},
+            browserClient: {},
+          }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi.fn().mockResolvedValue(authority),
+        inspectBinding,
+        getArtifactStore: () => ({}) as never,
+        createArtifactService: vi.fn(() => ({ ingest })) as never,
+      }),
+    );
+    const response = await request(callbackApp)
+      .post(`/internal/browser-runs/${authority.runId}/artifacts`)
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+      .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+      .set("x-firecrawl-adapter-process-id", String(authority.adapterProcessId))
+      .set("x-firecrawl-artifact-id", ID(7))
+      .set("x-firecrawl-artifact-kind", "screenshot")
+      .set("x-firecrawl-artifact-content-type", "image/png")
+      .set("x-firecrawl-artifact-byte-size", String(body.byteLength))
+      .set("x-firecrawl-artifact-sha256", sha256)
+      .set("content-length", String(body.byteLength))
+      .send(body);
+    expect(response.status).toBe(201);
+    expect(response.body).toEqual({
+      version: 1,
+      artifactId: ID(7),
+      kind: "screenshot",
+      contentType: "image/png",
+      byteSize: body.byteLength,
+      sha256,
+    });
+    expect(inspectBinding).toHaveBeenCalledTimes(1);
+    expect(ingest).toHaveBeenCalledWith(
+      authority,
+      expect.objectContaining({ sha256, byteSize: body.byteLength }),
+      body,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("rejects explicit ZDR authority before artifact ingestion", async () => {
+    const { authority, inspectBinding } = fixture();
+    const ingest = vi.fn();
+    const callbackApp = expressWs(express()).app;
+    callbackApp.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () => ({ gate: {}, browserClient: {} }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi
+          .fn()
+          .mockResolvedValue({ ...authority, zeroDataRetention: true }),
+        inspectBinding,
+        getArtifactStore: () => ({}) as never,
+        createArtifactService: vi.fn(() => ({ ingest })) as never,
+      }),
+    );
+    const response = await request(callbackApp)
+      .post(`/internal/browser-runs/${authority.runId}/artifacts`)
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+      .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+      .set("x-firecrawl-adapter-process-id", String(authority.adapterProcessId))
+      .send(Buffer.from("must not stream"));
+    expect(response.status).toBe(403);
+    expect(response.body.error).toBe("capability_denied");
+    expect(inspectBinding).not.toHaveBeenCalled();
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("aborts artifact ingestion at the per-operation deadline", async () => {
+    const { authority, inspectBinding } = fixture();
+    const ingest = vi.fn(
+      async (
+        _authority: unknown,
+        _headers: unknown,
+        _body: unknown,
+        signal: AbortSignal,
+      ) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () =>
+              reject(
+                Object.assign(new Error("interrupted"), {
+                  category: "artifact_upload_interrupted",
+                }),
+              ),
+            { once: true },
+          );
+        }),
+    );
+    const callbackApp = expressWs(express()).app;
+    callbackApp.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () => ({ gate: {}, browserClient: {} }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi
+          .fn()
+          .mockResolvedValue({ ...authority, perOperationTimeoutMs: 20 }),
+        inspectBinding,
+        getArtifactStore: () => ({}) as never,
+        createArtifactService: vi.fn(() => ({ ingest })) as never,
+      }),
+    );
+    const body = Buffer.from("deadline artifact");
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    const response = await request(callbackApp)
+      .post(`/internal/browser-runs/${authority.runId}/artifacts`)
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+      .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+      .set("x-firecrawl-adapter-process-id", String(authority.adapterProcessId))
+      .set("x-firecrawl-artifact-id", ID(7))
+      .set("x-firecrawl-artifact-kind", "screenshot")
+      .set("x-firecrawl-artifact-content-type", "image/png")
+      .set("x-firecrawl-artifact-byte-size", String(body.byteLength))
+      .set("x-firecrawl-artifact-sha256", sha256)
+      .set("content-length", String(body.byteLength))
+      .send(body);
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("artifact_upload_interrupted");
+  });
+
+  it("aborts after the body when the response socket disconnects", async () => {
+    const { authority, inspectBinding } = fixture();
+    let observedSignal!: AbortSignal;
+    let ingestStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      ingestStarted = resolve;
+    });
+    const ingest = vi.fn(
+      async (
+        _authority: unknown,
+        _headers: unknown,
+        _body: unknown,
+        signal: AbortSignal,
+      ) => {
+        observedSignal = signal;
+        ingestStarted();
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () =>
+              reject(
+                Object.assign(new Error("disconnected"), {
+                  category: "artifact_upload_interrupted",
+                }),
+              ),
+            { once: true },
+          );
+        });
+      },
+    );
+    const callbackApp = expressWs(express()).app;
+    callbackApp.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () => ({ gate: {}, browserClient: {} }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi.fn().mockResolvedValue(authority),
+        inspectBinding,
+        getArtifactStore: () => ({}) as never,
+        createArtifactService: vi.fn(() => ({ ingest })) as never,
+      }),
+    );
+    const server = callbackApp.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    const body = Buffer.from("disconnect artifact");
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    const client = httpRequest({
+      host: "127.0.0.1",
+      port,
+      method: "POST",
+      path: `/internal/browser-runs/${authority.runId}/artifacts`,
+      headers: {
+        authorization: `Bearer ${"x".repeat(32)}`,
+        "x-firecrawl-adapter-job-id": authority.adapterJobId,
+        "x-firecrawl-adapter-supervisor-id": authority.adapterSupervisorId,
+        "x-firecrawl-adapter-process-id": String(authority.adapterProcessId),
+        "x-firecrawl-artifact-id": ID(7),
+        "x-firecrawl-artifact-kind": "screenshot",
+        "x-firecrawl-artifact-content-type": "image/png",
+        "x-firecrawl-artifact-byte-size": String(body.byteLength),
+        "x-firecrawl-artifact-sha256": sha256,
+        "content-length": String(body.byteLength),
+      },
+    });
+    client.on("error", () => undefined);
+    client.end(body);
+    try {
+      await started;
+      client.destroy();
+      await vi.waitFor(() => expect(observedSignal.aborted).toBe(true));
+    } finally {
+      client.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it("rejects unknown artifact headers without invoking ingestion", async () => {
+    const { authority, inspectBinding } = fixture();
+    const ingest = vi.fn();
+    const callbackApp = expressWs(express()).app;
+    callbackApp.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () => ({ gate: {}, browserClient: {} }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi.fn().mockResolvedValue(authority),
+        inspectBinding,
+        getArtifactStore: () => ({}) as never,
+        createArtifactService: vi.fn(() => ({ ingest })) as never,
+      }),
+    );
+    const response = await request(callbackApp)
+      .post(`/internal/browser-runs/${authority.runId}/artifacts`)
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+      .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+      .set("x-firecrawl-adapter-process-id", String(authority.adapterProcessId))
+      .set("x-firecrawl-artifact-extra", "forbidden")
+      .send(Buffer.from("x"));
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("artifact_invalid_headers");
+    expect(inspectBinding).toHaveBeenCalledTimes(1);
+    expect(ingest).not.toHaveBeenCalled();
   });
 
   it("sanitizes malformed JSON after authenticating the binding", async () => {
@@ -242,6 +490,8 @@ describe("internal browser run callbacks", () => {
       adapterSupervisorId: ID(6),
       adapterProcessId: 42,
       deadline: new Date(Date.now() + 60_000),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
     };
     const app = expressWs(express()).app;
     app.use(
@@ -333,6 +583,8 @@ describe("internal browser run callbacks", () => {
       adapterSupervisorId: ID(6),
       adapterProcessId: 42,
       deadline: new Date(Date.now() + (failure === "deadline" ? 250 : 60_000)),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
     };
     const app = expressWs(express()).app;
     app.use(
@@ -416,6 +668,8 @@ describe("internal browser run callbacks", () => {
       adapterSupervisorId: ID(6),
       adapterProcessId: 42,
       deadline: new Date(Date.now() + 60_000),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
     };
     const app = expressWs(express()).app;
     app.use(
@@ -510,6 +764,8 @@ describe("internal browser run callbacks", () => {
         adapterSupervisorId: ID(6),
         adapterProcessId: 42,
         deadline: new Date(Date.now() + 60_000),
+        perOperationTimeoutMs: 30_000,
+        zeroDataRetention: false as const,
       };
       const app = expressWs(express()).app;
       app.use(
@@ -615,6 +871,8 @@ describe("internal browser run callbacks", () => {
       adapterSupervisorId: ID(6),
       adapterProcessId: 42,
       deadline: new Date(Date.now() + 60_000),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
     };
     const app = expressWs(express()).app;
     app.use(

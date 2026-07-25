@@ -9,6 +9,7 @@ export interface ArtifactManifestRecord {
   kind: string;
   contentType: string;
   byteSize: number;
+  checksum: string | null;
   deleteAfter: Date | null;
 }
 
@@ -17,6 +18,7 @@ export type ManifestArtifactInput = PutArtifactInput & {
   requestId: string | null;
   jobId: string | null;
   kind: string;
+  checksum?: string | null;
   deleteAfter: Date | null;
 };
 
@@ -46,6 +48,7 @@ export async function putArtifactWithManifest(
         kind: input.kind,
         contentType: stored.contentType,
         byteSize: stored.byteSize,
+        checksum: input.checksum ?? null,
         deleteAfter: input.deleteAfter,
       });
     } catch (error) {
