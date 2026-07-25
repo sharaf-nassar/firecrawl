@@ -4,6 +4,10 @@ import type {
   browser_session_activities,
   browser_sessions,
 } from "../../db/schema/public";
+import type { BrowserOperationResultV1 } from "../scrape-interact/browser-service-contracts";
+
+/** @public */
+export type { BrowserOperationResultV1 };
 
 export type BrowserSessionState =
   | "creating"
@@ -58,6 +62,24 @@ export interface BoundedPageState {
   snapshotExcerpt: string;
 }
 
+export type AdapterAuthorizationBinding = {
+  adapterJobId: string;
+  adapterSupervisorId: string;
+  adapterProcessId: number;
+};
+
+export type AdapterPendingBinding = Omit<
+  AdapterAuthorizationBinding,
+  "adapterProcessId"
+> & { adapterProcessId: null };
+
+export type AdapterPendingAuthorizationInput = {
+  adapterJobId: string;
+  adapterSupervisorId: string;
+  capabilityToken: string;
+  onAccepted(binding: AdapterAuthorizationBinding): Promise<void>;
+};
+
 export type ObservationV1 =
   | {
       version: 1;
@@ -72,7 +94,7 @@ export type ObservationV1 =
       actionId: string;
       actionKind: BrowserOperation["kind"];
       outcome: "succeeded" | "rejected_no_effect" | "failed_no_effect";
-      result?: unknown;
+      result?: BrowserOperationResultV1;
       error?: { category: string; message: string };
       page: BoundedPageState;
     };
@@ -101,11 +123,12 @@ export type BrowserInteractRunRow = Omit<BrowserInteractRunSelect, "state"> & {
 
 export type BrowserInteractActionRow = Omit<
   BrowserInteractActionSelect,
-  "state" | "effect" | "operation"
+  "state" | "effect" | "operation" | "result"
 > & {
   state: BrowserInteractActionState;
   effect: BrowserOperationEffect;
   operation: BrowserOperation;
+  result: BrowserOperationResultV1 | null;
 };
 
 export type CreateBrowserSessionInput = Omit<
@@ -153,6 +176,8 @@ export type InteractRunTransitionPatch = Partial<
   Pick<
     BrowserInteractRunRow,
     | "adapter_process_id"
+    | "adapter_job_id"
+    | "adapter_supervisor_id"
     | "started_at"
     | "finished_at"
     | "cancelled_at"

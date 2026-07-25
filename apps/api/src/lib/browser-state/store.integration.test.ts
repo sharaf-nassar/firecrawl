@@ -19,6 +19,7 @@ const databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
 const describeWithDatabase = databaseUrl ? describe : describe.skip;
 const ownerId = "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
 const adapterJobId = "4033373e-ae4e-4114-aa06-04c3d4214b7c";
+const adapterSupervisorId = "4033373e-ae4e-4114-aa06-04c3d4214b7d";
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
@@ -41,6 +42,7 @@ describeWithDatabase("durable browser state store", () => {
   const pool = new Pool({ connectionString: databaseUrl, max: 8 });
   const database = drizzle({ client: pool });
   let store: typeof import("./store");
+  let currentAdapterJobId = adapterJobId;
 
   async function createFixture(options?: { state?: "ready" | "executing" }) {
     const requestId = randomUUID();
@@ -48,6 +50,9 @@ describeWithDatabase("durable browser state store", () => {
     const sessionId = randomUUID();
     const runId = randomUUID();
     const correlationId = randomUUID();
+    const fixtureAdapterJobId = randomUUID();
+    const fixtureAdapterSupervisorId = randomUUID();
+    currentAdapterJobId = fixtureAdapterJobId;
     const now = new Date();
 
     await pool.query(
@@ -85,12 +90,22 @@ describeWithDatabase("durable browser state store", () => {
       reasoning_effort: "medium",
       deadline_at: new Date(now.getTime() + 120_000).toISOString(),
       correlation_id: correlationId,
+      adapter_job_id: fixtureAdapterJobId,
+      adapter_supervisor_id: fixtureAdapterSupervisorId,
+      adapter_process_id: 4242,
     });
     await pool.query(
       "UPDATE browser_sessions SET current_run_id = $1 WHERE id = $2",
       [run.id, session.id],
     );
-    return { requestId, scrapeId, session, run };
+    return {
+      requestId,
+      scrapeId,
+      session,
+      run,
+      adapterJobId: fixtureAdapterJobId,
+      adapterSupervisorId: fixtureAdapterSupervisorId,
+    };
   }
 
   function request(
@@ -100,7 +115,7 @@ describeWithDatabase("durable browser state store", () => {
   ): SubmitBrowserActionV1 {
     return {
       version: 1,
-      adapterJobId,
+      adapterJobId: currentAdapterJobId,
       sequence,
       actionId: randomUUID(),
       proposalHash: proposalHash(operation),
@@ -121,6 +136,39 @@ describeWithDatabase("durable browser state store", () => {
       const result = await store.interruptUnfinishedBrowserWork(now, {
         query: client.query.bind(client),
         databaseControlEpoch: 1,
+      });
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function withMutationLease<T>(
+    operation: (
+      lease: Parameters<typeof store.claimBrowserSessionStop>[0],
+    ) => Promise<T>,
+  ): Promise<T> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await operation({
+        epoch: 1,
+        scope: "filesystem_and_database",
+        binding: {
+          apiInstanceId: randomUUID(),
+          databaseControlEpoch: 1,
+          processNonce: "a".repeat(43),
+          controlGenerationNonce: "b".repeat(43),
+          snapshotDigest: "c".repeat(64),
+        },
+        transaction: {
+          query: client.query.bind(client),
+          databaseControlEpoch: 1,
+        },
       });
       await client.query("COMMIT");
       return result;
@@ -244,6 +292,160 @@ describeWithDatabase("durable browser state store", () => {
     );
   });
 
+  it("elects one durable stop owner and completes terminal cleanup", async () => {
+    const fixture = await createFixture({ state: "executing" });
+    const claims = await Promise.all([
+      withMutationLease(lease =>
+        store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
+      ),
+      withMutationLease(lease =>
+        store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
+      ),
+    ]);
+    expect(claims.filter(Boolean)).toEqual([
+      {
+        runId: fixture.run.id,
+        profileId: null,
+        browserId: null,
+        runtimeEpoch: 1,
+      },
+    ]);
+    await withMutationLease(lease =>
+      store.finishBrowserSessionStop(
+        lease,
+        fixture.session.id,
+        "requested",
+        "destroyed",
+      ),
+    );
+    const session = await pool.query(
+      `SELECT state, current_run_id, terminal_at, terminal_reason
+         FROM browser_sessions
+        WHERE id = $1`,
+      [fixture.session.id],
+    );
+    expect(session.rows[0]).toMatchObject({
+      state: "destroyed",
+      current_run_id: null,
+      terminal_at: expect.any(Date),
+      terminal_reason: "requested",
+    });
+    const run = await pool.query(
+      `SELECT state, cancelled_at, finished_at
+         FROM browser_interact_runs
+        WHERE id = $1`,
+      [fixture.run.id],
+    );
+    expect(run.rows[0]).toMatchObject({
+      state: "cancelled",
+      cancelled_at: expect.any(Date),
+      finished_at: expect.any(Date),
+    });
+  });
+
+  it("claims and terminalizes a direct session with no run", async () => {
+    const requestId = randomUUID();
+    const sessionId = randomUUID();
+    await pool.query(
+      `INSERT INTO requests
+         (id, kind, api_version, team_id, origin, target_hint)
+       VALUES ($1, 'scrape', 'v2', $2, 'test', 'direct session')`,
+      [requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO browser_sessions
+         (id, request_id, owner_id, state, absolute_deadline_at,
+          idle_deadline_at, last_activity_at, ttl_total,
+          ttl_without_activity)
+       VALUES ($1, $2, $3, 'ready', now() + interval '10 minutes',
+               now() + interval '5 minutes', now(), 600, 300)`,
+      [sessionId, requestId, ownerId],
+    );
+
+    await expect(
+      withMutationLease(lease =>
+        store.claimBrowserSessionStop(lease, sessionId, "requested"),
+      ),
+    ).resolves.toMatchObject({ runId: null, runtimeEpoch: 1 });
+    await withMutationLease(lease =>
+      store.finishBrowserSessionStop(
+        lease,
+        sessionId,
+        "requested",
+        "destroyed",
+      ),
+    );
+    await expect(store.getBrowserSession(sessionId)).resolves.toMatchObject({
+      state: "destroyed",
+      current_run_id: null,
+      terminal_at: expect.any(String),
+    });
+  });
+
+  it("commits one prepared profile generation with pointer CAS", async () => {
+    const fixture = await createFixture({ state: "ready" });
+    const profileId = randomUUID();
+    const originalGenerationId = randomUUID();
+    const preparedGenerationId = randomUUID();
+    await pool.query(
+      `INSERT INTO browser_profiles
+         (id, owner_id, name, writer_session_id)
+       VALUES ($1, $2, $3, $4)`,
+      [profileId, ownerId, `profile-${profileId}`, fixture.session.id],
+    );
+    await pool.query(
+      `INSERT INTO browser_profile_generations
+         (id, profile_id, generation, byte_size, checksum)
+       VALUES ($1, $2, 1, 128, $3)`,
+      [originalGenerationId, profileId, "1".repeat(64)],
+    );
+    await pool.query(
+      `UPDATE browser_profiles SET latest_generation_id = $2 WHERE id = $1`,
+      [profileId, originalGenerationId],
+    );
+    await pool.query(
+      `UPDATE browser_sessions
+          SET profile_id = $2, profile_generation_id = $3
+        WHERE id = $1`,
+      [fixture.session.id, profileId, originalGenerationId],
+    );
+    const claim = await withMutationLease(lease =>
+      store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
+    );
+    expect(claim).toMatchObject({ profileId });
+
+    await withMutationLease(lease =>
+      store.commitPreparedProfileGeneration(lease, claim!, {
+        profileId,
+        generationId: preparedGenerationId,
+        checksum: "2".repeat(64),
+        byteSize: 256,
+        prepareToken: "p".repeat(43),
+      }),
+    );
+    const profile = await pool.query(
+      `SELECT latest_generation_id, writer_session_id
+         FROM browser_profiles
+        WHERE id = $1`,
+      [profileId],
+    );
+    const generation = await pool.query(
+      `SELECT generation, byte_size, checksum
+         FROM browser_profile_generations
+        WHERE id = $1`,
+      [preparedGenerationId],
+    );
+    expect(profile.rows[0]).toMatchObject({
+      latest_generation_id: preparedGenerationId,
+      writer_session_id: fixture.session.id,
+    });
+    expect(generation.rows[0]).toEqual({
+      generation: 2,
+      byte_size: "256",
+      checksum: "2".repeat(64),
+    });
+  });
+
   it("validates action bodies, binding, hash, budget, and one in-flight action", async () => {
     const { run } = await createFixture({ state: "executing" });
     const first = request(1, { kind: "click", ref: "button-1" });
@@ -285,6 +487,19 @@ describeWithDatabase("durable browser state store", () => {
         request(2, { kind: "get_url" }),
       ),
     ).rejects.toThrow(/sequence/i);
+
+    const wrongJobFixture = await createFixture({ state: "executing" });
+    await expect(
+      store.prepareBrowserAction(
+        wrongJobFixture.run.id,
+        request(1, { kind: "get_url" }, { adapterJobId: randomUUID() }),
+      ),
+    ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
+    const actions = await pool.query(
+      "SELECT count(*)::int AS count FROM browser_interact_actions WHERE run_id = $1",
+      [wrongJobFixture.run.id],
+    );
+    expect(actions.rows).toEqual([{ count: 0 }]);
   });
 
   it("locks the active session and rejects stale or terminal run bindings", async () => {
@@ -301,6 +516,9 @@ describeWithDatabase("durable browser state store", () => {
       reasoning_effort: "medium",
       deadline_at: new Date(Date.now() + 120_000).toISOString(),
       correlation_id: randomUUID(),
+      adapter_job_id: randomUUID(),
+      adapter_supervisor_id: randomUUID(),
+      adapter_process_id: 4243,
     });
     await expect(
       store.prepareBrowserAction(
@@ -341,7 +559,7 @@ describeWithDatabase("durable browser state store", () => {
       actionId: action.actionId,
       proposalHash: action.proposalHash,
       outcome: "succeeded",
-      result: { text: "hello" },
+      result: { kind: "get_text", text: "hello" },
       page: {
         url: "https://example.com/result",
         title: "Result",
@@ -366,9 +584,13 @@ describeWithDatabase("durable browser state store", () => {
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
   });
 
-  it("preserves a successful JSON null result across callback replay", async () => {
+  it("preserves a successful JSON null value across callback replay", async () => {
     const { run } = await createFixture({ state: "executing" });
-    const action = request(1, { kind: "get_text", ref: "empty" });
+    const action = request(1, {
+      kind: "evaluate",
+      expression: "null",
+      args: {},
+    });
     await store.prepareBrowserAction(run.id, action);
     await store.markBrowserActionExecuting(run.id, action.actionId);
     const original = await store.completeBrowserAction({
@@ -376,7 +598,7 @@ describeWithDatabase("durable browser state store", () => {
       actionId: action.actionId,
       proposalHash: action.proposalHash,
       outcome: "succeeded",
-      result: null,
+      result: { kind: "evaluate", value: null },
       page: {
         url: "https://example.com/empty",
         title: "Empty",
@@ -389,7 +611,7 @@ describeWithDatabase("durable browser state store", () => {
       actionId: action.actionId,
       proposalHash: action.proposalHash,
       outcome: "succeeded",
-      result: null,
+      result: { kind: "evaluate", value: null },
       page: {
         url: "https://example.com/empty",
         title: "Empty",
@@ -398,8 +620,8 @@ describeWithDatabase("durable browser state store", () => {
     });
     expect(replay).toEqual({ kind: "cached", observation: original });
     expect(terminalRetry).toEqual(original);
-    expect(terminalRetry).toHaveProperty("result", null);
-    expect(original).toHaveProperty("result", null);
+    expect(terminalRetry).toHaveProperty("result.value", null);
+    expect(original).toHaveProperty("result.value", null);
   });
 
   it("allows repeated reads but rejects repeated side effects after no-effect", async () => {
@@ -531,7 +753,7 @@ describeWithDatabase("durable browser state store", () => {
 
   it("compare-and-sets execution and bounds completion data", async () => {
     const { run } = await createFixture({ state: "executing" });
-    const action = request(1, { kind: "click", ref: "button-1" });
+    const action = request(1, { kind: "get_text", ref: "button-1" });
     await store.prepareBrowserAction(run.id, action);
     await expect(
       store.markBrowserActionExecuting(run.id, action.actionId),
@@ -545,7 +767,7 @@ describeWithDatabase("durable browser state store", () => {
         actionId: action.actionId,
         proposalHash: action.proposalHash,
         outcome: "succeeded",
-        result: "x".repeat(65 * 1024),
+        result: { kind: "get_text", text: "x".repeat(65 * 1024) },
         page: {
           url: "https://example.com",
           title: "Example",
@@ -564,7 +786,7 @@ describeWithDatabase("durable browser state store", () => {
         actionId: mixed.actionId,
         proposalHash: mixed.proposalHash,
         outcome: "succeeded",
-        result: { url: "https://example.com" },
+        result: { kind: "get_url", url: "https://example.com" },
         error: { category: "unexpected", message: "must not coexist" },
         page: {
           url: "https://example.com",
@@ -620,17 +842,21 @@ describeWithDatabase("durable browser state store", () => {
     });
     await pool.query(
       `INSERT INTO browser_capabilities
-         (id, token_hash, owner_id, session_id, run_id, adapter_process_id,
-          operations, origins, navigation_policy_version, call_limit,
-          byte_limit, wall_deadline_at, per_operation_timeout_ms, expires_at)
-       VALUES ($1, $2, $3, $4, $5, 1, '[]', '[]', 1, 1, 1,
-               now() + interval '1 minute', 1000, now() + interval '1 minute')`,
+         (id, token_hash, owner_id, session_id, run_id, adapter_job_id,
+          adapter_supervisor_id, adapter_process_id, activated_at, operations,
+          origins, navigation_policy_version, call_limit, byte_limit,
+          wall_deadline_at, per_operation_timeout_ms, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 4242, now(), '[]', '[]',
+               1, 1, 1, now() + interval '1 minute', 1000,
+               now() + interval '1 minute')`,
       [
         randomUUID(),
         "a".repeat(64),
         ownerId,
         executingFixture.session.id,
         executingFixture.run.id,
+        executingFixture.adapterJobId,
+        executingFixture.adapterSupervisorId,
       ],
     );
     await pool.query(

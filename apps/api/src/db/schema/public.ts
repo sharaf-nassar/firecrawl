@@ -518,6 +518,8 @@ export const browser_interact_runs = pgTable(
     reasoning_effort: text("reasoning_effort").notNull(),
     deadline_at: ts("deadline_at").notNull(),
     correlation_id: uuid("correlation_id").notNull(),
+    adapter_job_id: uuid("adapter_job_id"),
+    adapter_supervisor_id: uuid("adapter_supervisor_id"),
     adapter_process_id: integer("adapter_process_id"),
     cancelled_at: ts("cancelled_at"),
     output_reference: jsonb("output_reference"),
@@ -543,6 +545,59 @@ export const browser_interact_runs = pgTable(
       "browser_interact_runs_artifact_references_check",
       sql`jsonb_typeof(${table.artifact_references}) = 'array'`,
     ),
+    check(
+      "browser_interact_runs_adapter_process_positive_check",
+      sql`${table.adapter_process_id} IS NULL OR ${table.adapter_process_id} > 0`,
+    ),
+    check(
+      "browser_interact_runs_adapter_job_non_nil_check",
+      sql`${table.adapter_job_id} IS NULL OR ${table.adapter_job_id} <> '00000000-0000-0000-0000-000000000000'::uuid`,
+    ),
+    check(
+      "browser_interact_runs_adapter_supervisor_non_nil_check",
+      sql`${table.adapter_supervisor_id} IS NULL OR ${table.adapter_supervisor_id} <> '00000000-0000-0000-0000-000000000000'::uuid`,
+    ),
+    check(
+      "browser_interact_runs_adapter_binding_pair_check",
+      sql`(${table.adapter_job_id} IS NULL) = (${table.adapter_supervisor_id} IS NULL)`,
+    ),
+    check(
+      "browser_interact_runs_adapter_process_binding_check",
+      sql`${table.adapter_process_id} IS NULL OR ${table.adapter_job_id} IS NOT NULL`,
+    ),
+    check(
+      "browser_interact_runs_adapter_state_binding_check",
+      sql`(
+        (${table.mode} IN ('browser_operation', 'replay')
+          AND ${table.adapter_job_id} IS NULL
+          AND ${table.adapter_supervisor_id} IS NULL
+          AND ${table.adapter_process_id} IS NULL)
+        OR
+        (${table.mode} IN ('prompt', 'code') AND (
+          (${table.state} = 'queued'
+            AND ${table.adapter_job_id} IS NULL
+            AND ${table.adapter_supervisor_id} IS NULL
+            AND ${table.adapter_process_id} IS NULL)
+          OR (${table.state} = 'starting'
+            AND ${table.adapter_job_id} IS NOT NULL
+            AND ${table.adapter_supervisor_id} IS NOT NULL
+            AND ${table.adapter_process_id} IS NULL)
+          OR (${table.state} = 'running'
+            AND ${table.adapter_job_id} IS NOT NULL
+            AND ${table.adapter_supervisor_id} IS NOT NULL
+            AND ${table.adapter_process_id} IS NOT NULL)
+          OR (${table.state} IN (
+            'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'
+          ) AND (
+            (${table.adapter_job_id} IS NULL
+              AND ${table.adapter_supervisor_id} IS NULL
+              AND ${table.adapter_process_id} IS NULL)
+            OR (${table.adapter_job_id} IS NOT NULL
+              AND ${table.adapter_supervisor_id} IS NOT NULL)
+          ))
+        ))
+      )`,
+    ),
     index("browser_interact_runs_session_state_idx").on(
       table.session_id,
       table.state,
@@ -556,6 +611,9 @@ export const browser_interact_runs = pgTable(
       .on(table.scrape_id, table.queued_at.desc())
       .where(sql`${table.scrape_id} IS NOT NULL`),
     index("browser_interact_runs_deadline_at_idx").on(table.deadline_at),
+    uniqueIndex("browser_interact_runs_adapter_job_id_key")
+      .on(table.adapter_job_id)
+      .where(sql`${table.adapter_job_id} IS NOT NULL`),
   ],
 );
 
@@ -576,7 +634,7 @@ export const browser_interact_actions = pgTable(
     session_id: uuid("session_id")
       .notNull()
       .references(() => browser_sessions.id, { onDelete: "cascade" }),
-    adapter_job_id: text("adapter_job_id").notNull(),
+    adapter_job_id: uuid("adapter_job_id").notNull(),
     action_id: uuid("action_id").notNull().unique(),
     sequence: integer("sequence").notNull(),
     proposal_hash: text("proposal_hash").notNull(),
@@ -610,6 +668,10 @@ export const browser_interact_actions = pgTable(
     check(
       "browser_interact_actions_sequence_check",
       sql`${table.sequence} BETWEEN 1 AND 25`,
+    ),
+    check(
+      "browser_interact_actions_adapter_job_non_nil_check",
+      sql`${table.adapter_job_id} <> '00000000-0000-0000-0000-000000000000'::uuid`,
     ),
     check(
       "browser_interact_actions_proposal_hash_check",
@@ -705,7 +767,9 @@ export const browser_capabilities = pgTable(
     run_id: uuid("run_id")
       .notNull()
       .references(() => browser_interact_runs.id, { onDelete: "cascade" }),
-    adapter_process_id: integer("adapter_process_id").notNull(),
+    adapter_job_id: uuid("adapter_job_id"),
+    adapter_supervisor_id: uuid("adapter_supervisor_id"),
+    adapter_process_id: integer("adapter_process_id"),
     operations: jsonb("operations").notNull(),
     origins: jsonb("origins").notNull(),
     navigation_policy_version: integer("navigation_policy_version").notNull(),
@@ -717,6 +781,7 @@ export const browser_capabilities = pgTable(
     per_operation_timeout_ms: integer("per_operation_timeout_ms").notNull(),
     issued_at: ts("issued_at").notNull().defaultNow(),
     redeemed_at: ts("redeemed_at"),
+    activated_at: ts("activated_at"),
     revoked_at: ts("revoked_at"),
     expires_at: ts("expires_at").notNull(),
   },
@@ -757,7 +822,44 @@ export const browser_capabilities = pgTable(
       "browser_capabilities_per_operation_timeout_ms_check",
       sql`${table.per_operation_timeout_ms} > 0`,
     ),
+    check(
+      "browser_capabilities_adapter_process_positive_check",
+      sql`${table.adapter_process_id} IS NULL OR ${table.adapter_process_id} > 0`,
+    ),
+    check(
+      "browser_capabilities_adapter_job_non_nil_check",
+      sql`${table.adapter_job_id} IS NULL OR ${table.adapter_job_id} <> '00000000-0000-0000-0000-000000000000'::uuid`,
+    ),
+    check(
+      "browser_capabilities_adapter_supervisor_non_nil_check",
+      sql`${table.adapter_supervisor_id} IS NULL OR ${table.adapter_supervisor_id} <> '00000000-0000-0000-0000-000000000000'::uuid`,
+    ),
+    check(
+      "browser_capabilities_adapter_binding_pair_check",
+      sql`(${table.adapter_job_id} IS NULL) = (${table.adapter_supervisor_id} IS NULL)`,
+    ),
+    check(
+      "browser_capabilities_activation_pair_check",
+      sql`(${table.adapter_process_id} IS NULL) = (${table.activated_at} IS NULL)`,
+    ),
+    check(
+      "browser_capabilities_active_binding_check",
+      sql`${table.revoked_at} IS NOT NULL OR (
+        ${table.adapter_job_id} IS NOT NULL
+        AND ${table.adapter_supervisor_id} IS NOT NULL
+      )`,
+    ),
+    check(
+      "browser_capabilities_redeemed_activation_check",
+      sql`${table.redeemed_at} IS NULL OR (
+        ${table.adapter_process_id} IS NOT NULL
+        AND ${table.activated_at} IS NOT NULL
+      )`,
+    ),
     index("browser_capabilities_expires_at_idx").on(table.expires_at),
+    uniqueIndex("browser_capabilities_active_run_job_key")
+      .on(table.run_id, table.adapter_job_id)
+      .where(sql`${table.revoked_at} IS NULL`),
   ],
 );
 

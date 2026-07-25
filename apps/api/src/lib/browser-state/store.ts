@@ -15,6 +15,7 @@ import type {
   BrowserActivityInput,
   BrowserInteractActionRow,
   BrowserInteractRunRow,
+  BrowserOperationResultV1,
   BrowserProfileLease,
   BrowserRecoveryResult,
   BrowserSessionRow,
@@ -27,7 +28,27 @@ import type {
   ObservationV1,
   SubmitBrowserActionV1,
 } from "./types";
-import type { BrowserControlFenceTransaction } from "../browser-runtime/startup-gate";
+import type {
+  BrowserControlFenceTransaction,
+  BrowserStateMutationLease,
+} from "../browser-runtime/startup-gate";
+import type {
+  BrowserSessionStopClaim,
+  PreparedProfileGeneration,
+} from "../browser-runtime/orchestrator";
+import {
+  browserOperationSchema,
+  codeRunResultSchema,
+  promptRunResultSchema,
+  runtimeUuidSchema,
+  type CodeRunResult,
+  type PromptRunResult,
+} from "../browser-runtime/protocol";
+import {
+  browserOperationResultSchema,
+  canonicalUuidSchema,
+  httpUrlSchema,
+} from "../scrape-interact/browser-service-contracts";
 
 const ACTION_LIMIT = 25;
 const OPERATION_LIMIT_BYTES = 32 * 1024;
@@ -69,7 +90,7 @@ export class ActionIdentityMismatchError extends BrowserStateError {
     super(
       "ActionIdentityMismatchError",
       "action_identity_mismatch",
-      "Action identity does not match its stored proposal",
+      "Action identity or adapter job binding does not match stored state",
     );
   }
 }
@@ -119,75 +140,29 @@ export class ActionLimitExceededError extends BrowserStateError {
 }
 
 const boundedString = (maximum: number) => z.string().max(maximum);
-const operationSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("snapshot") }),
-  z.strictObject({ kind: z.literal("click"), ref: boundedString(1_024) }),
-  z.strictObject({
-    kind: z.literal("fill"),
-    ref: boundedString(1_024),
-    value: boundedString(40_000),
-  }),
-  z.strictObject({
-    kind: z.literal("type"),
-    ref: boundedString(1_024),
-    value: boundedString(40_000),
-    delayMs: z.number().int().min(0).max(60_000),
-  }),
-  z.strictObject({
-    kind: z.literal("press"),
-    ref: boundedString(1_024),
-    key: boundedString(128),
-  }),
-  z.strictObject({
-    kind: z.literal("select"),
-    ref: boundedString(1_024),
-    values: z.array(boundedString(4_096)).max(100),
-  }),
-  z.strictObject({
-    kind: z.literal("scroll"),
-    deltaX: z.number().finite(),
-    deltaY: z.number().finite(),
-  }),
-  z.strictObject({
-    kind: z.literal("wait"),
-    milliseconds: z.number().int().min(0).max(60_000),
-  }),
-  z.strictObject({
-    kind: z.literal("get_text"),
-    ref: boundedString(1_024).optional(),
-  }),
-  z.strictObject({ kind: z.literal("get_url") }),
-  z.strictObject({ kind: z.literal("navigate"), url: boundedString(8_192) }),
-  z.strictObject({
-    kind: z.literal("evaluate"),
-    expression: boundedString(32_000),
-    args: z.record(z.string(), z.json()),
-  }),
-]);
-
 const submitBrowserActionSchema = z.strictObject({
   version: z.literal(1),
-  adapterJobId: z.uuid(),
+  adapterJobId: runtimeUuidSchema,
   sequence: z.number().int(),
-  actionId: z.uuid(),
+  actionId: runtimeUuidSchema,
   proposalHash: z.string().regex(/^[a-f0-9]{64}$/),
   effect: z.enum(["read_only", "side_effecting"]),
-  operation: operationSchema,
+  operation: browserOperationSchema,
 });
 
 const pageStateSchema = z.strictObject({
-  url: boundedString(8_192),
+  url: httpUrlSchema,
   title: boundedString(4_096),
   snapshotExcerpt: boundedString(40_000),
 });
 
 const completionSchema = z
   .strictObject({
-    runId: z.uuid(),
-    actionId: z.uuid(),
+    runId: runtimeUuidSchema,
+    actionId: runtimeUuidSchema,
     proposalHash: z.string().regex(/^[a-f0-9]{64}$/),
     outcome: z.enum(["succeeded", "rejected_no_effect", "failed_no_effect"]),
-    result: z.json().optional(),
+    result: browserOperationResultSchema.optional(),
     error: z
       .strictObject({
         category: boundedString(128),
@@ -214,19 +189,43 @@ const completionSchema = z
 
 const readOnlyOperations = new Set(["snapshot", "wait", "get_text", "get_url"]);
 
-function canonicalJson(value: unknown): string {
+function canonicalJson(
+  value: unknown,
+  seen = new WeakSet<object>(),
+  depth = 0,
+): string {
+  if (depth > 32) throw new TypeError("JSON value exceeds structural bounds");
   if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
+    if (seen.has(value)) throw new TypeError("cyclic JSON is forbidden");
+    seen.add(value);
+    try {
+      return `[${value
+        .map(item => canonicalJson(item, seen, depth + 1))
+        .join(",")}]`;
+    } finally {
+      seen.delete(value);
+    }
   }
   if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value).sort(([left], [right]) =>
-      left < right ? -1 : left > right ? 1 : 0,
-    );
-    return `{${entries
-      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
-      .join(",")}}`;
+    if (seen.has(value)) throw new TypeError("cyclic JSON is forbidden");
+    seen.add(value);
+    try {
+      const entries = Object.entries(value).sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      );
+      return `{${entries
+        .map(
+          ([key, item]) =>
+            `${JSON.stringify(key)}:${canonicalJson(item, seen, depth + 1)}`,
+        )
+        .join(",")}}`;
+    } finally {
+      seen.delete(value);
+    }
   }
-  return JSON.stringify(value);
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new TypeError("value is not JSON-safe");
+  return encoded;
 }
 
 function utf8Bytes(value: unknown): number {
@@ -274,7 +273,7 @@ function observationFromAction(
     page,
   };
   if (resultPresent) {
-    observation.result = action.result;
+    observation.result = browserOperationResultSchema.parse(action.result);
   }
   if (action.error_category !== null && action.error_detail !== null) {
     observation.error = {
@@ -410,7 +409,7 @@ export interface CompleteBrowserActionInput {
   actionId: string;
   proposalHash: string;
   outcome: "succeeded" | "rejected_no_effect" | "failed_no_effect";
-  result?: unknown;
+  result?: BrowserOperationResultV1;
   error?: { category: string; message: string };
   page: BoundedPageState;
 }
@@ -445,6 +444,9 @@ export async function prepareBrowserAction(
       .limit(1);
     if (!run || run.state !== "running") {
       throw new Error("Browser action is not bound to an active run");
+    }
+    if (run.adapter_job_id !== request.adapterJobId) {
+      throw new ActionIdentityMismatchError();
     }
     await tx.execute(
       sql`SELECT id FROM browser_sessions
@@ -760,6 +762,387 @@ export async function didSessionUsePrompt(id: string): Promise<boolean> {
     .where(eq(schema.browser_sessions.id, id))
     .limit(1);
   return row?.promptUsed ?? false;
+}
+
+const adapterFailureCategorySchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[a-z0-9_]+$/);
+
+function sanitizedAdapterFailure(error: unknown): {
+  category: string;
+  detail: string;
+  state: "failed" | "cancelled" | "timed_out";
+} {
+  const candidate =
+    error !== null && typeof error === "object" && "category" in error
+      ? adapterFailureCategorySchema.safeParse(error.category)
+      : null;
+  const category = candidate?.success ? candidate.data : "adapter_failed";
+  return {
+    category,
+    detail: "Browser adapter execution failed",
+    state:
+      category === "cancelled"
+        ? "cancelled"
+        : category === "timed_out"
+          ? "timed_out"
+          : "failed",
+  };
+}
+
+async function lockAdapterRun(
+  lease: BrowserStateMutationLease,
+  runId: string,
+): Promise<Record<string, unknown>> {
+  const result = await lease.transaction.query(
+    `SELECT r.id, r.mode, r.state, r.session_id, r.adapter_job_id,
+            r.adapter_supervisor_id, r.adapter_process_id,
+            s.state AS session_state, s.current_run_id
+       FROM browser_interact_runs r
+       JOIN browser_sessions s ON s.id = r.session_id
+      WHERE r.id = $1
+      FOR UPDATE OF r, s`,
+    [runtimeUuidSchema.parse(runId)],
+  );
+  if (result.rows.length !== 1) {
+    throw new Error("Browser adapter run does not exist");
+  }
+  return result.rows[0] as Record<string, unknown>;
+}
+
+/** @public Counts the exact durable action ledger under a mutation lease. */
+export async function countInteractActions(
+  lease: BrowserStateMutationLease,
+  runId: string,
+): Promise<number> {
+  const result = await lease.transaction.query(
+    `SELECT count(*)::int AS count
+       FROM browser_interact_actions
+      WHERE run_id = $1`,
+    [runtimeUuidSchema.parse(runId)],
+  );
+  return Number((result.rows[0] as { count: number }).count);
+}
+
+/** @public Persists a validated adapter result and releases the ready session. */
+export async function finishAdapterRun(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  untrustedResult: PromptRunResult | CodeRunResult,
+): Promise<void> {
+  const row = await lockAdapterRun(lease, runId);
+  if (
+    !["prompt", "code"].includes(String(row.mode)) ||
+    row.state !== "running" ||
+    row.adapter_job_id === null ||
+    row.adapter_supervisor_id === null ||
+    row.adapter_process_id === null ||
+    row.session_state !== "executing" ||
+    row.current_run_id !== row.id
+  ) {
+    throw new Error("Browser adapter run is not active");
+  }
+
+  let outputReference: Record<string, unknown>;
+  if (row.mode === "prompt") {
+    const result = promptRunResultSchema.parse(untrustedResult);
+    const actionCount = await countInteractActions(lease, runId);
+    if (result.actionCount !== actionCount) {
+      throw Object.assign(new Error("Adapter action count mismatch"), {
+        category: "model_protocol_error",
+      });
+    }
+    outputReference = { version: 1, mode: "prompt", ...result };
+  } else {
+    const result = codeRunResultSchema.parse(untrustedResult);
+    outputReference = { version: 1, mode: "code", ...result };
+  }
+
+  const run = await lease.transaction.query(
+    `UPDATE browser_interact_runs
+        SET state = 'succeeded',
+            output_reference = $2::jsonb,
+            error_category = NULL,
+            error_detail = NULL,
+            finished_at = now()
+      WHERE id = $1
+        AND state = 'running'
+      RETURNING id`,
+    [runtimeUuidSchema.parse(runId), JSON.stringify(outputReference)],
+  );
+  if (run.rows.length !== 1) {
+    throw new Error("Browser adapter run completion lost ownership");
+  }
+  const session = await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET state = 'ready',
+            current_run_id = NULL,
+            last_activity_at = now(),
+            updated_at = now()
+      WHERE id = $1
+        AND state = 'executing'
+        AND current_run_id = $2
+      RETURNING id`,
+    [row.session_id, row.id],
+  );
+  if (session.rows.length !== 1) {
+    throw new Error("Browser adapter session completion lost ownership");
+  }
+}
+
+/** @public Persists a sanitized adapter failure and releases its session. */
+export async function failAdapterRun(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  error: unknown,
+): Promise<void> {
+  const row = await lockAdapterRun(lease, runId);
+  if (
+    !["prompt", "code"].includes(String(row.mode)) ||
+    !["starting", "running"].includes(String(row.state)) ||
+    row.adapter_job_id === null ||
+    row.adapter_supervisor_id === null
+  ) {
+    if (
+      ["failed", "cancelled", "timed_out", "interrupted"].includes(
+        String(row.state),
+      )
+    ) {
+      return;
+    }
+    throw new Error("Browser adapter run is not fail-able");
+  }
+  const failure = sanitizedAdapterFailure(error);
+  const run = await lease.transaction.query(
+    `UPDATE browser_interact_runs
+        SET state = $2,
+            cancelled_at = CASE
+              WHEN $2 = 'cancelled' THEN COALESCE(cancelled_at, now())
+              ELSE cancelled_at
+            END,
+            error_category = $3,
+            error_detail = $4,
+            output_reference = NULL,
+            finished_at = COALESCE(finished_at, now())
+      WHERE id = $1
+        AND state IN ('starting', 'running')
+      RETURNING id`,
+    [
+      runtimeUuidSchema.parse(runId),
+      failure.state,
+      failure.category,
+      failure.detail,
+    ],
+  );
+  if (run.rows.length !== 1) {
+    throw new Error("Browser adapter run failure lost ownership");
+  }
+  await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET state = 'ready',
+            current_run_id = NULL,
+            last_activity_at = now(),
+            updated_at = now()
+      WHERE id = $1
+        AND state = 'executing'
+        AND current_run_id = $2`,
+    [row.session_id, row.id],
+  );
+}
+
+/** @public Claims the sole durable cleanup ownership for one session stop. */
+export async function claimBrowserSessionStop(
+  lease: BrowserStateMutationLease,
+  sessionId: string,
+  reason: string,
+): Promise<BrowserSessionStopClaim | null> {
+  const parsedSessionId = runtimeUuidSchema.parse(sessionId);
+  const terminalReason = z.string().min(1).max(128).parse(reason);
+  const result = await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET state = 'stopping',
+            terminal_reason = $2,
+            updated_at = now()
+      WHERE id = $1
+        AND state IN ('creating', 'replaying', 'ready', 'executing')
+      RETURNING current_run_id, profile_id, browser_id, runtime_epoch`,
+    [parsedSessionId, terminalReason],
+  );
+  if (result.rows.length !== 1) return null;
+  const row = result.rows[0] as {
+    current_run_id: string | null;
+    profile_id: string | null;
+    browser_id: string | null;
+    runtime_epoch: number;
+  };
+  return {
+    runId: row.current_run_id,
+    profileId: row.profile_id,
+    browserId: row.browser_id,
+    runtimeEpoch: row.runtime_epoch,
+  };
+}
+
+/** @public Commits one finalized generation with an exact profile pointer CAS. */
+export async function commitPreparedProfileGeneration(
+  lease: BrowserStateMutationLease,
+  claim: BrowserSessionStopClaim,
+  untrustedPrepared: PreparedProfileGeneration,
+): Promise<void> {
+  const prepared = z
+    .strictObject({
+      profileId: runtimeUuidSchema,
+      generationId: runtimeUuidSchema,
+      checksum: z.string().regex(/^[a-f0-9]{64}$/),
+      byteSize: z.number().int().safe().min(1).max(268_435_456),
+      prepareToken: z.string().min(32).max(512),
+    })
+    .parse(untrustedPrepared);
+  if (claim.profileId !== prepared.profileId) {
+    throw new Error("Prepared profile does not match stop ownership");
+  }
+  const session = await lease.transaction.query(
+    `SELECT id, profile_id, profile_generation_id
+       FROM browser_sessions
+      WHERE id = (
+        SELECT writer_session_id
+          FROM browser_profiles
+         WHERE id = $1
+         FOR UPDATE
+      )
+        AND state = 'stopping'
+      FOR UPDATE`,
+    [prepared.profileId],
+  );
+  if (session.rows.length !== 1) {
+    throw new Error("Profile writer stop ownership is not active");
+  }
+  const sessionRow = session.rows[0] as {
+    id: string;
+    profile_id: string;
+    profile_generation_id: string | null;
+  };
+  if (sessionRow.profile_id !== prepared.profileId) {
+    throw new Error("Profile writer binding changed");
+  }
+  const next = await lease.transaction.query(
+    `SELECT COALESCE(max(generation), 0)::int + 1 AS generation
+       FROM browser_profile_generations
+      WHERE profile_id = $1`,
+    [prepared.profileId],
+  );
+  const generation = Number(
+    (next.rows[0] as { generation: number }).generation,
+  );
+  await lease.transaction.query(
+    `INSERT INTO browser_profile_generations
+       (id, profile_id, generation, state_path, byte_size, checksum)
+     VALUES ($1, $2, $3, NULL, $4, $5)`,
+    [
+      prepared.generationId,
+      prepared.profileId,
+      generation,
+      prepared.byteSize,
+      prepared.checksum,
+    ],
+  );
+  const pointer = await lease.transaction.query(
+    `UPDATE browser_profiles
+        SET latest_generation_id = $2,
+            updated_at = now()
+      WHERE id = $1
+        AND writer_session_id = $3
+        AND latest_generation_id IS NOT DISTINCT FROM $4::uuid
+      RETURNING id`,
+    [
+      prepared.profileId,
+      prepared.generationId,
+      sessionRow.id,
+      sessionRow.profile_generation_id,
+    ],
+  );
+  if (pointer.rows.length !== 1) {
+    throw new Error("Profile generation pointer CAS failed");
+  }
+  await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET profile_generation_id = $2,
+            updated_at = now()
+      WHERE id = $1
+        AND state = 'stopping'`,
+    [sessionRow.id, prepared.generationId],
+  );
+}
+
+/** @public Completes stop as destroyed only after confirmed cleanup. */
+export async function finishBrowserSessionStop(
+  lease: BrowserStateMutationLease,
+  sessionId: string,
+  reason: string,
+  outcome: "destroyed" | "interrupted",
+): Promise<void> {
+  const parsedSessionId = runtimeUuidSchema.parse(sessionId);
+  const terminalReason = z.string().min(1).max(128).parse(reason);
+  const terminalState = z.enum(["destroyed", "interrupted"]).parse(outcome);
+  await lease.transaction.query(
+    `UPDATE browser_interact_runs
+        SET state = CASE
+              WHEN $2 = 'destroyed' THEN 'cancelled'
+              ELSE 'interrupted'
+            END,
+            cancelled_at = CASE
+              WHEN $2 = 'destroyed' THEN COALESCE(cancelled_at, now())
+              ELSE cancelled_at
+            END,
+            finished_at = COALESCE(finished_at, now()),
+            error_category = CASE
+              WHEN $2 = 'interrupted'
+                THEN COALESCE(error_category, 'cleanup_interrupted')
+              ELSE error_category
+            END
+      WHERE session_id = $1
+        AND state IN ('queued', 'starting', 'running')`,
+    [parsedSessionId, terminalState],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_capabilities
+        SET revoked_at = COALESCE(revoked_at, now())
+      WHERE session_id = $1
+        AND revoked_at IS NULL`,
+    [parsedSessionId],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_proxy_grants
+        SET revoked_at = COALESCE(revoked_at, now())
+      WHERE session_id = $1
+        AND revoked_at IS NULL`,
+    [parsedSessionId],
+  );
+  const result = await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET state = $3,
+            current_run_id = NULL,
+            terminal_at = COALESCE(terminal_at, now()),
+            terminal_reason = $2,
+            status = CASE WHEN $3 = 'destroyed' THEN 'closed' ELSE 'error' END,
+            updated_at = now()
+      WHERE id = $1
+        AND state = 'stopping'
+      RETURNING id`,
+    [parsedSessionId, terminalReason, terminalState],
+  );
+  if (result.rows.length !== 1) {
+    throw new Error("Browser stop ownership is not active");
+  }
+  await lease.transaction.query(
+    `UPDATE browser_profiles
+        SET writer_session_id = NULL,
+            updated_at = now()
+      WHERE writer_session_id = $1`,
+    [parsedSessionId],
+  );
 }
 
 /** @public */

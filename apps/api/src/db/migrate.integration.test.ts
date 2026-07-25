@@ -33,6 +33,7 @@ const retentionFkSchema = "migration_retention_fk_test";
 const preflightUpgradeSchema = "migration_preflight_upgrade_test";
 const asyncPlaceholderSchema = "migration_async_placeholder_test";
 const migrationBudgetSchema = "migration_budget_test";
+const adapterUpgradeSchema = "migration_adapter_upgrade_test";
 const baselineFilename = "0001_persistence_foundation.sql";
 const asyncPlaceholderFilename = "0002_async_request_placeholders.sql";
 const preflightFilename = "0002_preflight_orphan_webhooks.sql";
@@ -44,6 +45,7 @@ const replayCleanupHandoffFilename =
   "0005_replay_checkpoint_cleanup_handoff.sql";
 const replayWriterLeasesFilename = "0006_replay_checkpoint_writer_leases.sql";
 const browserControlFilename = "0007_browser_control_generation.sql";
+const browserAdapterBindingsFilename = "0008_browser_adapter_bindings.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -189,6 +191,7 @@ describeWithDatabase("application migrations", () => {
       preflightUpgradeSchema,
       asyncPlaceholderSchema,
       migrationBudgetSchema,
+      adapterUpgradeSchema,
     ]) {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.query(`CREATE SCHEMA ${schema}`);
@@ -217,6 +220,7 @@ describeWithDatabase("application migrations", () => {
       replayCleanupHandoffFilename,
       replayWriterLeasesFilename,
       browserControlFilename,
+      browserAdapterBindingsFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
       true,
@@ -600,6 +604,7 @@ describeWithDatabase("application migrations", () => {
       runId: randomUUID(),
       actionRowId: randomUUID(),
       actionId: randomUUID(),
+      supervisorId: randomUUID(),
       capabilityId: randomUUID(),
       grantId: randomUUID(),
     };
@@ -674,9 +679,11 @@ describeWithDatabase("application migrations", () => {
       await client.query(
         `INSERT INTO browser_interact_runs
            (id, request_id, owner_id, session_id, scrape_id, mode, state,
-            model, reasoning_effort, deadline_at, correlation_id)
+            model, reasoning_effort, deadline_at, correlation_id,
+            adapter_job_id, adapter_supervisor_id, adapter_process_id)
          VALUES ($1, $2, $3, $4, $5, 'prompt', 'running',
-                 'gpt-5.6-terra', 'medium', now() + interval '1 minute', $6)`,
+                 'gpt-5.6-terra', 'medium', now() + interval '1 minute', $6,
+                 $7, $8, 42)`,
         [
           fixture.runId,
           fixture.requestId,
@@ -684,13 +691,15 @@ describeWithDatabase("application migrations", () => {
           fixture.sessionId,
           fixture.scrapeId,
           randomUUID(),
+          fixture.actionId,
+          fixture.supervisorId,
         ],
       );
       await client.query(
         `INSERT INTO browser_interact_actions
            (id, request_id, owner_id, run_id, session_id, adapter_job_id,
             action_id, sequence, proposal_hash, effect, operation, state)
-         VALUES ($1, $2, $3, $4, $5, 'adapter-job-1', $6, 1, $7,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8,
                  'side_effecting', '{"kind":"click","ref":"a"}',
                  'prepared')`,
         [
@@ -700,16 +709,18 @@ describeWithDatabase("application migrations", () => {
           fixture.runId,
           fixture.sessionId,
           fixture.actionId,
+          fixture.actionId,
           checksum,
         ],
       );
       await client.query(
         `INSERT INTO browser_capabilities
-           (id, token_hash, owner_id, session_id, run_id,
-            adapter_process_id, operations, origins,
+           (id, token_hash, owner_id, session_id, run_id, adapter_job_id,
+            adapter_supervisor_id, adapter_process_id, activated_at,
+            operations, origins,
             navigation_policy_version, call_limit, byte_limit,
             wall_deadline_at, per_operation_timeout_ms, expires_at)
-         VALUES ($1, $2, $3, $4, $5, 42, '["click"]',
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 42, now(), '["click"]',
                  '["https://example.com"]', 1, 25, 1048576,
                  now() + interval '1 minute', 10000,
                  now() + interval '1 minute')`,
@@ -719,6 +730,8 @@ describeWithDatabase("application migrations", () => {
           fixture.ownerId,
           fixture.sessionId,
           fixture.runId,
+          fixture.actionId,
+          fixture.supervisorId,
         ],
       );
       await client.query(
@@ -844,9 +857,10 @@ describeWithDatabase("application migrations", () => {
     await client.query(
       `INSERT INTO browser_interact_runs
          (id, request_id, owner_id, session_id, scrape_id, mode, state,
-          model, reasoning_effort, deadline_at, correlation_id)
+          model, reasoning_effort, deadline_at, correlation_id,
+          adapter_job_id, adapter_supervisor_id, adapter_process_id)
        VALUES ($1, $2, $3, $4, $5, 'prompt', 'running', 'gpt-5.6-terra',
-               'medium', now() + interval '1 minute', $6)`,
+               'medium', now() + interval '1 minute', $6, $7, $8, 42)`,
       [
         fixture.runId,
         fixture.requestId,
@@ -854,13 +868,15 @@ describeWithDatabase("application migrations", () => {
         fixture.sessionId,
         fixture.scrapeId,
         randomUUID(),
+        fixture.actionId,
+        fixture.supervisorId,
       ],
     );
     await client.query(
       `INSERT INTO browser_interact_actions
          (id, request_id, owner_id, run_id, session_id, adapter_job_id,
           action_id, sequence, proposal_hash, effect, operation, state)
-       VALUES ($1, $2, $3, $4, $5, 'adapter-job-1', $6, 1, $7,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8,
                'side_effecting', '{}', 'prepared')`,
       [
         fixture.actionRowId,
@@ -868,6 +884,7 @@ describeWithDatabase("application migrations", () => {
         fixture.ownerId,
         fixture.runId,
         fixture.sessionId,
+        fixture.actionId,
         fixture.actionId,
         checksum,
       ],
@@ -897,11 +914,12 @@ describeWithDatabase("application migrations", () => {
     }
     await client.query(
       `INSERT INTO browser_capabilities
-         (id, token_hash, owner_id, session_id, run_id,
-          adapter_process_id, operations, origins,
+         (id, token_hash, owner_id, session_id, run_id, adapter_job_id,
+          adapter_supervisor_id, adapter_process_id, activated_at, operations,
+          origins,
           navigation_policy_version, call_limit, byte_limit,
           wall_deadline_at, per_operation_timeout_ms, expires_at)
-       VALUES ($1, $2, $3, $4, $5, 42, '["click"]',
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 42, now(), '["click"]',
                '["https://example.com"]', 1, 25, 1048576,
                now() + interval '1 minute', 10000,
                now() + interval '1 minute')`,
@@ -911,6 +929,8 @@ describeWithDatabase("application migrations", () => {
         fixture.ownerId,
         fixture.sessionId,
         fixture.runId,
+        fixture.actionId,
+        fixture.supervisorId,
       ],
     );
     await client.query(
@@ -940,13 +960,14 @@ describeWithDatabase("application migrations", () => {
       `INSERT INTO browser_interact_actions
          (id, request_id, owner_id, run_id, session_id, adapter_job_id,
           action_id, sequence, proposal_hash, effect, operation, state)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, 'adapter-job-1',
-               gen_random_uuid(), 1, $5, 'read_only', '{}', 'prepared')`,
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5,
+               gen_random_uuid(), 1, $6, 'read_only', '{}', 'prepared')`,
       [
         fixture.requestId,
         fixture.ownerId,
         fixture.runId,
         fixture.sessionId,
+        fixture.actionId,
         "d".repeat(64),
       ],
     );
@@ -954,13 +975,14 @@ describeWithDatabase("application migrations", () => {
       `INSERT INTO browser_interact_actions
          (id, request_id, owner_id, run_id, session_id, adapter_job_id,
           action_id, sequence, proposal_hash, effect, operation, state)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, 'adapter-job-1', $5, 2,
-               $6, 'read_only', '{}', 'prepared')`,
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 2,
+               $7, 'read_only', '{}', 'prepared')`,
       [
         fixture.requestId,
         fixture.ownerId,
         fixture.runId,
         fixture.sessionId,
+        fixture.actionId,
         fixture.actionId,
         "d".repeat(64),
       ],
@@ -974,16 +996,17 @@ describeWithDatabase("application migrations", () => {
         `INSERT INTO browser_interact_actions
            (id, request_id, owner_id, run_id, session_id, adapter_job_id,
             action_id, sequence, proposal_hash, effect, operation, state)
-         SELECT gen_random_uuid(), $1, $2, $3, $4, 'adapter-job-1',
+         SELECT gen_random_uuid(), $1, $2, $3, $4, $5,
                 gen_random_uuid(), 2,
-                ${column === "proposal_hash" ? "$5" : `'${checksum}'`},
-                ${column === "effect" ? "$5" : "'read_only'"}, '{}',
-                ${column === "state" ? "$5" : "'prepared'"}`,
+                ${column === "proposal_hash" ? "$6" : `'${checksum}'`},
+                ${column === "effect" ? "$6" : "'read_only'"}, '{}',
+                ${column === "state" ? "$6" : "'prepared'"}`,
         [
           fixture.requestId,
           fixture.ownerId,
           fixture.runId,
           fixture.sessionId,
+          fixture.actionId,
           value,
         ],
       );
@@ -1555,15 +1578,19 @@ describeWithDatabase("application migrations", () => {
         join(__dirname, "migrations", browserControlFilename),
         join(migrationsDirectory, browserControlFilename),
       );
+      await copyFile(
+        join(__dirname, "migrations", browserAdapterBindingsFilename),
+        join(migrationsDirectory, browserAdapterBindingsFilename),
+      );
       await writeFile(
-        join(migrationsDirectory, "0008_failure.sql"),
+        join(migrationsDirectory, "0009_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
          SELECT missing_migration_function();`,
       );
 
       await expect(
         runApplicationMigrations(migrationConfig, { migrationsDirectory }),
-      ).rejects.toThrow(/0008_failure\.sql/);
+      ).rejects.toThrow(/0009_failure\.sql/);
 
       const result = await client.query<{
         table_name: string | null;
@@ -1574,13 +1601,360 @@ describeWithDatabase("application migrations", () => {
                 EXISTS (
                   SELECT 1
                     FROM application_schema_migrations
-                   WHERE filename = '0008_failure.sql'
+                   WHERE filename = '0009_failure.sql'
                 ) AS ledgered`,
       );
       expect(result.rows).toEqual([{ table_name: null, ledgered: false }]);
     } finally {
       await rm(migrationsDirectory, { recursive: true, force: true });
     }
+  });
+
+  it("preflights legacy adapter jobs before any binding migration change", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-adapter-migration-"),
+    );
+    const adapterDatabaseUrl = databaseUrlForSchema(adapterUpgradeSchema);
+    const adapterClient = new Client({ connectionString: adapterDatabaseUrl });
+    const adapterConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: adapterDatabaseUrl,
+    };
+    const legacyJobId = randomUUID();
+    const legacyRequestId = randomUUID();
+    const legacySessionId = randomUUID();
+    const legacyRunId = randomUUID();
+    const legacyActionId = randomUUID();
+
+    try {
+      for (const filename of [
+        baselineFilename,
+        asyncPlaceholderFilename,
+        preflightFilename,
+        retentionFkFilename,
+        resolvedWebhookDeadlineFilename,
+        browserInteractFilename,
+        replayCleanupHandoffFilename,
+        replayWriterLeasesFilename,
+        browserControlFilename,
+      ]) {
+        await copyFile(
+          join(__dirname, "migrations", filename),
+          join(migrationsDirectory, filename),
+        );
+      }
+      await runApplicationMigrations(adapterConfig, { migrationsDirectory });
+      await adapterClient.connect();
+      await adapterClient.query(
+        `INSERT INTO requests
+           (id, kind, api_version, team_id, origin, target_hint)
+         VALUES ($1, 'scrape', 'v2', $2, 'test', 'legacy adapter')`,
+        [legacyRequestId, ownerId],
+      );
+      await adapterClient.query(
+        `INSERT INTO browser_sessions
+           (id, request_id, owner_id, state, absolute_deadline_at,
+            idle_deadline_at, last_activity_at)
+         VALUES ($1, $2, $3, 'executing', now() + interval '5 minutes',
+                 now() + interval '1 minute', now())`,
+        [legacySessionId, legacyRequestId, ownerId],
+      );
+      await adapterClient.query(
+        `INSERT INTO browser_interact_runs
+           (id, request_id, owner_id, session_id, mode, state, model,
+            reasoning_effort, deadline_at, correlation_id,
+            adapter_process_id)
+         VALUES ($1, $2, $3, $4, 'prompt', 'running', 'gpt-5.6-terra',
+                 'medium', now() + interval '1 minute', $5, 4242)`,
+        [legacyRunId, legacyRequestId, ownerId, legacySessionId, randomUUID()],
+      );
+      await adapterClient.query(
+        `INSERT INTO browser_interact_actions
+           (id, request_id, owner_id, run_id, session_id, adapter_job_id,
+            action_id, sequence, proposal_hash, effect, operation, state)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 1, $7,
+                 'read_only', '{"kind":"get_url"}', 'prepared')`,
+        [
+          legacyRequestId,
+          ownerId,
+          legacyRunId,
+          legacySessionId,
+          legacyJobId.toUpperCase(),
+          legacyActionId,
+          "a".repeat(64),
+        ],
+      );
+      await adapterClient.query(
+        `INSERT INTO browser_capabilities
+           (id, token_hash, owner_id, session_id, run_id,
+            adapter_process_id, operations, origins,
+            navigation_policy_version, call_limit, byte_limit,
+            wall_deadline_at, per_operation_timeout_ms, expires_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, 4242, '[]', '[]',
+                 1, 25, 1048576, now() + interval '1 minute', 30000,
+                 now() + interval '1 minute')`,
+        ["b".repeat(64), ownerId, legacySessionId, legacyRunId],
+      );
+      const before = await adapterClient.query(
+        `SELECT
+           (SELECT row_to_json(run)
+              FROM browser_interact_runs AS run
+             WHERE id = $1) AS run,
+           (SELECT row_to_json(capability)
+              FROM browser_capabilities AS capability
+             WHERE run_id = $1) AS capability,
+           (SELECT row_to_json(action)
+              FROM browser_interact_actions AS action
+             WHERE run_id = $1) AS action,
+           (SELECT array_agg(column_name ORDER BY ordinal_position)
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name IN (
+                 'browser_interact_runs', 'browser_capabilities'
+               )) AS columns`,
+        [legacyRunId],
+      );
+      await copyFile(
+        join(__dirname, "migrations", browserAdapterBindingsFilename),
+        join(migrationsDirectory, browserAdapterBindingsFilename),
+      );
+      await expect(
+        runApplicationMigrations(adapterConfig, { migrationsDirectory }),
+      ).rejects.toMatchObject({
+        filename: browserAdapterBindingsFilename,
+        cause: {
+          message: expect.stringContaining(
+            "browser_adapter_job_id_preflight_failed",
+          ),
+        },
+      });
+      const after = await adapterClient.query(
+        `SELECT
+           (SELECT row_to_json(run)
+              FROM browser_interact_runs AS run
+             WHERE id = $1) AS run,
+           (SELECT row_to_json(capability)
+              FROM browser_capabilities AS capability
+             WHERE run_id = $1) AS capability,
+           (SELECT row_to_json(action)
+              FROM browser_interact_actions AS action
+             WHERE run_id = $1) AS action,
+           (SELECT array_agg(column_name ORDER BY ordinal_position)
+              FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name IN (
+                 'browser_interact_runs', 'browser_capabilities'
+               )) AS columns`,
+        [legacyRunId],
+      );
+      expect(after.rows).toEqual(before.rows);
+      const ledger = await adapterClient.query(
+        `SELECT 1
+           FROM application_schema_migrations
+          WHERE filename = $1`,
+        [browserAdapterBindingsFilename],
+      );
+      expect(ledger.rows).toHaveLength(0);
+
+      await adapterClient.query(
+        `UPDATE browser_interact_actions
+            SET adapter_job_id = '00000000-0000-0000-0000-000000000000'
+          WHERE run_id = $1`,
+        [legacyRunId],
+      );
+      await expect(
+        runApplicationMigrations(adapterConfig, { migrationsDirectory }),
+      ).rejects.toMatchObject({
+        filename: browserAdapterBindingsFilename,
+        cause: {
+          message: expect.stringContaining(
+            "browser_adapter_job_id_preflight_failed",
+          ),
+        },
+      });
+      await adapterClient.query(
+        `UPDATE browser_interact_actions
+            SET adapter_job_id = $2
+          WHERE run_id = $1`,
+        [legacyRunId, legacyJobId],
+      );
+      await runApplicationMigrations(adapterConfig, { migrationsDirectory });
+      const migrated = await adapterClient.query(
+        `SELECT run.state, run.adapter_process_id,
+                capability.adapter_process_id AS capability_process_id,
+                capability.revoked_at
+           FROM browser_interact_runs AS run
+           JOIN browser_capabilities AS capability
+             ON capability.run_id = run.id
+          WHERE run.id = $1`,
+        [legacyRunId],
+      );
+      expect(migrated.rows[0]).toMatchObject({
+        state: "interrupted",
+        adapter_process_id: null,
+        capability_process_id: null,
+        revoked_at: expect.any(Date),
+      });
+    } finally {
+      await adapterClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces immutable pending and activated adapter bindings", async () => {
+    const requestId = randomUUID();
+    const sessionId = randomUUID();
+    const runId = randomUUID();
+    const adapterJobId = randomUUID();
+    const adapterSupervisorId = randomUUID();
+    await client.query(
+      `INSERT INTO requests
+         (id, kind, api_version, team_id, origin, target_hint)
+       VALUES ($1, 'scrape', 'v2', $2, 'test', 'adapter constraints')`,
+      [requestId, ownerId],
+    );
+    await client.query(
+      `INSERT INTO browser_sessions
+         (id, request_id, owner_id, state, absolute_deadline_at,
+          idle_deadline_at, last_activity_at)
+       VALUES ($1, $2, $3, 'executing', now() + interval '5 minutes',
+               now() + interval '1 minute', now())`,
+      [sessionId, requestId, ownerId],
+    );
+    await client.query(
+      `INSERT INTO browser_interact_runs
+         (id, request_id, owner_id, session_id, mode, state, model,
+          reasoning_effort, deadline_at, correlation_id, adapter_job_id,
+          adapter_supervisor_id)
+       VALUES ($1, $2, $3, $4, 'prompt', 'starting', 'gpt-5.6-terra',
+               'medium', now() + interval '1 minute', $5, $6, $7)`,
+      [
+        runId,
+        requestId,
+        ownerId,
+        sessionId,
+        randomUUID(),
+        adapterJobId,
+        adapterSupervisorId,
+      ],
+    );
+    await client.query(
+      `INSERT INTO browser_capabilities
+         (id, token_hash, owner_id, session_id, run_id, adapter_job_id,
+          adapter_supervisor_id, operations, origins,
+          navigation_policy_version, call_limit, byte_limit,
+          wall_deadline_at, per_operation_timeout_ms, expires_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, '[]', '[]',
+               1, 25, 1048576, now() + interval '1 minute', 30000,
+               now() + interval '1 minute')`,
+      [
+        "d".repeat(64),
+        ownerId,
+        sessionId,
+        runId,
+        adapterJobId,
+        adapterSupervisorId,
+      ],
+    );
+
+    const rejectsInOwnTransaction = async (
+      statement: string,
+      values: unknown[],
+      code: RegExp,
+    ) => {
+      await client.query("BEGIN");
+      try {
+        await expect(client.query(statement, values)).rejects.toMatchObject({
+          code: expect.stringMatching(code),
+        });
+      } finally {
+        await client.query("ROLLBACK");
+      }
+    };
+    await rejectsInOwnTransaction(
+      `INSERT INTO browser_interact_runs
+         (id, request_id, owner_id, session_id, mode, state, model,
+          reasoning_effort, deadline_at, correlation_id, adapter_job_id,
+          adapter_supervisor_id)
+       VALUES (gen_random_uuid(), $1, $2, $3, 'prompt', 'running',
+               'gpt-5.6-terra', 'medium', now() + interval '1 minute',
+               gen_random_uuid(), gen_random_uuid(), gen_random_uuid())`,
+      [requestId, ownerId, sessionId],
+      /^23514$/,
+    );
+    await rejectsInOwnTransaction(
+      `UPDATE browser_interact_runs
+          SET adapter_process_id = 0
+        WHERE id = $1`,
+      [runId],
+      /^23514$/,
+    );
+    await rejectsInOwnTransaction(
+      `INSERT INTO browser_interact_runs
+         (id, request_id, owner_id, session_id, mode, state, model,
+          reasoning_effort, deadline_at, correlation_id, adapter_job_id,
+          adapter_supervisor_id)
+       VALUES (gen_random_uuid(), $1, $2, $3, 'prompt', 'starting',
+               'gpt-5.6-terra', 'medium', now() + interval '1 minute',
+               gen_random_uuid(),
+               '00000000-0000-0000-0000-000000000000',
+               '00000000-0000-0000-0000-000000000000')`,
+      [requestId, ownerId, sessionId],
+      /^23514$/,
+    );
+
+    await client.query(
+      `UPDATE browser_interact_runs
+          SET state = 'running', adapter_process_id = 4242
+        WHERE id = $1`,
+      [runId],
+    );
+    await client.query(
+      `UPDATE browser_capabilities
+          SET adapter_process_id = 4242, activated_at = now()
+        WHERE run_id = $1`,
+      [runId],
+    );
+    await rejectsInOwnTransaction(
+      `UPDATE browser_interact_runs
+          SET adapter_process_id = 4243
+        WHERE id = $1`,
+      [runId],
+      /^P0001$/,
+    );
+    await rejectsInOwnTransaction(
+      `UPDATE browser_interact_runs
+          SET adapter_job_id = $2
+        WHERE id = $1`,
+      [runId, randomUUID()],
+      /^P0001$/,
+    );
+    await rejectsInOwnTransaction(
+      `UPDATE browser_capabilities
+          SET adapter_process_id = 4243, activated_at = now()
+        WHERE run_id = $1`,
+      [runId],
+      /^P0001$/,
+    );
+    await rejectsInOwnTransaction(
+      `INSERT INTO browser_capabilities
+         (id, token_hash, owner_id, session_id, run_id, adapter_job_id,
+          adapter_supervisor_id, operations, origins,
+          navigation_policy_version, call_limit, byte_limit,
+          wall_deadline_at, per_operation_timeout_ms, expires_at)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, '[]', '[]',
+               1, 25, 1048576, now() + interval '1 minute', 30000,
+               now() + interval '1 minute')`,
+      [
+        "e".repeat(64),
+        ownerId,
+        sessionId,
+        runId,
+        adapterJobId,
+        adapterSupervisorId,
+      ],
+      /^23505$/,
+    );
   });
 
   it("cleans legacy orphans and enforces retention parent integrity", async () => {
