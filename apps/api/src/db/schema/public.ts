@@ -487,6 +487,11 @@ export const browser_sessions = pgTable(
     index("browser_sessions_scrape_created_at_idx")
       .on(table.scrape_id, table.created_at.desc())
       .where(sql`${table.scrape_id} IS NOT NULL`),
+    uniqueIndex("browser_sessions_active_scrape_idx")
+      .on(table.scrape_id)
+      .where(
+        sql`${table.scrape_id} IS NOT NULL AND ${table.state} IN ('creating', 'replaying', 'ready', 'executing', 'stopping')`,
+      ),
     index("browser_sessions_idle_deadline_at_idx").on(table.idle_deadline_at),
     index("browser_sessions_absolute_deadline_at_idx").on(
       table.absolute_deadline_at,

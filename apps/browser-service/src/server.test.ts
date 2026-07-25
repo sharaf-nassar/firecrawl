@@ -88,6 +88,7 @@ function validActionBody(): string {
     normalizedProposalHash: "a".repeat(64),
     effect: "read_only",
     expectedSessionVersion: 0,
+    allowedDomains: ["example.com"],
     operation: { kind: "get_url" },
   });
 }
@@ -102,10 +103,10 @@ function realActionBody(
     actionId: IDS[1],
     runId: IDS[2],
     sequence: 1,
-    normalizedProposalHash:
-      normalizedProposalHashForOperation(operation),
+    normalizedProposalHash: normalizedProposalHashForOperation(operation),
     effect: "read_only",
     expectedSessionVersion: 1,
+    allowedDomains: ["example.com"],
     operation,
   });
 }
@@ -197,7 +198,7 @@ function realRegistryFixture(): {
     textContent: vi.fn(async () => "Example"),
     waitForTimeout: vi.fn(async () => {
       if (waitNeverSettles) {
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }),
     screenshot: vi.fn(async () => Buffer.from("image")),
@@ -305,16 +306,14 @@ function realRegistryFixture(): {
       close: vi.fn(async () => undefined),
       liveSocketCount: () => 0,
     })) as never,
-    launchPersistentChromiumForWorking: vi.fn(
-      async () => Object.freeze({ context }),
+    launchPersistentChromiumForWorking: vi.fn(async () =>
+      Object.freeze({ context }),
     ) as never,
     releaseChromiumSessionAttachment: vi.fn(async () => {
       await (context.close as () => Promise<void>)();
     }) as never,
     createRecordingProducer: vi.fn(async () => ({
-      snapshot: vi.fn(async () =>
-        Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3]),
-      ),
+      snapshot: vi.fn(async () => Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3])),
       subscribe: vi.fn(() => () => undefined),
       close: vi.fn(async () => undefined),
     })),
@@ -368,6 +367,7 @@ function harness(registryOverride?: SessionRegistry) {
     create: vi.fn(async () => session),
     get: vi.fn(() => session),
     touch: vi.fn(() => session),
+    extendAuthority: vi.fn(async () => session),
     executeAction: vi.fn(async () => ({
       version: 1,
       actionId: IDS[1],
@@ -429,14 +429,14 @@ function harness(registryOverride?: SessionRegistry) {
     }),
   };
   const profileStore = {
-    finalizePreparedGenerationByAuthorization: vi.fn(async input => ({
+    finalizePreparedGenerationByAuthorization: vi.fn(async (input) => ({
       version: 1,
       profileId: (input as { profileId: string }).profileId,
       generationId: (input as { generationId: string }).generationId,
       checksum: (input as { checksum: string }).checksum,
       committed: true,
     })),
-    deletePreparedGenerationByAuthorization: vi.fn(async input => ({
+    deletePreparedGenerationByAuthorization: vi.fn(async (input) => ({
       version: 1,
       profileId: (input as { profileId: string }).profileId,
       generationId: (input as { generationId: string }).generationId,
@@ -548,7 +548,7 @@ function harness(registryOverride?: SessionRegistry) {
       },
     },
     reconcile,
-    internalErrorSink: cause => {
+    internalErrorSink: (cause) => {
       internalErrors.push(cause);
     },
     sweepIntervalMs: 60_000,
@@ -584,7 +584,7 @@ async function provisionBrowserStateRoot(
     mode: 0o700,
   });
   await Promise.all(
-    optionalDirectories.map(directory =>
+    optionalDirectories.map((directory) =>
       mkdir(join(root, directory), { mode: 0o700 }),
     ),
   );
@@ -636,7 +636,7 @@ async function snapshotBrowserStateRoot(root: string) {
       await readdir(join(root, ".profile-publish-staging"))
     ).sort(),
     metadata: await Promise.all(
-      paths.map(async relative => {
+      paths.map(async (relative) => {
         const metadata = await lstat(join(root, relative), {
           bigint: true,
         });
@@ -658,9 +658,11 @@ async function snapshotBrowserStateRoot(root: string) {
 }
 
 afterEach(async () => {
-  await Promise.all(running.splice(0).map(server => server.beginShutdown()));
+  await Promise.all(running.splice(0).map((server) => server.beginShutdown()));
   await Promise.all(
-    stateRoots.splice(0).map(root => rm(root, { recursive: true, force: true })),
+    stateRoots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true })),
   );
 });
 
@@ -745,6 +747,7 @@ describe("private browser server", () => {
         normalizedProposalHash: "a".repeat(64),
         effect: "read_only",
         expectedSessionVersion: 0,
+        allowedDomains: ["example.com"],
         operation: { kind: "get_url" },
       }),
     });
@@ -771,20 +774,17 @@ describe("private browser server", () => {
   test("streams an artifact with the exact metadata header set", async () => {
     const h = harness();
     const base = await start(h);
-    const response = await fetch(
-      `${base}/v1/sessions/${IDS[0]}/artifacts`,
-      {
-        method: "POST",
-        headers: requestHeaders(),
-        body: JSON.stringify({
-          version: 1,
-          artifactId: IDS[2],
-          kind: "screenshot",
-          format: "png",
-          fullPage: false,
-        }),
-      },
-    );
+    const response = await fetch(`${base}/v1/sessions/${IDS[0]}/artifacts`, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: JSON.stringify({
+        version: 1,
+        artifactId: IDS[2],
+        kind: "screenshot",
+        format: "png",
+        fullPage: false,
+      }),
+    });
 
     expect(response.status).toBe(200);
     expect(Buffer.from(await response.arrayBuffer())).toEqual(
@@ -811,6 +811,8 @@ describe("private browser server", () => {
         permission: "passive",
         expiresAt,
         useLimit: 1,
+        expectedSessionVersion: 0,
+        allowedDomains: ["example.com"],
       }),
     });
     expect(created.status).toBe(201);
@@ -850,20 +852,17 @@ describe("private browser server", () => {
       h.profileStore.finalizePreparedGenerationByAuthorization,
     ).toHaveBeenCalledOnce();
 
-    const mismatch = await fetch(
-      `${base}/v1/profile-generations/${IDS[2]}`,
-      {
-        method: "DELETE",
-        headers: requestHeaders(),
-        body: JSON.stringify({
-          version: 1,
-          profileId: IDS[0],
-          generationId: IDS[1],
-          checksum,
-          prepareToken,
-        }),
-      },
-    );
+    const mismatch = await fetch(`${base}/v1/profile-generations/${IDS[2]}`, {
+      method: "DELETE",
+      headers: requestHeaders(),
+      body: JSON.stringify({
+        version: 1,
+        profileId: IDS[0],
+        generationId: IDS[1],
+        checksum,
+        prepareToken,
+      }),
+    });
     expect(mismatch.status).toBe(400);
     expect(
       h.profileStore.deletePreparedGenerationByAuthorization,
@@ -878,7 +877,9 @@ describe("private browser server", () => {
         upgrade: () => Promise<import("ws").WebSocket>,
       ) => {
         const socket = await upgrade();
-        await new Promise<void>(resolve => socket.once("close", () => resolve()));
+        await new Promise<void>((resolve) =>
+          socket.once("close", () => resolve()),
+        );
       },
     );
     const base = await start(h);
@@ -896,7 +897,7 @@ describe("private browser server", () => {
       client.once("open", () => {
         client.send(Buffer.alloc(256 * 1024 + 1), { binary: false });
       });
-      client.once("close", code => resolve(code));
+      client.once("close", (code) => resolve(code));
       client.once("error", reject);
     });
     await expect(closed).resolves.toBe(1009);
@@ -947,6 +948,7 @@ describe("private browser server", () => {
         normalizedProposalHash: "a".repeat(64),
         effect: "read_only",
         expectedSessionVersion: 0,
+        allowedDomains: ["example.com"],
         operation: { kind: "get_url" },
       }),
     });
@@ -962,18 +964,15 @@ describe("private browser server", () => {
     new TypeError("operation result serialization failed"),
   ])(
     "fail-stops registry-side ambiguous action rejection: %s",
-    async rejection => {
+    async (rejection) => {
       const h = harness();
       h.registry.executeAction.mockRejectedValueOnce(rejection);
       const base = await start(h);
-      const response = fetch(
-        `${base}/v1/sessions/${IDS[0]}/actions`,
-        {
-          method: "POST",
-          headers: requestHeaders(),
-          body: validActionBody(),
-        },
-      );
+      const response = fetch(`${base}/v1/sessions/${IDS[0]}/actions`, {
+        method: "POST",
+        headers: requestHeaders(),
+        body: validActionBody(),
+      });
 
       await expect(response).rejects.toThrow();
       expect(h.registry.close).toHaveBeenCalledWith(IDS[0], "error");
@@ -1104,14 +1103,11 @@ describe("private browser server", () => {
       ),
     );
     const base = await start(h);
-    const response = await fetch(
-      `${base}/v1/sessions/${IDS[0]}/actions`,
-      {
-        method: "POST",
-        headers: requestHeaders(),
-        body: validActionBody(),
-      },
-    );
+    const response = await fetch(`${base}/v1/sessions/${IDS[0]}/actions`, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: validActionBody(),
+    });
 
     expect(response.status).toBe(429);
     expect(await response.json()).toMatchObject({
@@ -1124,10 +1120,7 @@ describe("private browser server", () => {
   test("does not dispatch an action when transport closes before dispatch", async () => {
     const h = harness();
     const base = await start(h);
-    const target = new URL(
-      `/v1/sessions/${IDS[0]}/actions`,
-      base,
-    );
+    const target = new URL(`/v1/sessions/${IDS[0]}/actions`, base);
     const request = httpRequest(target, {
       method: "POST",
       headers: {
@@ -1139,20 +1132,18 @@ describe("private browser server", () => {
     request.write(validActionBody().slice(0, 20));
     request.destroy();
 
-    await new Promise(resolve => setTimeout(resolve, 25));
+    await new Promise((resolve) => setTimeout(resolve, 25));
     expect(h.registry.executeAction).not.toHaveBeenCalled();
     expect(h.registry.close).not.toHaveBeenCalled();
   });
 
   test("fail-stops an action when transport closes after dispatch", async () => {
     const h = harness();
-    const action = deferred<Awaited<ReturnType<typeof h.registry.executeAction>>>();
+    const action =
+      deferred<Awaited<ReturnType<typeof h.registry.executeAction>>>();
     h.registry.executeAction.mockImplementationOnce(() => action.promise);
     const base = await start(h);
-    const target = new URL(
-      `/v1/sessions/${IDS[0]}/actions`,
-      base,
-    );
+    const target = new URL(`/v1/sessions/${IDS[0]}/actions`, base);
     const request = httpRequest(target, {
       method: "POST",
       headers: {
@@ -1162,7 +1153,7 @@ describe("private browser server", () => {
     });
     request.on("error", () => undefined);
     let clientSocket: import("node:net").Socket | undefined;
-    request.once("socket", socket => {
+    request.once("socket", (socket) => {
       clientSocket = socket;
     });
     request.end(validActionBody());
@@ -1171,7 +1162,7 @@ describe("private browser server", () => {
     );
 
     clientSocket!.destroy();
-    await new Promise(resolve => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
     action.resolve({
       version: 1,
       actionId: IDS[1],
@@ -1237,10 +1228,7 @@ describe("private browser server", () => {
     const generationMismatch = await fetch(`${base}/v1/reconciliation`, {
       method: "POST",
       headers: requestHeaders(),
-      body: validReconciliationBody(
-        PROCESS_NONCE,
-        OLD_GENERATION_NONCE,
-      ),
+      body: validReconciliationBody(PROCESS_NONCE, OLD_GENERATION_NONCE),
     });
     expect(generationMismatch.status).toBe(409);
     expect(await generationMismatch.json()).toMatchObject({
@@ -1254,7 +1242,7 @@ describe("private browser server", () => {
     const observed = deferred<AbortSignal>();
     h.reconcile.mockImplementationOnce(async (_request, admission) => {
       observed.resolve(admission.signal);
-      await new Promise<void>(resolve =>
+      await new Promise<void>((resolve) =>
         admission.signal.addEventListener("abort", () => resolve(), {
           once: true,
         }),
@@ -1366,13 +1354,10 @@ describe("private browser server", () => {
       category: "control_generation_mismatch",
     });
 
-    const wrongControlMethod = await fetch(
-      `${base}/v1/control-generations`,
-      {
-        method: "GET",
-        headers: staleHeaders,
-      },
-    );
+    const wrongControlMethod = await fetch(`${base}/v1/control-generations`, {
+      method: "GET",
+      headers: staleHeaders,
+    });
     expect(wrongControlMethod.status).toBe(409);
     expect(await wrongControlMethod.json()).toMatchObject({
       category: "control_generation_mismatch",
@@ -1456,9 +1441,7 @@ describe("private browser server", () => {
   test.runIf(process.geteuid?.() !== 0)(
     "rejects an inaccessible parent without binding or mutation",
     async () => {
-      const container = await mkdtemp(
-        join(tmpdir(), "browser-server-denied-"),
-      );
+      const container = await mkdtemp(join(tmpdir(), "browser-server-denied-"));
       stateRoots.push(container);
       const stateRoot = join(container, "state");
       await mkdir(stateRoot, { mode: 0o700 });
@@ -1646,9 +1629,10 @@ describe("private browser server", () => {
       }),
     });
     expect(handedOff.status).toBe(201);
-    const generation = await handedOff.json() as ControlGenerationV1;
-    const snapshotDigest =
-      canonicalizeReconciliationSnapshot([]).snapshotDigest;
+    const generation = (await handedOff.json()) as ControlGenerationV1;
+    const snapshotDigest = canonicalizeReconciliationSnapshot(
+      [],
+    ).snapshotDigest;
     const reconciled = await fetch(`${base}/v1/reconciliation`, {
       method: "POST",
       headers: {

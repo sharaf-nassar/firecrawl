@@ -41,6 +41,7 @@ const action = {
   normalizedProposalHash: HASH,
   effect: "read_only" as const,
   expectedSessionVersion: 0,
+  allowedDomains: ["example.test"],
   operation: { kind: "get_url" as const },
 };
 const actionResult = {
@@ -592,6 +593,8 @@ describe("BrowserServiceClient", () => {
             permission: "passive",
             expiresAt: new Date(Date.now() + 10_000).toISOString(),
             useLimit: 1,
+            expectedSessionVersion: 0,
+            allowedDomains: ["example.test"],
           },
           ctx,
         ),

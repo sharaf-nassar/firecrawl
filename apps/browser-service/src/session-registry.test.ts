@@ -335,6 +335,18 @@ describe("persistent session registry", () => {
     );
   });
 
+  test("creates a direct about:blank session without network bootstrap", async () => {
+    const h = harness();
+    const session = await h.registry.create(
+      request({ initialUrl: "about:blank", allowedDomains: [] }),
+    );
+
+    expect(session.page.url).toBe("about:blank");
+    expect(h.page.goto).not.toHaveBeenCalled();
+    expect(h.gate.markPositiveControlBaseline).not.toHaveBeenCalled();
+    expect(h.gate.assertPositiveControl).not.toHaveBeenCalled();
+  });
+
   test.each([
     [30, 10],
     [600, 600],

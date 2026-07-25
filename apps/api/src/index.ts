@@ -65,6 +65,15 @@ import {
   type LocalRetentionService,
 } from "./services/local-retention-worker";
 import { registerInternalRoutes } from "./routes/internal";
+import {
+  createPublicBrowserRuntime,
+  registerPublicBrowserRuntime,
+} from "./lib/browser-runtime/public-browser-runtime";
+import {
+  getCombinedTeamActiveCount,
+  mirrorExternalSlotAcquire,
+  mirrorExternalSlotRelease,
+} from "./services/worker/nuq-router";
 
 type LocalBrowserRuntime = {
   pool: Pool;
@@ -246,6 +255,15 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
       handoff,
       browserClient: serviceClient,
     };
+    registerPublicBrowserRuntime(
+      createPublicBrowserRuntime({
+        gate,
+        browserClient: serviceClient,
+        getActiveCount: getCombinedTeamActiveCount,
+        acquireAdmission: mirrorExternalSlotAcquire,
+        releaseAdmission: mirrorExternalSlotRelease,
+      }),
+    );
     return handoff;
   } catch (error) {
     await coordinator.stop().catch(() => undefined);
@@ -279,6 +297,7 @@ async function initializeLocalBrowserAfterMigrations(
 
 async function stopLocalRuntime(): Promise<void> {
   localRuntimeStop ??= (async () => {
+    registerPublicBrowserRuntime(undefined);
     await localBrowserRuntime?.coordinator.stop();
     await localRetentionService?.stop();
     await localBrowserRuntime?.pool.end();

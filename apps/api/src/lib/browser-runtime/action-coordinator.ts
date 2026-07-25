@@ -386,6 +386,7 @@ export function createBrowserActionCoordinator(
           normalizedProposalHash: normalized.normalizedProposalHash,
           effect: normalized.effect,
           expectedSessionVersion: activeRun.expectedSessionVersion,
+          allowedDomains: activeRun.allowedDomains ?? [],
           operation: proposal.operation,
         });
 

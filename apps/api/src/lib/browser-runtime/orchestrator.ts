@@ -16,6 +16,7 @@ import {
   finishAdapterRun,
   finishBrowserSessionStop,
 } from "../browser-state/store";
+import type { BrowserSessionBillingClaim } from "../browser-state/store";
 import type { BrowserExecutionAdapter } from "./execution-adapter";
 import {
   codeRunInputSchema,
@@ -59,13 +60,14 @@ type BrowserOrchestratorStores = {
     lease: BrowserStateMutationLease,
     sessionId: string,
     reason: string,
+    ownerId?: string,
   ): Promise<BrowserSessionStopClaim | null>;
   finishStop(
     lease: BrowserStateMutationLease,
     sessionId: string,
     reason: string,
     outcome: "destroyed" | "interrupted",
-  ): Promise<void>;
+  ): Promise<BrowserSessionBillingClaim | null>;
   commitPreparedProfile?(
     lease: BrowserStateMutationLease,
     claim: BrowserSessionStopClaim,
@@ -88,6 +90,7 @@ type OrchestratorCapabilityStore = {
 export type BrowserSessionStopClaim = {
   runId: string | null;
   profileId: string | null;
+  requiresPreparedProfile?: boolean;
   browserId: string | null;
   runtimeEpoch: number;
 };
@@ -231,7 +234,7 @@ function createBrowserSessionOrchestratorCore(
       cancel(reason: string): Promise<void>;
     }
   >();
-  const stops = new Map<string, Promise<void>>();
+  const stops = new Map<string, Promise<BrowserSessionBillingClaim | null>>();
 
   const startBinding = async (runId: string): Promise<PendingRun> => {
     const requested = {
@@ -541,6 +544,11 @@ function createBrowserSessionOrchestratorCore(
               ),
           ),
         );
+        if (result.turnCount !== result.actionCount + 1) {
+          throw Object.assign(new Error("Adapter turn count mismatch"), {
+            category: "model_protocol_error",
+          });
+        }
         const durableActionCount =
           await deps.gate.withBrowserStateMutationLease(
             "filesystem_and_database",
@@ -599,16 +607,22 @@ function createBrowserSessionOrchestratorCore(
       }
     },
 
-    stopSession(sessionId: string, reason: string): Promise<void> {
+    stopSession(
+      sessionId: string,
+      reason: string,
+      ownerId?: string,
+    ): Promise<BrowserSessionBillingClaim | null> {
       const existing = stops.get(sessionId);
-      if (existing) return existing;
+      if (existing) {
+        return existing.then(() => null);
+      }
       const stop = (async () => {
         runtimeUuidSchema.parse(sessionId);
         const claim = await deps.gate.withBrowserStateMutationLease(
           "filesystem_and_database",
-          lease => deps.stores.claimStop(lease, sessionId, reason),
+          lease => deps.stores.claimStop(lease, sessionId, reason, ownerId),
         );
-        if (claim === null) return;
+        if (claim === null) return null;
         const errors: unknown[] = [];
         if (claim.runId !== null) {
           const execution = active.get(claim.runId);
@@ -640,7 +654,7 @@ function createBrowserSessionOrchestratorCore(
           errors.push(error);
         }
         const prepared = closed?.preparedProfile ?? null;
-        if (claim.profileId !== null && prepared === null) {
+        if (claim.requiresPreparedProfile === true && prepared === null) {
           errors.push(
             new Error("Profile-bearing stop returned no prepared profile"),
           );
@@ -678,8 +692,9 @@ function createBrowserSessionOrchestratorCore(
             errors.push(error);
           }
         }
+        let billingClaim: BrowserSessionBillingClaim | null = null;
         try {
-          await deps.gate.withBrowserStateMutationLease(
+          billingClaim = await deps.gate.withBrowserStateMutationLease(
             "filesystem_and_database",
             lease =>
               deps.stores.finishStop(
@@ -695,6 +710,7 @@ function createBrowserSessionOrchestratorCore(
         if (errors.length > 0) {
           throw new AggregateError(errors, "Browser stop cleanup failed");
         }
+        return billingClaim;
       })().finally(() => {
         stops.delete(sessionId);
       });

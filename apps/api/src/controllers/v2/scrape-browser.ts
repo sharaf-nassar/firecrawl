@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { isIP } from "node:net";
 import { v7 as uuidv7 } from "uuid";
 import { Response } from "express";
 import { z } from "zod";
@@ -17,7 +18,6 @@ import {
   didBrowserSessionUsePrompt,
   clearBrowserSessionPromptFlag,
 } from "../../lib/browser-sessions";
-import {} from "../../lib/concurrency-limit";
 import {
   getCombinedTeamActiveCount,
   mirrorExternalSlotAcquire,
@@ -40,6 +40,8 @@ import {
   executePromptViaBrowserAgent,
   executeCodeViaBrowserSession,
   AgentResult,
+  getPublicBrowserRuntime,
+  PublicBrowserRuntimeError,
 } from "../../lib/scrape-interact/browser-agent";
 import { sanitizeUrlForTrace } from "../../lib/scrape-interact/langsmith";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
@@ -63,12 +65,13 @@ import {
 import { autumnService } from "../../services/autumn/autumn.service";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 import { isScrapeOwnedBy } from "../../lib/local-owner";
+import { configuredPublicBrowserOrigins } from "./browser";
 
 // ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
 
-const browserCreateRequestSchema = z.object({
+const browserCreateRequestSchema = z.strictObject({
   ttl: z.number().min(30).max(3600).default(600),
   activityTtl: z.number().min(10).max(3600).default(300),
   streamWebView: z.boolean().default(true),
@@ -81,18 +84,48 @@ const browserCreateRequestSchema = z.object({
     .optional(),
 });
 
-const browserExecuteRequestSchema = z
-  .object({
+const interactAllowedDomainSchema = z
+  .string()
+  .min(1)
+  .max(253)
+  .superRefine((value, context) => {
+    if (
+      value !== value.toLowerCase() ||
+      value === "localhost" ||
+      value.includes(":") ||
+      value.includes("/") ||
+      value.includes("@") ||
+      value.includes("*") ||
+      isIP(value) !== 0 ||
+      !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(
+        value,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "allowedDomains must contain lowercase ASCII hostnames",
+      });
+    }
+  });
+
+export const browserExecuteRequestSchema = z
+  .strictObject({
     code: z.string().min(1).max(100_000).optional(),
     prompt: z.string().min(1).max(10_000).optional(),
     language: z.enum(["python", "node", "bash"]).default("node"),
-    timeout: z.number().min(1).max(300).default(30),
+    timeout: z.number().int().min(1).max(300).default(30),
     origin: z.string().optional(),
     integration: integrationSchema.optional().transform(val => val || null),
-    existingSessionId: z.string().optional(),
+    existingSessionId: z.string().uuid().optional(),
+    allowedDomains: z.array(interactAllowedDomainSchema).max(8).default([]),
   })
-  .refine(data => data.code || data.prompt, {
-    message: "Either 'code' or 'prompt' must be provided.",
+  .superRefine((data, context) => {
+    if ((data.code === undefined) === (data.prompt === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Exactly one of 'code' or 'prompt' must be provided.",
+      });
+    }
   });
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
@@ -103,12 +136,69 @@ interface BrowserExecuteResponse {
   liveViewUrl?: string;
   interactiveLiveViewUrl?: string;
   output?: string;
+  turnCount?: number;
+  actionCount?: number;
+  usage?: { inputTokens: number; outputTokens: number };
   stdout?: string;
   result?: string;
   stderr?: string;
   exitCode?: number;
   killed?: boolean;
   error?: string;
+}
+
+function mapLocalInteractError(error: unknown): {
+  status: number;
+  message: string;
+} {
+  const category =
+    error instanceof PublicBrowserRuntimeError
+      ? error.category
+      : error &&
+          typeof error === "object" &&
+          "category" in error &&
+          typeof error.category === "string"
+        ? error.category
+        : "browser_unavailable";
+  if (category === "browser_not_found")
+    return { status: 404, message: "Browser session not found." };
+  if (category === "insufficient_credits")
+    return {
+      status: 402,
+      message: "Insufficient credits for browser session.",
+    };
+  if (category === "keyless_credits")
+    return { status: 429, message: KEYLESS_CREDITS_MESSAGE };
+  if (category === "browser_forbidden" || category === "capability_denied")
+    return { status: 403, message: "Forbidden." };
+  if (category === "target_blocked")
+    return { status: 403, message: "Forbidden." };
+  if (
+    category === "concurrency_exceeded" ||
+    category === "action_limit_exceeded"
+  )
+    return { status: 429, message: "Browser concurrency limit was reached." };
+  if (category === "browser_expired")
+    return { status: 410, message: "Browser session has expired." };
+  if (
+    category === "replay_unavailable" ||
+    category === "replay_unsupported" ||
+    category === "zdr_replay_unavailable" ||
+    category === "profile_locked"
+  )
+    return {
+      status: 409,
+      message:
+        "Replay context is unavailable for this scrape job. Please rerun the scrape.",
+    };
+  if (category === "model_protocol_error")
+    return {
+      status: 502,
+      message: "Browser execution returned an invalid protocol result.",
+    };
+  if (category === "deadline_exceeded" || category === "timed_out")
+    return { status: 504, message: "Browser execution timed out." };
+  return { status: 503, message: "Browser state is temporarily unavailable." };
 }
 
 interface BrowserDeleteResponse {
@@ -155,6 +245,160 @@ export async function scrapeInteractController(
   // can't be stored). Compare against that derived UUID for keyless requests.
   if (!isScrapeOwnedBy(scrape.team_id, req.auth.team_id)) {
     return res.status(403).json({ success: false, error: "Forbidden." });
+  }
+
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
+    const runtime = getPublicBrowserRuntime();
+    if (!runtime) {
+      return res.status(503).json({
+        success: false,
+        error: "Browser state is temporarily unavailable.",
+      });
+    }
+    if (getScrapeZDR(req.acuc?.flags) === "forced") {
+      return res.status(409).json({
+        success: false,
+        error: "Replay context is unavailable for zero-data-retention scrapes.",
+      });
+    }
+    let keylessReserved = 0;
+    let localSessionCreated = false;
+    try {
+      const replay = await runtime.loadReplayState(req.auth.team_id, scrapeId);
+      if (replay.kind !== "checkpoint") {
+        return res.status(409).json({
+          success: false,
+          error:
+            "Replay context is unavailable for this scrape job. Please rerun the scrape.",
+        });
+      }
+      const navigationDomains = [
+        new URL(replay.envelope.canonicalTargetUrl).hostname.toLowerCase(),
+        new URL(replay.checkpoint.finalUrl).hostname.toLowerCase(),
+      ];
+      const allowedDomains = [
+        ...new Set([...req.body.allowedDomains, ...navigationDomains]),
+      ];
+      if (allowedDomains.length > 8) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "allowedDomains and replay origins may contain at most 8 hosts.",
+        });
+      }
+      const requestId = uuidv7();
+      const correlationId = uuidv7();
+      await logRequest({
+        id: requestId,
+        kind: "interact",
+        api_version: "v2",
+        team_id: req.auth.team_id,
+        target_hint: "Interact session",
+        origin: origin ?? "api",
+        integration: req.body.integration ?? null,
+        zeroDataRetention: false,
+        api_key_id: req.acuc?.api_key_id ?? null,
+      });
+      const publicOrigins = configuredPublicBrowserOrigins();
+      const estimatedCredits = calculateBrowserSessionCredits(
+        3_600_000,
+        BROWSER_CREDITS_PER_HOUR,
+      );
+      const executed = await runtime.interact({
+        requestId,
+        ownerId: req.auth.team_id,
+        scrapeId,
+        mode: prompt === undefined ? "code" : "prompt",
+        ...(prompt === undefined ? { source: rawCode! } : { prompt }),
+        language,
+        timeoutSeconds: timeout,
+        correlationId,
+        existingSessionId: req.body.existingSessionId,
+        allowedDomains,
+        initialUrl: replay.envelope.canonicalTargetUrl,
+        replay: replay.checkpoint,
+        settings: replay.envelope.browserSettings,
+        profile: replay.envelope.profile,
+        concurrencyLimit: req.acuc?.concurrency ?? 2,
+        ...publicOrigins,
+        admitSession: async () => {
+          const reservation = await reserveKeylessCredits(
+            req.auth.team_id,
+            estimatedCredits,
+          );
+          if (!reservation.ok) {
+            throw Object.assign(new Error(KEYLESS_CREDITS_MESSAGE), {
+              category: "keyless_credits",
+            });
+          }
+          keylessReserved = estimatedCredits;
+          const autumnResult = await autumnService.checkCredits({
+            teamId: req.auth.team_id,
+            value: estimatedCredits,
+            properties: { source: "scrapeBrowserCreate", path: req.path },
+          });
+          if (autumnResult !== null && !autumnResult.allowed) {
+            throw Object.assign(new Error("Insufficient credits"), {
+              category: "insufficient_credits",
+            });
+          }
+        },
+        sessionCreated: async session => {
+          localSessionCreated = true;
+          invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
+        },
+      });
+      const result = executed.result;
+      if ("output" in result) {
+        return res.status(200).json({
+          success: true,
+          cdpUrl: executed.session.cdpUrl,
+          liveViewUrl: executed.session.liveViewUrl,
+          interactiveLiveViewUrl: executed.session.interactiveLiveViewUrl,
+          output: result.output,
+          turnCount: result.turnCount,
+          actionCount: result.actionCount,
+          usage: result.usage,
+        });
+      }
+      const hasError = result.exitCode !== 0 || result.killed;
+      return res.status(200).json({
+        success: !hasError,
+        cdpUrl: executed.session.cdpUrl,
+        liveViewUrl: executed.session.liveViewUrl,
+        interactiveLiveViewUrl: executed.session.interactiveLiveViewUrl,
+        stdout: result.stdout,
+        result: result.result,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        killed: result.killed,
+        ...(hasError ? { error: result.stderr || "Execution failed" } : {}),
+      });
+    } catch (error) {
+      if (keylessReserved > 0 && !localSessionCreated) {
+        adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(
+          () => {},
+        );
+      }
+      const mapped = mapLocalInteractError(error);
+      if (
+        error &&
+        typeof error === "object" &&
+        "category" in error &&
+        error.category === "keyless_credits"
+      ) {
+        applyAgentAuthDiscoveryHeader(res);
+      }
+      logger.warn("Local interact execution failed", {
+        category:
+          error && typeof error === "object" && "category" in error
+            ? error.category
+            : "browser_unavailable",
+      });
+      return res
+        .status(mapped.status)
+        .json({ success: false, error: mapped.message });
+    }
   }
 
   // --- Build replay context from original scrape ---
@@ -395,6 +639,71 @@ export async function scrapeStopInteractiveBrowserController(
     module: "api/v2",
     method: "scrapeStopInteractiveBrowserController",
   });
+
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
+    const runtime = getPublicBrowserRuntime();
+    if (!runtime) {
+      return res.status(503).json({
+        success: false,
+        error: "Browser state is temporarily unavailable.",
+      });
+    }
+    try {
+      const result = await runtime.stopInteract(
+        req.auth.team_id,
+        req.params.jobId,
+      );
+      invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
+      if (result.stopped && result.sessionId) {
+        mirrorExternalSlotRelease(req.auth.team_id, result.sessionId).catch(
+          () => {},
+        );
+      }
+      if (
+        result.stopped &&
+        result.sessionId !== undefined &&
+        result.creditsBilled !== undefined
+      ) {
+        billTeam(
+          req.auth.team_id,
+          req.acuc?.sub_id ?? undefined,
+          result.creditsBilled,
+          req.acuc?.api_key_id ?? null,
+          { endpoint: "interact", jobId: result.sessionId },
+        ).catch(error => {
+          logger.error("Failed to bill local interact session", {
+            error,
+            creditsBilled: result.creditsBilled,
+          });
+        });
+        const reservedCredits = calculateBrowserSessionCredits(
+          (result.ttlTotalSeconds ?? 3_600) * 1_000,
+          BROWSER_CREDITS_PER_HOUR,
+        );
+        adjustKeylessCredits(
+          req.auth.team_id,
+          result.creditsBilled - reservedCredits,
+        ).catch(() => {});
+        logKeylessCreditUsage(req.auth.team_id, result.creditsBilled).catch(
+          () => {},
+        );
+      }
+      return res.status(200).json({
+        success: true,
+        ...(result.sessionDurationMs === undefined
+          ? {}
+          : { sessionDurationMs: result.sessionDurationMs }),
+        ...(result.creditsBilled === undefined
+          ? {}
+          : { creditsBilled: result.creditsBilled }),
+      });
+    } catch (error) {
+      const mapped = mapLocalInteractError(error);
+      return res
+        .status(mapped.status)
+        .json({ success: false, error: mapped.message });
+    }
+  }
 
   const session = await getBrowserSessionFromScrape(req.params.jobId);
 

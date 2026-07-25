@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { isIP } from "node:net";
 import { v7 as uuidv7 } from "uuid";
 import { Request, Response } from "express";
 import { z } from "zod";
@@ -33,23 +34,59 @@ import {
   calculateBrowserSessionCredits,
 } from "../../lib/browser-billing";
 import { autumnService } from "../../services/autumn/autumn.service";
+import {
+  getPublicBrowserRuntime,
+  PublicBrowserRuntimeError,
+  type PublicBrowserSession,
+} from "../../lib/scrape-interact/browser-agent";
 
 // ---------------------------------------------------------------------------
 // Zod schemas
 // ---------------------------------------------------------------------------
 
-const browserCreateRequestSchema = z.object({
-  ttl: z.number().min(30).max(3600).default(600),
-  activityTtl: z.number().min(10).max(3600).default(300),
-  streamWebView: z.boolean().default(true),
-  integration: integrationSchema.optional().transform(val => val || null),
-  profile: z
-    .object({
-      name: z.string().min(1).max(128),
-      saveChanges: z.boolean().default(true),
-    })
-    .optional(),
-});
+const allowedDomainSchema = z
+  .string()
+  .min(1)
+  .max(253)
+  .superRefine((value, context) => {
+    if (
+      value !== value.toLowerCase() ||
+      value === "localhost" ||
+      value.includes(":") ||
+      value.includes("/") ||
+      value.includes("@") ||
+      value.includes("*") ||
+      isIP(value) !== 0 ||
+      !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(
+        value,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "allowedDomains must contain lowercase ASCII hostnames",
+      });
+    }
+  });
+
+export const browserCreateRequestSchema = z
+  .strictObject({
+    ttl: z.number().int().min(30).max(3600).default(600),
+    activityTtl: z.number().int().min(10).max(600).default(300),
+    allowedDomains: z.array(allowedDomainSchema).max(8).default([]),
+    streamWebView: z.boolean().default(true),
+    integration: integrationSchema.optional().transform(val => val || null),
+    profile: z
+      .strictObject({
+        name: z.string().min(1).max(128),
+        saveChanges: z.boolean().default(true),
+      })
+      .optional(),
+  })
+  .transform(value => ({
+    ...value,
+    activityTtl: Math.min(value.ttl, value.activityTtl),
+    allowedDomains: [...new Set(value.allowedDomains)],
+  }));
 
 type BrowserCreateRequest = z.infer<typeof browserCreateRequestSchema>;
 
@@ -63,11 +100,12 @@ interface BrowserCreateResponse {
   error?: string;
 }
 
-const browserExecuteRequestSchema = z.object({
+const browserExecuteRequestSchema = z.strictObject({
   code: z.string().min(1).max(100_000),
   language: z.enum(["python", "node", "bash"]).default("node"),
   timeout: z.number().min(1).max(300).default(30),
   origin: z.string().optional(),
+  allowedDomains: z.array(allowedDomainSchema).max(8).default([]),
 });
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
@@ -102,6 +140,97 @@ interface BrowserListResponse {
     lastActivity: string;
   }>;
   error?: string;
+}
+
+export function configuredPublicBrowserOrigins(): {
+  publicBase: string;
+  publicWsBase: string;
+} {
+  if (!config.BROWSER_PUBLIC_API_ORIGIN) {
+    throw Object.assign(new Error("Browser public API origin is unavailable"), {
+      category: "browser_state_unavailable",
+    });
+  }
+  const parsed = new URL(config.BROWSER_PUBLIC_API_ORIGIN);
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.pathname !== "/" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    parsed.origin !== config.BROWSER_PUBLIC_API_ORIGIN
+  ) {
+    throw Object.assign(new Error("Browser public API origin is invalid"), {
+      category: "browser_state_unavailable",
+    });
+  }
+  const publicBase = parsed.origin;
+  return {
+    publicBase,
+    publicWsBase: publicBase.replace(/^http/, "ws"),
+  };
+}
+
+function publicSessionResponse(session: PublicBrowserSession) {
+  return {
+    id: session.id,
+    cdpUrl: session.cdpUrl,
+    liveViewUrl: session.liveViewUrl,
+    interactiveLiveViewUrl: session.interactiveLiveViewUrl,
+    expiresAt: session.expiresAt,
+  };
+}
+
+function mapLocalBrowserError(error: unknown): {
+  status: number;
+  message: string;
+} {
+  const category =
+    error instanceof PublicBrowserRuntimeError
+      ? error.category
+      : error &&
+          typeof error === "object" &&
+          "category" in error &&
+          typeof error.category === "string"
+        ? error.category
+        : "browser_unavailable";
+  const status =
+    category === "profile_locked"
+      ? 409
+      : category === "concurrency_exceeded" ||
+          category === "action_limit_exceeded"
+        ? 429
+        : category === "browser_not_found"
+          ? 404
+          : category === "browser_expired"
+            ? 410
+            : category === "browser_forbidden" ||
+                category === "capability_denied" ||
+                category === "target_blocked"
+              ? 403
+              : category === "model_protocol_error"
+                ? 502
+                : category === "deadline_exceeded" || category === "timed_out"
+                  ? 504
+                  : 503;
+  const message =
+    status === 409
+      ? "Another session is currently writing to this profile."
+      : status === 404
+        ? "Browser session not found."
+        : status === 410
+          ? "Browser session has expired."
+          : status === 403
+            ? "Forbidden."
+            : status === 429
+              ? "Browser concurrency limit was reached."
+              : status === 502
+                ? "Browser execution returned an invalid protocol result."
+                : status === 504
+                  ? "Browser execution timed out."
+                  : "Browser state is temporarily unavailable.";
+  return { status, message };
 }
 
 // ---------------------------------------------------------------------------
@@ -212,9 +341,19 @@ export async function browserCreateController(
 
   req.body = browserCreateRequestSchema.parse(req.body);
 
-  const { ttl, activityTtl, streamWebView, profile, integration } = req.body;
+  const {
+    ttl,
+    activityTtl,
+    allowedDomains,
+    streamWebView,
+    profile,
+    integration,
+  } = req.body;
 
-  if (!config.BROWSER_SERVICE_URL) {
+  if (
+    config.LOCAL_BROWSER_SERVICE_ENABLED !== true &&
+    !config.BROWSER_SERVICE_URL
+  ) {
     return res.status(503).json({
       success: false,
       error:
@@ -255,6 +394,76 @@ export async function browserCreateController(
       success: false,
       error: `You have reached the maximum number of concurrent jobs (${concurrencyLimit}). Please wait for existing jobs to complete or destroy browser sessions before creating new ones.`,
     });
+  }
+
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
+    const runtime = getPublicBrowserRuntime();
+    if (!runtime) {
+      return res.status(503).json({
+        success: false,
+        error: "Browser state is temporarily unavailable.",
+      });
+    }
+    try {
+      await logRequest({
+        id: sessionId,
+        kind: "browser",
+        api_version: "v2",
+        team_id: req.auth.team_id,
+        target_hint: "Browser session",
+        origin: "api",
+        integration: integration ?? null,
+        zeroDataRetention: false,
+        api_key_id: req.acuc?.api_key_id ?? null,
+      });
+      const session = await runtime.createSession({
+        requestId: sessionId,
+        ownerId: req.auth.team_id,
+        initialUrl: "about:blank",
+        allowedDomains,
+        ttlSeconds: ttl,
+        activityTtlSeconds: activityTtl,
+        streamWebView,
+        profile,
+        replay: null,
+        settings: {
+          headers: {},
+          cookies: [],
+          viewport: {
+            width: 1280,
+            height: 800,
+            deviceScaleFactor: 1,
+            isMobile: false,
+            hasTouch: false,
+          },
+          userAgent: "Firecrawl",
+          locale: "en-US",
+          location: { country: "us-generic", languages: ["en-US"] },
+          proxy: { kind: "auto" },
+          skipTlsVerification: false,
+          blockAds: false,
+          lockdown: true,
+        },
+        concurrencyLimit,
+        ...configuredPublicBrowserOrigins(),
+      });
+      invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
+      return res.status(200).json({
+        success: true,
+        ...publicSessionResponse(session),
+      });
+    } catch (error) {
+      const mapped = mapLocalBrowserError(error);
+      logger.warn("Local browser session creation failed", {
+        category:
+          error && typeof error === "object" && "category" in error
+            ? error.category
+            : "browser_unavailable",
+      });
+      return res
+        .status(mapped.status)
+        .json({ success: false, error: mapped.message });
+    }
   }
 
   // 1. Create a browser session via the browser service (retry up to 3 times)
@@ -410,7 +619,7 @@ export async function browserExecuteController(
   req.body = browserExecuteRequestSchema.parse(req.body);
 
   const id = req.params.sessionId;
-  const { code, language, timeout, origin } = req.body;
+  const { code, language, timeout, origin, allowedDomains } = req.body;
 
   const logger = _logger.child({
     sessionId: id,
@@ -418,6 +627,61 @@ export async function browserExecuteController(
     module: "api/v2",
     method: "browserExecuteController",
   });
+
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
+    const runtime = getPublicBrowserRuntime();
+    if (!runtime) {
+      return res.status(503).json({
+        success: false,
+        error: "Browser state is temporarily unavailable.",
+      });
+    }
+    try {
+      const requestId = uuidv7();
+      await logRequest({
+        id: requestId,
+        kind: "browser",
+        api_version: "v2",
+        team_id: req.auth.team_id,
+        target_hint: "Browser execution",
+        origin: origin ?? "api",
+        integration: null,
+        zeroDataRetention: false,
+        api_key_id: req.acuc?.api_key_id ?? null,
+      });
+      const execResult = await runtime.executeSession({
+        requestId,
+        ownerId: req.auth.team_id,
+        sessionId: id,
+        language,
+        source: code,
+        timeoutSeconds: timeout,
+        correlationId: uuidv7(),
+        allowedDomains,
+      });
+      const hasError = execResult.exitCode !== 0 || execResult.killed;
+      return res.status(200).json({
+        success: true,
+        stdout: execResult.stdout,
+        result: execResult.result,
+        stderr: execResult.stderr,
+        exitCode: execResult.exitCode,
+        killed: execResult.killed,
+        ...(hasError ? { error: execResult.stderr || "Execution failed" } : {}),
+      });
+    } catch (error) {
+      const mapped = mapLocalBrowserError(error);
+      logger.warn("Local browser execution failed", {
+        category:
+          error && typeof error === "object" && "category" in error
+            ? error.category
+            : "browser_unavailable",
+      });
+      return res
+        .status(mapped.status)
+        .json({ success: false, error: mapped.message });
+    }
+  }
 
   // Look up session from Supabase
   const session = await getBrowserSession(id);
@@ -514,6 +778,54 @@ export async function browserDeleteController(
     module: "api/v2",
     method: "browserDeleteController",
   });
+
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
+    const runtime = getPublicBrowserRuntime();
+    if (!runtime) {
+      return res.status(503).json({
+        success: false,
+        error: "Browser state is temporarily unavailable.",
+      });
+    }
+    try {
+      const result = await runtime.stopSession(req.auth.team_id, id);
+      invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
+      if (result.stopped) {
+        mirrorExternalSlotRelease(req.auth.team_id, id).catch(() => {});
+      }
+      if (result.stopped && result.creditsBilled !== undefined) {
+        billTeam(
+          req.auth.team_id,
+          req.acuc?.sub_id ?? undefined,
+          result.creditsBilled,
+          req.acuc?.api_key_id ?? null,
+          {
+            endpoint: result.usedPrompt ? "interact" : "browser",
+            jobId: id,
+          },
+        ).catch(error => {
+          logger.error("Failed to bill local browser session", {
+            error,
+            creditsBilled: result.creditsBilled,
+          });
+        });
+      }
+      return res.status(200).json({
+        success: true,
+        ...(result.sessionDurationMs === undefined
+          ? {}
+          : { sessionDurationMs: result.sessionDurationMs }),
+        ...(result.creditsBilled === undefined
+          ? {}
+          : { creditsBilled: result.creditsBilled }),
+      });
+    } catch (error) {
+      const mapped = mapLocalBrowserError(error);
+      return res
+        .status(mapped.status)
+        .json({ success: false, error: mapped.message });
+    }
+  }
 
   const session = await getBrowserSession(id);
 
@@ -643,6 +955,41 @@ export async function browserListController(
     | "active"
     | "destroyed"
     | undefined;
+
+  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
+    const runtime = getPublicBrowserRuntime();
+    if (!runtime) {
+      return res.status(503).json({
+        success: false,
+        error: "Browser state is temporarily unavailable.",
+      });
+    }
+    try {
+      const sessions = await runtime.listSessions(
+        req.auth.team_id,
+        statusFilter,
+        configuredPublicBrowserOrigins(),
+      );
+      return res.status(200).json({
+        success: true,
+        sessions: sessions.map(session => ({
+          id: session.id,
+          status: session.status,
+          cdpUrl: session.cdpUrl,
+          liveViewUrl: session.liveViewUrl,
+          interactiveLiveViewUrl: session.interactiveLiveViewUrl,
+          streamWebView: session.streamWebView,
+          createdAt: session.createdAt,
+          lastActivity: session.lastActivity,
+        })),
+      });
+    } catch (error) {
+      const mapped = mapLocalBrowserError(error);
+      return res
+        .status(mapped.status)
+        .json({ success: false, error: mapped.message });
+    }
+  }
 
   const rows = await listBrowserSessions(req.auth.team_id, {
     status: statusFilter,

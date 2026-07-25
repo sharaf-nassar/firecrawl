@@ -1,0 +1,519 @@
+import { randomUUID } from "node:crypto";
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  runtime: {
+    loadReplayState: vi.fn(),
+    interact: vi.fn(),
+    stopInteract: vi.fn(),
+  },
+  getRuntime: vi.fn(),
+  legacyPrompt: vi.fn(),
+  legacyCode: vi.fn(),
+  getScrape: vi.fn(),
+  logRequest: vi.fn(),
+  reserveKeyless: vi.fn(),
+  adjustKeyless: vi.fn(),
+  checkCredits: vi.fn(),
+  activeCount: vi.fn(),
+  mirrorAcquire: vi.fn(),
+  mirrorRelease: vi.fn(),
+  billTeam: vi.fn(),
+  updateCredits: vi.fn(),
+  getSessionFromScrape: vi.fn(),
+}));
+
+vi.mock("../../lib/scrape-interact/browser-agent", () => ({
+  getPublicBrowserRuntime: mocks.getRuntime,
+  executePromptViaBrowserAgent: mocks.legacyPrompt,
+  executeCodeViaBrowserSession: mocks.legacyCode,
+  PublicBrowserRuntimeError: class PublicBrowserRuntimeError extends Error {
+    constructor(public readonly category: string) {
+      super(category);
+    }
+  },
+}));
+vi.mock("../../lib/supabase-jobs", () => ({
+  supabaseGetScrapeById: mocks.getScrape,
+}));
+vi.mock("../../services/logging/log_job", () => ({
+  logRequest: mocks.logRequest,
+}));
+vi.mock("../../lib/browser-sessions", () => ({
+  insertBrowserSession: vi.fn(),
+  getBrowserSession: vi.fn(),
+  updateBrowserSessionActivity: vi.fn(async () => undefined),
+  updateBrowserSessionCreditsUsed: mocks.updateCredits,
+  updateBrowserSessionScrapeId: vi.fn(async () => undefined),
+  claimBrowserSessionDestroyed: vi.fn(),
+  invalidateActiveBrowserSessionCount: vi.fn(async () => undefined),
+  getBrowserSessionFromScrape: mocks.getSessionFromScrape,
+  markBrowserSessionUsedPrompt: vi.fn(async () => undefined),
+  didBrowserSessionUsePrompt: vi.fn(),
+  clearBrowserSessionPromptFlag: vi.fn(async () => undefined),
+}));
+vi.mock("../../lib/keyless", () => ({
+  KEYLESS_CREDITS_MESSAGE: "Insufficient credits",
+  adjustKeylessCredits: mocks.adjustKeyless,
+  logKeylessCreditUsage: vi.fn(async () => undefined),
+  reserveKeylessCredits: mocks.reserveKeyless,
+  keylessTeamUuid: vi.fn(() => null),
+}));
+vi.mock("../../services/worker/nuq-router", () => ({
+  getCombinedTeamActiveCount: mocks.activeCount,
+  mirrorExternalSlotAcquire: mocks.mirrorAcquire,
+  mirrorExternalSlotRelease: mocks.mirrorRelease,
+}));
+vi.mock("../../services/autumn/autumn.service", () => ({
+  autumnService: { checkCredits: mocks.checkCredits },
+}));
+vi.mock("../../lib/browser-session-activity", () => ({
+  enqueueBrowserSessionActivity: vi.fn(async () => undefined),
+}));
+vi.mock("../../services/billing/credit_billing", () => ({
+  billTeam: mocks.billTeam,
+}));
+
+import { config } from "../../config";
+import {
+  browserExecuteRequestSchema,
+  scrapeInteractController,
+  scrapeStopInteractiveBrowserController,
+} from "./scrape-browser";
+
+function response() {
+  const result = {
+    statusCode: 0,
+    body: undefined as unknown,
+    status(code: number) {
+      result.statusCode = code;
+      return result;
+    },
+    json(body: unknown) {
+      result.body = body;
+      return result;
+    },
+  };
+  return result;
+}
+
+function request(
+  ownerId: string,
+  body: unknown,
+  jobId = randomUUID(),
+  flags: Record<string, unknown> = {},
+) {
+  return {
+    body,
+    params: { jobId },
+    path: `/v2/scrape/${jobId}/interact`,
+    protocol: "http",
+    get: (name: string) => (name === "host" ? "api.example.test" : undefined),
+    auth: { team_id: ownerId },
+    acuc: { api_key_id: randomUUID(), flags },
+  } as never;
+}
+
+function replay() {
+  return {
+    kind: "checkpoint" as const,
+    envelope: {
+      version: 1 as const,
+      navigationPolicyVersion: 1 as const,
+      canonicalTargetUrl: "https://fixture.example/start",
+      callerOrigin: "api",
+      waitForMs: 0,
+      browserSettings: {
+        headers: {},
+        cookies: [],
+        viewport: {
+          width: 1280,
+          height: 800,
+          deviceScaleFactor: 1,
+          isMobile: false,
+          hasTouch: false,
+        },
+        userAgent: "Firecrawl",
+        locale: "en-US",
+        location: { country: "us-generic", languages: ["en-US"] },
+        proxy: { kind: "auto" as const },
+        skipTlsVerification: false,
+        blockAds: false,
+        lockdown: true,
+      },
+      actions: [],
+    },
+    checkpoint: {
+      version: 1 as const,
+      statePath: "replay/owner/scrape/state.json",
+      storageState: { cookies: [], origins: [] },
+      finalUrl: "https://fixture.example/start",
+      fingerprint: {
+        finalUrl: "https://fixture.example/start",
+        titleSha256: "a".repeat(64),
+        bodyTextSha256: "b".repeat(64),
+      },
+      checksum: "c".repeat(64),
+      byteSize: 32,
+    },
+  };
+}
+
+describe("local scrape Interact compatibility", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    for (const method of Object.values(mocks.runtime)) method.mockReset();
+    (
+      config as { LOCAL_BROWSER_SERVICE_ENABLED?: boolean }
+    ).LOCAL_BROWSER_SERVICE_ENABLED = true;
+    (
+      config as { BROWSER_PUBLIC_API_ORIGIN?: string }
+    ).BROWSER_PUBLIC_API_ORIGIN = "http://api.example.test";
+    mocks.getRuntime.mockReturnValue(mocks.runtime);
+    mocks.logRequest.mockResolvedValue(undefined);
+    mocks.reserveKeyless.mockResolvedValue({ ok: true });
+    mocks.adjustKeyless.mockResolvedValue(undefined);
+    mocks.checkCredits.mockResolvedValue(null);
+    mocks.activeCount.mockResolvedValue(0);
+    mocks.mirrorAcquire.mockResolvedValue(undefined);
+    mocks.mirrorRelease.mockResolvedValue(undefined);
+    mocks.billTeam.mockResolvedValue(undefined);
+    mocks.updateCredits.mockResolvedValue(undefined);
+    mocks.getSessionFromScrape.mockResolvedValue(null);
+    mocks.runtime.loadReplayState.mockResolvedValue(replay());
+  });
+
+  it("enforces exact prompt/code XOR and bounded allowed domains", () => {
+    expect(browserExecuteRequestSchema.safeParse({}).success).toBe(false);
+    expect(
+      browserExecuteRequestSchema.safeParse({ prompt: "read", code: "1" })
+        .success,
+    ).toBe(false);
+    expect(
+      browserExecuteRequestSchema.safeParse({ prompt: "read" }).success,
+    ).toBe(true);
+    expect(
+      browserExecuteRequestSchema.safeParse({
+        code: "1",
+        allowedDomains: Array.from(
+          { length: 9 },
+          (_, index) => `d${index}.example`,
+        ),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("submits one full prompt job and returns action and turn counts", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    mocks.runtime.interact.mockResolvedValue({
+      session: {
+        cdpUrl: "ws://api.example.test/v2/browser/proxy/cdp/cdp",
+        liveViewUrl: "http://api.example.test/v2/browser/proxy/live/view",
+        interactiveLiveViewUrl:
+          "http://api.example.test/v2/browser/proxy/input/view",
+      },
+      result: {
+        output: "done",
+        turnCount: 3,
+        actionCount: 2,
+        usage: { inputTokens: 100, outputTokens: 20 },
+        protocol: {
+          toolEventCount: 0,
+          approvalEventCount: 0,
+          decisionSchemaVersion: 1,
+          observationSchemaVersion: 1,
+        },
+      },
+    });
+    const res = response();
+
+    await scrapeInteractController(
+      request(ownerId, { prompt: "Read the heading" }, jobId),
+      res as never,
+    );
+
+    expect(mocks.runtime.interact).toHaveBeenCalledTimes(1);
+    expect(mocks.runtime.interact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mode: "prompt",
+        prompt: "Read the heading",
+        timeoutSeconds: 30,
+      }),
+    );
+    expect(mocks.legacyPrompt).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      output: "done",
+      turnCount: 3,
+      actionCount: 2,
+    });
+  });
+
+  it("maps unavailable local adapters without cloud fallback", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    mocks.runtime.interact.mockRejectedValue(
+      Object.assign(new Error("missing"), { category: "codex_unavailable" }),
+    );
+    const res = response();
+
+    await scrapeInteractController(
+      request(ownerId, { prompt: "read" }, jobId),
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(503);
+    expect(mocks.legacyPrompt).not.toHaveBeenCalled();
+    expect(mocks.legacyCode).not.toHaveBeenCalled();
+  });
+
+  it("rejects cross-owner, ZDR, and unavailable replay before execution", async () => {
+    const ownerId = randomUUID();
+    const otherOwner = randomUUID();
+    const jobId = randomUUID();
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: otherOwner,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    const forbidden = response();
+    await scrapeInteractController(
+      request(ownerId, { prompt: "read" }, jobId),
+      forbidden as never,
+    );
+    expect(forbidden.statusCode).toBe(403);
+
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    const zdr = response();
+    await scrapeInteractController(
+      request(ownerId, { prompt: "read" }, jobId, { forceZDR: true }),
+      zdr as never,
+    );
+    expect(zdr.statusCode).toBe(409);
+    expect(mocks.runtime.loadReplayState).not.toHaveBeenCalled();
+
+    mocks.runtime.loadReplayState.mockResolvedValue({
+      kind: "error",
+      category: "replay_unavailable",
+      fields: ["checkpoint"],
+      message: "private detail",
+    });
+    const unavailable = response();
+    await scrapeInteractController(
+      request(ownerId, { prompt: "read" }, jobId),
+      unavailable as never,
+    );
+    expect(unavailable.statusCode).toBe(409);
+    expect(JSON.stringify(unavailable.body)).not.toContain("private");
+    expect(mocks.runtime.interact).not.toHaveBeenCalled();
+  });
+
+  it("passes owned session reuse, profile, and domain union to one code job", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    const existingSessionId = randomUUID();
+    const baseReplay = replay();
+    const replayState = {
+      ...baseReplay,
+      envelope: {
+        ...baseReplay.envelope,
+        profile: { name: "saved", saveChanges: false },
+      },
+    };
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    mocks.runtime.loadReplayState.mockResolvedValue(replayState);
+    mocks.runtime.interact.mockResolvedValue({
+      session: {
+        cdpUrl: "ws://api.example.test/v2/browser/proxy/cdp/cdp",
+        liveViewUrl: "http://api.example.test/v2/browser/proxy/live/view",
+        interactiveLiveViewUrl:
+          "http://api.example.test/v2/browser/proxy/input/view",
+      },
+      result: {
+        stdout: "ok",
+        result: "marker",
+        stderr: "",
+        exitCode: 0,
+        killed: false,
+      },
+    });
+    const res = response();
+
+    await scrapeInteractController(
+      request(
+        ownerId,
+        {
+          code: "return 1",
+          existingSessionId,
+          allowedDomains: ["assets.example"],
+        },
+        jobId,
+      ),
+      res as never,
+    );
+
+    expect(mocks.runtime.interact).toHaveBeenCalledTimes(1);
+    expect(mocks.runtime.interact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mode: "code",
+        source: "return 1",
+        existingSessionId,
+        allowedDomains: ["assets.example", "fixture.example"],
+        profile: { name: "saved", saveChanges: false },
+      }),
+    );
+    expect(res.body).toMatchObject({ stdout: "ok", result: "marker" });
+  });
+
+  it("stops through one idempotent local runtime operation", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    mocks.runtime.stopInteract.mockResolvedValue({ stopped: true });
+    const first = response();
+    const second = response();
+
+    await scrapeStopInteractiveBrowserController(
+      request(ownerId, {}, jobId),
+      first as never,
+    );
+    await scrapeStopInteractiveBrowserController(
+      request(ownerId, {}, jobId),
+      second as never,
+    );
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(mocks.runtime.stopInteract).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects interact and stop when startup mutation admission closes", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    const unavailable = Object.assign(new Error("closed"), {
+      category: "browser_state_unavailable",
+    });
+    mocks.runtime.loadReplayState.mockRejectedValue(unavailable);
+    mocks.runtime.stopInteract.mockRejectedValue(unavailable);
+    const interact = response();
+    const stop = response();
+
+    await scrapeInteractController(
+      request(ownerId, { prompt: "read" }, jobId),
+      interact as never,
+    );
+    await scrapeStopInteractiveBrowserController(
+      request(ownerId, {}, jobId),
+      stop as never,
+    );
+
+    expect(interact.statusCode).toBe(503);
+    expect(stop.statusCode).toBe(503);
+    expect(mocks.runtime.interact).not.toHaveBeenCalled();
+    expect(mocks.logRequest).not.toHaveBeenCalled();
+  });
+
+  it("runs local Interact admission and finalization hooks exactly once", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    const sessionId = randomUUID();
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    mocks.runtime.interact.mockImplementation(async input => {
+      await input.admitSession();
+      const session = {
+        id: sessionId,
+        cdpUrl: "ws://api.example.test/v2/browser/proxy/cdp/cdp",
+        liveViewUrl: "http://api.example.test/v2/browser/proxy/live/view",
+        interactiveLiveViewUrl:
+          "http://api.example.test/v2/browser/proxy/input/view",
+      };
+      await input.sessionCreated(session);
+      return {
+        session,
+        result: {
+          stdout: "ok",
+          result: "done",
+          stderr: "",
+          exitCode: 0,
+          killed: false,
+        },
+      };
+    });
+    mocks.runtime.stopInteract
+      .mockResolvedValueOnce({
+        stopped: true,
+        sessionId,
+        sessionDurationMs: 120_000,
+        creditsBilled: 14,
+        ttlTotalSeconds: 3_600,
+      })
+      .mockResolvedValueOnce({
+        stopped: false,
+        sessionId,
+        sessionDurationMs: 120_000,
+      });
+    mocks.getSessionFromScrape.mockResolvedValue({
+      id: sessionId,
+      ttl_total: 3600,
+    });
+
+    await scrapeInteractController(
+      request(ownerId, { code: "1" }, jobId),
+      response() as never,
+    );
+    await scrapeStopInteractiveBrowserController(
+      request(ownerId, {}, jobId),
+      response() as never,
+    );
+    await scrapeStopInteractiveBrowserController(
+      request(ownerId, {}, jobId),
+      response() as never,
+    );
+
+    expect(mocks.reserveKeyless).toHaveBeenCalledTimes(1);
+    expect(mocks.checkCredits).toHaveBeenCalledTimes(1);
+    expect(mocks.runtime.interact).toHaveBeenCalledWith(
+      expect.objectContaining({ concurrencyLimit: 2 }),
+    );
+    expect(mocks.activeCount).not.toHaveBeenCalled();
+    expect(mocks.mirrorAcquire).not.toHaveBeenCalled();
+    expect(mocks.updateCredits).not.toHaveBeenCalled();
+    expect(mocks.billTeam).toHaveBeenCalledTimes(1);
+    expect(mocks.mirrorRelease).toHaveBeenCalledTimes(1);
+  });
+});

@@ -124,6 +124,8 @@ export const httpUrlSchema = z
     }
   });
 
+const initialPageUrlSchema = z.union([z.literal("about:blank"), httpUrlSchema]);
+
 const timestampSchema = z.string().superRefine((value, context) => {
   const timestamp = Date.parse(value);
   if (
@@ -309,6 +311,14 @@ const browserOperationSchema = z
   });
 
 /** @public */
+const authorityDomainSchema = z
+  .string()
+  .min(1)
+  .max(253)
+  .regex(
+    /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/,
+  );
+
 export const actionExecutionRequestSchema = z.strictObject({
   version: z.literal(1),
   actionId: canonicalUuidSchema,
@@ -317,11 +327,12 @@ export const actionExecutionRequestSchema = z.strictObject({
   normalizedProposalHash: sha256Schema,
   effect: z.enum(["read_only", "side_effecting"]),
   expectedSessionVersion: safeIntegerSchema,
+  allowedDomains: z.array(authorityDomainSchema).max(8),
   operation: browserOperationSchema,
 });
 
 const boundedPageStateSchema = z.strictObject({
-  url: httpUrlSchema,
+  url: initialPageUrlSchema,
   title: z.string().max(4_096),
   snapshotExcerpt: z.string().max(40_000),
 });
@@ -1009,7 +1020,7 @@ export const createSessionV1Schema = z
   .strictObject({
     version: z.literal(1),
     sessionId: canonicalUuidSchema,
-    initialUrl: httpUrlSchema,
+    initialUrl: initialPageUrlSchema,
     allowedDomains: z.array(hostnameSchema).max(SESSION_MAX_ALLOWED_DOMAINS),
     ttlSeconds: z
       .number()
@@ -1036,6 +1047,12 @@ export const createSessionV1Schema = z
       context.addIssue({
         code: "custom",
         message: "allowed domains must be unique",
+      });
+    }
+    if (request.initialUrl === "about:blank" && request.replay !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "about:blank initial page cannot restore replay",
       });
     }
     if (
@@ -1142,6 +1159,8 @@ export const createRelayGrantV1Schema = z.strictObject({
   permission: z.enum(["passive", "interactive", "cdp"]),
   expiresAt: timestampSchema,
   useLimit: z.literal(1),
+  expectedSessionVersion: safeIntegerSchema,
+  allowedDomains: z.array(authorityDomainSchema).max(8),
 });
 /** @public */
 export const relayGrantV1Schema = z.strictObject({

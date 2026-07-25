@@ -177,7 +177,7 @@ async function observedWithin<T>(
 export function createBrowserOperationSession(options: {
   page: OperationPage;
   allowedDomains: readonly string[];
-  initialOrigin: string;
+  initialOrigin: string | null;
   cdpSetupTimeoutMs?: number;
   cdpTeardownTimeoutMs?: number;
 }): BrowserOperationSession {
@@ -185,9 +185,11 @@ export function createBrowserOperationSession(options: {
   const allowedDomains = Object.freeze(
     options.allowedDomains.map((domain) => domain.toLowerCase()),
   );
-  const committedOrigins = new Set([
-    checkedHttpUrl(options.initialOrigin).origin,
-  ]);
+  const committedOrigins = new Set(
+    options.initialOrigin === null
+      ? []
+      : [checkedHttpUrl(options.initialOrigin).origin],
+  );
   const reservedOrigins = new Set<string>();
   const refs = new Map<string, OperationElement>();
   const pausedJobs = new Set<Promise<void>>();

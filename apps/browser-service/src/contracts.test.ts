@@ -74,6 +74,7 @@ function validAction(overrides: Record<string, unknown> = {}) {
     normalizedProposalHash: "a".repeat(64),
     effect: "side_effecting",
     expectedSessionVersion: 0,
+    allowedDomains: ["example.test"],
     operation: { kind: "click", ref: "e1" },
     ...overrides,
   };
@@ -2154,6 +2155,13 @@ describe("private V1 contracts", () => {
       },
     };
     expect(createSessionV1Schema.safeParse(request).success).toBe(true);
+    expect(
+      createSessionV1Schema.safeParse({
+        ...request,
+        initialUrl: "about:blank",
+        allowedDomains: [],
+      }).success,
+    ).toBe(true);
     expect(
       createSessionV1Schema.safeParse({
         ...request,

@@ -620,6 +620,8 @@ export function createBrowserRunsInternalRouter(
                   permission: "cdp",
                   expiresAt: deadline.toISOString(),
                   useLimit: 1,
+                  expectedSessionVersion: authority.expectedSessionVersion,
+                  allowedDomains: [...(authority.allowedDomains ?? [])],
                 },
                 context,
               );

@@ -16,6 +16,12 @@ import {
   InteractTraceMetadata,
 } from "./langsmith";
 
+export {
+  getPublicBrowserRuntime,
+  PublicBrowserRuntimeError,
+  type PublicBrowserSession,
+} from "../browser-runtime/public-browser-runtime";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

@@ -57,33 +57,21 @@ import {
   unreadyHealthV1Schema,
   type ReconciliationRequestV1,
 } from "./contracts.js";
-import {
-  BROWSER_SERVICE_ERROR_STATUS,
-  BrowserServiceError,
-} from "./errors.js";
-import {
-  ProfileStoreError,
-  type ProfileStore,
-} from "./profile-store.js";
+import { BROWSER_SERVICE_ERROR_STATUS, BrowserServiceError } from "./errors.js";
+import { ProfileStoreError, type ProfileStore } from "./profile-store.js";
 import type { InternalReconciliationOutcome } from "./reconciliation.js";
 import {
   SessionRegistryError,
   type SessionRegistry,
 } from "./session-registry.js";
-import {
-  STREAM_LIMITS,
-  type RelayGrantManager,
-} from "./streams.js";
+import { STREAM_LIMITS, type RelayGrantManager } from "./streams.js";
 import type {
   ControlGenerationBinding,
   ControlGenerationDrainAdmission,
   InternalStartupAdmission,
   ReconciliationExecutionAdmission,
 } from "./startup-state.js";
-import {
-  artifactMetadataHeaders,
-  type ArtifactService,
-} from "./artifacts.js";
+import { artifactMetadataHeaders, type ArtifactService } from "./artifacts.js";
 
 export const RELAY_TOKEN_HEADER = "x-firecrawl-relay-token";
 
@@ -176,14 +164,8 @@ function authorize(
 ): AuthorizedPrivateRequest {
   return authorizePrivateRequest(
     {
-      authorization: singleHeader(
-        request,
-        PRIVATE_AUTH_HEADERS.authorization,
-      ),
-      correlationId: singleHeader(
-        request,
-        PRIVATE_AUTH_HEADERS.correlationId,
-      ),
+      authorization: singleHeader(request, PRIVATE_AUTH_HEADERS.authorization),
+      correlationId: singleHeader(request, PRIVATE_AUTH_HEADERS.correlationId),
       deadline: singleHeader(request, PRIVATE_AUTH_HEADERS.deadline),
     },
     apiKey,
@@ -197,10 +179,7 @@ function fencing(request: IncomingMessage): ControlGenerationBinding {
         singleHeader(request, PRIVATE_FENCING_HEADERS.processNonce),
       ),
       controlGenerationNonce: tokenSchema.parse(
-        singleHeader(
-          request,
-          PRIVATE_FENCING_HEADERS.controlGenerationNonce,
-        ),
+        singleHeader(request, PRIVATE_FENCING_HEADERS.controlGenerationNonce),
       ),
     };
   } catch (cause) {
@@ -227,11 +206,9 @@ function isProvenNoEffectActionError(cause: unknown): boolean {
   if (cause instanceof BrowserServiceError) return true;
   return (
     cause instanceof SessionRegistryError &&
-    (
-      cause.category === "invalid_request" ||
+    (cause.category === "invalid_request" ||
       cause.category === "concurrency_exceeded" ||
-      cause.category === "session_not_found"
-    )
+      cause.category === "session_not_found")
   );
 }
 
@@ -341,7 +318,7 @@ async function writeJsonConfirmed(
   response.setHeader("cache-control", "no-store");
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.setHeader("content-length", Buffer.byteLength(encoded, "utf8"));
-  return new Promise<boolean>(resolve => {
+  return new Promise<boolean>((resolve) => {
     const settle = (delivered: boolean): void => {
       response.off("finish", onFinish);
       response.off("close", onClose);
@@ -365,7 +342,13 @@ function writeError(response: ServerResponse, cause: unknown): void {
   }
   const error = errorEnvelope(cause);
   try {
-    writeJson(response, error.status, privateErrorV1Schema, error.body, 4 * 1024);
+    writeJson(
+      response,
+      error.status,
+      privateErrorV1Schema,
+      error.body,
+      4 * 1024,
+    );
   } catch {
     response.destroy();
   }
@@ -376,7 +359,9 @@ async function readJsonBody(
   maximumBytes: number,
 ): Promise<Readonly<{ value: unknown; bytes: number }>> {
   const contentType = singleHeader(request, "content-type");
-  if (contentType?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+  if (
+    contentType?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json"
+  ) {
     throw new BrowserServiceError(
       "invalid_request",
       "content type must be application/json",
@@ -572,7 +557,7 @@ export function createBrowserServiceServer(
   const waitForRequests = (): Promise<void> =>
     activeRequests === 0
       ? Promise.resolve()
-      : new Promise<void>(resolve => requestWaiters.add(resolve));
+      : new Promise<void>((resolve) => requestWaiters.add(resolve));
 
   const currentRuntime = (
     request: IncomingMessage,
@@ -683,7 +668,7 @@ export function createBrowserServiceServer(
       }
       activeRequests += 1;
       void handler(request, response)
-        .catch(cause => writeError(response, cause))
+        .catch((cause) => writeError(response, cause))
         .finally(() => {
           activeRequests -= 1;
           signalRequestSettled();
@@ -691,443 +676,485 @@ export function createBrowserServiceServer(
     };
   };
 
-  app.get("/health/live", route(async (request, response) => {
-    authorize(request, options.apiKey);
-    const processHeader = singleHeader(
-      request,
-      PRIVATE_FENCING_HEADERS.processNonce,
-    );
-    const generationHeader = singleHeader(
-      request,
-      PRIVATE_FENCING_HEADERS.controlGenerationNonce,
-    );
-    if (processHeader === undefined && generationHeader === undefined) {
+  app.get(
+    "/health/live",
+    route(async (request, response) => {
+      authorize(request, options.apiKey);
+      const processHeader = singleHeader(
+        request,
+        PRIVATE_FENCING_HEADERS.processNonce,
+      );
+      const generationHeader = singleHeader(
+        request,
+        PRIVATE_FENCING_HEADERS.controlGenerationNonce,
+      );
+      if (processHeader === undefined && generationHeader === undefined) {
+        writeJson(
+          response,
+          200,
+          liveDiscoveryV1Schema,
+          options.admission.liveHealth(),
+          4 * 1024,
+        );
+        return;
+      }
+      const binding = fencing(request);
+      const health = options.admission.scopedLiveHealth(binding);
+      writeJson(response, 200, scopedLiveHealthV1Schema, health, 4 * 1024);
+    }),
+  );
+
+  app.post(
+    "/v1/control-generations",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const transport = requestAbort(
+        request,
+        response,
+        shutdownController.signal,
+      );
+      try {
+        const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+        const input = createControlGenerationV1Schema.parse(body.value);
+        const result = await options.admission.createControlGeneration(
+          input,
+          {
+            transportSignal: transport.signal,
+            deadlineAtMs: Math.min(
+              authorization.deadline.getTime(),
+              Date.now() + RECONCILIATION_DEADLINE_MS,
+            ),
+          },
+          (admission) => drainCurrentRuntime("handoff", admission),
+        );
+        writeJson(response, 201, controlGenerationV1Schema, result);
+      } finally {
+        transport.cleanup();
+      }
+    }),
+  );
+
+  app.get(
+    "/health/ready",
+    route(async (request, response) => {
+      authorize(request, options.apiKey);
+      const binding = fencing(request);
+      options.admission.scopedLiveHealth(binding);
+      const health = options.admission.readyHealth();
       writeJson(
         response,
-        200,
-        liveDiscoveryV1Schema,
-        options.admission.liveHealth(),
+        health.status === "ready" ? 200 : 503,
+        health.status === "ready" ? readyHealthV1Schema : unreadyHealthV1Schema,
+        health,
         4 * 1024,
       );
-      return;
-    }
-    const binding = fencing(request);
-    const health = options.admission.scopedLiveHealth(binding);
-    writeJson(response, 200, scopedLiveHealthV1Schema, health, 4 * 1024);
-  }));
+    }),
+  );
 
-  app.post("/v1/control-generations", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const transport = requestAbort(
-      request,
-      response,
-      shutdownController.signal,
-    );
-    try {
-      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-      const input = createControlGenerationV1Schema.parse(body.value);
-      const result = await options.admission.createControlGeneration(
-        input,
-        {
-          transportSignal: transport.signal,
-          deadlineAtMs: Math.min(
-            authorization.deadline.getTime(),
-            Date.now() + RECONCILIATION_DEADLINE_MS,
-          ),
-        },
-        admission => drainCurrentRuntime("handoff", admission),
+  app.post(
+    "/v1/reconciliation",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const binding = fencing(request);
+      options.admission.scopedLiveHealth(binding);
+      const transport = requestAbort(
+        request,
+        response,
+        shutdownController.signal,
       );
-      writeJson(response, 201, controlGenerationV1Schema, result);
-    } finally {
-      transport.cleanup();
-    }
-  }));
-
-  app.get("/health/ready", route(async (request, response) => {
-    authorize(request, options.apiKey);
-    const binding = fencing(request);
-    options.admission.scopedLiveHealth(binding);
-    const health = options.admission.readyHealth();
-    writeJson(
-      response,
-      health.status === "ready" ? 200 : 503,
-      health.status === "ready" ? readyHealthV1Schema : unreadyHealthV1Schema,
-      health,
-      4 * 1024,
-    );
-  }));
-
-  app.post("/v1/reconciliation", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const binding = fencing(request);
-    options.admission.scopedLiveHealth(binding);
-    const transport = requestAbort(
-      request,
-      response,
-      shutdownController.signal,
-    );
-    try {
-      let body: Awaited<ReturnType<typeof readJsonBody>>;
       try {
-        body = await readJsonBody(request, MAX_REPLAY_REQUEST_BYTES);
-      } catch (cause) {
+        let body: Awaited<ReturnType<typeof readJsonBody>>;
+        try {
+          body = await readJsonBody(request, MAX_REPLAY_REQUEST_BYTES);
+        } catch (cause) {
+          if (
+            cause instanceof BrowserServiceError &&
+            cause.category === "request_too_large"
+          ) {
+            throw new BrowserServiceError(
+              "reconciliation_snapshot_too_large",
+              "reconciliation snapshot exceeds its limit",
+            );
+          }
+          if (
+            cause instanceof BrowserServiceError &&
+            cause.category === "invalid_request"
+          ) {
+            throw new BrowserServiceError(
+              "reconciliation_snapshot_invalid",
+              "reconciliation snapshot is invalid",
+            );
+          }
+          throw cause;
+        }
         if (
-          cause instanceof BrowserServiceError &&
-          cause.category === "request_too_large"
+          body.value !== null &&
+          typeof body.value === "object" &&
+          Array.isArray((body.value as { references?: unknown }).references) &&
+          (body.value as { references: unknown[] }).references.length >
+            MAX_RECONCILIATION_REFERENCES
         ) {
           throw new BrowserServiceError(
             "reconciliation_snapshot_too_large",
             "reconciliation snapshot exceeds its limit",
           );
         }
-        if (
-          cause instanceof BrowserServiceError &&
-          cause.category === "invalid_request"
-        ) {
+        let input: ReconciliationRequestV1;
+        try {
+          input = reconciliationRequestV1Schema.parse(body.value);
+        } catch {
           throw new BrowserServiceError(
             "reconciliation_snapshot_invalid",
             "reconciliation snapshot is invalid",
           );
         }
-        throw cause;
-      }
-      if (
-        body.value !== null &&
-        typeof body.value === "object" &&
-        Array.isArray((body.value as { references?: unknown }).references) &&
-        (body.value as { references: unknown[] }).references.length >
-          MAX_RECONCILIATION_REFERENCES
-      ) {
-        throw new BrowserServiceError(
-          "reconciliation_snapshot_too_large",
-          "reconciliation snapshot exceeds its limit",
-        );
-      }
-      let input: ReconciliationRequestV1;
-      try {
-        input = reconciliationRequestV1Schema.parse(body.value);
-      } catch {
-        throw new BrowserServiceError(
-          "reconciliation_snapshot_invalid",
-          "reconciliation snapshot is invalid",
-        );
-      }
-      if (binding.processNonce !== input.processNonce) {
-        throw new BrowserServiceError(
-          "reconciliation_nonce_mismatch",
-          "reconciliation process binding does not match",
-        );
-      }
-      if (
-        binding.controlGenerationNonce !== input.controlGenerationNonce
-      ) {
-        throw new BrowserServiceError(
-          "control_generation_mismatch",
-          "reconciliation generation binding does not match",
-        );
-      }
-      const deadlineAtMs = Math.min(
-        authorization.deadline.getTime(),
-        Date.now() + RECONCILIATION_DEADLINE_MS,
-      );
-      const result = await options.admission.reconcileWithAuthority(
-        input,
-        async (requestValue, admission) => {
-          const bounded = boundedReconciliationAdmission(
-            admission,
-            transport.signal,
-            deadlineAtMs,
+        if (binding.processNonce !== input.processNonce) {
+          throw new BrowserServiceError(
+            "reconciliation_nonce_mismatch",
+            "reconciliation process binding does not match",
           );
+        }
+        if (binding.controlGenerationNonce !== input.controlGenerationNonce) {
+          throw new BrowserServiceError(
+            "control_generation_mismatch",
+            "reconciliation generation binding does not match",
+          );
+        }
+        const deadlineAtMs = Math.min(
+          authorization.deadline.getTime(),
+          Date.now() + RECONCILIATION_DEADLINE_MS,
+        );
+        const result = await options.admission.reconcileWithAuthority(
+          input,
+          async (requestValue, admission) => {
+            const bounded = boundedReconciliationAdmission(
+              admission,
+              transport.signal,
+              deadlineAtMs,
+            );
+            try {
+              bounded.admission.assertAdmitted();
+              return await options.reconcile(
+                requestValue,
+                bounded.admission,
+                authorization.correlationId,
+              );
+            } finally {
+              bounded.cleanup();
+            }
+          },
+        );
+        writeJson(
+          response,
+          200,
+          reconciliationResultV1Schema,
+          result,
+          4 * 1024,
+        );
+      } finally {
+        transport.cleanup();
+      }
+    }),
+  );
+
+  app.post(
+    "/v1/sessions",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const body = await readJsonBody(request, MAX_REPLAY_REQUEST_BYTES);
+      const input = createSessionV1Schema.parse(body.value);
+      if (input.replay === null && body.bytes > MAX_PRIVATE_REQUEST_BYTES) {
+        throw new BrowserServiceError(
+          "request_too_large",
+          "session request exceeds its byte limit",
+        );
+      }
+      const result = await context.runtime.registry.create(input);
+      try {
+        writeJson(response, 201, sessionV1Schema, result);
+      } catch (cause) {
+        await context.runtime.registry
+          .close(result.runtimeSessionId, "error")
+          .catch(() => undefined);
+        response.destroy();
+        if (!(cause instanceof ResponseSerializationError)) throw cause;
+      }
+    }),
+  );
+
+  app.get(
+    "/v1/sessions/:runtimeSessionId",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const runtimeSessionId = canonicalParameter(
+        request.params.runtimeSessionId,
+        "runtime session ID",
+      );
+      const result = context.runtime.registry.touch(runtimeSessionId);
+      writeJson(response, 200, sessionV1Schema, result);
+    }),
+  );
+
+  app.delete(
+    "/v1/sessions/:runtimeSessionId",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const runtimeSessionId = canonicalParameter(
+        request.params.runtimeSessionId,
+        "runtime session ID",
+      );
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = closeSessionV1Schema.parse(body.value);
+      const active = context.runtime.registry.get(runtimeSessionId);
+      if (
+        active !== undefined &&
+        active.sessionVersion !== input.expectedSessionVersion
+      ) {
+        throw new SessionRegistryError(
+          "concurrency_exceeded",
+          "session version does not match",
+        );
+      }
+      const result = await context.runtime.registry.close(
+        runtimeSessionId,
+        input.reason,
+      );
+      for (const grantId of grantIdsBySession.get(runtimeSessionId) ?? []) {
+        await context.runtime.grants.revoke(runtimeSessionId, {
+          version: 1,
+          grantId,
+        });
+      }
+      grantIdsBySession.delete(runtimeSessionId);
+      context.runtime.artifacts.releaseSession({
+        ...context.binding,
+        runtimeSessionId,
+      });
+      writeJson(response, 200, closedSessionV1Schema, result);
+    }),
+  );
+
+  app.post(
+    "/v1/sessions/:runtimeSessionId/actions",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const runtimeSessionId = canonicalParameter(
+        request.params.runtimeSessionId,
+        "runtime session ID",
+      );
+      const transport = requestAbort(
+        request,
+        response,
+        shutdownController.signal,
+      );
+      try {
+        const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+        const input = actionExecutionRequestSchema.parse(body.value);
+        if (transport.signal.aborted) return;
+        const failStopAndDestroy = async (primary: unknown): Promise<void> => {
+          let internalFailure = primary;
           try {
-            bounded.admission.assertAdmitted();
-            return await options.reconcile(
-              requestValue,
-              bounded.admission,
-              authorization.correlationId,
+            await failStopAmbiguousAction(context, runtimeSessionId);
+          } catch (cleanupFailure) {
+            internalFailure = new AggregateError(
+              [primary, cleanupFailure],
+              "ambiguous action and cleanup failed",
             );
           } finally {
-            bounded.cleanup();
+            response.destroy();
           }
-        },
-      );
-      writeJson(response, 200, reconciliationResultV1Schema, result, 4 * 1024);
-    } finally {
-      transport.cleanup();
-    }
-  }));
-
-  app.post("/v1/sessions", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const body = await readJsonBody(request, MAX_REPLAY_REQUEST_BYTES);
-    const input = createSessionV1Schema.parse(body.value);
-    if (input.replay === null && body.bytes > MAX_PRIVATE_REQUEST_BYTES) {
-      throw new BrowserServiceError(
-        "request_too_large",
-        "session request exceeds its byte limit",
-      );
-    }
-    const result = await context.runtime.registry.create(input);
-    try {
-      writeJson(response, 201, sessionV1Schema, result);
-    } catch (cause) {
-      await context.runtime.registry
-        .close(result.runtimeSessionId, "error")
-        .catch(() => undefined);
-      response.destroy();
-      if (!(cause instanceof ResponseSerializationError)) throw cause;
-    }
-  }));
-
-  app.get("/v1/sessions/:runtimeSessionId", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const runtimeSessionId = canonicalParameter(
-      request.params.runtimeSessionId,
-      "runtime session ID",
-    );
-    const result = context.runtime.registry.touch(runtimeSessionId);
-    writeJson(response, 200, sessionV1Schema, result);
-  }));
-
-  app.delete("/v1/sessions/:runtimeSessionId", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const runtimeSessionId = canonicalParameter(
-      request.params.runtimeSessionId,
-      "runtime session ID",
-    );
-    const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-    const input = closeSessionV1Schema.parse(body.value);
-    const active = context.runtime.registry.get(runtimeSessionId);
-    if (
-      active !== undefined &&
-      active.sessionVersion !== input.expectedSessionVersion
-    ) {
-      throw new SessionRegistryError(
-        "concurrency_exceeded",
-        "session version does not match",
-      );
-    }
-    const result = await context.runtime.registry.close(
-      runtimeSessionId,
-      input.reason,
-    );
-    for (const grantId of grantIdsBySession.get(runtimeSessionId) ?? []) {
-      await context.runtime.grants.revoke(runtimeSessionId, {
-        version: 1,
-        grantId,
-      });
-    }
-    grantIdsBySession.delete(runtimeSessionId);
-    context.runtime.artifacts.releaseSession({
-      ...context.binding,
-      runtimeSessionId,
-    });
-    writeJson(response, 200, closedSessionV1Schema, result);
-  }));
-
-  app.post("/v1/sessions/:runtimeSessionId/actions", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const runtimeSessionId = canonicalParameter(
-      request.params.runtimeSessionId,
-      "runtime session ID",
-    );
-    const transport = requestAbort(
-      request,
-      response,
-      shutdownController.signal,
-    );
-    try {
-      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-      const input = actionExecutionRequestSchema.parse(body.value);
-      if (transport.signal.aborted) return;
-      const failStopAndDestroy = async (primary: unknown): Promise<void> => {
-        let internalFailure = primary;
+          try {
+            options.internalErrorSink?.(internalFailure);
+          } catch {
+            // Diagnostics cannot alter fail-stop transport behavior.
+          }
+        };
         try {
-          await failStopAmbiguousAction(context, runtimeSessionId);
-        } catch (cleanupFailure) {
-          internalFailure = new AggregateError(
-            [primary, cleanupFailure],
-            "ambiguous action and cleanup failed",
+          const result = await context.runtime.registry.executeAction(
+            runtimeSessionId,
+            input,
           );
-        } finally {
-          response.destroy();
-        }
-        try {
-          options.internalErrorSink?.(internalFailure);
-        } catch {
-          // Diagnostics cannot alter fail-stop transport behavior.
-        }
-      };
-      try {
-        const result = await context.runtime.registry.executeAction(
-          runtimeSessionId,
-          input,
-        );
-        if (transport.signal.aborted) {
-          await failStopAndDestroy(
-            new Error("action response transport closed after dispatch"),
-          );
-          return;
-        }
-        try {
-          const delivered = await writeJsonConfirmed(
-            response,
-            200,
-            actionExecutionResultSchema,
-            result,
-          );
-          if (!delivered || transport.signal.aborted) {
+          if (transport.signal.aborted) {
             await failStopAndDestroy(
               new Error("action response transport closed after dispatch"),
             );
+            return;
+          }
+          try {
+            const delivered = await writeJsonConfirmed(
+              response,
+              200,
+              actionExecutionResultSchema,
+              result,
+            );
+            if (!delivered || transport.signal.aborted) {
+              await failStopAndDestroy(
+                new Error("action response transport closed after dispatch"),
+              );
+            }
+          } catch (cause) {
+            await failStopAndDestroy(cause);
           }
         } catch (cause) {
+          if (isProvenNoEffectActionError(cause)) {
+            if (transport.signal.aborted) response.destroy();
+            else throw cause;
+            return;
+          }
           await failStopAndDestroy(cause);
         }
-      } catch (cause) {
-        if (isProvenNoEffectActionError(cause)) {
-          if (transport.signal.aborted) response.destroy();
-          else throw cause;
-          return;
+      } finally {
+        transport.cleanup();
+      }
+    }),
+  );
+
+  app.post(
+    "/v1/sessions/:runtimeSessionId/grants",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const runtimeSessionId = canonicalParameter(
+        request.params.runtimeSessionId,
+        "runtime session ID",
+      );
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = createRelayGrantV1Schema.parse(body.value);
+      await context.runtime.registry.extendAuthority(
+        runtimeSessionId,
+        input.expectedSessionVersion,
+        input.allowedDomains,
+      );
+      const result = context.runtime.grants.create(runtimeSessionId, input);
+      let grants = grantIdsBySession.get(runtimeSessionId);
+      if (grants === undefined) {
+        grants = new Set();
+        grantIdsBySession.set(runtimeSessionId, grants);
+      }
+      grants.add(input.grantId);
+      writeJson(response, 201, relayGrantV1Schema, result);
+    }),
+  );
+
+  app.delete(
+    "/v1/sessions/:runtimeSessionId/grants/:grantId",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const runtimeSessionId = canonicalParameter(
+        request.params.runtimeSessionId,
+        "runtime session ID",
+      );
+      const grantId = canonicalParameter(request.params.grantId, "grant ID");
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = revokeRelayGrantV1Schema.parse(body.value);
+      ensureRepeatedId(grantId, input.grantId, "grant ID");
+      const result = await context.runtime.grants.revoke(
+        runtimeSessionId,
+        input,
+      );
+      grantIdsBySession.get(runtimeSessionId)?.delete(grantId);
+      writeJson(response, 200, revokedRelayGrantV1Schema, result);
+    }),
+  );
+
+  app.post(
+    "/v1/sessions/:runtimeSessionId/artifacts",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const runtimeSessionId = canonicalParameter(
+        request.params.runtimeSessionId,
+        "runtime session ID",
+      );
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const transport = requestAbort(request, response);
+      try {
+        const artifact = await context.runtime.artifacts.capture(
+          { ...context.binding, runtimeSessionId },
+          body.value,
+          { signal: transport.signal },
+        );
+        const metadata = artifactMetadataV1Schema.parse(artifact.metadata);
+        response.statusCode = 200;
+        response.setHeader("cache-control", "no-store");
+        for (const [name, value] of Object.entries(
+          artifactMetadataHeaders(metadata),
+        )) {
+          response.setHeader(name, value);
         }
-        await failStopAndDestroy(cause);
+        await pipeline(artifact.stream, response);
+      } finally {
+        transport.cleanup();
       }
-    } finally {
-      transport.cleanup();
-    }
-  }));
+    }),
+  );
 
-  app.post("/v1/sessions/:runtimeSessionId/grants", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const runtimeSessionId = canonicalParameter(
-      request.params.runtimeSessionId,
-      "runtime session ID",
-    );
-    const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-    const input = createRelayGrantV1Schema.parse(body.value);
-    const result = context.runtime.grants.create(runtimeSessionId, input);
-    let grants = grantIdsBySession.get(runtimeSessionId);
-    if (grants === undefined) {
-      grants = new Set();
-      grantIdsBySession.set(runtimeSessionId, grants);
-    }
-    grants.add(input.grantId);
-    writeJson(response, 201, relayGrantV1Schema, result);
-  }));
-
-  app.delete("/v1/sessions/:runtimeSessionId/grants/:grantId", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const runtimeSessionId = canonicalParameter(
-      request.params.runtimeSessionId,
-      "runtime session ID",
-    );
-    const grantId = canonicalParameter(request.params.grantId, "grant ID");
-    const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-    const input = revokeRelayGrantV1Schema.parse(body.value);
-    ensureRepeatedId(grantId, input.grantId, "grant ID");
-    const result = await context.runtime.grants.revoke(runtimeSessionId, input);
-    grantIdsBySession.get(runtimeSessionId)?.delete(grantId);
-    writeJson(response, 200, revokedRelayGrantV1Schema, result);
-  }));
-
-  app.post("/v1/sessions/:runtimeSessionId/artifacts", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const runtimeSessionId = canonicalParameter(
-      request.params.runtimeSessionId,
-      "runtime session ID",
-    );
-    const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-    const transport = requestAbort(request, response);
-    try {
-      const artifact = await context.runtime.artifacts.capture(
-        { ...context.binding, runtimeSessionId },
-        body.value,
-        { signal: transport.signal },
+  app.post(
+    "/v1/profile-generations/:generationId/finalize",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const generationId = canonicalParameter(
+        request.params.generationId,
+        "profile generation ID",
       );
-      const metadata = artifactMetadataV1Schema.parse(artifact.metadata);
-      response.statusCode = 200;
-      response.setHeader("cache-control", "no-store");
-      for (const [name, value] of Object.entries(
-        artifactMetadataHeaders(metadata),
-      )) {
-        response.setHeader(name, value);
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = finalizeProfileGenerationV1Schema.parse(body.value);
+      ensureRepeatedId(generationId, input.generationId, "generation ID");
+      const result =
+        await context.runtime.profileStore.finalizePreparedGenerationByAuthorization(
+          input,
+        );
+      writeJson(response, 200, finalizedProfileGenerationV1Schema, result);
+    }),
+  );
+
+  app.delete(
+    "/v1/profile-generations/:generationId",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const generationId = canonicalParameter(
+        request.params.generationId,
+        "profile generation ID",
+      );
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = deleteProfileGenerationV1Schema.parse(body.value);
+      ensureRepeatedId(generationId, input.generationId, "generation ID");
+      const result =
+        await context.runtime.profileStore.deletePreparedGenerationByAuthorization(
+          input,
+        );
+      writeJson(response, 200, deletedProfileGenerationV1Schema, result);
+    }),
+  );
+
+  app.use(
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const pathname = new URL(request.originalUrl, "http://browser.invalid")
+        .pathname;
+      const isBootstrapRoute =
+        (request.method === "GET" && pathname === "/health/live") ||
+        (request.method === "POST" && pathname === "/v1/control-generations");
+      if (pathname === "/health/ready" || pathname === "/v1/reconciliation") {
+        options.admission.scopedLiveHealth(fencing(request));
+      } else if (!isBootstrapRoute) {
+        currentRuntime(request, authorization);
       }
-      await pipeline(artifact.stream, response);
-    } finally {
-      transport.cleanup();
-    }
-  }));
-
-  app.post("/v1/profile-generations/:generationId/finalize", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const generationId = canonicalParameter(
-      request.params.generationId,
-      "profile generation ID",
-    );
-    const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-    const input = finalizeProfileGenerationV1Schema.parse(body.value);
-    ensureRepeatedId(generationId, input.generationId, "generation ID");
-    const result =
-      await context.runtime.profileStore.finalizePreparedGenerationByAuthorization(
-        input,
+      writeError(
+        response,
+        new BrowserServiceError("invalid_request", "private route not found"),
       );
-    writeJson(response, 200, finalizedProfileGenerationV1Schema, result);
-  }));
+    }),
+  );
 
-  app.delete("/v1/profile-generations/:generationId", route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const context = currentRuntime(request, authorization);
-    const generationId = canonicalParameter(
-      request.params.generationId,
-      "profile generation ID",
-    );
-    const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
-    const input = deleteProfileGenerationV1Schema.parse(body.value);
-    ensureRepeatedId(generationId, input.generationId, "generation ID");
-    const result =
-      await context.runtime.profileStore.deletePreparedGenerationByAuthorization(
-        input,
-      );
-    writeJson(response, 200, deletedProfileGenerationV1Schema, result);
-  }));
-
-  app.use(route(async (request, response) => {
-    const authorization = authorize(request, options.apiKey);
-    const pathname = new URL(
-      request.originalUrl,
-      "http://browser.invalid",
-    ).pathname;
-    const isBootstrapRoute =
-      (request.method === "GET" && pathname === "/health/live") ||
-      (
-        request.method === "POST" &&
-        pathname === "/v1/control-generations"
-      );
-    if (
-      pathname === "/health/ready" ||
-      pathname === "/v1/reconciliation"
-    ) {
-      options.admission.scopedLiveHealth(fencing(request));
-    } else if (!isBootstrapRoute) {
-      currentRuntime(request, authorization);
-    }
-    writeError(
-      response,
-      new BrowserServiceError("invalid_request", "private route not found"),
-    );
-  }));
-
-  const writeUpgradeFailure = (
-    socket: Duplex,
-    cause: unknown,
-  ): void => {
+  const writeUpgradeFailure = (socket: Duplex, cause: unknown): void => {
     const error = errorEnvelope(cause);
     const body = encodeJson(privateErrorV1Schema, error.body, 4 * 1024);
     const reason = STATUS_CODES[error.status] ?? "Error";
@@ -1185,8 +1212,7 @@ export function createBrowserServiceServer(
             relayToken,
             authority: {
               processNonce: context.binding.processNonce,
-              controlGenerationNonce:
-                context.binding.controlGenerationNonce,
+              controlGenerationNonce: context.binding.controlGenerationNonce,
               authBinding: options.apiKey,
             },
           },
@@ -1197,7 +1223,7 @@ export function createBrowserServiceServer(
                   request,
                   socket,
                   head,
-                  websocket => {
+                  (websocket) => {
                     websocket.on("error", () => undefined);
                     upgraded = true;
                     resolve(websocket);
@@ -1264,13 +1290,13 @@ export function createBrowserServiceServer(
         clearInterval(sweepTimer);
         sweepTimer = undefined;
       }
-      listenerClosePromise = new Promise<void>(resolve => {
+      listenerClosePromise = new Promise<void>((resolve) => {
         resolveListenerClosed = resolve;
       });
       let physicalClose: Promise<void>;
       if (listening) {
         physicalClose = new Promise<void>((resolve, reject) => {
-          httpServer.close(cause => {
+          httpServer.close((cause) => {
             if (cause === undefined) resolve();
             else reject(cause);
           });

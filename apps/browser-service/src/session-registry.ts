@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { chromium, devices, type Page } from "playwright";
 
 import {
+  actionExecutionRequestSchema,
   type BrowserActionExecutionResultV1,
   closedSessionV1Schema,
   createSessionV1Schema,
@@ -189,8 +190,8 @@ type RegistryEntry = {
   createdAtMs: number;
   expiresAtMs: number;
   idleExpiresAtMs: number;
-  initialOrigin: string;
-  allowedDomains: readonly string[];
+  initialOrigin: string | null;
+  allowedDomains: string[];
   learnedOrigins: Set<string>;
   deadlineAtMs: number;
   devToolsEndpoint: string | null;
@@ -256,6 +257,11 @@ export type SessionRegistry = {
     runtimeSessionId: string,
     input: unknown,
   ): Promise<BrowserActionExecutionResultV1>;
+  extendAuthority(
+    runtimeSessionId: string,
+    expectedSessionVersion: number,
+    allowedDomains: readonly string[],
+  ): Promise<SessionV1>;
   close(
     runtimeSessionId: string,
     reason: "requested" | "expired" | "error" | "shutdown",
@@ -328,9 +334,7 @@ function trackBrowserEffect<T>(
   return effect;
 }
 
-export function sessionRuntimeSignal(
-  lease: SessionRuntimeLease,
-): AbortSignal {
+export function sessionRuntimeSignal(lease: SessionRuntimeLease): AbortSignal {
   return requireRuntimeLease(lease).controller.signal;
 }
 
@@ -498,7 +502,9 @@ async function captureTrace(entry: RegistryEntry): Promise<Uint8Array> {
     }
     throw cause;
   } finally {
-    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    await rm(directory, { recursive: true, force: true }).catch(
+      () => undefined,
+    );
   }
 }
 
@@ -512,32 +518,35 @@ export async function captureSessionArtifact(
   const capture = async (): Promise<
     Readonly<{ contentType: string; bytes: Uint8Array }>
   > => {
-  let contentType: string;
-  let bytes: Uint8Array;
-  if (request.kind === "screenshot") {
-    if (entry.page === undefined) {
-      throw asError("browser_unavailable", "session page is unavailable");
+    let contentType: string;
+    let bytes: Uint8Array;
+    if (request.kind === "screenshot") {
+      if (entry.page === undefined) {
+        throw asError("browser_unavailable", "session page is unavailable");
+      }
+      contentType = request.format === "png" ? "image/png" : "image/jpeg";
+      bytes = await entry.page.screenshot({
+        type: request.format,
+        fullPage: request.fullPage,
+      });
+    } else if (request.kind === "recording") {
+      if (entry.recordingProducer === undefined) {
+        throw asError(
+          "browser_unavailable",
+          "session recording is unavailable",
+        );
+      }
+      contentType = "video/webm";
+      bytes = await entry.recordingProducer.snapshot();
+    } else {
+      contentType = "application/zip";
+      bytes = await captureTrace(entry);
     }
-    contentType = request.format === "png" ? "image/png" : "image/jpeg";
-    bytes = await entry.page.screenshot({
-      type: request.format,
-      fullPage: request.fullPage,
-    });
-  } else if (request.kind === "recording") {
-    if (entry.recordingProducer === undefined) {
-      throw asError("browser_unavailable", "session recording is unavailable");
+    requireRuntimeLease(lease);
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_CAPTURE_BYTES) {
+      throw asError("browser_unavailable", "artifact exceeds its byte limit");
     }
-    contentType = "video/webm";
-    bytes = await entry.recordingProducer.snapshot();
-  } else {
-    contentType = "application/zip";
-    bytes = await captureTrace(entry);
-  }
-  requireRuntimeLease(lease);
-  if (bytes.byteLength === 0 || bytes.byteLength > MAX_CAPTURE_BYTES) {
-    throw asError("browser_unavailable", "artifact exceeds its byte limit");
-  }
-  return Object.freeze({ contentType, bytes });
+    return Object.freeze({ contentType, bytes });
   };
   return trackBrowserEffect(entry, capture());
 }
@@ -641,7 +650,7 @@ function validateSupportedSettings(request: CreateSessionV1): void {
 function validateSessionTargets(request: CreateSessionV1): void {
   const allowed = request.allowedDomains.map((domain) => domain.toLowerCase());
   for (const target of [
-    request.initialUrl,
+    ...(request.initialUrl === "about:blank" ? [] : [request.initialUrl]),
     ...(request.replay === null ? [] : [request.replay.finalUrl]),
   ]) {
     const hostname = new URL(target).hostname.toLowerCase();
@@ -849,6 +858,35 @@ export function createSessionRegistry(options: {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  async function applyAuthority(
+    entry: RegistryEntry,
+    expectedSessionVersion: number,
+    allowedDomains: readonly string[],
+  ): Promise<void> {
+    if (entry.sessionVersion !== expectedSessionVersion) {
+      throw asError("concurrency_exceeded", "session version does not match");
+    }
+    const next = [...new Set(allowedDomains)].sort();
+    if (
+      next.length !== allowedDomains.length ||
+      next.length > 8 ||
+      entry.allowedDomains.some((domain) => !next.includes(domain))
+    ) {
+      throw asError("invalid_request", "session authority is not monotonic");
+    }
+    if (
+      next.length === entry.allowedDomains.length &&
+      next.every((domain, index) => domain === entry.allowedDomains[index])
+    ) {
+      return;
+    }
+    if (entry.operationSession !== undefined) {
+      await entry.operationSession.dispose();
+      entry.operationSession = undefined;
+    }
+    entry.allowedDomains.splice(0, entry.allowedDomains.length, ...next);
   }
 
   function runAdmitted<T>(entry: RegistryEntry, operation: () => T): T {
@@ -1103,8 +1141,8 @@ export function createSessionRegistry(options: {
         settlement.state === "rejected" &&
         settlement.error instanceof UnverifiedChromiumLaunchError
       ) {
-        entry.chromiumAttachment =
-          settlement.error.attachment as unknown as AttachedChromium;
+        entry.chromiumAttachment = settlement.error
+          .attachment as unknown as AttachedChromium;
         entry.context = entry.chromiumAttachment.context;
       }
       entry.launchAttempt = undefined;
@@ -1262,9 +1300,16 @@ export function createSessionRegistry(options: {
         createdAtMs,
         expiresAtMs: createdAtMs + request.ttlSeconds * 1_000,
         idleExpiresAtMs: createdAtMs + request.activityTtlSeconds * 1_000,
-        initialOrigin: new URL(request.initialUrl).origin,
-        allowedDomains: Object.freeze([...request.allowedDomains]),
-        learnedOrigins: new Set([new URL(request.initialUrl).origin]),
+        initialOrigin:
+          request.initialUrl === "about:blank"
+            ? null
+            : new URL(request.initialUrl).origin,
+        allowedDomains: [...request.allowedDomains].sort(),
+        learnedOrigins: new Set(
+          request.initialUrl === "about:blank"
+            ? []
+            : [new URL(request.initialUrl).origin],
+        ),
         deadlineAtMs: creationDeadlineAtMs,
         devToolsEndpoint: null,
         streamHub: Object.freeze({}),
@@ -1283,9 +1328,8 @@ export function createSessionRegistry(options: {
           entry.runtimeDrainStarted = true;
           options.admission.beginDraining();
         },
-        observeCleanupEffect: (effect) => observeWithin(
-          effect.then(() => undefined),
-        ),
+        observeCleanupEffect: (effect) =>
+          observeWithin(effect.then(() => undefined)),
         work: undefined,
         proxy: undefined,
         context: undefined,
@@ -1334,10 +1378,7 @@ export function createSessionRegistry(options: {
           ) {
             entry.work = error.retainedWork;
           }
-          if (
-            error instanceof ProfileStoreError &&
-            error.cleanupUnverified
-          ) {
+          if (error instanceof ProfileStoreError && error.cleanupUnverified) {
             entry.state = "cleanup_failed";
             entry.admission = "closed";
             entry.cleanupDetail = "profile_acquisition_cleanup_unverified";
@@ -1356,7 +1397,7 @@ export function createSessionRegistry(options: {
         assertProvisioningAdmitted(entry);
         entry.proxy = await createProxy({
           restoreGate: createRestoreGate(),
-          allowedDomains: request.allowedDomains,
+          allowedDomains: entry.allowedDomains,
           deadlineAtMs: () =>
             Math.min(entry.expiresAtMs, entry.idleExpiresAtMs),
         });
@@ -1385,8 +1426,9 @@ export function createSessionRegistry(options: {
             1,
             Math.min(launchTimeoutMs, launchRemainingMs),
           );
-          const workingGeneration =
-            options.profileStore.workingGeneration(entry.work);
+          const workingGeneration = options.profileStore.workingGeneration(
+            entry.work,
+          );
           const readyBinding = requireReady();
           const persistentOptions = launchOptions(
             request,
@@ -1470,13 +1512,11 @@ export function createSessionRegistry(options: {
             );
           }
           if (replayState !== null) {
-            await runWithinDeadline(
-              entry,
-              () => context.setStorageState(replayState.storageState),
+            await runWithinDeadline(entry, () =>
+              context.setStorageState(replayState.storageState),
             );
-            const exported: unknown = await runWithinDeadline(
-              entry,
-              () => context.storageState({ indexedDB: true }),
+            const exported: unknown = await runWithinDeadline(entry, () =>
+              context.storageState({ indexedDB: true }),
             );
             assertProvisioningAdmitted(entry);
             verifySemanticallyEquivalentStorageState(
@@ -1497,28 +1537,27 @@ export function createSessionRegistry(options: {
                 "context cannot install requested cookies",
               );
             }
-            await runWithinDeadline(
-              entry,
-              () => context.addCookies!(request.settings.cookies),
+            await runWithinDeadline(entry, () =>
+              context.addCookies!(request.settings.cookies),
             );
           }
           const target = replayState?.checkpoint.finalUrl ?? request.initialUrl;
-          const positiveControl = runAdmitted(entry, () =>
-            gate.markPositiveControlBaseline(target),
-          );
-          await runWithinDeadline(
-            entry,
-            () =>
+          if (target !== "about:blank") {
+            const positiveControl = runAdmitted(entry, () =>
+              gate.markPositiveControlBaseline(target),
+            );
+            await runWithinDeadline(entry, () =>
               page.goto(target, {
                 timeout: Math.max(
                   1,
                   Math.min(operationTimeoutMs, entry.deadlineAtMs - now()),
                 ),
               }),
-          );
-          runAdmitted(entry, () =>
-            gate.assertPositiveControl(positiveControl, target),
-          );
+            );
+            runAdmitted(entry, () =>
+              gate.assertPositiveControl(positiveControl, target),
+            );
+          }
           const title = await runWithinDeadline(entry, () => page.title());
           const body =
             (await runWithinDeadline(entry, () => page.textContent("body"))) ??
@@ -1701,11 +1740,19 @@ export function createSessionRegistry(options: {
     async executeAction(runtimeSessionId, input) {
       const entry = requireEntry(runtimeSessionId);
       assertEntryAdmitted(entry);
+      const request = actionExecutionRequestSchema.parse(input);
       return executeCachedAction({
         cache: entry.actionCache,
-        request: input,
+        request,
         withWriter: (operation) =>
-          registry.withWriter(runtimeSessionId, operation),
+          registry.withWriter(runtimeSessionId, async () => {
+            await applyAuthority(
+              entry,
+              request.expectedSessionVersion,
+              request.allowedDomains,
+            );
+            return operation();
+          }),
         executeOperation: (operation) =>
           runWithinDeadline(entry, async () => {
             if (entry.operationSession === undefined) {
@@ -1750,6 +1797,18 @@ export function createSessionRegistry(options: {
           await registry.close(runtimeSessionId, "error");
         },
       });
+    },
+
+    async extendAuthority(
+      runtimeSessionId,
+      expectedSessionVersion,
+      allowedDomains,
+    ) {
+      const entry = requireEntry(runtimeSessionId);
+      await registry.withWriter(runtimeSessionId, () =>
+        applyAuthority(entry, expectedSessionVersion, allowedDomains),
+      );
+      return publicSession(entry);
     },
 
     async close(runtimeSessionId, reason) {
@@ -1803,13 +1862,15 @@ export function createSessionRegistry(options: {
           );
         }
         entry.sessionVersion += 1;
-        const result = Object.freeze(closedSessionV1Schema.parse({
-          version: 1 as const,
-          runtimeSessionId,
-          closed: true as const,
-          sessionVersion: entry.sessionVersion,
-          preparedProfile: normalClose.preparedProfile,
-        }));
+        const result = Object.freeze(
+          closedSessionV1Schema.parse({
+            version: 1 as const,
+            runtimeSessionId,
+            closed: true as const,
+            sessionVersion: entry.sessionVersion,
+            preparedProfile: normalClose.preparedProfile,
+          }),
+        );
         rememberClosed(runtimeSessionId, result);
         entry.closeResult = result;
         entriesByRuntime.delete(runtimeSessionId);
@@ -1878,7 +1939,9 @@ export function createSessionRegistry(options: {
         ]).then(() => undefined);
         if (!(await observeWithin(runtimeSettlement))) {
           failures.push(
-            new Error(`runtime lease drain timed out for ${entry.runtimeSessionId}`),
+            new Error(
+              `runtime lease drain timed out for ${entry.runtimeSessionId}`,
+            ),
           );
         }
         if (entry.writerHeld) {

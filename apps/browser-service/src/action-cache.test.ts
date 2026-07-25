@@ -34,6 +34,7 @@ function action(
     normalizedProposalHash: HASH,
     effect: "side_effecting",
     expectedSessionVersion: 0,
+    allowedDomains: ["example.test"],
     operation: CLICK_OPERATION,
     ...overrides,
   };
@@ -182,9 +183,7 @@ describe("session action cache", () => {
   test("validates trusted effects before creating pending work", () => {
     const cache = new SessionActionCache();
 
-    expectProtocolError(() =>
-      cache.begin(action({ effect: "read_only" })),
-    );
+    expectProtocolError(() => cache.begin(action({ effect: "read_only" })));
     expect(cache.pending).toBe(false);
     expect(cache.size).toBe(0);
   });

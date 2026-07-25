@@ -37,6 +37,11 @@ import type {
   PreparedProfileGeneration,
 } from "../browser-runtime/orchestrator";
 import {
+  BROWSER_CREDITS_PER_HOUR,
+  INTERACT_CREDITS_PER_HOUR,
+  calculateBrowserSessionCredits,
+} from "../browser-billing";
+import {
   codeRunResultSchema,
   promptRunResultSchema,
   runtimeUuidSchema,
@@ -701,6 +706,7 @@ export type ActiveBrowserRunAuthority = {
   adapterProcessId: number;
   deadline: Date;
   perOperationTimeoutMs: number;
+  allowedDomains?: readonly string[];
   zeroDataRetention: false;
 };
 
@@ -726,6 +732,7 @@ export async function getActiveBrowserRunAuthority(
       currentRunId: schema.browser_sessions.current_run_id,
       sessionOwnerId: schema.browser_sessions.owner_id,
       absoluteDeadline: schema.browser_sessions.absolute_deadline_at,
+      allowedDomains: schema.browser_sessions.workspace_id,
       perOperationTimeoutMs:
         schema.browser_capabilities.per_operation_timeout_ms,
       capabilityActivatedAt: schema.browser_capabilities.activated_at,
@@ -793,6 +800,20 @@ export async function getActiveBrowserRunAuthority(
     adapterProcessId: row.adapterProcessId,
     deadline: new Date(row.deadline),
     perOperationTimeoutMs: row.perOperationTimeoutMs,
+    allowedDomains: Object.freeze(
+      (() => {
+        try {
+          const parsed = JSON.parse(row.allowedDomains ?? "[]");
+          return Array.isArray(parsed) &&
+            parsed.length <= 8 &&
+            parsed.every(value => typeof value === "string")
+            ? [...parsed].sort()
+            : [];
+        } catch {
+          return [];
+        }
+      })(),
+    ),
     // Request logging persists this exact redaction sentinel for ZDR. Reject
     // it above before returning the narrow non-ZDR proof consumed before
     // artifact bytes are read.
@@ -1438,6 +1459,10 @@ export async function finishAdapterRun(
         SET state = 'ready',
             current_run_id = NULL,
             last_activity_at = now(),
+            idle_deadline_at = least(
+              absolute_deadline_at,
+              now() + make_interval(secs => ttl_without_activity)
+            ),
             updated_at = now()
       WHERE id = $1
         AND state = 'executing'
@@ -1502,6 +1527,10 @@ export async function failAdapterRun(
         SET state = 'ready',
             current_run_id = NULL,
             last_activity_at = now(),
+            idle_deadline_at = least(
+              absolute_deadline_at,
+              now() + make_interval(secs => ttl_without_activity)
+            ),
             updated_at = now()
       WHERE id = $1
         AND state = 'executing'
@@ -1515,6 +1544,7 @@ export async function claimBrowserSessionStop(
   lease: BrowserStateMutationLease,
   sessionId: string,
   reason: string,
+  ownerId?: string,
 ): Promise<BrowserSessionStopClaim | null> {
   const parsedSessionId = runtimeUuidSchema.parse(sessionId);
   const terminalReason = z.string().min(1).max(128).parse(reason);
@@ -1524,9 +1554,16 @@ export async function claimBrowserSessionStop(
             terminal_reason = $2,
             updated_at = now()
       WHERE id = $1
+        AND ($3::uuid IS NULL OR owner_id = $3::uuid)
         AND state IN ('creating', 'replaying', 'ready', 'executing')
-      RETURNING current_run_id, profile_id, browser_id, runtime_epoch`,
-    [parsedSessionId, terminalReason],
+      RETURNING current_run_id, profile_id, browser_id, runtime_epoch,
+        profile_id IS NOT NULL AND EXISTS (
+          SELECT 1
+            FROM browser_profiles
+           WHERE id = browser_sessions.profile_id
+             AND writer_session_id = browser_sessions.id
+        ) AS requires_prepared_profile`,
+    [parsedSessionId, terminalReason, ownerId ?? null],
   );
   if (result.rows.length !== 1) return null;
   const row = result.rows[0] as {
@@ -1534,14 +1571,27 @@ export async function claimBrowserSessionStop(
     profile_id: string | null;
     browser_id: string | null;
     runtime_epoch: number;
+    requires_prepared_profile: boolean;
   };
   return {
     runId: row.current_run_id,
     profileId: row.profile_id,
+    requiresPreparedProfile: row.requires_prepared_profile,
     browserId: row.browser_id,
     runtimeEpoch: row.runtime_epoch,
   };
 }
+
+/** @public Immutable external billing work elected by durable stop ownership. */
+export type BrowserSessionBillingClaim = Readonly<{
+  sessionId: string;
+  ownerId: string;
+  scrapeId: string | null;
+  sessionDurationMs: number;
+  creditsBilled: number;
+  usedPrompt: boolean;
+  ttlTotalSeconds: number | null;
+}>;
 
 /** @public Commits one finalized generation with an exact profile pointer CAS. */
 export async function commitPreparedProfileGeneration(
@@ -1640,7 +1690,7 @@ export async function finishBrowserSessionStop(
   sessionId: string,
   reason: string,
   outcome: "destroyed" | "interrupted",
-): Promise<void> {
+): Promise<BrowserSessionBillingClaim | null> {
   const parsedSessionId = runtimeUuidSchema.parse(sessionId);
   const terminalReason = z.string().min(1).max(128).parse(reason);
   const terminalState = z.enum(["destroyed", "interrupted"]).parse(outcome);
@@ -1678,6 +1728,31 @@ export async function finishBrowserSessionStop(
         AND revoked_at IS NULL`,
     [parsedSessionId],
   );
+  const locked = await lease.transaction.query<{
+    id: string;
+    owner_id: string;
+    scrape_id: string | null;
+    created_at: string | Date;
+    prompt_used: boolean;
+    ttl_total: number | null;
+  }>(
+    `SELECT id, owner_id, scrape_id, created_at, prompt_used, ttl_total
+       FROM browser_sessions
+      WHERE id = $1
+        AND state = 'stopping'
+      FOR UPDATE`,
+    [parsedSessionId],
+  );
+  const billing = locked.rows[0];
+  if (!billing) return null;
+  const sessionDurationMs = Math.max(
+    0,
+    Date.now() - new Date(billing.created_at).getTime(),
+  );
+  const creditsBilled = calculateBrowserSessionCredits(
+    sessionDurationMs,
+    billing.prompt_used ? INTERACT_CREDITS_PER_HOUR : BROWSER_CREDITS_PER_HOUR,
+  );
   const result = await lease.transaction.query(
     `UPDATE browser_sessions
         SET state = $3,
@@ -1685,11 +1760,13 @@ export async function finishBrowserSessionStop(
             terminal_at = COALESCE(terminal_at, now()),
             terminal_reason = $2,
             status = CASE WHEN $3 = 'destroyed' THEN 'closed' ELSE 'error' END,
+            credits_used = $4,
+            prompt_used = false,
             updated_at = now()
       WHERE id = $1
         AND state = 'stopping'
       RETURNING id`,
-    [parsedSessionId, terminalReason, terminalState],
+    [parsedSessionId, terminalReason, terminalState, creditsBilled],
   );
   if (result.rows.length !== 1) {
     throw new Error("Browser stop ownership is not active");
@@ -1701,6 +1778,15 @@ export async function finishBrowserSessionStop(
       WHERE writer_session_id = $1`,
     [parsedSessionId],
   );
+  return Object.freeze({
+    sessionId: billing.id,
+    ownerId: billing.owner_id,
+    scrapeId: billing.scrape_id,
+    sessionDurationMs,
+    creditsBilled,
+    usedPrompt: billing.prompt_used,
+    ttlTotalSeconds: billing.ttl_total,
+  });
 }
 
 /** @public */

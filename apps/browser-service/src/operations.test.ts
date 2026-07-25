@@ -42,12 +42,11 @@ function action(
     runId: RUN_ID,
     sequence: 1,
     normalizedProposalHash: hash(operation),
-    effect: ["snapshot", "wait", "get_text", "get_url"].includes(
-      operation.kind,
-    )
+    effect: ["snapshot", "wait", "get_text", "get_url"].includes(operation.kind)
       ? "read_only"
       : "side_effecting",
     expectedSessionVersion: 1,
+    allowedDomains: ["example.test"],
     operation,
     ...overrides,
   };
@@ -108,22 +107,22 @@ function fakePage(
   let body = "body text";
   let redirectUrl: string | null = null;
   let failNextContinue = false;
-  const downloadListeners: Array<(download: { cancel(): Promise<void> }) => void> =
-    [];
+  const downloadListeners: Array<
+    (download: { cancel(): Promise<void> }) => void
+  > = [];
   const frameListeners: Array<(frame: unknown) => void> = [];
-  const routeListeners: Array<(route: {
-    request(): {
-      isNavigationRequest(): boolean;
-      frame(): unknown;
-      url(): string;
-    };
-    abort(): Promise<void>;
-    continue(): Promise<void>;
-  }) => Promise<void>> = [];
-  const cdpListeners = new Map<
-    string,
-    Array<(event: unknown) => void>
-  >();
+  const routeListeners: Array<
+    (route: {
+      request(): {
+        isNavigationRequest(): boolean;
+        frame(): unknown;
+        url(): string;
+      };
+      abort(): Promise<void>;
+      continue(): Promise<void>;
+    }) => Promise<void>
+  > = [];
+  const cdpListeners = new Map<string, Array<(event: unknown) => void>>();
   const decisions = new Map<string, "continue" | "fail">();
   let requestCounter = 0;
   let loaderCounter = 0;
@@ -233,14 +232,12 @@ function fakePage(
       (value): value is string => value !== null,
     )) {
       const requestId = `request-${requestCounter + 1}`;
-      aborted = !(
-        await emitRoute(
-          candidate,
-          failNextContinue,
-          loaderId,
-          redirectedRequestId,
-        )
-      );
+      aborted = !(await emitRoute(
+        candidate,
+        failNextContinue,
+        loaderId,
+        redirectedRequestId,
+      ));
       redirectedRequestId = requestId;
       failNextContinue = false;
       if (aborted) throw new Error("navigation blocked before following");
@@ -332,76 +329,72 @@ function fakePage(
 }
 
 describe("browser operation session", () => {
-  test(
-    "live Chromium continues granted navigation and blocks new redirect origin",
-    async () => {
-      let redirectTarget = "";
-      let blockedOriginHits = 0;
-      const initialServer = createServer((_request, response) => {
-        response.end("<title>initial</title>");
-      });
-      const targetServer = createServer((request, response) => {
-        if (request.url === "/redirect") {
-          response.writeHead(302, { location: redirectTarget });
-          response.end();
-          return;
-        }
-        response.end("<title>target</title>");
-      });
-      const blockedServer = createServer((_request, response) => {
-        blockedOriginHits += 1;
-        response.end("<title>blocked</title>");
-      });
-      const [initialOrigin, targetOrigin, blockedOrigin] = await Promise.all([
-        listenLoopback(initialServer),
-        listenLoopback(targetServer),
-        listenLoopback(blockedServer),
-      ]);
-      redirectTarget = `${blockedOrigin}/landing`;
-      const browser = await chromium.launch({ headless: true });
-      try {
-        const context = await browser.newContext({
-          acceptDownloads: false,
-          serviceWorkers: "block",
-        });
-        const page = await context.newPage();
-        await page.goto(`${initialOrigin}/start`);
-        const session = createBrowserOperationSession({
-          page,
-          allowedDomains: ["127.0.0.1"],
-          initialOrigin,
-        });
-        try {
-          await expect(
-            session.execute({
-              kind: "navigate",
-              url: `${targetOrigin}/target`,
-            }),
-          ).resolves.toMatchObject({
-            result: { kind: "navigate", applied: true },
-          });
-          await expect(
-            session.execute({
-              kind: "navigate",
-              url: `${targetOrigin}/redirect`,
-            }),
-          ).rejects.toThrow();
-          expect(blockedOriginHits).toBe(0);
-        } finally {
-          await session.dispose();
-          await context.close();
-        }
-      } finally {
-        await browser.close();
-        await Promise.all([
-          closeServer(initialServer),
-          closeServer(targetServer),
-          closeServer(blockedServer),
-        ]);
+  test("live Chromium continues granted navigation and blocks new redirect origin", async () => {
+    let redirectTarget = "";
+    let blockedOriginHits = 0;
+    const initialServer = createServer((_request, response) => {
+      response.end("<title>initial</title>");
+    });
+    const targetServer = createServer((request, response) => {
+      if (request.url === "/redirect") {
+        response.writeHead(302, { location: redirectTarget });
+        response.end();
+        return;
       }
-    },
-    15_000,
-  );
+      response.end("<title>target</title>");
+    });
+    const blockedServer = createServer((_request, response) => {
+      blockedOriginHits += 1;
+      response.end("<title>blocked</title>");
+    });
+    const [initialOrigin, targetOrigin, blockedOrigin] = await Promise.all([
+      listenLoopback(initialServer),
+      listenLoopback(targetServer),
+      listenLoopback(blockedServer),
+    ]);
+    redirectTarget = `${blockedOrigin}/landing`;
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.goto(`${initialOrigin}/start`);
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: ["127.0.0.1"],
+        initialOrigin,
+      });
+      try {
+        await expect(
+          session.execute({
+            kind: "navigate",
+            url: `${targetOrigin}/target`,
+          }),
+        ).resolves.toMatchObject({
+          result: { kind: "navigate", applied: true },
+        });
+        await expect(
+          session.execute({
+            kind: "navigate",
+            url: `${targetOrigin}/redirect`,
+          }),
+        ).rejects.toThrow();
+        expect(blockedOriginHits).toBe(0);
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+      await Promise.all([
+        closeServer(initialServer),
+        closeServer(targetServer),
+        closeServer(blockedServer),
+      ]);
+    }
+  }, 15_000);
 
   test("uses Playwright 1.61.1 ElementHandle.type from production declarations", () => {
     const require = createRequire(import.meta.url);
@@ -410,7 +403,10 @@ describe("browser operation session", () => {
       version: string;
     };
     const declarations = readFileSync(
-      new URL("../playwright-core/types/types.d.ts", pathToFileURL(packageJsonPath)),
+      new URL(
+        "../playwright-core/types/types.d.ts",
+        pathToFileURL(packageJsonPath),
+      ),
       "utf8",
     );
     const elementHandleStart = declarations.indexOf(
@@ -475,10 +471,7 @@ describe("browser operation session", () => {
     );
     expect(h.cdpSession.send).toHaveBeenCalledWith("Fetch.disable");
     expect(h.cdpSession.detach).toHaveBeenCalledOnce();
-    expect(h.page.off).toHaveBeenCalledWith(
-      "download",
-      expect.any(Function),
-    );
+    expect(h.page.off).toHaveBeenCalledWith("download", expect.any(Function));
     expect(h.page.off).toHaveBeenCalledWith(
       "framenavigated",
       expect.any(Function),
@@ -580,9 +573,9 @@ describe("browser operation session", () => {
     const execution = await session.execute({ kind: "snapshot" });
 
     expect(execution.result).toEqual({ kind: "snapshot", refCount: 500 });
-    expect(Array.from(execution.page.snapshotExcerpt).length).toBeLessThanOrEqual(
-      40_000,
-    );
+    expect(
+      Array.from(execution.page.snapshotExcerpt).length,
+    ).toBeLessThanOrEqual(40_000);
     expect(elements[500]!.dispose).toHaveBeenCalledOnce();
     await expect(
       session.execute({ kind: "click", ref: "e501" }),
@@ -662,11 +655,7 @@ describe("browser operation session", () => {
   });
 
   test("does not deadlock when navigation waits for Fetch continue", async () => {
-    const h = fakePage(
-      [fakeElement()],
-      "https://example.test/start",
-      true,
-    );
+    const h = fakePage([fakeElement()], "https://example.test/start", true);
     const session = createBrowserOperationSession({
       page: h.page,
       allowedDomains: ["example.test", "other.test"],
@@ -747,9 +736,9 @@ describe("browser operation session", () => {
     const element = fakeElement();
     const h = fakePage([element]);
     vi.mocked(element.click).mockImplementationOnce(async () => {
-      expect(
-        await h.emitRoute("https://other.test/script-navigation"),
-      ).toBe(false);
+      expect(await h.emitRoute("https://other.test/script-navigation")).toBe(
+        false,
+      );
     });
     const session = createBrowserOperationSession({
       page: h.page,
@@ -908,17 +897,14 @@ describe("browser operation session", () => {
     });
     await expect(session.dispose()).resolves.toBeUndefined();
     await expect(pause).resolves.toBe(false);
-    const disableOrder =
-      h.cdpSession.send.mock.invocationCallOrder.find(
-        (_order, index) =>
-          h.cdpSession.send.mock.calls[index]?.[0] === "Fetch.disable",
-      )!;
-    const offOrder =
-      h.cdpSession.off.mock.invocationCallOrder.find(
-        (_order, index) =>
-          h.cdpSession.off.mock.calls[index]?.[0] ===
-          "Fetch.requestPaused",
-      )!;
+    const disableOrder = h.cdpSession.send.mock.invocationCallOrder.find(
+      (_order, index) =>
+        h.cdpSession.send.mock.calls[index]?.[0] === "Fetch.disable",
+    )!;
+    const offOrder = h.cdpSession.off.mock.invocationCallOrder.find(
+      (_order, index) =>
+        h.cdpSession.off.mock.calls[index]?.[0] === "Fetch.requestPaused",
+    )!;
     expect(disableOrder).toBeLessThan(offOrder);
   });
 
@@ -1074,8 +1060,8 @@ describe("browser operation session", () => {
 
   test("matches host canonical ordering for mixed-case and non-ASCII keys", async () => {
     const h = fakePage();
-    vi.mocked(h.page.evaluate).mockImplementationOnce(
-      async (source: unknown) => (0, eval)(String(source)),
+    vi.mocked(h.page.evaluate).mockImplementationOnce(async (source: unknown) =>
+      (0, eval)(String(source)),
     );
     Object.defineProperty(globalThis, "document", {
       configurable: true,
@@ -1316,9 +1302,13 @@ describe("cached action execution", () => {
   test("abandons ambiguity, closes the session, and never retries", async () => {
     const cache = new SessionActionCache();
     const closeAmbiguous = vi.fn(async () => undefined);
-    const operation = { kind: "evaluate", expression: "args.value", args: {
-      value: "x",
-    } } as const;
+    const operation = {
+      kind: "evaluate",
+      expression: "args.value",
+      args: {
+        value: "x",
+      },
+    } as const;
     const executeOperation = vi.fn(async () => {
       throw new Error("Chromium disconnected");
     });
@@ -1507,8 +1497,7 @@ test("SessionRegistry exposes cached executeAction and closes ambiguity", async 
       close: async () => undefined,
       liveSocketCount: () => 0,
     }),
-    launchPersistentChromiumForWorking: async () =>
-      Object.freeze({ context }),
+    launchPersistentChromiumForWorking: async () => Object.freeze({ context }),
     releaseChromiumSessionAttachment: async () => {
       await context.close();
     },

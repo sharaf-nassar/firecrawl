@@ -810,6 +810,7 @@ describe("browser session orchestrator", () => {
       claimStop: vi.fn(async () => ({
         runId: null,
         profileId: randomUUID(),
+        requiresPreparedProfile: true,
         browserId: "browser-1",
         runtimeEpoch: 1,
       })),

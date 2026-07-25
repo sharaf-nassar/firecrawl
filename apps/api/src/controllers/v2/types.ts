@@ -79,14 +79,11 @@ const strictMessage =
   "Unrecognized key in body -- please review the v2 API documentation for request body changes";
 
 // Helper function to add strict validation
-// In zod v4, .strict() doesn't accept arguments
 // The custom error message is handled in the error handler (see src/index.ts)
-// We use a type assertion to preserve the input type so optional fields with defaults remain optional
-// The 'as any' is necessary because zod v4's .strict() changes type inference in a way that makes
-// optional fields with defaults appear required, even though they're not at runtime
+// Preserve the input type so optional fields with defaults remain optional.
 function strictWithMessage<T extends z.ZodObject<any>>(schema: T): T {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return schema.strict() as any as T;
+  return z.strictObject(schema.shape) as any as T;
 }
 
 function normalizeSchemaForOpenAI(schema: any): any {
