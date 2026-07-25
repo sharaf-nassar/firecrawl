@@ -38,6 +38,43 @@ import { initializeEngineForcing } from "./scraper/WebScraper/utils/engine-forci
 import responseTime from "response-time";
 import { shutdownWebhookQueue } from "./services/webhook";
 import { shutdownIndexerQueue } from "./services/indexing/indexer-queue";
+import { Pool } from "pg";
+import { runApplicationMigrations } from "./db/migrate";
+import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
+import { BrowserStateFilesystem } from "./lib/browser-state/filesystem-store";
+import { inspectBrowserStateProcessIdentity } from "./lib/browser-state/process-identity";
+import { interruptUnfinishedBrowserWork } from "./lib/browser-state/store";
+import { BrowserServiceClient } from "./lib/scrape-interact/browser-service-client";
+import {
+  createBrowserStartupGate,
+  type BrowserStartupGate,
+} from "./lib/browser-runtime/startup-gate";
+import {
+  BrowserReconciliationCoordinatorError,
+  createBrowserReconciliationCoordinator,
+  type BrowserControlGenerationHandoff,
+  type BrowserReconciliationCoordinator,
+} from "./lib/browser-runtime/reconciliation-coordinator";
+import { loadBrowserReconciliationSnapshot } from "./lib/browser-runtime/reconciliation-snapshot";
+import { runApiStartupLifecycle } from "./lib/browser-runtime/api-startup-lifecycle";
+import { registerReplayPersistenceAuthorityRoute } from "./lib/scrape-interact/replay-store";
+import {
+  createLocalRetentionService,
+  recoverBrowserCleanupIntentsBeforeSnapshot,
+  runLocalRetentionLoop,
+  type LocalRetentionService,
+} from "./services/local-retention-worker";
+
+type LocalBrowserRuntime = {
+  pool: Pool;
+  gate: BrowserStartupGate;
+  coordinator: BrowserReconciliationCoordinator;
+  handoff: BrowserControlGenerationHandoff;
+};
+
+let localBrowserRuntime: LocalBrowserRuntime | undefined;
+let localRetentionService: LocalRetentionService | undefined;
+let localRuntimeStop: Promise<void> | undefined;
 
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
@@ -63,6 +100,10 @@ global.isProduction = config.IS_PRODUCTION;
 
 setSentryServiceTag("api");
 
+registerReplayPersistenceAuthorityRoute(app, {
+  apiKey: config.BROWSER_REPLAY_INGEST_API_KEY,
+  getGate: () => localBrowserRuntime?.gate,
+});
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json({ limit: "10mb" }));
 
@@ -111,13 +152,149 @@ app.use(adminRouter);
 const DEFAULT_PORT = config.PORT;
 const HOST = config.HOST;
 
+function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, milliseconds);
+    function done() {
+      signal.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }
+    signal.addEventListener("abort", aborted, { once: true });
+  });
+}
+
+async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGenerationHandoff> {
+  const local = resolveLocalRuntimeConfig(config);
+  if (!local.enabled || !local.browserServiceEnabled) {
+    throw new Error("Browser runtime preparation requires enabled local mode");
+  }
+  const pool = new Pool({
+    connectionString: local.applicationDatabaseUrl,
+    application_name: "firecrawl-browser-reconciliation",
+    max: 4,
+    connectionTimeoutMillis: local.browserReconciliationStartupBudgetMs,
+    statement_timeout: local.browserReconciliationStartupBudgetMs,
+    query_timeout: local.browserReconciliationStartupBudgetMs,
+    lock_timeout: local.browserReconciliationStartupBudgetMs,
+    idle_in_transaction_session_timeout:
+      local.browserReconciliationStartupBudgetMs,
+  });
+  pool.on("error", error => {
+    logger.error("Browser reconciliation PostgreSQL pool error", {
+      errorName: error.name,
+    });
+  });
+  const gate = createBrowserStartupGate({ pool });
+  const filesystem = new BrowserStateFilesystem(local.browserStateRoot);
+  const serviceClient = new BrowserServiceClient({
+    baseUrl: local.browserServiceUrl,
+    apiKey: local.browserServiceApiKey,
+    requestTimeoutMs: local.browserServiceRequestTimeoutMs,
+    reconciliationTimeoutMs: local.browserReconciliationTimeoutMs,
+    onControlGenerationMismatch: () => {
+      gate.close("control_generation_mismatch");
+    },
+  });
+  const coordinator = createBrowserReconciliationCoordinator({
+    gate,
+    pool,
+    filesystem,
+    inspectProcessIdentity: inspectBrowserStateProcessIdentity,
+    serviceClient,
+    loadSnapshot: loadBrowserReconciliationSnapshot,
+    interruptUnfinishedBrowserWork,
+    recoverBrowserCleanupIntentsBeforeSnapshot,
+    pauseBrowserRetention: async () => undefined,
+    startBrowserRetention: async () => undefined,
+    retry: {
+      maxAttempts: local.browserReconciliationMaxAttempts,
+      initialBackoffMs: local.browserReconciliationInitialBackoffMs,
+      maxBackoffMs: local.browserReconciliationMaxBackoffMs,
+      startupBudgetMs: local.browserReconciliationStartupBudgetMs,
+      monitorIntervalMs: local.browserReconciliationMonitorIntervalMs,
+      retryCooldownMs: local.browserReconciliationRetryCooldownMs,
+    },
+    now: Date.now,
+    sleep,
+    logger,
+  });
+  try {
+    const handoff = await coordinator.acquireControlGeneration();
+    localBrowserRuntime = { pool, gate, coordinator, handoff };
+    return handoff;
+  } catch (error) {
+    await coordinator.stop().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function startLocalRetentionAfterMigrations(): Promise<void> {
+  const local = resolveLocalRuntimeConfig(config);
+  if (!local.enabled) return;
+  localRetentionService = createLocalRetentionService(signal =>
+    runLocalRetentionLoop({
+      signal,
+      configSource: config,
+      browserStartupGate: localBrowserRuntime?.gate,
+    }),
+  );
+  // Operational retention owns its loop as soon as migrations are complete.
+  void localRetentionService.start();
+}
+
+async function initializeLocalBrowserAfterMigrations(
+  handoff: BrowserControlGenerationHandoff,
+): Promise<void> {
+  if (!localBrowserRuntime) {
+    throw new Error("Browser runtime handoff is unavailable");
+  }
+  await localBrowserRuntime.coordinator.initializeAfterMigrations(handoff);
+}
+
+async function stopLocalRuntime(): Promise<void> {
+  localRuntimeStop ??= (async () => {
+    await localBrowserRuntime?.coordinator.stop();
+    await localRetentionService?.stop();
+    await localBrowserRuntime?.pool.end();
+    localBrowserRuntime = undefined;
+    localRetentionService = undefined;
+  })();
+  return localRuntimeStop;
+}
+
 async function startServer(port = DEFAULT_PORT) {
   try {
-    await initializeBlocklist();
-    initializeEngineForcing();
+    const local = resolveLocalRuntimeConfig(config);
+    await runApiStartupLifecycle({
+      persistenceEnabled: local.enabled,
+      browserEnabled: local.enabled && local.browserServiceEnabled === true,
+      acquireBrowserControl: prepareLocalRuntimeBeforeMigrations,
+      runMigrations: async handoff =>
+        runApplicationMigrations(config, {
+          ...(handoff === undefined
+            ? {}
+            : { timeoutMs: Math.max(1, handoff.deadlineMs - Date.now()) }),
+        }),
+      startOperationalRetention: startLocalRetentionAfterMigrations,
+      initializeBrowser: initializeLocalBrowserAfterMigrations,
+      startApplication: async () => {
+        await initializeBlocklist();
+        initializeEngineForcing();
+      },
+    });
   } catch (error) {
+    await stopLocalRuntime().catch(() => undefined);
     logger.error("Failed to initialize blocklist and engine forcing", {
-      error,
+      category:
+        error instanceof BrowserReconciliationCoordinatorError
+          ? "browser_state_unavailable"
+          : "api_startup_failed",
     });
     throw error;
   }
@@ -131,6 +308,7 @@ async function startServer(port = DEFAULT_PORT) {
 
   const exitHandler = async () => {
     logger.info("SIGTERM signal received: closing HTTP server");
+    const localStop = stopLocalRuntime();
     if (config.IS_KUBERNETES) {
       // Account for GCE load balancer drain timeout
       logger.info("Waiting 60s for GCE load balancer drain timeout");
@@ -138,11 +316,13 @@ async function startServer(port = DEFAULT_PORT) {
     }
     server.close(() => {
       logger.info("Server closed.");
-      nuqShutdown().finally(() => {
-        shutdownWebhookQueue().finally(() => {
-          shutdownIndexerQueue().finally(() => {
-            logger.info("NUQ shutdown complete");
-            process.exit(0);
+      localStop.finally(() => {
+        nuqShutdown().finally(() => {
+          shutdownWebhookQueue().finally(() => {
+            shutdownIndexerQueue().finally(() => {
+              logger.info("NUQ shutdown complete");
+              process.exit(0);
+            });
           });
         });
       });
@@ -158,7 +338,12 @@ async function startServer(port = DEFAULT_PORT) {
 
 if (require.main === module) {
   startServer().catch(error => {
-    logger.error("Failed to start server", { error });
+    logger.error("Failed to start server", {
+      category:
+        error instanceof BrowserReconciliationCoordinatorError
+          ? "browser_state_unavailable"
+          : "api_startup_failed",
+    });
     process.exit(1);
   });
 }

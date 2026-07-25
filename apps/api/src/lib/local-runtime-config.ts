@@ -8,6 +8,8 @@ export type LocalRuntimeConfigSource = {
   LOCAL_BROWSER_STATE_ROOT?: string;
   BROWSER_SERVICE_URL?: string;
   BROWSER_SERVICE_API_KEY?: string;
+  BROWSER_REPLAY_INGEST_URL?: string;
+  BROWSER_REPLAY_INGEST_API_KEY?: string;
   BROWSER_SERVICE_REQUEST_TIMEOUT_MS?: number | string;
   BROWSER_RECONCILIATION_TIMEOUT_MS?: number | string;
   BROWSER_RECONCILIATION_MAX_ATTEMPTS?: number | string;
@@ -45,6 +47,8 @@ type EnabledBrowserServiceRuntimeConfig = {
   browserStateRoot: string;
   browserServiceUrl: string;
   browserServiceApiKey: string;
+  browserReplayIngestUrl: string;
+  browserReplayIngestApiKey: string;
   browserServiceRequestTimeoutMs: number;
   browserReconciliationTimeoutMs: number;
   browserReconciliationMaxAttempts: number;
@@ -270,6 +274,31 @@ export function resolveLocalRuntimeConfig(
       );
     }
     if (
+      source.BROWSER_REPLAY_INGEST_URL === undefined ||
+      !isPrivateBrowserServiceUrl(source.BROWSER_REPLAY_INGEST_URL)
+    ) {
+      issues.push(
+        "BROWSER_REPLAY_INGEST_URL is required and must be a private HTTP origin when LOCAL_BROWSER_SERVICE_ENABLED=true",
+      );
+    }
+    if (
+      source.BROWSER_REPLAY_INGEST_API_KEY === undefined ||
+      Buffer.byteLength(source.BROWSER_REPLAY_INGEST_API_KEY, "utf8") < 32 ||
+      Buffer.byteLength(source.BROWSER_REPLAY_INGEST_API_KEY, "utf8") > 4_089
+    ) {
+      issues.push(
+        "BROWSER_REPLAY_INGEST_API_KEY is required and must contain 32..4089 UTF-8 bytes when LOCAL_BROWSER_SERVICE_ENABLED=true",
+      );
+    }
+    if (
+      source.BROWSER_REPLAY_INGEST_API_KEY !== undefined &&
+      source.BROWSER_REPLAY_INGEST_API_KEY === source.BROWSER_SERVICE_API_KEY
+    ) {
+      issues.push(
+        "BROWSER_REPLAY_INGEST_API_KEY must differ from BROWSER_SERVICE_API_KEY",
+      );
+    }
+    if (
       source.BROWSER_ADAPTER_TOKEN_FILE !== undefined &&
       !path.isAbsolute(source.BROWSER_ADAPTER_TOKEN_FILE)
     ) {
@@ -355,6 +384,8 @@ export function resolveLocalRuntimeConfig(
           browserStateRoot,
           browserServiceUrl: source.BROWSER_SERVICE_URL!,
           browserServiceApiKey: source.BROWSER_SERVICE_API_KEY!,
+          browserReplayIngestUrl: source.BROWSER_REPLAY_INGEST_URL!,
+          browserReplayIngestApiKey: source.BROWSER_REPLAY_INGEST_API_KEY!,
           browserServiceRequestTimeoutMs,
           browserReconciliationTimeoutMs,
           browserReconciliationMaxAttempts,

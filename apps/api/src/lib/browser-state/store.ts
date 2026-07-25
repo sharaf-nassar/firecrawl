@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
 
 import { db } from "../../db/connection";
@@ -27,6 +27,7 @@ import type {
   ObservationV1,
   SubmitBrowserActionV1,
 } from "./types";
+import type { BrowserControlFenceTransaction } from "../browser-runtime/startup-gate";
 
 const ACTION_LIMIT = 25;
 const OPERATION_LIMIT_BYTES = 32 * 1024;
@@ -833,97 +834,88 @@ export async function releaseProfileWriter(
 /** @public */
 export async function interruptUnfinishedBrowserWork(
   now: Date,
+  controlTransaction: BrowserControlFenceTransaction,
 ): Promise<BrowserRecoveryResult> {
-  return db.transaction(async tx => {
-    const timestamp = now.toISOString();
-    const prepared = await tx
-      .update(schema.browser_interact_actions)
-      .set({
-        state: "cancelled_no_effect",
-        error_category: "process_interrupted",
-        error_detail: "Action was not dispatched before process interruption",
-        finished_at: timestamp,
-        updated_at: timestamp,
-      })
-      .where(eq(schema.browser_interact_actions.state, "prepared"))
-      .returning({ id: schema.browser_interact_actions.id });
-    const executing = await tx
-      .update(schema.browser_interact_actions)
-      .set({
-        state: "outcome_unknown",
-        error_category: "process_interrupted",
-        error_detail: "Action outcome is unknown after process interruption",
-        finished_at: timestamp,
-        updated_at: timestamp,
-      })
-      .where(eq(schema.browser_interact_actions.state, "executing"))
-      .returning({ id: schema.browser_interact_actions.id });
-    const runs = await tx
-      .update(schema.browser_interact_runs)
-      .set({
-        state: "interrupted",
-        error_category: "process_interrupted",
-        error_detail: "Run was interrupted by process restart",
-        finished_at: timestamp,
-      })
-      .where(
-        inArray(schema.browser_interact_runs.state, [
-          "queued",
-          "starting",
-          "running",
-        ]),
-      )
-      .returning({ id: schema.browser_interact_runs.id });
-    const sessions = await tx
-      .update(schema.browser_sessions)
-      .set({
-        state: "interrupted",
-        status: "error",
-        terminal_at: timestamp,
-        terminal_reason: "process_interrupted",
-        updated_at: timestamp,
-      })
-      .where(
-        inArray(schema.browser_sessions.state, [
-          "creating",
-          "replaying",
-          "ready",
-          "executing",
-          "stopping",
-        ]),
-      )
-      .returning({ id: schema.browser_sessions.id });
-    const capabilities = await tx
-      .update(schema.browser_capabilities)
-      .set({ revoked_at: timestamp })
-      .where(isNull(schema.browser_capabilities.revoked_at))
-      .returning({ id: schema.browser_capabilities.id });
-    const grants = await tx
-      .update(schema.browser_proxy_grants)
-      .set({ revoked_at: timestamp })
-      .where(isNull(schema.browser_proxy_grants.revoked_at))
-      .returning({ id: schema.browser_proxy_grants.id });
-    const leases =
-      sessions.length === 0
-        ? []
-        : await tx
-            .update(schema.browser_profiles)
-            .set({ writer_session_id: null, updated_at: timestamp })
-            .where(
-              inArray(
-                schema.browser_profiles.writer_session_id,
-                sessions.map(session => session.id),
-              ),
-            )
-            .returning({ id: schema.browser_profiles.id });
-    return {
-      preparedActionsCancelled: prepared.length,
-      executingActionsUnknown: executing.length,
-      runsInterrupted: runs.length,
-      sessionsInterrupted: sessions.length,
-      capabilitiesRevoked: capabilities.length,
-      grantsRevoked: grants.length,
-      writerLeasesCleared: leases.length,
-    };
-  });
+  const timestamp = now.toISOString();
+  const prepared = await controlTransaction.query(
+    `UPDATE browser_interact_actions
+          SET state = 'cancelled_no_effect',
+              error_category = 'process_interrupted',
+              error_detail =
+                'Action was not dispatched before process interruption',
+              finished_at = $1,
+              updated_at = $1
+        WHERE state = 'prepared'
+        RETURNING id`,
+    [timestamp],
+  );
+  const executing = await controlTransaction.query(
+    `UPDATE browser_interact_actions
+          SET state = 'outcome_unknown',
+              error_category = 'process_interrupted',
+              error_detail =
+                'Action outcome is unknown after process interruption',
+              finished_at = $1,
+              updated_at = $1
+        WHERE state = 'executing'
+        RETURNING id`,
+    [timestamp],
+  );
+  const runs = await controlTransaction.query(
+    `UPDATE browser_interact_runs
+          SET state = 'interrupted',
+              error_category = 'process_interrupted',
+              error_detail = 'Run was interrupted by process restart',
+              finished_at = $1
+        WHERE state IN ('queued', 'starting', 'running')
+        RETURNING id`,
+    [timestamp],
+  );
+  const sessions = await controlTransaction.query<{ id: string }>(
+    `UPDATE browser_sessions
+          SET state = 'interrupted',
+              status = 'error',
+              terminal_at = $1,
+              terminal_reason = 'process_interrupted',
+              updated_at = $1
+        WHERE state IN (
+          'creating', 'replaying', 'ready', 'executing', 'stopping'
+        )
+        RETURNING id`,
+    [timestamp],
+  );
+  const capabilities = await controlTransaction.query(
+    `UPDATE browser_capabilities
+          SET revoked_at = $1
+        WHERE revoked_at IS NULL
+        RETURNING id`,
+    [timestamp],
+  );
+  const grants = await controlTransaction.query(
+    `UPDATE browser_proxy_grants
+          SET revoked_at = $1
+        WHERE revoked_at IS NULL
+        RETURNING id`,
+    [timestamp],
+  );
+  const leases =
+    sessions.rows.length === 0
+      ? { rows: [] }
+      : await controlTransaction.query(
+          `UPDATE browser_profiles
+                SET writer_session_id = NULL,
+                    updated_at = $1
+              WHERE writer_session_id = ANY($2::uuid[])
+              RETURNING id`,
+          [timestamp, sessions.rows.map(session => session.id)],
+        );
+  return {
+    preparedActionsCancelled: prepared.rows.length,
+    executingActionsUnknown: executing.rows.length,
+    runsInterrupted: runs.rows.length,
+    sessionsInterrupted: sessions.rows.length,
+    capabilitiesRevoked: capabilities.rows.length,
+    grantsRevoked: grants.rows.length,
+    writerLeasesCleared: leases.rows.length,
+  };
 }

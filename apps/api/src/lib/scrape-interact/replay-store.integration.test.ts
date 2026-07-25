@@ -13,10 +13,12 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants } from "node:fs";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { drizzle } from "drizzle-orm/node-postgres";
+import express from "express";
 import { Pool } from "pg";
 import {
   afterAll,
@@ -261,7 +263,12 @@ describeWithDatabase("scrape replay checkpoint store", () => {
   const pool = new Pool({ connectionString: databaseUrl, max: 4 });
   const database = drizzle({ client: pool });
   let root: string;
-  let replayStore: typeof import("./replay-store");
+  let replayStore: typeof import("./replay-store") & {
+    persistScrapeReplayState: ReturnType<
+      (typeof import("./replay-store"))["createReplayPersistenceForTesting"]
+    >;
+  };
+  let replayIngest: typeof import("./replay-ingest");
   let processIdentityInspection: "live" | "dead" | "unknown" | undefined;
 
   async function createFixture(options?: { requestDeadline?: Date | null }) {
@@ -337,7 +344,13 @@ describeWithDatabase("scrape replay checkpoint store", () => {
           actual.inspectBrowserStateProcessIdentity(expected),
       };
     });
-    replayStore = await import("./replay-store.js");
+    const replayStoreModule = await import("./replay-store.js");
+    replayStore = {
+      ...replayStoreModule,
+      persistScrapeReplayState:
+        replayStoreModule.createReplayPersistenceForTesting(),
+    };
+    replayIngest = await import("./replay-ingest.js");
   });
 
   beforeEach(async () => {
@@ -406,6 +419,128 @@ describeWithDatabase("scrape replay checkpoint store", () => {
         checksum: rows.rows[0]!.checksum,
       },
     });
+  });
+
+  it("converges an exact retry without publishing a fresh generation", async () => {
+    const fixture = await createFixture();
+    const replayInput = input(fixture);
+
+    await expect(
+      replayStore.persistScrapeReplayState(replayInput),
+    ).resolves.toEqual({ persisted: true });
+    const first = await pool.query<{ state_path: string }>(
+      `SELECT state_path
+         FROM browser_replay_checkpoints
+        WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    const directory = path.dirname(path.join(root, first.rows[0]!.state_path));
+    const before = await readdir(directory);
+
+    await expect(
+      replayStore.persistScrapeReplayState(replayInput),
+    ).resolves.toEqual({ persisted: true });
+
+    const after = await pool.query<{
+      state_path: string;
+      checkpoints: number;
+      intents: number;
+    }>(
+      `SELECT state_path,
+              (SELECT count(*)::int
+                 FROM browser_replay_checkpoints
+                WHERE scrape_id = $1) AS checkpoints,
+              (SELECT count(*)::int
+                 FROM browser_replay_checkpoint_cleanup_intents
+                WHERE scrape_id = $1) AS intents
+         FROM browser_replay_checkpoints
+        WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    expect(after.rows[0]).toMatchObject({
+      state_path: first.rows[0]!.state_path,
+      checkpoints: 1,
+      intents: 0,
+    });
+    expect(await readdir(directory)).toEqual(before);
+  });
+
+  it("converges a lost worker response through API, gate, database, and file", async () => {
+    const fixture = await createFixture();
+    const app = express();
+    const gate = {
+      withBrowserStateMutationLease: vi.fn(async (_scope, operation) =>
+        operation({
+          epoch: 1,
+          scope: "filesystem_and_database",
+          binding: {},
+          transaction: {},
+        }),
+      ),
+    };
+    replayStore.registerReplayPersistenceAuthorityRoute(app, {
+      apiKey: "r".repeat(32),
+      getGate: () => gate as never,
+    });
+    const server = app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      server.once("listening", resolve);
+      server.once("error", reject);
+    });
+    const port = (server.address() as AddressInfo).port;
+    let attempts = 0;
+    const loseFirstResponse: typeof fetch = async (resource, init) => {
+      attempts += 1;
+      const response = await fetch(resource, init);
+      if (attempts === 1) {
+        await response.arrayBuffer();
+        throw new Error("response lost after authority commit");
+      }
+      return response;
+    };
+
+    try {
+      const persistThroughAuthority =
+        replayIngest.createReplayIngestClientForTesting({
+          enabled: true,
+          fetch: loseFirstResponse,
+          baseUrl: `http://127.0.0.1:${port}`,
+          apiKey: "r".repeat(32),
+          budgetMs: 60_000,
+          requestTimeoutMs: 30_000,
+          sleep: async () => undefined,
+        });
+      await expect(persistThroughAuthority(input(fixture))).resolves.toEqual({
+        persisted: true,
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close(error => (error ? reject(error) : resolve())),
+      );
+    }
+
+    expect(attempts).toBe(2);
+    expect(gate.withBrowserStateMutationLease).toHaveBeenCalledTimes(2);
+    const rows = await pool.query<{
+      state_path: string;
+      checkpoints: number;
+      intents: number;
+    }>(
+      `SELECT state_path,
+              (SELECT count(*)::int
+                 FROM browser_replay_checkpoints
+                WHERE scrape_id = $1) AS checkpoints,
+              (SELECT count(*)::int
+                 FROM browser_replay_checkpoint_cleanup_intents
+                WHERE scrape_id = $1) AS intents
+         FROM browser_replay_checkpoints
+        WHERE scrape_id = $1`,
+      [fixture.scrapeId],
+    );
+    expect(rows.rows[0]).toMatchObject({ checkpoints: 1, intents: 0 });
+    await expect(
+      lstat(path.join(root, rows.rows[0]!.state_path)),
+    ).resolves.toBeTruthy();
   });
 
   it("calls the filesystem through its three-argument write contract", async () => {

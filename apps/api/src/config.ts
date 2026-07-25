@@ -142,6 +142,8 @@ export const configSchema = z.object({
   ),
   BROWSER_SERVICE_URL: emptyStringAsUndefined(z.string()),
   BROWSER_SERVICE_API_KEY: emptyStringAsUndefined(z.string()),
+  BROWSER_REPLAY_INGEST_URL: emptyStringAsUndefined(z.string()),
+  BROWSER_REPLAY_INGEST_API_KEY: emptyStringAsUndefined(z.string()),
   BROWSER_SERVICE_REQUEST_TIMEOUT_MS: emptyStringAsDefault(
     z.coerce.number().int().min(100).max(60_000).default(30_000),
   ),

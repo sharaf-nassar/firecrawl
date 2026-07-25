@@ -4,6 +4,10 @@ import { config } from "../config";
 import { getArtifactStore, type ArtifactStore } from "../lib/artifacts";
 import { BrowserStateFilesystem } from "../lib/browser-state/filesystem-store";
 import { inspectBrowserStateProcessIdentity } from "../lib/browser-state/process-identity";
+import type {
+  BrowserControlFenceTransaction,
+  BrowserStartupGate,
+} from "../lib/browser-runtime/startup-gate";
 import { logger as defaultLogger } from "../lib/logger";
 import {
   resolveLocalRuntimeConfig,
@@ -289,10 +293,12 @@ export interface LocalRetentionDatabase {
   listExpiredBrowserStateFiles(
     now: Date,
     limit: number,
+    controlTransaction?: BrowserControlFenceTransaction,
   ): Promise<ExpiredBrowserStateFile[]>;
   tryClaimBrowserStateFile(
     candidate: ExpiredBrowserStateFile,
     now: Date,
+    controlTransaction?: BrowserControlFenceTransaction,
   ): Promise<BrowserStateFileClaim | null>;
   listExpiredArtifactManifests(
     now: Date,
@@ -321,6 +327,8 @@ type IterationOptions = {
   now?: Date;
   signal?: AbortSignal;
   logger?: RetentionLogger;
+  operationalRetentionEnabled?: boolean;
+  browserControlTransaction?: BrowserControlFenceTransaction;
 };
 
 type IterationResult = OperationalCleanupResult & {
@@ -341,6 +349,7 @@ type LoopOptions = {
   logger?: RetentionLogger;
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  browserStartupGate?: BrowserStartupGate;
 };
 
 type LocalRetentionRunner = (signal: AbortSignal) => Promise<void>;
@@ -353,6 +362,14 @@ type LocalRetentionServiceOptions = {
 export type LocalRetentionService = {
   start(): Promise<void>;
   stop(): Promise<void>;
+};
+
+/** @public */
+export type CleanupIntentStartupRecoveryResult = {
+  liveRetained: number;
+  unknownRetained: number;
+  deadRecovered: number;
+  missingConverged: number;
 };
 
 type ArtifactManifestRow = {
@@ -546,8 +563,10 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
   async listExpiredBrowserStateFiles(
     now: Date,
     limit: number,
+    controlTransaction?: BrowserControlFenceTransaction,
   ): Promise<ExpiredBrowserStateFile[]> {
-    const client = await this.pool.connect();
+    const ownsClient = controlTransaction === undefined;
+    const client = controlTransaction ?? (await this.pool.connect());
     let released = false;
     try {
       const candidates: ExpiredBrowserStateFile[] = [];
@@ -647,19 +666,23 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       }
       return candidates;
     } catch (error) {
-      released = true;
-      client.release(true);
+      if (ownsClient) {
+        released = true;
+        (client as PoolClient).release(true);
+      }
       throw error;
     } finally {
-      if (!released) client.release();
+      if (ownsClient && !released) (client as PoolClient).release();
     }
   }
 
   async tryClaimBrowserStateFile(
     candidate: ExpiredBrowserStateFile,
     now: Date,
+    controlTransaction?: BrowserControlFenceTransaction,
   ): Promise<BrowserStateFileClaim | null> {
-    const client = await this.pool.connect();
+    const ownsClient = controlTransaction === undefined;
+    const client = controlTransaction ?? (await this.pool.connect());
     const acquiredLocks: string[] = [];
     let clientReleased = false;
     try {
@@ -669,7 +692,7 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       );
       if (lock.rows[0]?.acquired !== true) {
         clientReleased = true;
-        client.release();
+        if (ownsClient) (client as PoolClient).release();
         return null;
       }
       acquiredLocks.push(candidate.statePath);
@@ -680,7 +703,7 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
         );
         if (scrapeLock.rows[0]?.acquired !== true) {
           clientReleased = true;
-          await releaseBrowserStateLocks(client, acquiredLocks);
+          await releaseBrowserStateLocks(client, acquiredLocks, ownsClient);
           return null;
         }
         acquiredLocks.push(candidate.scrapeId);
@@ -694,7 +717,7 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
       );
       if (!selected) {
         clientReleased = true;
-        await releaseBrowserStateLocks(client, acquiredLocks);
+        await releaseBrowserStateLocks(client, acquiredLocks, ownsClient);
         return null;
       }
       const current = selected.file;
@@ -795,9 +818,9 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
           if (claimReleased) return;
           claimReleased = true;
           if (destroyOnRelease) {
-            client.release(true);
+            if (ownsClient) (client as PoolClient).release(true);
           } else {
-            await releaseBrowserStateLocks(client, acquiredLocks);
+            await releaseBrowserStateLocks(client, acquiredLocks, ownsClient);
           }
         },
       };
@@ -806,12 +829,12 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
         throw error;
       } else if (acquiredLocks.length > 0) {
         try {
-          await releaseBrowserStateLocks(client, acquiredLocks);
+          await releaseBrowserStateLocks(client, acquiredLocks, ownsClient);
         } catch (cleanupError) {
           throw new LocalRetentionResourceError(error, cleanupError);
         }
-      } else {
-        client.release(true);
+      } else if (ownsClient) {
+        (client as PoolClient).release(true);
       }
       throw error;
     }
@@ -1047,7 +1070,7 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
 }
 
 async function selectBrowserStateFile(
-  client: PoolClient,
+  client: Pick<PoolClient, "query">,
   candidate: ExpiredBrowserStateFile,
   now: Date,
   inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity,
@@ -1149,8 +1172,9 @@ async function selectBrowserStateFile(
 }
 
 async function releaseBrowserStateLocks(
-  client: PoolClient,
+  client: Pick<PoolClient, "query">,
   lockKeys: string[],
+  releaseClient = true,
 ): Promise<void> {
   try {
     for (const lockKey of [...lockKeys].reverse()) {
@@ -1159,10 +1183,10 @@ async function releaseBrowserStateLocks(
       ]);
     }
   } catch (error) {
-    client.release(true);
+    if (releaseClient) (client as PoolClient).release(true);
     throw error;
   }
-  client.release();
+  if (releaseClient) (client as PoolClient).release();
 }
 
 async function releaseArtifactLock(
@@ -1178,6 +1202,205 @@ async function releaseArtifactLock(
     throw error;
   }
   client.release();
+}
+
+/** @public */
+export async function recoverBrowserCleanupIntentsBeforeSnapshot(deps: {
+  pool: Pick<Pool, "connect">;
+  filesystem: BrowserStateFilesystem;
+  inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity;
+  signal: AbortSignal;
+}): Promise<CleanupIntentStartupRecoveryResult> {
+  const result: CleanupIntentStartupRecoveryResult = {
+    liveRetained: 0,
+    unknownRetained: 0,
+    deadRecovered: 0,
+    missingConverged: 0,
+  };
+  const listing = await deps.pool.connect();
+  let intents: BrowserCleanupIntentRow[];
+  try {
+    intents = (
+      await listing.query<BrowserCleanupIntentRow>(
+        `SELECT id, scrape_id, state_path, checksum, state, created_at,
+                writer_lease, writer_pid, writer_boot_id, writer_start_time
+           FROM browser_replay_checkpoint_cleanup_intents
+          WHERE state = 'preparing'
+          ORDER BY created_at, id`,
+      )
+    ).rows;
+  } finally {
+    listing.release();
+  }
+
+  for (const candidate of intents) {
+    if (deps.signal.aborted) {
+      throw deps.signal.reason ?? new Error("cleanup recovery aborted");
+    }
+    if (
+      candidate.writer_lease === null ||
+      candidate.writer_pid === null ||
+      candidate.writer_boot_id === null ||
+      candidate.writer_start_time === null
+    ) {
+      throw new Error(
+        "preparing cleanup intent has incomplete writer identity",
+      );
+    }
+    const classification = await deps.inspectProcessIdentity({
+      pid: candidate.writer_pid,
+      bootId: candidate.writer_boot_id,
+      startTime: candidate.writer_start_time,
+    });
+    if (classification === "live") {
+      result.liveRetained += 1;
+      continue;
+    }
+    if (classification === "unknown") {
+      result.unknownRetained += 1;
+      continue;
+    }
+
+    const client = await deps.pool.connect();
+    const locks = [candidate.state_path, candidate.scrape_id];
+    try {
+      for (const lock of locks) {
+        await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [
+          lock,
+        ]);
+      }
+      const selectExact = () =>
+        client.query<
+          BrowserCleanupIntentRow & { current_state_path: string | null }
+        >(
+          `SELECT intent.id, intent.scrape_id, intent.state_path,
+                intent.checksum, intent.state, intent.created_at,
+                intent.writer_lease, intent.writer_pid,
+                intent.writer_boot_id, intent.writer_start_time,
+                checkpoint.state_path AS current_state_path
+           FROM browser_replay_checkpoint_cleanup_intents intent
+           LEFT JOIN browser_replay_checkpoints checkpoint
+             ON checkpoint.scrape_id = intent.scrape_id
+          WHERE intent.id = $1
+            AND intent.scrape_id = $2
+            AND intent.state_path = $3
+            AND intent.checksum = $4
+            AND intent.state = 'preparing'
+            AND intent.writer_lease = $5
+            AND intent.writer_pid = $6
+            AND intent.writer_boot_id = $7
+            AND intent.writer_start_time = $8`,
+          [
+            candidate.id,
+            candidate.scrape_id,
+            candidate.state_path,
+            candidate.checksum,
+            candidate.writer_lease,
+            candidate.writer_pid,
+            candidate.writer_boot_id,
+            candidate.writer_start_time,
+          ],
+        );
+      let selected = await selectExact();
+      if (!selected.rows[0]) selected = await selectExact();
+      const current = selected.rows[0];
+      if (!current) continue;
+      const currentClassification = await deps.inspectProcessIdentity({
+        pid: current.writer_pid!,
+        bootId: current.writer_boot_id!,
+        startTime: current.writer_start_time!,
+      });
+      if (currentClassification !== "dead") {
+        result[
+          currentClassification === "live" ? "liveRetained" : "unknownRetained"
+        ] += 1;
+        continue;
+      }
+
+      let missing = false;
+      if (current.current_state_path !== current.state_path) {
+        try {
+          await deps.filesystem.delete(current.state_path);
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "ENOENT"
+          ) {
+            missing = true;
+          } else {
+            throw error;
+          }
+        }
+      }
+      let deleted = await client.query(
+        `DELETE FROM browser_replay_checkpoint_cleanup_intents
+          WHERE id = $1
+            AND scrape_id = $2
+            AND state_path = $3
+            AND checksum = $4
+            AND state = 'preparing'
+            AND writer_lease = $5
+            AND writer_pid = $6
+            AND writer_boot_id = $7
+            AND writer_start_time = $8`,
+        [
+          current.id,
+          current.scrape_id,
+          current.state_path,
+          current.checksum,
+          current.writer_lease,
+          current.writer_pid,
+          current.writer_boot_id,
+          current.writer_start_time,
+        ],
+      );
+      if (deleted.rowCount !== 1) {
+        const retry = await selectExact();
+        if (!retry.rows[0]) {
+          throw new Error("cleanup intent recovery compare-and-set lost");
+        }
+        deleted = await client.query(
+          `DELETE FROM browser_replay_checkpoint_cleanup_intents
+            WHERE id = $1
+              AND scrape_id = $2
+              AND state_path = $3
+              AND checksum = $4
+              AND state = 'preparing'
+              AND writer_lease = $5
+              AND writer_pid = $6
+              AND writer_boot_id = $7
+              AND writer_start_time = $8`,
+          [
+            current.id,
+            current.scrape_id,
+            current.state_path,
+            current.checksum,
+            current.writer_lease,
+            current.writer_pid,
+            current.writer_boot_id,
+            current.writer_start_time,
+          ],
+        );
+        if (deleted.rowCount !== 1) {
+          throw new Error("cleanup intent recovery compare-and-set failed");
+        }
+      }
+      result[missing ? "missingConverged" : "deadRecovered"] += 1;
+    } finally {
+      try {
+        for (const lock of [...locks].reverse()) {
+          await client.query(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+            [lock],
+          );
+        }
+      } finally {
+        client.release();
+      }
+    }
+  }
+  return result;
 }
 
 export async function runLocalRetentionIteration(
@@ -1340,13 +1563,18 @@ export async function runLocalRetentionIteration(
     const candidates = await options.database.listExpiredBrowserStateFiles(
       now,
       RETENTION_BATCH_SIZE,
+      options.browserControlTransaction,
     );
     result.browserStateCandidates = candidates.length;
     for (const candidate of candidates) {
       if (options.signal?.aborted) break;
       let claim: BrowserStateFileClaim | null;
       try {
-        claim = await options.database.tryClaimBrowserStateFile(candidate, now);
+        claim = await options.database.tryClaimBrowserStateFile(
+          candidate,
+          now,
+          options.browserControlTransaction,
+        );
       } catch (error) {
         result.browserStateFailures += 1;
         const source =
@@ -1443,7 +1671,10 @@ export async function runLocalRetentionIteration(
     });
   }
 
-  if (!options.signal?.aborted) {
+  if (
+    options.operationalRetentionEnabled !== false &&
+    !options.signal?.aborted
+  ) {
     try {
       const operational = await options.database.deleteExpiredOperationalRows(
         now,
@@ -1529,6 +1760,27 @@ export async function runLocalRetentionIteration(
   return result;
 }
 
+/** @public */
+export function runOperationalAndArtifactRetentionIteration(
+  options: Omit<IterationOptions, "browserStateFilesystem">,
+): Promise<IterationResult> {
+  return runLocalRetentionIteration({
+    ...options,
+    browserStateFilesystem: null,
+  });
+}
+
+/** @public */
+export function runBrowserStateRetentionIteration(
+  options: Omit<IterationOptions, "artifactStore">,
+): Promise<IterationResult> {
+  return runLocalRetentionIteration({
+    ...options,
+    artifactStore: null,
+    operationalRetentionEnabled: false,
+  });
+}
+
 function abortableSleep(
   milliseconds: number,
   signal: AbortSignal,
@@ -1577,6 +1829,60 @@ export async function runLocalRetentionLoop(
     artifactProvider: localConfig.artifactProvider,
   });
   try {
+    if (options.browserStartupGate && browserStateFilesystem) {
+      const operationalLoop = async () => {
+        while (!options.signal.aborted) {
+          try {
+            await runOperationalAndArtifactRetentionIteration({
+              database,
+              artifactStore,
+              now: now(),
+              signal: options.signal,
+              logger,
+            });
+          } catch (error) {
+            logger.error(
+              "Local operational retention iteration failed",
+              retentionFailureMetadata(error),
+            );
+          }
+          if (!options.signal.aborted) {
+            await sleep(IDLE_BACKOFF_MS, options.signal);
+          }
+        }
+      };
+      const browserLoop = async () => {
+        while (!options.signal.aborted) {
+          try {
+            await options.browserStartupGate!.waitUntilOpen(options.signal);
+            await options.browserStartupGate!.withBrowserStateMutationLease(
+              "filesystem_and_database",
+              async lease =>
+                runBrowserStateRetentionIteration({
+                  database,
+                  browserStateFilesystem,
+                  browserControlTransaction: lease.transaction,
+                  now: now(),
+                  signal: options.signal,
+                  logger,
+                }),
+            );
+          } catch (error) {
+            if (!options.signal.aborted) {
+              logger.error(
+                "Local browser state retention iteration failed",
+                retentionFailureMetadata(error),
+              );
+            }
+          }
+          if (!options.signal.aborted) {
+            await sleep(IDLE_BACKOFF_MS, options.signal);
+          }
+        }
+      };
+      await Promise.all([operationalLoop(), browserLoop()]);
+      return;
+    }
     while (!options.signal.aborted) {
       try {
         await runLocalRetentionIteration({

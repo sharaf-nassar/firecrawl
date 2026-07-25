@@ -32,6 +32,7 @@ const nullChecksumSchema = "migration_null_checksum_test";
 const retentionFkSchema = "migration_retention_fk_test";
 const preflightUpgradeSchema = "migration_preflight_upgrade_test";
 const asyncPlaceholderSchema = "migration_async_placeholder_test";
+const migrationBudgetSchema = "migration_budget_test";
 const baselineFilename = "0001_persistence_foundation.sql";
 const asyncPlaceholderFilename = "0002_async_request_placeholders.sql";
 const preflightFilename = "0002_preflight_orphan_webhooks.sql";
@@ -42,6 +43,7 @@ const browserInteractFilename = "0004_browser_interact_foundation.sql";
 const replayCleanupHandoffFilename =
   "0005_replay_checkpoint_cleanup_handoff.sql";
 const replayWriterLeasesFilename = "0006_replay_checkpoint_writer_leases.sql";
+const browserControlFilename = "0007_browser_control_generation.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -100,6 +102,7 @@ const browserFoundationTables = [
   "browser_replay_checkpoint_cleanup_intents",
   "browser_capabilities",
   "browser_proxy_grants",
+  "browser_control_generation",
 ];
 
 const browserRequestIndexes = [
@@ -185,6 +188,7 @@ describeWithDatabase("application migrations", () => {
       retentionFkSchema,
       preflightUpgradeSchema,
       asyncPlaceholderSchema,
+      migrationBudgetSchema,
     ]) {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.query(`CREATE SCHEMA ${schema}`);
@@ -212,6 +216,7 @@ describeWithDatabase("application migrations", () => {
       browserInteractFilename,
       replayCleanupHandoffFilename,
       replayWriterLeasesFilename,
+      browserControlFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
       true,
@@ -222,6 +227,37 @@ describeWithDatabase("application migrations", () => {
       [ownerId],
     );
     expect(owners.rows[0]?.count).toBe("1");
+  });
+
+  it("enforces one deadline across the complete migration statement loop", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-migration-budget-"),
+    );
+    const budgetDatabaseUrl = databaseUrlForSchema(migrationBudgetSchema);
+    const budgetConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: budgetDatabaseUrl,
+    };
+    try {
+      await writeFile(
+        join(migrationsDirectory, "0001_slow_first.sql"),
+        "SELECT pg_sleep(0.18);\n",
+      );
+      await writeFile(
+        join(migrationsDirectory, "0002_slow_second.sql"),
+        "SELECT pg_sleep(0.18);\n",
+      );
+      const startedAt = Date.now();
+      await expect(
+        runApplicationMigrations(budgetConfig, {
+          migrationsDirectory,
+          timeoutMs: 300,
+        }),
+      ).rejects.toBeTruthy();
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
   });
 
   it("rejects changed contents for an applied migration filename", async () => {
@@ -1038,6 +1074,77 @@ describeWithDatabase("application migrations", () => {
     );
   });
 
+  it("creates one constrained monotonic browser control fence", async () => {
+    const apiA = randomUUID();
+    const apiB = randomUUID();
+    const processNonce = Buffer.alloc(32, 1).toString("base64url");
+    const controlA = Buffer.alloc(32, 2).toString("base64url");
+    const controlB = Buffer.alloc(32, 3).toString("base64url");
+    await client.query(
+      `INSERT INTO browser_control_generation (
+         singleton_id, database_control_epoch, api_instance_id,
+         process_nonce, control_generation_nonce
+       ) VALUES (1, 1, $1, $2, $3)`,
+      [apiA, processNonce, controlA],
+    );
+    const first = await client.query<{
+      database_control_epoch: string;
+      api_instance_id: string;
+    }>(
+      `SELECT database_control_epoch, api_instance_id
+         FROM browser_control_generation
+        WHERE singleton_id = 1`,
+    );
+    expect(first.rows).toEqual([
+      { database_control_epoch: "1", api_instance_id: apiA },
+    ]);
+    await client.query(
+      `UPDATE browser_control_generation
+          SET database_control_epoch = database_control_epoch + 1,
+              api_instance_id = $1,
+              control_generation_nonce = $2
+        WHERE singleton_id = 1`,
+      [apiB, controlB],
+    );
+    await expect(
+      client.query(
+        `INSERT INTO browser_control_generation (
+           singleton_id, database_control_epoch, api_instance_id,
+           process_nonce, control_generation_nonce
+         ) VALUES (2, 3, $1, $2, $3)`,
+        [apiB, processNonce, controlB],
+      ),
+    ).rejects.toMatchObject({ code: "23514" });
+    await expect(
+      client.query(
+        `UPDATE browser_control_generation
+            SET database_control_epoch = 0
+          WHERE singleton_id = 1`,
+      ),
+    ).rejects.toMatchObject({ code: "23514" });
+    for (const [column, value] of [
+      ["process_nonce", "short"],
+      ["process_nonce", `${"A".repeat(42)}B`],
+      ["control_generation_nonce", "short"],
+      ["control_generation_nonce", `${"A".repeat(42)}B`],
+    ] as const) {
+      await expect(
+        client.query(
+          `UPDATE browser_control_generation
+              SET ${column} = $1
+            WHERE singleton_id = 1`,
+          [value],
+        ),
+      ).rejects.toMatchObject({ code: "23514" });
+    }
+    const second = await client.query<{ database_control_epoch: string }>(
+      `SELECT database_control_epoch
+         FROM browser_control_generation
+        WHERE singleton_id = 1`,
+    );
+    expect(second.rows[0]?.database_control_epoch).toBe("2");
+  });
+
   it("indexes webhook lookups by crawl, event, and newest delivery", async () => {
     const result = await client.query<{ indexdef: string }>(
       `SELECT indexdef
@@ -1444,15 +1551,19 @@ describeWithDatabase("application migrations", () => {
         join(__dirname, "migrations", replayWriterLeasesFilename),
         join(migrationsDirectory, replayWriterLeasesFilename),
       );
+      await copyFile(
+        join(__dirname, "migrations", browserControlFilename),
+        join(migrationsDirectory, browserControlFilename),
+      );
       await writeFile(
-        join(migrationsDirectory, "0007_failure.sql"),
+        join(migrationsDirectory, "0008_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
          SELECT missing_migration_function();`,
       );
 
       await expect(
         runApplicationMigrations(migrationConfig, { migrationsDirectory }),
-      ).rejects.toThrow(/0007_failure\.sql/);
+      ).rejects.toThrow(/0008_failure\.sql/);
 
       const result = await client.query<{
         table_name: string | null;
@@ -1463,7 +1574,7 @@ describeWithDatabase("application migrations", () => {
                 EXISTS (
                   SELECT 1
                     FROM application_schema_migrations
-                   WHERE filename = '0007_failure.sql'
+                   WHERE filename = '0008_failure.sql'
                 ) AS ledgered`,
       );
       expect(result.rows).toEqual([{ table_name: null, ledgered: false }]);

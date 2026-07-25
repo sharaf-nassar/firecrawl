@@ -29,10 +29,8 @@ import {
 } from "../../lib/local-owner";
 import { isArtifactStoreConfigured } from "../../lib/artifacts";
 import { retentionDeadline } from "../../lib/local-retention-deadline";
-import {
-  persistScrapeReplayState,
-  type ReplayCheckpointCaptureV1,
-} from "../../lib/scrape-interact/replay-store";
+import { type ReplayCheckpointCaptureV1 } from "../../lib/scrape-interact/replay-store";
+import { persistScrapeReplayStateThroughAuthority } from "../../lib/scrape-interact/replay-ingest";
 configDotenv();
 
 const nullByteRegex = /\u0000/g;
@@ -312,7 +310,7 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
 
   const tableName = scrape.is_parse ? "parses" : "scrapes";
 
-  const inserted = await robustInsert(
+  await robustInsert(
     tableName,
     {
       id: scrape.id,
@@ -344,9 +342,9 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
     logger,
   );
 
-  if (inserted && !scrape.is_parse && scrape.is_successful) {
+  if (!scrape.is_parse && scrape.is_successful) {
     try {
-      const result = await persistScrapeReplayState({
+      const result = await persistScrapeReplayStateThroughAuthority({
         requestId: scrape.request_id,
         scrapeId: scrape.id,
         ownerId: resolveScrapePersistenceOwner(scrape.team_id),

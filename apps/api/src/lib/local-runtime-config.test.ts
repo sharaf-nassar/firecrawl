@@ -29,6 +29,8 @@ const enabledBrowserSettings: LocalRuntimeConfigSource = {
   LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser",
   BROWSER_SERVICE_URL: "http://browser-service:3010",
   BROWSER_SERVICE_API_KEY: "s".repeat(32),
+  BROWSER_REPLAY_INGEST_URL: "http://api:3002",
+  BROWSER_REPLAY_INGEST_API_KEY: "r".repeat(32),
 };
 
 describe("resolveLocalRuntimeConfig", () => {
@@ -83,14 +85,18 @@ describe("resolveLocalRuntimeConfig", () => {
     });
   });
 
-  it("requires private URL and key when enabled", () => {
+  it("requires private service and replay authority URLs and keys", () => {
     expect(() =>
       resolveLocalRuntimeConfig({
         ...enabledBrowserSettings,
         BROWSER_SERVICE_URL: undefined,
         BROWSER_SERVICE_API_KEY: undefined,
+        BROWSER_REPLAY_INGEST_URL: undefined,
+        BROWSER_REPLAY_INGEST_API_KEY: undefined,
       }),
-    ).toThrow(/BROWSER_SERVICE_URL.*BROWSER_SERVICE_API_KEY/s);
+    ).toThrow(
+      /BROWSER_SERVICE_URL.*BROWSER_SERVICE_API_KEY.*BROWSER_REPLAY_INGEST_URL.*BROWSER_REPLAY_INGEST_API_KEY/s,
+    );
   });
 
   it.each([
@@ -114,6 +120,28 @@ describe("resolveLocalRuntimeConfig", () => {
         BROWSER_SERVICE_API_KEY: "short",
       }),
     ).toThrow(/BROWSER_SERVICE_API_KEY/);
+  });
+
+  it("requires a private replay target with a distinct 32-byte key", () => {
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_REPLAY_INGEST_URL: "https://api.example.com",
+      }),
+    ).toThrow(/BROWSER_REPLAY_INGEST_URL/);
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_REPLAY_INGEST_API_KEY: "short",
+      }),
+    ).toThrow(/BROWSER_REPLAY_INGEST_API_KEY/);
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_REPLAY_INGEST_API_KEY:
+          enabledBrowserSettings.BROWSER_SERVICE_API_KEY,
+      }),
+    ).toThrow(/must differ/);
   });
 
   it("accepts exactly 32..4089 UTF-8 browser key bytes", () => {

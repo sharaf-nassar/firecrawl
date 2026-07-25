@@ -27,6 +27,7 @@ import {
   LocalOperationalRetentionError,
   LocalRetentionShutdownTimeoutError,
   PgLocalRetentionDatabase,
+  recoverBrowserCleanupIntentsBeforeSnapshot,
   runLocalRetentionIteration,
   runLocalRetentionLoop,
   type ArtifactManifestClaim,
@@ -34,6 +35,69 @@ import {
   type LocalRetentionDatabase,
   type RetentionLogger,
 } from "./local-retention-worker";
+
+describe("recoverBrowserCleanupIntentsBeforeSnapshot", () => {
+  it("recovers only an exact dead preparing writer", async () => {
+    const intent = {
+      id: "11111111-1111-4111-8111-111111111111",
+      scrape_id: "22222222-2222-4222-8222-222222222222",
+      state_path:
+        "replay/33333333-3333-4333-8333-333333333333/22222222-2222-4222-8222-222222222222/44444444-4444-4444-8444-444444444444.json",
+      checksum: "a".repeat(64),
+      state: "preparing",
+      created_at: new Date(),
+      writer_lease: "55555555-5555-4555-8555-555555555555",
+      writer_pid: 42,
+      writer_boot_id: "b".repeat(32),
+      writer_start_time: "1234",
+    };
+    const listing = {
+      query: vi.fn(async () => ({ rows: [intent] })),
+      release: vi.fn(),
+    };
+    let deleteAttempts = 0;
+    const recovery = {
+      query: vi.fn(async (text: string) => {
+        if (text.includes("LEFT JOIN browser_replay_checkpoints")) {
+          return {
+            rows: [{ ...intent, current_state_path: "another/path.json" }],
+          };
+        }
+        if (text.includes("DELETE FROM")) {
+          deleteAttempts += 1;
+          return { rows: [], rowCount: deleteAttempts === 1 ? 0 : 1 };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi
+        .fn()
+        .mockResolvedValueOnce(listing)
+        .mockResolvedValueOnce(recovery),
+    };
+    const filesystem = { delete: vi.fn(async () => undefined) };
+    const inspectProcessIdentity = vi.fn(async () => "dead" as const);
+    await expect(
+      recoverBrowserCleanupIntentsBeforeSnapshot({
+        pool: pool as never,
+        filesystem: filesystem as never,
+        inspectProcessIdentity,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toEqual({
+      liveRetained: 0,
+      unknownRetained: 0,
+      deadRecovered: 1,
+      missingConverged: 0,
+    });
+    expect(filesystem.delete).toHaveBeenCalledWith(intent.state_path);
+    expect(inspectProcessIdentity).toHaveBeenCalledTimes(2);
+    expect(deleteAttempts).toBe(2);
+    expect(recovery.release).toHaveBeenCalledOnce();
+  });
+});
 
 const localConfig = {
   LOCAL_PERSISTENCE_ENABLED: true,
@@ -68,6 +132,7 @@ class FakeDatabase implements LocalRetentionDatabase {
   operationalRuns = 0;
   manifestDeleteError: Error | undefined;
   browserMarkResult = true;
+  browserControlTransactions: unknown[] = [];
 
   async listExpiredArtifactManifests(
     _now: Date,
@@ -104,14 +169,18 @@ class FakeDatabase implements LocalRetentionDatabase {
   async listExpiredBrowserStateFiles(
     _now: Date,
     limit: number,
+    controlTransaction?: unknown,
   ): Promise<ExpiredBrowserStateFile[]> {
+    this.browserControlTransactions.push(controlTransaction);
     return this.browserStateFiles.slice(0, limit);
   }
 
   async tryClaimBrowserStateFile(
     candidate: ExpiredBrowserStateFile,
     _now: Date,
+    controlTransaction?: unknown,
   ): Promise<BrowserStateFileClaim | null> {
+    this.browserControlTransactions.push(controlTransaction);
     const file = this.browserStateFiles.find(
       item => item.kind === candidate.kind && item.id === candidate.id,
     );
@@ -845,6 +914,78 @@ describe("runLocalRetentionIteration", () => {
 });
 
 describe("runLocalRetentionLoop", () => {
+  it("runs operational work while browser work waits on the startup gate", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = browserStateFiles(1);
+    const controller = new AbortController();
+    const deleted: string[] = [];
+    let releaseGate!: () => void;
+    const gateOpened = new Promise<void>(resolve => {
+      releaseGate = resolve;
+    });
+    const controlTransaction = {
+      query: vi.fn(),
+      databaseControlEpoch: 1,
+    };
+    const gate = {
+      assertOpen: vi.fn(),
+      close: vi.fn(),
+      open: vi.fn(),
+      waitUntilOpen: vi.fn(async () => {
+        await gateOpened;
+        return {};
+      }),
+      withBrowserStateMutationLease: vi.fn(async (_scope, operation) =>
+        operation({
+          epoch: 1,
+          scope: "filesystem_and_database",
+          binding: {},
+          transaction: controlTransaction,
+        }),
+      ),
+      withDrainedBrowserStateMutation: vi.fn(),
+    };
+    let sleeps = 0;
+    const loop = runLocalRetentionLoop({
+      configSource: {
+        ...localConfig,
+        LOCAL_BROWSER_SERVICE_ENABLED: true,
+        LOCAL_BROWSER_STATE_ROOT: "/tmp/firecrawl-retention-gate-test",
+        BROWSER_SERVICE_URL: "http://127.0.0.1:3002",
+        BROWSER_SERVICE_API_KEY: "x".repeat(32),
+        BROWSER_REPLAY_INGEST_URL: "http://127.0.0.1:3002",
+        BROWSER_REPLAY_INGEST_API_KEY: "r".repeat(32),
+      },
+      database,
+      artifactStore: null,
+      browserStateFilesystem: {
+        delete: async statePath => {
+          deleted.push(statePath);
+        },
+      },
+      browserStartupGate: gate as never,
+      signal: controller.signal,
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps >= 2) controller.abort();
+      },
+      logger: silentLogger,
+    });
+    await vi.waitFor(() => expect(database.operationalRuns).toBe(1));
+    expect(gate.withBrowserStateMutationLease).not.toHaveBeenCalled();
+    releaseGate();
+    await loop;
+    expect(gate.withBrowserStateMutationLease).toHaveBeenCalledWith(
+      "filesystem_and_database",
+      expect.any(Function),
+    );
+    expect(deleted).toHaveLength(1);
+    expect(database.browserControlTransactions).toEqual([
+      controlTransaction,
+      controlTransaction,
+    ]);
+  });
+
   it("does not start in hosted mode", async () => {
     const database = new FakeDatabase();
     const sleep = vi.fn();

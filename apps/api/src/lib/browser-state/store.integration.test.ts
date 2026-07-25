@@ -114,6 +114,24 @@ describeWithDatabase("durable browser state store", () => {
     };
   }
 
+  async function interruptUnfinishedBrowserWork(now: Date) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await store.interruptUnfinishedBrowserWork(now, {
+        query: client.query.bind(client),
+        databaseControlEpoch: 1,
+      });
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   beforeAll(async () => {
     await pool.query("DROP SCHEMA public CASCADE");
     await pool.query("CREATE SCHEMA public");
@@ -624,7 +642,7 @@ describeWithDatabase("durable browser state store", () => {
       [randomUUID(), "b".repeat(64), ownerId, executingFixture.session.id],
     );
 
-    const recovered = await store.interruptUnfinishedBrowserWork(
+    const recovered = await interruptUnfinishedBrowserWork(
       new Date("2026-07-20T23:00:00.000Z"),
     );
     expect(recovered).toEqual({
@@ -651,7 +669,7 @@ describeWithDatabase("durable browser state store", () => {
       ),
     ).toMatchObject({ state: "outcome_unknown" });
     expect(
-      await store.interruptUnfinishedBrowserWork(
+      await interruptUnfinishedBrowserWork(
         new Date("2026-07-20T23:01:00.000Z"),
       ),
     ).toEqual({
@@ -684,7 +702,7 @@ describeWithDatabase("durable browser state store", () => {
     `);
     try {
       await expect(
-        store.interruptUnfinishedBrowserWork(new Date()),
+        interruptUnfinishedBrowserWork(new Date()),
       ).rejects.toThrow();
     } finally {
       await pool.query(

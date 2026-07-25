@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { and, eq, sql } from "drizzle-orm";
+import type { Application } from "express";
 
 import { config } from "../../config";
 import { db } from "../../db/connection";
 import * as schema from "../../db/schema";
 import { runWithBrowserStateFilesystemContext } from "../browser-state/filesystem-store-internal";
-import { BrowserStateFilesystem } from "../browser-state/filesystem-store";
+import {
+  BrowserStateFilesystem,
+  canonicalizeBrowserStateCheckpoint,
+} from "../browser-state/filesystem-store";
+import type { BrowserStartupGate } from "../browser-runtime/startup-gate";
 import { inspectBrowserStateProcessIdentity } from "../browser-state/process-identity";
 import { logger as rootLogger } from "../logger";
 import {
@@ -16,6 +22,7 @@ import {
   type ReplayResolution,
   type StoredReplayCheckpoint,
 } from "./replay-envelope";
+import { registerReplayIngestTransportRoute } from "./replay-ingest";
 
 type JsonValue =
   | null
@@ -77,7 +84,8 @@ export interface ReplayCheckpointCaptureV1 {
   browserSettings: ReplayBrowserSettingsV1;
 }
 
-interface PersistScrapeReplayStateInput {
+/** @public */
+export interface PersistScrapeReplayStateInput {
   requestId: string;
   scrapeId: string;
   ownerId: string;
@@ -87,6 +95,12 @@ interface PersistScrapeReplayStateInput {
   zeroDataRetention: boolean;
   replayCheckpoint?: ReplayCheckpointCaptureV1;
 }
+
+/** @public */
+export type ReplayPersistenceResult = {
+  persisted: boolean;
+  reason?: "disabled" | "zdr" | "checkpoint_unavailable";
+};
 
 class ReplayOwnershipError extends Error {
   readonly category = "replay_ownership_mismatch";
@@ -106,12 +120,29 @@ class ReplayCheckpointValidationError extends Error {
   }
 }
 
+/** @public */
+export class ReplayUnavailableError extends Error {
+  readonly category = "replay_unavailable";
+
+  constructor() {
+    super("Replay checkpoint is unavailable");
+    this.name = "ReplayUnavailableError";
+  }
+}
+
 class ReplayCheckpointPreparationError extends Error {
   readonly category = "replay_checkpoint_preparation_failed";
 
   constructor() {
     super("Replay checkpoint preparation did not complete");
     this.name = "ReplayCheckpointPreparationError";
+  }
+}
+
+class ReplayCheckpointAlreadyPersisted extends Error {
+  constructor() {
+    super("Replay checkpoint is already persisted");
+    this.name = "ReplayCheckpointAlreadyPersisted";
   }
 }
 
@@ -316,13 +347,9 @@ function runtimeConfig(): {
   };
 }
 
-/** @public */
-export async function persistScrapeReplayState(
+async function persistScrapeReplayStateUnderAuthority(
   input: PersistScrapeReplayStateInput,
-): Promise<{
-  persisted: boolean;
-  reason?: "disabled" | "zdr" | "checkpoint_unavailable";
-}> {
+): Promise<ReplayPersistenceResult> {
   const runtime = runtimeConfig();
   if (!runtime.enabled) return { persisted: false, reason: "disabled" };
   if (input.zeroDataRetention) return { persisted: false, reason: "zdr" };
@@ -339,6 +366,9 @@ export async function persistScrapeReplayState(
   if (normalized.kind === "error") {
     return { persisted: false, reason: "checkpoint_unavailable" };
   }
+  const canonicalCheckpoint = canonicalizeBrowserStateCheckpoint(
+    input.replayCheckpoint.storageState,
+  );
 
   let prepared: PreparedCheckpoint | undefined;
   const filesystem = new BrowserStateFilesystem(runtime.root);
@@ -372,6 +402,82 @@ export async function persistScrapeReplayState(
           const cleanupIntentId = randomUUID();
           await db.transaction(async tx => {
             await lockScrape(tx, input.scrapeId);
+            const [existingCheckpoint] = await tx
+              .select({
+                requestId: schema.browser_replay_checkpoints.request_id,
+                ownerId: schema.browser_replay_checkpoints.owner_id,
+                envelopeVersion:
+                  schema.browser_replay_checkpoints.envelope_version,
+                statePath: schema.browser_replay_checkpoints.state_path,
+                finalUrl: schema.browser_replay_checkpoints.final_url,
+                fingerprint: schema.browser_replay_checkpoints.fingerprint,
+                checksum: schema.browser_replay_checkpoints.checksum,
+                byteSize: schema.browser_replay_checkpoints.byte_size,
+                fileDeletedAt:
+                  schema.browser_replay_checkpoints.file_deleted_at,
+                envelope: schema.browser_replay_envelopes.envelope,
+                envelopeRequestId: schema.browser_replay_envelopes.request_id,
+                envelopeOwnerId: schema.browser_replay_envelopes.owner_id,
+                envelopeVersionValue: schema.browser_replay_envelopes.version,
+                navigationPolicyVersion:
+                  schema.browser_replay_envelopes.navigation_policy_version,
+              })
+              .from(schema.browser_replay_checkpoints)
+              .innerJoin(
+                schema.browser_replay_envelopes,
+                eq(
+                  schema.browser_replay_envelopes.scrape_id,
+                  schema.browser_replay_checkpoints.scrape_id,
+                ),
+              )
+              .where(
+                eq(schema.browser_replay_checkpoints.scrape_id, input.scrapeId),
+              )
+              .limit(1);
+            if (
+              existingCheckpoint &&
+              existingCheckpoint.requestId === input.requestId &&
+              existingCheckpoint.ownerId === input.ownerId &&
+              existingCheckpoint.envelopeVersion === 1 &&
+              existingCheckpoint.envelopeRequestId === input.requestId &&
+              existingCheckpoint.envelopeOwnerId === input.ownerId &&
+              existingCheckpoint.envelopeVersionValue === 1 &&
+              existingCheckpoint.navigationPolicyVersion === 1 &&
+              existingCheckpoint.fileDeletedAt === null &&
+              existingCheckpoint.statePath !== null &&
+              existingCheckpoint.finalUrl ===
+                input.replayCheckpoint!.finalUrl &&
+              isDeepStrictEqual(
+                existingCheckpoint.fingerprint,
+                input.replayCheckpoint!.fingerprint,
+              ) &&
+              existingCheckpoint.checksum === canonicalCheckpoint.checksum &&
+              existingCheckpoint.byteSize === canonicalCheckpoint.byteSize &&
+              isDeepStrictEqual(
+                existingCheckpoint.envelope,
+                normalized.envelope,
+              )
+            ) {
+              try {
+                const existingStorageState = await filesystem.readCheckpoint(
+                  existingCheckpoint.statePath,
+                  canonicalCheckpoint.checksum,
+                );
+                if (
+                  isDeepStrictEqual(
+                    existingStorageState,
+                    input.replayCheckpoint!.storageState,
+                  )
+                ) {
+                  throw new ReplayCheckpointAlreadyPersisted();
+                }
+              } catch (error) {
+                if (error instanceof ReplayCheckpointAlreadyPersisted) {
+                  throw error;
+                }
+                // Missing or corrupt files are repaired by the normal write.
+              }
+            }
             const [ownedScrape] = await tx
               .select({ id: schema.scrapes.id })
               .from(schema.scrapes)
@@ -424,6 +530,9 @@ export async function persistScrapeReplayState(
         ),
     );
   } catch (error) {
+    if (error instanceof ReplayCheckpointAlreadyPersisted) {
+      return { persisted: true };
+    }
     if (error instanceof ReplayCheckpointValidationError) {
       return { persisted: false, reason: "checkpoint_unavailable" };
     }
@@ -620,6 +729,30 @@ export async function persistScrapeReplayState(
 }
 
 /** @public */
+export function registerReplayPersistenceAuthorityRoute(
+  app: Application,
+  deps: {
+    apiKey: string | undefined;
+    getGate: () => BrowserStartupGate | undefined;
+  },
+): void {
+  registerReplayIngestTransportRoute(app, {
+    ...deps,
+    persist: persistScrapeReplayStateUnderAuthority,
+  });
+}
+
+/** @internal Direct persistence is available only to the test runtime. */
+export function createReplayPersistenceForTesting(): (
+  input: PersistScrapeReplayStateInput,
+) => Promise<ReplayPersistenceResult> {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("Direct replay persistence is unavailable");
+  }
+  return persistScrapeReplayStateUnderAuthority;
+}
+
+/** @public */
 export async function loadScrapeReplayState(
   ownerId: string,
   scrapeId: string,
@@ -759,4 +892,28 @@ export async function loadScrapeReplayState(
     profileGenerationId: storedProfile?.generationId,
     checkpoint,
   });
+}
+
+/** @public */
+export async function loadReplayCheckpointForBrowserService(
+  ownerId: string,
+  scrapeId: string,
+  gate: BrowserStartupGate,
+): Promise<StoredReplayCheckpoint> {
+  return gate.withBrowserStateMutationLease(
+    "filesystem_and_database",
+    async lease => {
+      const resolution = await loadScrapeReplayState(ownerId, scrapeId);
+      const after = gate.assertOpen();
+      if (
+        lease.binding.databaseControlEpoch !== after.databaseControlEpoch ||
+        lease.binding.processNonce !== after.processNonce ||
+        lease.binding.controlGenerationNonce !== after.controlGenerationNonce ||
+        resolution.kind !== "checkpoint"
+      ) {
+        throw new ReplayUnavailableError();
+      }
+      return resolution.checkpoint;
+    },
+  );
 }

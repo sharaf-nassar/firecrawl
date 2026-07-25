@@ -694,7 +694,11 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         logger.warn("Failed to record monitor scrape result", { error }),
       );
 
-      if (job.data.skipNuq) {
+      const requiresReplayAuthority =
+        config.LOCAL_BROWSER_SERVICE_ENABLED === true &&
+        pipeline.replayCheckpoint !== undefined &&
+        !job.data.zeroDataRetention;
+      if (job.data.skipNuq && !requiresReplayAuthority) {
         // doesn't use GCS for result retrieval, safe to not await
         logScrapePromise.catch(err =>
           logger.warn("Background scrape log failed", { error: err }),

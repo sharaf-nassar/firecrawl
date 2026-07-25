@@ -331,6 +331,86 @@ export const browser_replay_checkpoint_cleanup_intents = pgTable(
   ],
 );
 
+/** @public Singleton cross-process browser mutation fence. */
+export const browser_control_generation = pgTable(
+  "browser_control_generation",
+  {
+    singleton_id: smallint("singleton_id").primaryKey().default(1),
+    database_control_epoch: bigintNum("database_control_epoch").notNull(),
+    api_instance_id: uuid("api_instance_id").notNull(),
+    process_nonce: text("process_nonce").notNull(),
+    control_generation_nonce: text("control_generation_nonce").notNull(),
+    activated_at: ts("activated_at").notNull().defaultNow(),
+  },
+  table => [
+    check(
+      "browser_control_generation_singleton_check",
+      sql`${table.singleton_id} = 1`,
+    ),
+    check(
+      "browser_control_generation_epoch_check",
+      sql`${table.database_control_epoch} > 0`,
+    ),
+    check(
+      "browser_control_generation_api_instance_check",
+      sql`${table.api_instance_id}::text = lower(${table.api_instance_id}::text)`,
+    ),
+    check(
+      "browser_control_generation_process_nonce_check",
+      sql`${table.process_nonce} ~ '^[A-Za-z0-9_-]{43}$'
+        AND length(decode(
+          translate(
+            ${table.process_nonce} || repeat(
+              '=',
+              (4 - length(${table.process_nonce}) % 4) % 4
+            ),
+            '-_',
+            '+/'
+          ),
+          'base64'
+        )) = 32
+        AND rtrim(translate(encode(decode(
+          translate(
+            ${table.process_nonce} || repeat(
+              '=',
+              (4 - length(${table.process_nonce}) % 4) % 4
+            ),
+            '-_',
+            '+/'
+          ),
+          'base64'
+        ), 'base64'), '+/', '-_'), '=') = ${table.process_nonce}`,
+    ),
+    check(
+      "browser_control_generation_control_nonce_check",
+      sql`${table.control_generation_nonce} ~ '^[A-Za-z0-9_-]{43}$'
+        AND length(decode(
+          translate(
+            ${table.control_generation_nonce} || repeat(
+              '=',
+              (4 - length(${table.control_generation_nonce}) % 4) % 4
+            ),
+            '-_',
+            '+/'
+          ),
+          'base64'
+        )) = 32
+        AND rtrim(translate(encode(decode(
+          translate(
+            ${table.control_generation_nonce} || repeat(
+              '=',
+              (4 - length(${table.control_generation_nonce}) % 4) % 4
+            ),
+            '-_',
+            '+/'
+          ),
+          'base64'
+        ), 'base64'), '+/', '-_'), '=') =
+          ${table.control_generation_nonce}`,
+    ),
+  ],
+);
+
 export const browser_sessions = pgTable(
   "browser_sessions",
   {

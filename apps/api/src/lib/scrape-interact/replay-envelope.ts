@@ -284,7 +284,8 @@ const locationSchema = z.strictObject({
   languages: z.array(languageTagSchema).max(32),
 });
 
-const browserSettingsSchema = z.strictObject({
+/** Canonical browser settings accepted by replay persistence. @public */
+export const replayBrowserSettingsV1Schema = z.strictObject({
   headers: headersSchema,
   cookies: z
     .array(
@@ -436,7 +437,8 @@ const optionPolicies = {
 
 const knownOptionKeys = new Set<string>(Object.keys(optionPolicies));
 
-const optionsSchema = z.strictObject({
+/** Canonical scrape options accepted by replay persistence. @public */
+export const replayScrapeOptionsSchema = z.strictObject({
   headers: headersSchema.optional(),
   waitFor: z.number().int().nonnegative().finite().max(60_000).optional(),
   mobile: z.boolean().optional(),
@@ -606,7 +608,8 @@ const indexedDBDatabaseSchema = z.strictObject({
   stores: z.array(indexedDBStoreSchema),
 });
 
-const storageStateSchema = z.strictObject({
+/** Canonical Playwright storage state accepted by replay persistence. @public */
+export const replayStorageStateV1Schema = z.strictObject({
   cookies: z.array(storageCookieSchema),
   origins: z.array(
     z.strictObject({
@@ -623,7 +626,7 @@ const checkpointSchema = z
   .strictObject({
     version: z.literal(1),
     statePath: boundedString(4_096),
-    storageState: storageStateSchema,
+    storageState: replayStorageStateV1Schema,
     finalUrl: retainedUrlSchema,
     fingerprint: z.strictObject({
       finalUrl: retainedUrlSchema,
@@ -732,7 +735,7 @@ function canonicalUrl(value: string): string | undefined {
 }
 
 function deriveBrowserSettings(
-  options: z.output<typeof optionsSchema>,
+  options: z.output<typeof replayScrapeOptionsSchema>,
 ): ReplayBrowserSettingsV1 {
   const mobile = options.mobile ?? false;
   const location = {
@@ -789,7 +792,9 @@ function effectForAction(action: ReplayAction): ReplayActionEffect {
   }
 }
 
-function aggregateWaitMs(options: z.output<typeof optionsSchema>): number {
+function aggregateWaitMs(
+  options: z.output<typeof replayScrapeOptionsSchema>,
+): number {
   return (
     (options.waitFor ?? 0) +
     (options.actions ?? []).reduce((total, action) => {
@@ -850,7 +855,7 @@ export function normalizeReplayEnvelope(
   }
 
   const parsedOptions = rawOptions
-    ? optionsSchema.safeParse(rawOptions)
+    ? replayScrapeOptionsSchema.safeParse(rawOptions)
     : undefined;
   if (parsedOptions && !parsedOptions.success) {
     unsupported.push(
@@ -875,7 +880,7 @@ export function normalizeReplayEnvelope(
 
   let browserSettings: ReplayBrowserSettingsV1 | undefined;
   if (source.browserSettings !== undefined) {
-    const parsedSettings = browserSettingsSchema.safeParse(
+    const parsedSettings = replayBrowserSettingsV1Schema.safeParse(
       source.browserSettings,
     );
     if (parsedSettings.success) {

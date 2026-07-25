@@ -56,6 +56,19 @@ function checksum(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/** Canonical storage-only representation used by replay checkpoint files. */
+export function canonicalizeBrowserStateCheckpoint(storageState: unknown): {
+  bytes: Buffer;
+  byteSize: number;
+  checksum: string;
+} {
+  const bytes = Buffer.from(stableJson(storageState), "utf8");
+  if (bytes.byteLength > CHECKPOINT_MAX_BYTES) {
+    throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
+  }
+  return { bytes, byteSize: bytes.byteLength, checksum: checksum(bytes) };
+}
+
 function validateSegment(value: string, label: string): void {
   if (!SAFE_PATH_SEGMENT.test(value)) {
     throw new BrowserStateUnavailableError(`${label} is not a safe path ID`);
@@ -360,10 +373,8 @@ export class BrowserStateFilesystem {
   ): Promise<{ pathId: string; byteSize: number; checksum: string }> {
     validateSegment(ownerId, "owner ID");
     validateSegment(scrapeId, "scrape ID");
-    const bytes = Buffer.from(stableJson(storageState), "utf8");
-    if (bytes.byteLength > CHECKPOINT_MAX_BYTES) {
-      throw new BrowserStateUnavailableError("checkpoint exceeds 2 MiB");
-    }
+    const canonical = canonicalizeBrowserStateCheckpoint(storageState);
+    const { bytes } = canonical;
     const generationId = randomUUID();
     const writerLease = randomUUID();
     const writerIdentity = await readBrowserStateProcessIdentity();
@@ -371,8 +382,8 @@ export class BrowserStateFilesystem {
     const plan = {
       generationId,
       pathId: path.posix.join("replay", ownerId, scrapeId, filename),
-      byteSize: bytes.byteLength,
-      checksum: checksum(bytes),
+      byteSize: canonical.byteSize,
+      checksum: canonical.checksum,
       writerLease,
       writerPid: writerIdentity.pid,
       writerBootId: writerIdentity.bootId,

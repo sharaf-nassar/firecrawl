@@ -1,23 +1,12 @@
 import { config } from "./config";
-import { runApplicationMigrations } from "./db/migrate";
 import { type ChildProcess, spawn } from "child_process";
 import { existsSync } from "fs";
 import * as net from "net";
 import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
-import {
-  clearLocalPersistenceExternalSettings,
-  createLocalBrowserStateStartup,
-} from "./harness-local-persistence";
+import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
 import { createSharedShutdown } from "./harness-shutdown";
-import { BrowserStateFilesystem } from "./lib/browser-state/filesystem-store";
-import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
-import { logger as applicationLogger } from "./lib/logger";
-import {
-  createLocalRetentionService,
-  runLocalRetentionLoop,
-} from "./services/local-retention-worker";
 
 const childProcesses = new Set<ChildProcess>();
 const stopping = new WeakSet<ChildProcess>(); // processes we're intentionally stopping
@@ -43,19 +32,6 @@ let applicationPostgresContainer: {
 } | null = null;
 let localPersistenceHarness = false;
 let fixtureServerPort: number | null = null;
-const localRetentionService = createLocalRetentionService(signal =>
-  runLocalRetentionLoop({ signal }),
-);
-const localBrowserStateStartup = createLocalBrowserStateStartup({
-  health: (root: string) => BrowserStateFilesystem.health(root),
-  recover: async (now: Date) => {
-    const { interruptUnfinishedBrowserWork } = await import(
-      "./lib/browser-state/store.js"
-    );
-    return await interruptUnfinishedBrowserWork(now);
-  },
-});
-
 // Get the monorepo root for both tsx source execution and compiled dist execution.
 // __dirname is available in CommonJS (which this compiles to)
 const SOURCE_MONOREPO_ROOT = join(__dirname, "..", "..", "..");
@@ -688,9 +664,6 @@ async function setupApplicationPostgres(): Promise<void> {
   await waitForApplicationPostgres(databaseUrl);
   process.env.APPLICATION_DATABASE_URL = databaseUrl;
   config.APPLICATION_DATABASE_URL = databaseUrl;
-
-  await runApplicationMigrations(config);
-  logger.success("Application database migrations applied");
 }
 
 async function buildNuqPostgresImage(runtime: string): Promise<void> {
@@ -1080,23 +1053,6 @@ async function installDependencies() {
 
 async function startServices(command?: string[]): Promise<Services> {
   await setupApplicationPostgres();
-  const recovered = await localBrowserStateStartup({
-    enabled: config.LOCAL_BROWSER_SERVICE_ENABLED,
-    root: config.LOCAL_BROWSER_STATE_ROOT,
-  });
-  if (recovered) {
-    applicationLogger.info("Recovered durable browser state", recovered);
-  }
-  const localRuntime = resolveLocalRuntimeConfig(config);
-  if (localRuntime.enabled) {
-    const retentionLoop = localRetentionService.start();
-    void retentionLoop.catch(error => {
-      logger.error("Local retention worker terminated unexpectedly", {
-        errorName: error instanceof Error ? error.name : "UnknownError",
-      });
-      serviceError = true;
-    });
-  }
 
   // Setup NUQ PostgreSQL container if needed
   const nuqPostgres = await setupNuqPostgres();
@@ -1140,6 +1096,8 @@ async function startServices(command?: string[]): Promise<Services> {
       NUQ_POD_NAME: "api",
     },
   );
+  logger.info(`Waiting for API on localhost:${PORT}`);
+  await waitForPort(Number(PORT), "localhost");
 
   const worker = execForward(
     "worker",
@@ -1222,17 +1180,6 @@ async function startServices(command?: string[]): Promise<Services> {
         },
       )
     : undefined;
-
-  // tests hammer the API instantly, so we need to ensure it's running before launching tests
-  if (
-    command &&
-    Array.isArray(command) &&
-    command[0] === "pnpm" &&
-    command[1].startsWith("test:snips")
-  ) {
-    logger.info(`Waiting for API on localhost:${PORT}`);
-    await waitForPort(Number(PORT), "localhost");
-  }
 
   const commandProcess =
     command && !command?.[0].startsWith("--")
@@ -1445,14 +1392,6 @@ const gracefulShutdown = createSharedShutdown(async () => {
   restartSignal?.abort();
 
   logger.section("Shutting down");
-  try {
-    await localRetentionService.stop();
-  } catch (error) {
-    logger.error("Local retention worker shutdown failed", {
-      errorName: error instanceof Error ? error.name : "UnknownError",
-    });
-    serviceError = true;
-  }
   const forceTerminate = IS_DEV;
   const terminationPromises = Array.from(childProcesses).map(proc =>
     terminateProcess(proc, forceTerminate),

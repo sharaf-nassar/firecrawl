@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { Client } from "pg";
+import { Client, type QueryResult, type QueryResultRow } from "pg";
 
 import { config } from "../config";
 import {
@@ -16,6 +16,7 @@ const migrationFilenamePattern = /^\d{4}_.+\.sql$/;
 
 export type ApplicationMigrationDependencies = {
   migrationsDirectory?: string;
+  timeoutMs?: number;
 };
 
 export class ApplicationMigrationError extends Error {
@@ -82,34 +83,73 @@ export async function runApplicationMigrations(
 
   const migrationsDirectory =
     dependencies.migrationsDirectory ?? defaultMigrationsDirectory();
+  const timeoutMs = dependencies.timeoutMs;
+  const deadlineMs =
+    timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
   const client = new Client({
     connectionString: localConfig.applicationDatabaseUrl,
     application_name: "firecrawl-application-migrations",
+    ...(timeoutMs === undefined
+      ? {}
+      : {
+          connectionTimeoutMillis: timeoutMs,
+          statement_timeout: timeoutMs,
+          query_timeout: timeoutMs,
+          lock_timeout: timeoutMs,
+          idle_in_transaction_session_timeout: timeoutMs,
+        }),
   });
   let connected = false;
   let lockAcquired = false;
   let operationError: unknown;
+  const remainingMs = (): number | undefined => {
+    if (deadlineMs === undefined) return undefined;
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) {
+      throw new Error("Application migration deadline exceeded");
+    }
+    return remaining;
+  };
+  const query = async <Row extends QueryResultRow = never>(
+    text: string,
+    values?: any[],
+  ): Promise<QueryResult<Row>> => {
+    const remaining = remainingMs();
+    if (remaining === undefined) return client.query<Row>(text, values);
+    await client.query({
+      text: `SELECT set_config('statement_timeout', $1, false),
+                    set_config('lock_timeout', $1, false)`,
+      values: [`${remaining}ms`],
+      query_timeout: remaining,
+    } as any);
+    const afterConfiguration = remainingMs()!;
+    return client.query<Row>({
+      text,
+      values,
+      query_timeout: afterConfiguration,
+    } as any);
+  };
 
   try {
     await client.connect();
     connected = true;
-    await client.query("SELECT pg_advisory_lock($1, $2)", advisoryLockKeys);
+    await query("SELECT pg_advisory_lock($1, $2)", advisoryLockKeys);
     lockAcquired = true;
 
-    await client.query(`
+    await query(`
       CREATE TABLE IF NOT EXISTS application_schema_migrations (
         filename text PRIMARY KEY,
         checksum text NOT NULL,
         applied_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await client.query(`
+    await query(`
       ALTER TABLE application_schema_migrations
       ADD COLUMN IF NOT EXISTS checksum text
     `);
 
     const filenames = await migrationFilenames(migrationsDirectory);
-    const appliedResult = await client.query<{
+    const appliedResult = await query<{
       filename: string;
       checksum: string | null;
     }>(
@@ -158,18 +198,25 @@ export async function runApplicationMigrations(
         continue;
       }
 
-      await client.query("BEGIN");
+      await query("BEGIN");
       try {
-        await client.query(file.toString("utf8"));
-        await client.query(
+        await query(file.toString("utf8"));
+        await query(
           `INSERT INTO application_schema_migrations(filename, checksum)
            VALUES ($1, $2)`,
           [filename, checksum],
         );
-        await client.query("COMMIT");
+        await query("COMMIT");
       } catch (error) {
         try {
-          await client.query("ROLLBACK");
+          const rollbackQuery =
+            deadlineMs === undefined
+              ? "ROLLBACK"
+              : {
+                  text: "ROLLBACK",
+                  query_timeout: Math.max(1, deadlineMs - Date.now()),
+                };
+          await client.query(rollbackQuery as any);
         } catch (rollbackError) {
           throw new ApplicationMigrationError(
             filename,
@@ -181,7 +228,7 @@ export async function runApplicationMigrations(
       }
     }
 
-    await client.query(
+    await query(
       `INSERT INTO local_owners(id, label)
        VALUES ($1, 'local')
        ON CONFLICT DO NOTHING`,
