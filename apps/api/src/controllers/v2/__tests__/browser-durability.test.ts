@@ -39,7 +39,7 @@ vi.mock("../../../lib/browser-sessions", () => ({
 vi.mock("../../../lib/browser-session-activity", () => ({
   enqueueBrowserSessionActivity: mocks.enqueueBrowserSessionActivity,
 }));
-vi.mock("../../../lib/scrape-interact/browser-service-client", () => ({
+vi.mock("../../../lib/scrape-interact/legacy-browser-service-client", () => ({
   browserServiceRequest: mocks.browserServiceRequest,
   BrowserServiceError: class BrowserServiceError extends Error {},
 }));

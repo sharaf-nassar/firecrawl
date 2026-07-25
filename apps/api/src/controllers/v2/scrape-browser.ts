@@ -29,7 +29,7 @@ import {
   BrowserServiceExecResponse,
   BrowserServiceCreateResponse,
   BrowserServiceDeleteResponse,
-} from "../../lib/scrape-interact/browser-service-client";
+} from "../../lib/scrape-interact/legacy-browser-service-client";
 import {
   ScrapeContextRow,
   buildReplayContextFromScrape,

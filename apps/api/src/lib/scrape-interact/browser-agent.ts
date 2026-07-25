@@ -7,7 +7,7 @@ import { getModel } from "../generic-ai";
 import {
   browserServiceRequest,
   BrowserServiceExecResponse,
-} from "./browser-service-client";
+} from "./legacy-browser-service-client";
 import { config } from "../../config";
 import {
   generateText,
