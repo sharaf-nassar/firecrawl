@@ -871,17 +871,28 @@ class AnchoredRoot {
   }
 
   async close(): Promise<void> {
-    await closeAll(
-      [...this.components]
-        .reverse()
-        .map(
+    const components = [...this.components].reverse();
+    try {
+      await closeAll(
+        components.map(
           (component, index) =>
             [
               component.handle,
               index === 0 ? "root" : `root-chain-${index}`,
             ] as const,
         ),
-    );
+      );
+    } catch (error) {
+      try {
+        await closeAllDirect(components.map(component => component.handle));
+      } catch (fallbackError) {
+        throw new AggregateError(
+          [error, fallbackError],
+          "root descriptor cleanup failed",
+        );
+      }
+      throw error;
+    }
   }
 
   async openDirectory(relative: string): Promise<FileHandle> {
@@ -23588,76 +23599,79 @@ export async function closeAtomicEffectController(
   ) {
     throw atomicFailure("atomic publication controller is not closable");
   }
-  flight.state = "closing";
-  const owned = [...flight.records]
-    .filter((record) => record.owned)
-    .sort(
-      (left, right) =>
-        atomicRecordDepth(flight, right) - atomicRecordDepth(flight, left),
-    );
-  const failures: unknown[] = [];
-  for (const retained of flight.transientHandles) {
-    try {
-      await atomicVerifiedClose(
-        flight,
-        [retained.parent],
-        retained.point,
-        () => retained.handle.close(),
-        () => {
-          flight.transientHandles.delete(retained);
-        },
+  try {
+    flight.state = "closing";
+    const owned = [...flight.records]
+      .filter((record) => record.owned)
+      .sort(
+        (left, right) =>
+          atomicRecordDepth(flight, right) - atomicRecordDepth(flight, left),
       );
-    } catch (error) {
-      failures.push(error);
+    const failures: unknown[] = [];
+    for (const retained of flight.transientHandles) {
+      try {
+        await atomicVerifiedClose(
+          flight,
+          [retained.parent],
+          retained.point,
+          () => retained.handle.close(),
+          () => {
+            flight.transientHandles.delete(retained);
+          },
+        );
+      } catch (error) {
+        failures.push(error);
+      }
     }
-  }
-  for (const partial of flight.livePartials) {
-    if (partial.handle === null) continue;
-    try {
-      const parent = resolveAtomicRecord(flight, partial.parentId);
-      const handle = partial.handle;
-      await atomicVerifiedClose(
-        flight,
-        [parent],
-        "atomic-controller-partial-close",
-        () => handle.close(),
-        () => {
-          partial.handle = null;
-        },
-      );
-    } catch (error) {
-      failures.push(error);
+    for (const partial of flight.livePartials) {
+      if (partial.handle === null) continue;
+      try {
+        const parent = resolveAtomicRecord(flight, partial.parentId);
+        const handle = partial.handle;
+        await atomicVerifiedClose(
+          flight,
+          [parent],
+          "atomic-controller-partial-close",
+          () => handle.close(),
+          () => {
+            partial.handle = null;
+          },
+        );
+      } catch (error) {
+        failures.push(error);
+      }
     }
-  }
-  for (const record of owned) {
-    try {
-      const parent =
-        record.parentId === null
-          ? null
-          : resolveAtomicRecord(flight, record.parentId);
-      await atomicVerifiedClose(
-        flight,
-        parent === null ? [] : [parent],
-        "atomic-controller-close",
-        () => record.handle.close(),
-        () => {
-          flight.records.delete(record);
-        },
-      );
-    } catch (error) {
-      failures.push(error);
+    for (const record of owned) {
+      try {
+        const parent =
+          record.parentId === null
+            ? null
+            : resolveAtomicRecord(flight, record.parentId);
+        await atomicVerifiedClose(
+          flight,
+          parent === null ? [] : [parent],
+          "atomic-controller-close",
+          () => record.handle.close(),
+          () => {
+            flight.records.delete(record);
+          },
+        );
+      } catch (error) {
+        failures.push(error);
+      }
     }
+    if (failures.length !== 0) {
+      flight.state = "fail_stopped";
+      flight.root.acceptingOperations = false;
+      throw atomicFailure("atomic publication close is unverified");
+    }
+    flight.records.clear();
+    flight.livePartials.clear();
+    flight.state = "closed";
+    atomicEffectFlightRecords.delete(controller as object);
+  } finally {
+    flight.releaseRootOperation();
   }
-  if (failures.length !== 0) {
-    flight.state = "fail_stopped";
-    flight.root.acceptingOperations = false;
-    throw atomicFailure("atomic publication close is unverified");
-  }
-  flight.records.clear();
-  flight.livePartials.clear();
-  flight.state = "closed";
-  atomicEffectFlightRecords.delete(controller as object);
-  flight.releaseRootOperation();
 }
 
 export function atomicHeldProfileHashImplementationIdentityForTest(): string {

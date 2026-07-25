@@ -3081,6 +3081,7 @@ describe("filesystem reconciliation", () => {
       callbackFailure,
       closeFailure,
     ]);
+    expect(await rootDescriptors(canonicalRoot)).toEqual([]);
     expect(maximumActiveCloses).toBe(1);
     expect(closePoints[0]).toBe("root");
     expect(closePoints.slice(1)).toEqual(
