@@ -140,6 +140,33 @@ export const configSchema = z.object({
   LOCAL_BROWSER_STATE_ROOT: emptyStringAsDefault(
     z.string().default("/var/lib/firecrawl-browser"),
   ),
+  BROWSER_SERVICE_URL: emptyStringAsUndefined(z.string()),
+  BROWSER_SERVICE_API_KEY: emptyStringAsUndefined(z.string()),
+  BROWSER_SERVICE_REQUEST_TIMEOUT_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(100).max(60_000).default(30_000),
+  ),
+  BROWSER_RECONCILIATION_TIMEOUT_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(5_000).max(60_000).default(60_000),
+  ),
+  BROWSER_RECONCILIATION_MAX_ATTEMPTS: emptyStringAsDefault(
+    z.coerce.number().int().min(1).max(8).default(4),
+  ),
+  BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(100).max(5_000).default(250),
+  ),
+  BROWSER_RECONCILIATION_MAX_BACKOFF_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(100).max(10_000).default(2_000),
+  ),
+  BROWSER_RECONCILIATION_STARTUP_BUDGET_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(5_000).max(60_000).default(60_000),
+  ),
+  BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(1_000).max(60_000).default(5_000),
+  ),
+  BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(5_000).max(300_000).default(30_000),
+  ),
+  BROWSER_ADAPTER_TOKEN_FILE: emptyStringAsUndefined(z.string()),
   APPLICATION_DATABASE_URL: emptyStringAsUndefined(z.string().url()),
   LOCAL_OWNER_ID: emptyStringAsUndefined(z.string().uuid()),
   ARTIFACT_STORE_PROVIDER: emptyStringAsDefault(
@@ -339,9 +366,7 @@ export const configSchema = z.object({
   WIKIPEDIA_ENTERPRISE_USERNAME: z.string().optional(),
   WIKIPEDIA_ENTERPRISE_PASSWORD: z.string().optional(),
 
-  // Browser Service
-  BROWSER_SERVICE_URL: z.string().optional(),
-  BROWSER_SERVICE_API_KEY: z.string().optional(),
+  // Legacy hosted Browser Service callbacks
   BROWSER_SERVICE_WEBHOOK_SECRET: z.string().optional(),
 
   // Audio (avgrab)

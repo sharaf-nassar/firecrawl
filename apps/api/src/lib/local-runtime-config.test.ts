@@ -23,6 +23,14 @@ const validLocalSettings: LocalRuntimeConfigSource = {
   USE_DB_AUTHENTICATION: false,
 };
 
+const enabledBrowserSettings: LocalRuntimeConfigSource = {
+  ...validLocalSettings,
+  LOCAL_BROWSER_SERVICE_ENABLED: true,
+  LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser",
+  BROWSER_SERVICE_URL: "http://browser-service:3010",
+  BROWSER_SERVICE_API_KEY: "s".repeat(32),
+};
+
 describe("resolveLocalRuntimeConfig", () => {
   it("leaves persistence disabled without local settings", () => {
     expect(resolveLocalRuntimeConfig({})).toEqual({ enabled: false });
@@ -46,7 +54,15 @@ describe("resolveLocalRuntimeConfig", () => {
     ).toThrowError(/LOCAL_PERSISTENCE_ENABLED/);
   });
 
-  it.each(["relative/browser-state", "/"])(
+  it.each([
+    "relative/browser-state",
+    "/",
+    "/var/lib/firecrawl-browser/",
+    "/var/lib//firecrawl-browser",
+    "/var/lib/./firecrawl-browser",
+    "/var/lib/state/../firecrawl-browser",
+    "//var/lib/firecrawl-browser",
+  ])(
     "rejects browser state root %s when the browser service is enabled",
     browserStateRoot => {
       expect(() =>
@@ -60,13 +76,116 @@ describe("resolveLocalRuntimeConfig", () => {
   );
 
   it("accepts an absolute non-root browser state root when enabled", () => {
+    expect(resolveLocalRuntimeConfig(enabledBrowserSettings)).toMatchObject({
+      enabled: true,
+      browserServiceEnabled: true,
+      browserStateRoot: "/var/lib/firecrawl-browser",
+    });
+  });
+
+  it("requires private URL and key when enabled", () => {
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_URL: undefined,
+        BROWSER_SERVICE_API_KEY: undefined,
+      }),
+    ).toThrow(/BROWSER_SERVICE_URL.*BROWSER_SERVICE_API_KEY/s);
+  });
+
+  it.each([
+    "https://browser-service:3010",
+    "http://example.com:3010",
+    "http://user:pass@browser-service:3010",
+    "http://browser-service:3010/private",
+  ])("rejects non-private browser service URL %s", browserServiceUrl => {
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_URL: browserServiceUrl,
+      }),
+    ).toThrow(/BROWSER_SERVICE_URL/);
+  });
+
+  it("requires a 32-byte browser service key", () => {
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_API_KEY: "short",
+      }),
+    ).toThrow(/BROWSER_SERVICE_API_KEY/);
+  });
+
+  it("accepts exactly 32..4089 UTF-8 browser key bytes", () => {
     expect(
       resolveLocalRuntimeConfig({
-        ...validLocalSettings,
-        LOCAL_BROWSER_SERVICE_ENABLED: true,
-        LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser",
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_API_KEY: "é".repeat(16),
       }),
-    ).toMatchObject({ enabled: true });
+    ).toMatchObject({ browserServiceEnabled: true });
+    expect(
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_API_KEY: "x".repeat(4_089),
+      }),
+    ).toMatchObject({ browserServiceEnabled: true });
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_API_KEY: "x".repeat(4_090),
+      }),
+    ).toThrow(/BROWSER_SERVICE_API_KEY/);
+  });
+
+  it("locks bounded reconciliation retry defaults", () => {
+    expect(resolveLocalRuntimeConfig(enabledBrowserSettings)).toMatchObject({
+      browserServiceRequestTimeoutMs: 30_000,
+      browserReconciliationTimeoutMs: 60_000,
+      browserReconciliationMaxAttempts: 4,
+      browserReconciliationInitialBackoffMs: 250,
+      browserReconciliationMaxBackoffMs: 2_000,
+      browserReconciliationStartupBudgetMs: 60_000,
+      browserReconciliationMonitorIntervalMs: 5_000,
+      browserReconciliationRetryCooldownMs: 30_000,
+    });
+  });
+
+  it.each([
+    { BROWSER_RECONCILIATION_MAX_ATTEMPTS: "0" },
+    { BROWSER_RECONCILIATION_MAX_ATTEMPTS: "1.5" },
+    { BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS: "-1" },
+    {
+      BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS: "2000",
+      BROWSER_RECONCILIATION_MAX_BACKOFF_MS: "1000",
+    },
+    { BROWSER_RECONCILIATION_MAX_BACKOFF_MS: "10001" },
+    { BROWSER_RECONCILIATION_STARTUP_BUDGET_MS: "60001" },
+    { BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS: "999" },
+    { BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS: "300001" },
+  ])("rejects unbounded reconciliation setting %#", overrides => {
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        ...overrides,
+      }),
+    ).toThrow(/BROWSER_RECONCILIATION_/);
+  });
+
+  it("requires an absolute adapter token file when configured", () => {
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_ADAPTER_TOKEN_FILE: "adapter.token",
+      }),
+    ).toThrow(/BROWSER_ADAPTER_TOKEN_FILE/);
+    expect(
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_ADAPTER_TOKEN_FILE: "/run/secrets/browser-adapter-token",
+      }),
+    ).toMatchObject({
+      browserAdapterTokenFile: "/run/secrets/browser-adapter-token",
+    });
   });
 
   it("requires an application database URL when enabled", () => {
@@ -201,6 +320,9 @@ describe("configSchema browser settings", () => {
     expect(configSchema.parse({})).toMatchObject({
       LOCAL_BROWSER_SERVICE_ENABLED: false,
       LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser",
+      BROWSER_SERVICE_REQUEST_TIMEOUT_MS: 30_000,
+      BROWSER_RECONCILIATION_TIMEOUT_MS: 60_000,
+      BROWSER_RECONCILIATION_MAX_ATTEMPTS: 4,
     });
   });
 
