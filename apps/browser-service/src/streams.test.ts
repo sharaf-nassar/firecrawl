@@ -295,12 +295,12 @@ describe("relay grant authority", () => {
         async () => new FakeSocket() as unknown as WebSocket,
       ),
     ).rejects.toMatchObject({ category: "unauthorized" });
-    expect(
+    await expect(
       h.manager.revoke(IDS[0], {
         version: 1,
         grantId: grant.grantId,
       }),
-    ).toEqual({ version: 1, grantId: IDS[1], revoked: true });
+    ).resolves.toEqual({ version: 1, grantId: IDS[1], revoked: true });
     await expect(
       h.manager.open(
         {
@@ -312,6 +312,69 @@ describe("relay grant authority", () => {
         async () => new FakeSocket() as unknown as WebSocket,
       ),
     ).rejects.toMatchObject({ category: "unauthorized" });
+  });
+
+  test("revocation is idempotent and acknowledges writer release", async () => {
+    const h = harness();
+    const grant = h.manager.create(IDS[0], grantInput("cdp"));
+    let releaseWriter!: () => void;
+    const writerRelease = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    let writerExited = false;
+    h.withRuntime.mockImplementationOnce(
+      async (_runtimeSessionId, _mode, operation) => {
+        try {
+          return await operation(
+            Object.freeze({}) as SessionRuntimeLease,
+          );
+        } finally {
+          await writerRelease;
+          writerExited = true;
+        }
+      },
+    );
+    const socket = new FakeSocket();
+    const opened = h.manager.open(
+      {
+        runtimeSessionId: IDS[0],
+        permission: "cdp",
+        relayToken: grant.relayToken,
+        authority: authority(),
+      },
+      async () => socket as unknown as WebSocket,
+    );
+    await settle();
+
+    let acknowledged = false;
+    const revoked = h.manager
+      .revoke(IDS[0], { version: 1, grantId: grant.grantId })
+      .then(result => {
+        acknowledged = true;
+        return result;
+      });
+    await settle();
+    expect(acknowledged).toBe(false);
+    expect(writerExited).toBe(false);
+
+    releaseWriter();
+    await expect(revoked).resolves.toEqual({
+      version: 1,
+      grantId: grant.grantId,
+      revoked: true,
+    });
+    await opened;
+    expect(writerExited).toBe(true);
+    await expect(
+      h.manager.revoke(IDS[0], {
+        version: 1,
+        grantId: "33333333-3333-4333-8333-333333333333",
+      }),
+    ).resolves.toEqual({
+      version: 1,
+      grantId: "33333333-3333-4333-8333-333333333333",
+      revoked: true,
+    });
   });
 
   test("expires unused grants without allowing a late redemption", async () => {
@@ -582,7 +645,10 @@ describe("live streams", () => {
       if (mode === "socket") {
         socket.close();
       } else if (mode === "revoke") {
-        h.manager.revoke(IDS[0], { version: 1, grantId: grant.grantId });
+        await h.manager.revoke(IDS[0], {
+          version: 1,
+          grantId: grant.grantId,
+        });
       } else if (mode === "expiry") {
         h.advanceNow(30_001);
         expect(h.manager.sweepExpired()).toBe(1);
@@ -675,8 +741,12 @@ describe("live streams", () => {
         }),
       );
       let drained: Promise<void> | undefined;
+      let revoked: Promise<unknown> | undefined;
       if (mode === "revoke") {
-        h.manager.revoke(IDS[0], { version: 1, grantId: grant.grantId });
+        revoked = h.manager.revoke(IDS[0], {
+          version: 1,
+          grantId: grant.grantId,
+        });
       } else if (mode === "expiry") {
         h.advanceNow(30_001);
         expect(h.manager.sweepExpired()).toBe(1);
@@ -687,6 +757,7 @@ describe("live streams", () => {
       await expect(opened).rejects.toMatchObject({
         category: "browser_unavailable",
       });
+      await revoked;
       await drained;
       expect(h.runtimeApi.closeCdp).toHaveBeenCalledOnce();
     },
@@ -713,8 +784,12 @@ describe("live streams", () => {
       );
       await vi.waitFor(() => expect(h.runtimeApi.openCdp).toHaveBeenCalledOnce());
       let drained: Promise<void> | undefined;
+      let revoked: Promise<unknown> | undefined;
       if (mode === "revoke") {
-        h.manager.revoke(IDS[0], { version: 1, grantId: grant.grantId });
+        revoked = h.manager.revoke(IDS[0], {
+          version: 1,
+          grantId: grant.grantId,
+        });
       } else if (mode === "expiry") {
         h.advanceNow(30_001);
         expect(h.manager.sweepExpired()).toBe(1);
@@ -725,6 +800,7 @@ describe("live streams", () => {
       await expect(opened).rejects.toMatchObject({
         category: "browser_unavailable",
       });
+      await revoked;
       await drained;
       expect(h.runtimeApi.closeCdp).not.toHaveBeenCalled();
     },
@@ -803,11 +879,15 @@ describe("live streams", () => {
         },
       });
       await settle();
-      h.manager.revoke(IDS[0], { version: 1, grantId: grant.grantId });
+      const revoked = h.manager.revoke(IDS[0], {
+        version: 1,
+        grantId: grant.grantId,
+      });
 
       await expect(opened).rejects.toMatchObject({
         category: "browser_unavailable",
       });
+      await revoked;
       expect(h.runtimeApi.closeCdp).toHaveBeenCalledOnce();
     },
   );
@@ -1108,7 +1188,10 @@ test.each(["revoke", "expiry"] as const)(
     );
     await settle();
     if (mode === "revoke") {
-      h.manager.revoke(IDS[0], { version: 1, grantId: grant.grantId });
+      await h.manager.revoke(IDS[0], {
+        version: 1,
+        grantId: grant.grantId,
+      });
     } else {
       h.advanceNow(30_001);
       expect(h.manager.sweepExpired()).toBe(1);
@@ -1322,11 +1405,12 @@ describe("real ws no-server upgrade boundary", () => {
         const closed = new Promise<number>((resolve) => {
           real.client.once("close", code => resolve(code));
         });
-        real.h.manager.revoke(IDS[0], {
+        const revoked = real.h.manager.revoke(IDS[0], {
           version: 1,
           grantId: IDS[1],
         });
         await expect(closed).resolves.toBe(1006);
+        await revoked;
         expect(terminate).toHaveBeenCalledOnce();
         await real.opened();
       } finally {

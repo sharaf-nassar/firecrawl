@@ -64,12 +64,14 @@ import {
   runLocalRetentionLoop,
   type LocalRetentionService,
 } from "./services/local-retention-worker";
+import { registerInternalRoutes } from "./routes/internal";
 
 type LocalBrowserRuntime = {
   pool: Pool;
   gate: BrowserStartupGate;
   coordinator: BrowserReconciliationCoordinator;
   handoff: BrowserControlGenerationHandoff;
+  browserClient: BrowserServiceClient;
 };
 
 let localBrowserRuntime: LocalBrowserRuntime | undefined;
@@ -93,7 +95,9 @@ cacheableLookup.install(https.globalAgent);
 
 // Initialize Express with WebSocket support
 const expressApp = express();
-const ws = expressWs(expressApp);
+const ws = expressWs(expressApp, undefined, {
+  wsOptions: { maxPayload: 256 * 1024 },
+});
 const app = ws.app;
 
 global.isProduction = config.IS_PRODUCTION;
@@ -103,6 +107,16 @@ setSentryServiceTag("api");
 registerReplayPersistenceAuthorityRoute(app, {
   apiKey: config.BROWSER_REPLAY_INGEST_API_KEY,
   getGate: () => localBrowserRuntime?.gate,
+});
+registerInternalRoutes(app, {
+  adapterTokenFile: config.BROWSER_ADAPTER_TOKEN_FILE,
+  getRuntime: () =>
+    localBrowserRuntime
+      ? {
+          gate: localBrowserRuntime.gate,
+          browserClient: localBrowserRuntime.browserClient,
+        }
+      : undefined,
 });
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json({ limit: "10mb" }));
@@ -225,7 +239,13 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
   });
   try {
     const handoff = await coordinator.acquireControlGeneration();
-    localBrowserRuntime = { pool, gate, coordinator, handoff };
+    localBrowserRuntime = {
+      pool,
+      gate,
+      coordinator,
+      handoff,
+      browserClient: serviceClient,
+    };
     return handoff;
   } catch (error) {
     await coordinator.stop().catch(() => undefined);

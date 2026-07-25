@@ -427,7 +427,10 @@ export type RelayGrantInventory = Readonly<{
 
 export type RelayGrantManager = Readonly<{
   create(runtimeSessionId: string, input: unknown): RelayGrantV1;
-  revoke(runtimeSessionId: string, input: unknown): RevokedRelayGrantV1;
+  revoke(
+    runtimeSessionId: string,
+    input: unknown,
+  ): Promise<RevokedRelayGrantV1>;
   open(
     input: unknown,
     upgrade: () => Promise<WebSocket>,
@@ -1432,15 +1435,19 @@ export function createRelayGrantManager(options: {
       });
     },
 
-    revoke(runtimeSessionId, input) {
+    async revoke(runtimeSessionId, input) {
       canonicalUuidSchema.parse(runtimeSessionId);
       const request = revokeRelayGrantV1Schema.parse(input);
       const record = grantsById.get(request.grantId);
-      if (
-        record === undefined ||
-        record.runtimeSessionId !== runtimeSessionId
-      ) {
+      if (record !== undefined && record.runtimeSessionId !== runtimeSessionId) {
         throw invalidRequest("relay grant is unavailable");
+      }
+      if (record === undefined) {
+        return revokedRelayGrantV1Schema.parse({
+          version: 1,
+          grantId: request.grantId,
+          revoked: true,
+        });
       }
       grantsByHash.delete(record.tokenHash.toString("hex"));
       if (record.state !== "consumed") record.state = "revoked";
@@ -1451,7 +1458,24 @@ export function createRelayGrantManager(options: {
           "relay grant revoked",
         );
       }
-      record.active?.abort.abort();
+      const active = record.active;
+      active?.abort.abort();
+      if (active !== undefined) {
+        const releaseTimeoutMs =
+          STREAM_LIMITS.closeTimeoutMs + cleanupTimeoutMs + 250;
+        let timer: NodeJS.Timeout | undefined;
+        const outcome = await Promise.race([
+          active.done.then(() => "released" as const),
+          new Promise<"timeout">((resolve) => {
+            timer = setTimeout(resolve, releaseTimeoutMs, "timeout");
+            timer.unref();
+          }),
+        ]);
+        if (timer !== undefined) clearTimeout(timer);
+        if (outcome === "timeout") {
+          throw browserUnavailable("relay writer release is unverified");
+        }
+      }
       return revokedRelayGrantV1Schema.parse({
         version: 1,
         grantId: request.grantId,

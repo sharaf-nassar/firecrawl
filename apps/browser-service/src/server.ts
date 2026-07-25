@@ -642,7 +642,7 @@ export function createBrowserServiceServer(
     }
     for (const grantId of grantIdsBySession.get(runtimeSessionId) ?? []) {
       try {
-        context.runtime.grants.revoke(runtimeSessionId, {
+        await context.runtime.grants.revoke(runtimeSessionId, {
           version: 1,
           grantId,
         });
@@ -914,7 +914,7 @@ export function createBrowserServiceServer(
       input.reason,
     );
     for (const grantId of grantIdsBySession.get(runtimeSessionId) ?? []) {
-      context.runtime.grants.revoke(runtimeSessionId, {
+      await context.runtime.grants.revoke(runtimeSessionId, {
         version: 1,
         grantId,
       });
@@ -1030,7 +1030,7 @@ export function createBrowserServiceServer(
     const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
     const input = revokeRelayGrantV1Schema.parse(body.value);
     ensureRepeatedId(grantId, input.grantId, "grant ID");
-    const result = context.runtime.grants.revoke(runtimeSessionId, input);
+    const result = await context.runtime.grants.revoke(runtimeSessionId, input);
     grantIdsBySession.get(runtimeSessionId)?.delete(grantId);
     writeJson(response, 200, revokedRelayGrantV1Schema, result);
   }));

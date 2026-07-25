@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -37,7 +37,6 @@ import type {
   PreparedProfileGeneration,
 } from "../browser-runtime/orchestrator";
 import {
-  browserOperationSchema,
   codeRunResultSchema,
   promptRunResultSchema,
   runtimeUuidSchema,
@@ -45,8 +44,11 @@ import {
   type PromptRunResult,
 } from "../browser-runtime/protocol";
 import {
+  normalizeBrowserAction,
+  submitBrowserActionV1Schema,
+} from "../browser-runtime/action-normalization";
+import {
   browserOperationResultSchema,
-  canonicalUuidSchema,
   httpUrlSchema,
 } from "../scrape-interact/browser-service-contracts";
 
@@ -140,16 +142,6 @@ export class ActionLimitExceededError extends BrowserStateError {
 }
 
 const boundedString = (maximum: number) => z.string().max(maximum);
-const submitBrowserActionSchema = z.strictObject({
-  version: z.literal(1),
-  adapterJobId: runtimeUuidSchema,
-  sequence: z.number().int(),
-  actionId: runtimeUuidSchema,
-  proposalHash: z.string().regex(/^[a-f0-9]{64}$/),
-  effect: z.enum(["read_only", "side_effecting"]),
-  operation: browserOperationSchema,
-});
-
 const pageStateSchema = z.strictObject({
   url: httpUrlSchema,
   title: boundedString(4_096),
@@ -187,55 +179,8 @@ const completionSchema = z
     }
   });
 
-const readOnlyOperations = new Set(["snapshot", "wait", "get_text", "get_url"]);
-
-function canonicalJson(
-  value: unknown,
-  seen = new WeakSet<object>(),
-  depth = 0,
-): string {
-  if (depth > 32) throw new TypeError("JSON value exceeds structural bounds");
-  if (Array.isArray(value)) {
-    if (seen.has(value)) throw new TypeError("cyclic JSON is forbidden");
-    seen.add(value);
-    try {
-      return `[${value
-        .map(item => canonicalJson(item, seen, depth + 1))
-        .join(",")}]`;
-    } finally {
-      seen.delete(value);
-    }
-  }
-  if (value !== null && typeof value === "object") {
-    if (seen.has(value)) throw new TypeError("cyclic JSON is forbidden");
-    seen.add(value);
-    try {
-      const entries = Object.entries(value).sort(([left], [right]) =>
-        left < right ? -1 : left > right ? 1 : 0,
-      );
-      return `{${entries
-        .map(
-          ([key, item]) =>
-            `${JSON.stringify(key)}:${canonicalJson(item, seen, depth + 1)}`,
-        )
-        .join(",")}}`;
-    } finally {
-      seen.delete(value);
-    }
-  }
-  const encoded = JSON.stringify(value);
-  if (encoded === undefined) throw new TypeError("value is not JSON-safe");
-  return encoded;
-}
-
 function utf8Bytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-function canonicalProposalHash(operation: unknown): string {
-  return createHash("sha256")
-    .update(canonicalJson(operation), "utf8")
-    .digest("hex");
 }
 
 function asSession(row: typeof schema.browser_sessions.$inferSelect) {
@@ -414,22 +359,22 @@ export interface CompleteBrowserActionInput {
   page: BoundedPageState;
 }
 
-/** @public */
-export async function prepareBrowserAction(
+async function prepareBrowserAction(
   runId: string,
   untrustedRequest: SubmitBrowserActionV1,
 ): Promise<PrepareBrowserActionResult> {
-  const request = submitBrowserActionSchema.parse(untrustedRequest);
-  if (request.sequence < 1 || request.sequence > ACTION_LIMIT) {
+  if (
+    Number.isInteger(untrustedRequest.sequence) &&
+    (untrustedRequest.sequence < 1 || untrustedRequest.sequence > ACTION_LIMIT)
+  ) {
     throw new ActionLimitExceededError();
   }
+  const request = submitBrowserActionV1Schema.parse(untrustedRequest);
   if (utf8Bytes(request.operation) > OPERATION_LIMIT_BYTES) {
     throw new Error("Browser operation exceeds 32 KiB");
   }
-  const expectedEffect = readOnlyOperations.has(request.operation.kind)
-    ? "read_only"
-    : "side_effecting";
-  if (request.effect !== expectedEffect) {
+  const normalized = normalizeBrowserAction(request.operation);
+  if (request.effect !== normalized.effect) {
     throw new Error("Browser operation effect does not match its operation");
   }
 
@@ -518,7 +463,7 @@ export async function prepareBrowserAction(
       };
     }
 
-    if (canonicalProposalHash(request.operation) !== request.proposalHash) {
+    if (normalized.normalizedProposalHash !== request.proposalHash) {
       throw new Error("Browser action proposal hash is invalid");
     }
     const [boundAction] = await tx
@@ -595,8 +540,7 @@ export async function prepareBrowserAction(
   });
 }
 
-/** @public */
-export async function markBrowserActionExecuting(
+async function markBrowserActionExecuting(
   runId: string,
   actionId: string,
 ): Promise<BrowserInteractActionRow> {
@@ -632,8 +576,7 @@ export async function markBrowserActionExecuting(
   });
 }
 
-/** @public */
-export async function completeBrowserAction(
+async function completeBrowserAction(
   untrustedInput: CompleteBrowserActionInput,
 ): Promise<ObservationV1> {
   const input = completionSchema.parse(untrustedInput);
@@ -744,6 +687,581 @@ export async function getBrowserActionByIdentity(
     )
     .limit(1);
   return row ? asAction(row) : null;
+}
+
+/** @public Durable authority resolved before accepting an adapter callback. */
+export type ActiveBrowserRunAuthority = {
+  runId: string;
+  ownerId: string;
+  sessionId: string;
+  runtimeSessionId: string;
+  expectedSessionVersion: number;
+  adapterJobId: string;
+  adapterSupervisorId: string;
+  adapterProcessId: number;
+  deadline: Date;
+};
+
+/** @public */
+export async function getActiveBrowserRunAuthority(
+  runId: string,
+): Promise<ActiveBrowserRunAuthority | null> {
+  const parsedRunId = runtimeUuidSchema.safeParse(runId);
+  if (!parsedRunId.success) return null;
+  const [row] = await db
+    .select({
+      runId: schema.browser_interact_runs.id,
+      ownerId: schema.browser_interact_runs.owner_id,
+      sessionId: schema.browser_interact_runs.session_id,
+      runtimeSessionId: schema.browser_sessions.browser_id,
+      expectedSessionVersion: schema.browser_sessions.runtime_epoch,
+      adapterJobId: schema.browser_interact_runs.adapter_job_id,
+      adapterSupervisorId: schema.browser_interact_runs.adapter_supervisor_id,
+      adapterProcessId: schema.browser_interact_runs.adapter_process_id,
+      deadline: schema.browser_interact_runs.deadline_at,
+      runState: schema.browser_interact_runs.state,
+      sessionState: schema.browser_sessions.state,
+      currentRunId: schema.browser_sessions.current_run_id,
+      sessionOwnerId: schema.browser_sessions.owner_id,
+      absoluteDeadline: schema.browser_sessions.absolute_deadline_at,
+    })
+    .from(schema.browser_interact_runs)
+    .innerJoin(
+      schema.browser_sessions,
+      eq(schema.browser_sessions.id, schema.browser_interact_runs.session_id),
+    )
+    .where(eq(schema.browser_interact_runs.id, parsedRunId.data))
+    .limit(1);
+  if (
+    !row ||
+    row.runState !== "running" ||
+    row.sessionState !== "executing" ||
+    row.currentRunId !== row.runId ||
+    row.ownerId !== row.sessionOwnerId ||
+    row.runtimeSessionId === null ||
+    row.adapterJobId === null ||
+    row.adapterSupervisorId === null ||
+    row.adapterProcessId === null ||
+    new Date(row.deadline).getTime() <= Date.now() ||
+    new Date(row.absoluteDeadline).getTime() <= Date.now()
+  ) {
+    return null;
+  }
+  return {
+    runId: row.runId,
+    ownerId: row.ownerId,
+    sessionId: row.sessionId,
+    runtimeSessionId: row.runtimeSessionId,
+    expectedSessionVersion: row.expectedSessionVersion,
+    adapterJobId: row.adapterJobId,
+    adapterSupervisorId: row.adapterSupervisorId,
+    adapterProcessId: row.adapterProcessId,
+    deadline: new Date(row.deadline),
+  };
+}
+
+/** @public Finds prior side effects while holding the caller's fence lease. */
+export async function findSideEffectingActionByHash(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  normalizedProposalHash: string,
+): Promise<BrowserInteractActionRow | null> {
+  const parsedRunId = runtimeUuidSchema.parse(runId);
+  const hash = z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .parse(normalizedProposalHash);
+  const result = await lease.transaction.query(
+    `SELECT *
+       FROM browser_interact_actions
+      WHERE run_id = $1
+        AND proposal_hash = $2
+        AND effect = 'side_effecting'
+      LIMIT 1`,
+    [parsedRunId, hash],
+  );
+  return result.rows[0] ? (result.rows[0] as BrowserInteractActionRow) : null;
+}
+
+/** @public Atomically makes an ambiguous action and its authority terminal. */
+export async function markBrowserActionOutcomeUnknown(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  actionId: string,
+  now = new Date(),
+): Promise<void> {
+  const parsedRunId = runtimeUuidSchema.parse(runId);
+  const parsedActionId = runtimeUuidSchema.parse(actionId);
+  const timestamp = now.toISOString();
+  const action = await lease.transaction.query<{ session_id: string }>(
+    `UPDATE browser_interact_actions
+        SET state = 'outcome_unknown',
+            result = NULL,
+            page_state = NULL,
+            error_category = 'action_outcome_unknown',
+            error_detail = 'Browser action outcome could not be proven',
+            finished_at = $3,
+            updated_at = $3
+      WHERE run_id = $1
+        AND action_id = $2
+        AND state IN ('prepared', 'executing')
+      RETURNING session_id`,
+    [parsedRunId, parsedActionId, timestamp],
+  );
+  if (action.rows.length !== 1) {
+    const existing = await lease.transaction.query<{ state: string }>(
+      `SELECT state
+         FROM browser_interact_actions
+        WHERE run_id = $1 AND action_id = $2`,
+      [parsedRunId, parsedActionId],
+    );
+    if (existing.rows[0]?.state === "outcome_unknown") return;
+    throw new ActionOutcomeUnknownError();
+  }
+  await lease.transaction.query(
+    `UPDATE browser_interact_runs
+        SET state = 'failed',
+            error_category = 'action_outcome_unknown',
+            error_detail = 'Browser action outcome could not be proven',
+            finished_at = $2
+      WHERE id = $1 AND state IN ('starting', 'running')`,
+    [parsedRunId, timestamp],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET state = 'error',
+            status = 'error',
+            terminal_at = $2,
+            terminal_reason = 'action_outcome_unknown',
+            updated_at = $2
+      WHERE id = $1 AND state = 'executing'`,
+    [action.rows[0]!.session_id, timestamp],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_capabilities
+        SET revoked_at = COALESCE(revoked_at, $2)
+      WHERE run_id = $1`,
+    [parsedRunId, timestamp],
+  );
+}
+
+/** @public Records a cancellation only while dispatch is durably impossible. */
+export async function cancelPreparedBrowserAction(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  actionId: string,
+  now = new Date(),
+): Promise<void> {
+  const result = await lease.transaction.query(
+    `UPDATE browser_interact_actions
+        SET state = 'cancelled_no_effect',
+            result = NULL,
+            error_category = 'cancelled',
+            error_detail = 'Browser action was cancelled before dispatch',
+            finished_at = $3,
+            updated_at = $3
+      WHERE run_id = $1
+        AND action_id = $2
+        AND state = 'prepared'
+      RETURNING id`,
+    [
+      runtimeUuidSchema.parse(runId),
+      runtimeUuidSchema.parse(actionId),
+      now.toISOString(),
+    ],
+  );
+  if (result.rows.length !== 1) throw new ActionInFlightError();
+}
+
+type CompleteBrowserActionWithLeaseInput = CompleteBrowserActionInput & {
+  expectedSessionVersion: number;
+  sessionVersion: number;
+};
+
+function parsePreparedActionRequest(untrustedRequest: SubmitBrowserActionV1): {
+  request: SubmitBrowserActionV1;
+  normalizedProposalHash: string;
+} {
+  if (
+    Number.isInteger(untrustedRequest.sequence) &&
+    (untrustedRequest.sequence < 1 || untrustedRequest.sequence > ACTION_LIMIT)
+  ) {
+    throw new ActionLimitExceededError();
+  }
+  const request = submitBrowserActionV1Schema.parse(untrustedRequest);
+  if (utf8Bytes(request.operation) > OPERATION_LIMIT_BYTES) {
+    throw new Error("Browser operation exceeds 32 KiB");
+  }
+  const normalized = normalizeBrowserAction(request.operation);
+  if (
+    request.effect !== normalized.effect ||
+    request.proposalHash !== normalized.normalizedProposalHash
+  ) {
+    throw new ActionIdentityMismatchError();
+  }
+  return {
+    request,
+    normalizedProposalHash: normalized.normalizedProposalHash,
+  };
+}
+
+async function prepareBrowserActionWithLease(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  untrustedRequest: SubmitBrowserActionV1,
+): Promise<PrepareBrowserActionResult> {
+  const parsedRunId = runtimeUuidSchema.parse(runId);
+  const { request, normalizedProposalHash } =
+    parsePreparedActionRequest(untrustedRequest);
+  const locked = await lease.transaction.query(
+    `SELECT r.*, s.owner_id AS session_owner_id,
+            s.request_id AS session_request_id,
+            s.state AS session_state, s.current_run_id
+       FROM browser_interact_runs r
+       JOIN browser_sessions s ON s.id = r.session_id
+      WHERE r.id = $1
+      FOR UPDATE OF r, s`,
+    [parsedRunId],
+  );
+  if (locked.rows.length !== 1) {
+    throw new Error("Browser action is not bound to an active run");
+  }
+  const run = locked.rows[0] as Record<string, unknown>;
+  if (
+    run.state !== "running" ||
+    run.adapter_job_id !== request.adapterJobId ||
+    run.owner_id !== run.session_owner_id ||
+    run.request_id !== run.session_request_id ||
+    run.session_state !== "executing" ||
+    run.current_run_id !== run.id
+  ) {
+    if (run.adapter_job_id !== request.adapterJobId) {
+      throw new ActionIdentityMismatchError();
+    }
+    throw new Error("Browser action active run binding is invalid");
+  }
+
+  const identities = await lease.transaction.query(
+    `SELECT *, result IS NOT NULL AS result_present
+       FROM browser_interact_actions
+      WHERE run_id = $1
+        AND (action_id = $2 OR sequence = $3)
+      ORDER BY id`,
+    [parsedRunId, request.actionId, request.sequence],
+  );
+  const mismatched = identities.rows.some(row => {
+    const action = row as Record<string, unknown>;
+    return (
+      action.proposal_hash !== request.proposalHash ||
+      action.action_id !== request.actionId ||
+      Number(action.sequence) !== request.sequence ||
+      action.adapter_job_id !== request.adapterJobId ||
+      action.effect !== request.effect
+    );
+  });
+  if (mismatched) throw new ActionIdentityMismatchError();
+  const identical = identities.rows[0] as
+    | (Record<string, unknown> & { result_present?: boolean })
+    | undefined;
+  if (identical) {
+    const action = asAction(identical as never);
+    if (["prepared", "executing"].includes(action.state)) {
+      throw new ActionInFlightError();
+    }
+    if (action.state === "outcome_unknown") {
+      throw new ActionOutcomeUnknownError();
+    }
+    return {
+      kind: "cached",
+      observation: observationFromAction(
+        action,
+        Boolean(identical.result_present),
+      ),
+    };
+  }
+
+  const policy = await lease.transaction.query<{
+    count: number;
+    maximum_sequence: number;
+    in_flight: boolean;
+    duplicate_side_effect: boolean;
+    bound_job_id: string | null;
+  }>(
+    `SELECT count(*)::int AS count,
+            coalesce(max(sequence), 0)::int AS maximum_sequence,
+            bool_or(state IN ('prepared', 'executing')) AS in_flight,
+            bool_or(
+              effect = 'side_effecting' AND proposal_hash = $2
+            ) AS duplicate_side_effect,
+            min(adapter_job_id::text) AS bound_job_id
+       FROM browser_interact_actions
+      WHERE run_id = $1`,
+    [parsedRunId, normalizedProposalHash],
+  );
+  const state = policy.rows[0]!;
+  if (
+    state.bound_job_id !== null &&
+    state.bound_job_id !== request.adapterJobId
+  ) {
+    throw new ActionIdentityMismatchError();
+  }
+  if (state.in_flight) throw new ActionInFlightError();
+  if (Number(state.count) >= ACTION_LIMIT) throw new ActionLimitExceededError();
+  if (request.sequence !== Number(state.maximum_sequence) + 1) {
+    throw new ActionIdentityMismatchError();
+  }
+  if (request.effect === "side_effecting" && state.duplicate_side_effect) {
+    throw new DuplicateSideEffectError();
+  }
+
+  const inserted = await lease.transaction.query(
+    `INSERT INTO browser_interact_actions (
+       id, request_id, owner_id, run_id, session_id, adapter_job_id,
+       action_id, sequence, proposal_hash, effect, operation, state
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 'prepared'
+     )
+     RETURNING *`,
+    [
+      randomUUID(),
+      run.request_id,
+      run.owner_id,
+      parsedRunId,
+      run.session_id,
+      request.adapterJobId,
+      request.actionId,
+      request.sequence,
+      request.proposalHash,
+      request.effect,
+      JSON.stringify(request.operation),
+    ],
+  );
+  if (inserted.rows.length !== 1) {
+    throw new Error("Browser action preparation failed");
+  }
+  return { kind: "prepared", action: asAction(inserted.rows[0] as never) };
+}
+
+async function markBrowserActionExecutingWithLease(
+  lease: BrowserStateMutationLease,
+  runId: string,
+  actionId: string,
+): Promise<BrowserInteractActionRow> {
+  const result = await lease.transaction.query(
+    `UPDATE browser_interact_actions
+        SET state = 'executing', executing_at = now(), updated_at = now()
+      WHERE run_id = $1 AND action_id = $2 AND state = 'prepared'
+      RETURNING *`,
+    [runtimeUuidSchema.parse(runId), runtimeUuidSchema.parse(actionId)],
+  );
+  if (result.rows.length === 1) return asAction(result.rows[0] as never);
+  const existing = await lease.transaction.query<{ state: string }>(
+    `SELECT state FROM browser_interact_actions
+      WHERE run_id = $1 AND action_id = $2`,
+    [runId, actionId],
+  );
+  if (existing.rows[0]?.state === "outcome_unknown") {
+    throw new ActionOutcomeUnknownError();
+  }
+  if (existing.rows.length > 0) throw new ActionInFlightError();
+  throw new Error("Browser action was not found");
+}
+
+async function completeBrowserActionWithLease(
+  lease: BrowserStateMutationLease,
+  untrustedInput: CompleteBrowserActionWithLeaseInput,
+): Promise<ObservationV1> {
+  const {
+    expectedSessionVersion: rawExpectedSessionVersion,
+    sessionVersion: rawSessionVersion,
+    ...completion
+  } = untrustedInput;
+  const input = completionSchema.parse(completion);
+  const expectedSessionVersion = z
+    .number()
+    .int()
+    .safe()
+    .min(0)
+    .parse(rawExpectedSessionVersion);
+  const sessionVersion = z
+    .number()
+    .int()
+    .safe()
+    .min(0)
+    .parse(rawSessionVersion);
+  const requiredVersion =
+    input.outcome === "succeeded"
+      ? expectedSessionVersion + 1
+      : expectedSessionVersion;
+  if (
+    !Number.isSafeInteger(requiredVersion) ||
+    sessionVersion !== requiredVersion
+  ) {
+    throw new ActionIdentityMismatchError();
+  }
+
+  const locked = await lease.transaction.query(
+    `SELECT a.*, a.result IS NOT NULL AS result_present,
+            s.runtime_epoch AS persisted_session_version,
+            s.state AS session_state, s.current_run_id
+       FROM browser_interact_actions a
+       JOIN browser_sessions s ON s.id = a.session_id
+      WHERE a.run_id = $1 AND a.action_id = $2
+      FOR UPDATE OF a, s`,
+    [input.runId, input.actionId],
+  );
+  if (locked.rows.length !== 1) throw new Error("Browser action was not found");
+  const row = locked.rows[0] as Record<string, unknown> & {
+    result_present?: boolean;
+  };
+  const action = asAction(row as never);
+  if (
+    action.proposal_hash !== input.proposalHash ||
+    Number(row.persisted_session_version) !== expectedSessionVersion ||
+    row.session_state !== "executing" ||
+    row.current_run_id !== input.runId
+  ) {
+    throw new ActionIdentityMismatchError();
+  }
+  if (
+    ["succeeded", "rejected_no_effect", "failed_no_effect"].includes(
+      action.state,
+    )
+  ) {
+    if (action.state !== input.outcome) throw new ActionIdentityMismatchError();
+    return observationFromAction(action, Boolean(row.result_present));
+  }
+  if (action.state === "outcome_unknown") throw new ActionOutcomeUnknownError();
+  const validSource =
+    (input.outcome === "rejected_no_effect" && action.state === "prepared") ||
+    (input.outcome !== "rejected_no_effect" && action.state === "executing");
+  if (!validSource) throw new ActionInFlightError();
+
+  const observation: ObservationV1 = {
+    version: 1,
+    type: "action_result",
+    sequence: action.sequence,
+    actionId: action.action_id,
+    actionKind: action.operation.kind,
+    outcome: input.outcome,
+    page: input.page,
+    ...(input.result === undefined ? {} : { result: input.result }),
+    ...(input.error === undefined ? {} : { error: input.error }),
+  };
+  if (utf8Bytes(observation) > OBSERVATION_LIMIT_BYTES) {
+    throw new Error("Browser action observation exceeds 64 KiB");
+  }
+  if (input.outcome === "succeeded") {
+    const advanced = await lease.transaction.query(
+      `UPDATE browser_sessions
+          SET runtime_epoch = $3, updated_at = now()
+        WHERE id = $1
+          AND runtime_epoch = $2
+          AND state = 'executing'
+          AND current_run_id = $4
+        RETURNING id`,
+      [action.session_id, expectedSessionVersion, sessionVersion, input.runId],
+    );
+    if (advanced.rows.length !== 1) throw new ActionIdentityMismatchError();
+  }
+  const updated = await lease.transaction.query(
+    `UPDATE browser_interact_actions
+        SET state = $3,
+            result = $4::jsonb,
+            page_state = $5::jsonb,
+            error_category = $6,
+            error_detail = $7,
+            finished_at = now(),
+            updated_at = now()
+      WHERE run_id = $1 AND action_id = $2 AND state = $8
+      RETURNING id`,
+    [
+      input.runId,
+      input.actionId,
+      input.outcome,
+      input.result === undefined ? null : JSON.stringify(input.result),
+      JSON.stringify(input.page),
+      input.error?.category ?? null,
+      input.error?.message ?? null,
+      action.state,
+    ],
+  );
+  if (updated.rows.length !== 1) throw new ActionInFlightError();
+  return observation;
+}
+
+/** @public Gate-owning action persistence facade used by the coordinator. */
+export function createBrowserActionStore(deps: {
+  gate: import("../browser-runtime/startup-gate").BrowserStartupGate;
+}) {
+  return {
+    prepare(runId: string, request: SubmitBrowserActionV1) {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => prepareBrowserActionWithLease(lease, runId, request),
+      );
+    },
+    prepareWithLease(
+      lease: BrowserStateMutationLease,
+      runId: string,
+      request: SubmitBrowserActionV1,
+    ) {
+      return prepareBrowserActionWithLease(lease, runId, request);
+    },
+    markExecuting(runId: string, actionId: string) {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => markBrowserActionExecutingWithLease(lease, runId, actionId),
+      );
+    },
+    markExecutingWithLease(
+      lease: BrowserStateMutationLease,
+      runId: string,
+      actionId: string,
+    ) {
+      return markBrowserActionExecutingWithLease(lease, runId, actionId);
+    },
+    complete(input: CompleteBrowserActionWithLeaseInput) {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => completeBrowserActionWithLease(lease, input),
+      );
+    },
+    completeWithLease(
+      lease: BrowserStateMutationLease,
+      input: CompleteBrowserActionWithLeaseInput,
+    ) {
+      return completeBrowserActionWithLease(lease, input);
+    },
+    getByIdentity: getBrowserActionByIdentity,
+    getAuthority: getActiveBrowserRunAuthority,
+    markOutcomeUnknown(runId: string, actionId: string) {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => markBrowserActionOutcomeUnknown(lease, runId, actionId),
+      );
+    },
+    markOutcomeUnknownWithLease(
+      lease: BrowserStateMutationLease,
+      runId: string,
+      actionId: string,
+    ) {
+      return markBrowserActionOutcomeUnknown(lease, runId, actionId);
+    },
+    cancelPrepared(runId: string, actionId: string) {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => cancelPreparedBrowserAction(lease, runId, actionId),
+      );
+    },
+    cancelPreparedWithLease(
+      lease: BrowserStateMutationLease,
+      runId: string,
+      actionId: string,
+    ) {
+      return cancelPreparedBrowserAction(lease, runId, actionId);
+    },
+  };
 }
 
 /** @public */

@@ -15,6 +15,7 @@ import { runtimeUuidSchema } from "../browser-runtime/protocol";
 import type {
   AdapterAuthorizationBinding,
   AdapterPendingBinding,
+  BrowserOperation,
 } from "./types";
 
 const CAPABILITY_CALL_LIMIT = 25;
@@ -74,6 +75,17 @@ const authorizationInputSchema = z.strictObject({
   adapterProcessId: z.number().int().positive(),
 });
 
+const persistedBindingInputSchema = z.strictObject({
+  ownerId: runtimeUuidSchema,
+  sessionId: runtimeUuidSchema,
+  runId: runtimeUuidSchema,
+  adapterJobId: runtimeUuidSchema,
+  adapterSupervisorId: runtimeUuidSchema,
+  adapterProcessId: z.number().int().positive(),
+  operation: z.enum(CAPABILITY_OPERATIONS).optional(),
+  byteCount: z.number().int().min(0).max(CAPABILITY_BYTE_LIMIT).optional(),
+});
+
 /** @public */
 export type BeginAdapterCapabilityInput = AdapterPendingBinding & {
   runId: string;
@@ -85,6 +97,15 @@ export type AuthorizeAdapterCapabilityInput = AdapterAuthorizationBinding & {
   ownerId: string;
   sessionId: string;
   runId: string;
+};
+
+/** @public Server-resolved callback binding; never accepts a raw grant token. */
+export type AuthorizePersistedCapabilityInput = AdapterAuthorizationBinding & {
+  ownerId: string;
+  sessionId: string;
+  runId: string;
+  operation?: BrowserOperation["kind"];
+  byteCount?: number;
 };
 
 /** @public */
@@ -99,6 +120,7 @@ export type AdapterCapabilityBinding = {
   activatedAt: Date | null;
   revokedAt: Date | null;
   wallDeadlineAt: Date;
+  perOperationTimeoutMs: number;
   expiresAt: Date;
 };
 
@@ -131,6 +153,7 @@ function mapBinding(row: Record<string, unknown>): AdapterCapabilityBinding {
     revokedAt:
       row.revoked_at === null ? null : new Date(String(row.revoked_at)),
     wallDeadlineAt: new Date(String(row.wall_deadline_at)),
+    perOperationTimeoutMs: Number(row.per_operation_timeout_ms),
     expiresAt: new Date(String(row.expires_at)),
   };
 }
@@ -210,7 +233,8 @@ async function beginAdapterRun(
      )
      RETURNING id, owner_id, session_id, run_id, adapter_job_id,
                adapter_supervisor_id, adapter_process_id, activated_at,
-               revoked_at, wall_deadline_at, expires_at`,
+               revoked_at, wall_deadline_at, per_operation_timeout_ms,
+               expires_at`,
     [
       randomUUID(),
       hashCapabilityToken(token),
@@ -219,7 +243,7 @@ async function beginAdapterRun(
       input.runId,
       input.adapterJobId,
       input.adapterSupervisorId,
-      JSON.stringify(CAPABILITY_OPERATIONS),
+      JSON.stringify([...CAPABILITY_OPERATIONS, "cdp"]),
       CAPABILITY_CALL_LIMIT,
       CAPABILITY_BYTE_LIMIT,
       new Date(deadlineMs).toISOString(),
@@ -301,7 +325,8 @@ async function activateAdapter(
         AND session_id = $7
       RETURNING id, owner_id, session_id, run_id, adapter_job_id,
                 adapter_supervisor_id, adapter_process_id, activated_at,
-                revoked_at, wall_deadline_at, expires_at`,
+                revoked_at, wall_deadline_at, per_operation_timeout_ms,
+                expires_at`,
     [
       runId,
       binding.adapterJobId,
@@ -325,7 +350,8 @@ async function authorizeAdapter(
   const result = await lease.transaction.query(
     `SELECT c.id, c.token_hash, c.owner_id, c.session_id, c.run_id,
             c.adapter_job_id, c.adapter_supervisor_id, c.adapter_process_id,
-            c.activated_at, c.revoked_at, c.wall_deadline_at, c.expires_at,
+            c.activated_at, c.revoked_at, c.wall_deadline_at,
+            c.per_operation_timeout_ms, c.expires_at,
             r.state AS run_state, r.owner_id AS run_owner_id,
             r.session_id AS run_session_id, r.adapter_job_id AS run_job_id,
             r.adapter_supervisor_id AS run_supervisor_id,
@@ -376,6 +402,150 @@ async function authorizeAdapter(
   return mapBinding(row);
 }
 
+async function authorizePersistedBinding(
+  lease: BrowserStateMutationLease,
+  untrustedInput: AuthorizePersistedCapabilityInput,
+  now: Date,
+  consume: boolean,
+): Promise<AdapterCapabilityBinding> {
+  const input = parseOrDeny(persistedBindingInputSchema, untrustedInput);
+  const result = await lease.transaction.query(
+    `SELECT c.id, c.owner_id, c.session_id, c.run_id, c.adapter_job_id,
+            c.adapter_supervisor_id, c.adapter_process_id, c.operations,
+            c.call_limit, c.calls_used, c.byte_limit, c.bytes_used,
+            c.activated_at, c.revoked_at, c.wall_deadline_at,
+            c.per_operation_timeout_ms, c.expires_at,
+            r.state AS run_state, r.owner_id AS run_owner_id,
+            r.session_id AS run_session_id, r.adapter_job_id AS run_job_id,
+            r.adapter_supervisor_id AS run_supervisor_id,
+            r.adapter_process_id AS run_process_id,
+            r.deadline_at AS run_deadline_at,
+            s.state AS session_state, s.owner_id AS session_owner_id,
+            s.current_run_id, s.absolute_deadline_at
+       FROM browser_capabilities c
+       JOIN browser_interact_runs r ON r.id = c.run_id
+       JOIN browser_sessions s ON s.id = c.session_id
+      WHERE c.run_id = $1
+        AND c.revoked_at IS NULL
+      FOR UPDATE OF c, r, s`,
+    [input.runId],
+  );
+  if (result.rows.length !== 1) deny();
+  const row = asRecord(result.rows[0]);
+  const nowMs = now.getTime();
+  const operations = Array.isArray(row.operations)
+    ? row.operations.map(String)
+    : [];
+  const byteCount = input.byteCount ?? 0;
+  if (
+    row.owner_id !== input.ownerId ||
+    row.session_id !== input.sessionId ||
+    row.adapter_job_id !== input.adapterJobId ||
+    row.adapter_supervisor_id !== input.adapterSupervisorId ||
+    row.adapter_process_id !== input.adapterProcessId ||
+    row.activated_at === null ||
+    row.run_state !== "running" ||
+    row.run_owner_id !== input.ownerId ||
+    row.run_session_id !== input.sessionId ||
+    row.run_job_id !== input.adapterJobId ||
+    row.run_supervisor_id !== input.adapterSupervisorId ||
+    row.run_process_id !== input.adapterProcessId ||
+    row.session_state !== "executing" ||
+    row.session_owner_id !== input.ownerId ||
+    row.current_run_id !== input.runId ||
+    (input.operation !== undefined && !operations.includes(input.operation)) ||
+    new Date(String(row.wall_deadline_at)).getTime() <= nowMs ||
+    new Date(String(row.expires_at)).getTime() <= nowMs ||
+    new Date(String(row.run_deadline_at)).getTime() <= nowMs ||
+    new Date(String(row.absolute_deadline_at)).getTime() <= nowMs ||
+    (consume && Number(row.calls_used) + 1 > Number(row.call_limit)) ||
+    (consume && Number(row.bytes_used) + byteCount > Number(row.byte_limit))
+  ) {
+    deny();
+  }
+  if (consume) {
+    const consumed = await lease.transaction.query(
+      `UPDATE browser_capabilities
+          SET calls_used = calls_used + 1,
+              bytes_used = bytes_used + $2,
+              redeemed_at = COALESCE(redeemed_at, $3)
+        WHERE id = $1
+          AND calls_used + 1 <= call_limit
+          AND bytes_used + $2 <= byte_limit
+        RETURNING id`,
+      [row.id, byteCount, now.toISOString()],
+    );
+    if (consumed.rows.length !== 1) deny();
+  }
+  return mapBinding(row);
+}
+
+async function redeemCdpBinding(
+  lease: BrowserStateMutationLease,
+  untrustedInput: AuthorizePersistedCapabilityInput,
+  now: Date,
+): Promise<AdapterCapabilityBinding> {
+  const input = parseOrDeny(persistedBindingInputSchema, untrustedInput);
+  const result = await lease.transaction.query(
+    `SELECT c.id, c.owner_id, c.session_id, c.run_id, c.adapter_job_id,
+            c.adapter_supervisor_id, c.adapter_process_id, c.activated_at,
+            c.revoked_at, c.wall_deadline_at, c.per_operation_timeout_ms,
+            c.expires_at, c.operations,
+            r.state AS run_state, r.owner_id AS run_owner_id,
+            r.session_id AS run_session_id, r.adapter_job_id AS run_job_id,
+            r.adapter_supervisor_id AS run_supervisor_id,
+            r.adapter_process_id AS run_process_id,
+            r.deadline_at AS run_deadline_at,
+            s.state AS session_state, s.owner_id AS session_owner_id,
+            s.current_run_id, s.absolute_deadline_at
+       FROM browser_capabilities c
+       JOIN browser_interact_runs r ON r.id = c.run_id
+       JOIN browser_sessions s ON s.id = c.session_id
+      WHERE c.run_id = $1
+        AND c.revoked_at IS NULL
+      FOR UPDATE OF c, r, s`,
+    [input.runId],
+  );
+  if (result.rows.length !== 1) deny();
+  const row = asRecord(result.rows[0]);
+  const nowMs = now.getTime();
+  if (
+    row.owner_id !== input.ownerId ||
+    row.session_id !== input.sessionId ||
+    row.adapter_job_id !== input.adapterJobId ||
+    row.adapter_supervisor_id !== input.adapterSupervisorId ||
+    row.adapter_process_id !== input.adapterProcessId ||
+    row.activated_at === null ||
+    row.run_state !== "running" ||
+    row.run_owner_id !== input.ownerId ||
+    row.run_session_id !== input.sessionId ||
+    row.run_job_id !== input.adapterJobId ||
+    row.run_supervisor_id !== input.adapterSupervisorId ||
+    row.run_process_id !== input.adapterProcessId ||
+    row.session_state !== "executing" ||
+    row.session_owner_id !== input.ownerId ||
+    row.current_run_id !== input.runId ||
+    !Array.isArray(row.operations) ||
+    !row.operations.includes("cdp") ||
+    new Date(String(row.wall_deadline_at)).getTime() <= nowMs ||
+    new Date(String(row.expires_at)).getTime() <= nowMs ||
+    new Date(String(row.run_deadline_at)).getTime() <= nowMs ||
+    new Date(String(row.absolute_deadline_at)).getTime() <= nowMs
+  ) {
+    deny();
+  }
+  const consumed = await lease.transaction.query(
+    `UPDATE browser_capabilities
+        SET operations = operations - 'cdp'
+      WHERE id = $1
+        AND operations ? 'cdp'
+      RETURNING id`,
+    [row.id],
+  );
+  if (consumed.rows.length !== 1) deny();
+  return mapBinding(row);
+}
+
 /** @public */
 export function createCapabilityStore(deps: { gate: BrowserStartupGate }) {
   return {
@@ -408,6 +578,56 @@ export function createCapabilityStore(deps: { gate: BrowserStartupGate }) {
         "filesystem_and_database",
         lease => authorizeAdapter(lease, input, now),
       );
+    },
+
+    inspectBinding(
+      input: AuthorizePersistedCapabilityInput,
+      now = new Date(),
+    ): Promise<AdapterCapabilityBinding> {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => authorizePersistedBinding(lease, input, now, false),
+      );
+    },
+
+    inspectBindingWithLease(
+      lease: BrowserStateMutationLease,
+      input: AuthorizePersistedCapabilityInput,
+      now = new Date(),
+    ): Promise<AdapterCapabilityBinding> {
+      return authorizePersistedBinding(lease, input, now, false);
+    },
+
+    redeemAction(
+      input: AuthorizePersistedCapabilityInput & {
+        operation: BrowserOperation["kind"];
+        byteCount: number;
+      },
+      now = new Date(),
+    ): Promise<AdapterCapabilityBinding> {
+      return deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        lease => authorizePersistedBinding(lease, input, now, true),
+      );
+    },
+
+    redeemActionWithLease(
+      lease: BrowserStateMutationLease,
+      input: AuthorizePersistedCapabilityInput & {
+        operation: BrowserOperation["kind"];
+        byteCount: number;
+      },
+      now = new Date(),
+    ): Promise<AdapterCapabilityBinding> {
+      return authorizePersistedBinding(lease, input, now, true);
+    },
+
+    redeemCdpWithLease(
+      lease: BrowserStateMutationLease,
+      input: AuthorizePersistedCapabilityInput,
+      now = new Date(),
+    ): Promise<AdapterCapabilityBinding> {
+      return redeemCdpBinding(lease, input, now);
     },
 
     revoke(runId: string, now = new Date()): Promise<boolean> {

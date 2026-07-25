@@ -397,7 +397,7 @@ function harness(registryOverride?: SessionRegistry) {
       expiresAt: "2026-07-24T14:30:00.000Z",
       relayToken: Buffer.alloc(32, 9).toString("base64url"),
     })),
-    revoke: vi.fn(() => ({
+    revoke: vi.fn(async () => ({
       version: 1,
       grantId: IDS[1],
       revoked: true,

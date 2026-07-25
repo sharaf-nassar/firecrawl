@@ -10,10 +10,12 @@ import {
 } from "./capability-store";
 import {
   countInteractActions,
+  createBrowserActionStore,
   failAdapterRun,
   finishAdapterRun,
 } from "./store";
 import { runApplicationMigrations } from "../../db/migrate";
+import { normalizeBrowserAction } from "../browser-runtime/action-normalization";
 import type { BrowserStartupGate } from "../browser-runtime/startup-gate";
 
 describe("browser capability store", () => {
@@ -67,6 +69,7 @@ describeWithDatabase("durable browser capability bindings", () => {
     },
   } as BrowserStartupGate;
   const capabilities = createCapabilityStore({ gate });
+  const actions = createBrowserActionStore({ gate });
 
   beforeAll(async () => {
     await pool.query("DROP SCHEMA public CASCADE");
@@ -246,6 +249,256 @@ describeWithDatabase("durable browser capability bindings", () => {
         adapterJobId: exact.adapterJobId.toUpperCase(),
       }),
     ).rejects.toMatchObject({ category: "capability_denied" });
+  });
+
+  it("redeems action policy once and accounts bounded calls and bytes", async () => {
+    const pending = await fixture();
+    const binding = {
+      adapterJobId: pending.adapterJobId,
+      adapterSupervisorId: pending.adapterSupervisorId,
+      adapterProcessId: 4242,
+    };
+    await capabilities.activate(pending.runId, binding);
+    const exact = {
+      ownerId,
+      sessionId: pending.sessionId,
+      runId: pending.runId,
+      ...binding,
+    };
+    await expect(capabilities.inspectBinding(exact)).resolves.toMatchObject(
+      exact,
+    );
+    await expect(
+      capabilities.redeemAction({
+        ...exact,
+        operation: "get_url",
+        byteCount: 18,
+      }),
+    ).resolves.toMatchObject(exact);
+    const usage = await pool.query(
+      `SELECT calls_used, bytes_used, redeemed_at
+         FROM browser_capabilities
+        WHERE run_id = $1`,
+      [pending.runId],
+    );
+    expect(usage.rows).toEqual([
+      {
+        calls_used: 1,
+        bytes_used: "18",
+        redeemed_at: expect.any(Date),
+      },
+    ]);
+    await expect(
+      capabilities.redeemAction({
+        ...exact,
+        operation: "unknown" as "get_url",
+        byteCount: 1,
+      }),
+    ).rejects.toMatchObject({ category: "capability_denied" });
+    const unchanged = await pool.query(
+      `SELECT calls_used, bytes_used
+         FROM browser_capabilities
+        WHERE run_id = $1`,
+      [pending.runId],
+    );
+    expect(unchanged.rows).toEqual([{ calls_used: 1, bytes_used: "18" }]);
+  });
+
+  it("redeems one dedicated CDP relay policy grant", async () => {
+    const pending = await fixture();
+    const binding = {
+      adapterJobId: pending.adapterJobId,
+      adapterSupervisorId: pending.adapterSupervisorId,
+      adapterProcessId: 4242,
+    };
+    await capabilities.activate(pending.runId, binding);
+    const exact = {
+      ownerId,
+      sessionId: pending.sessionId,
+      runId: pending.runId,
+      ...binding,
+    };
+    await expect(
+      gate.withBrowserStateMutationLease("filesystem_and_database", lease =>
+        capabilities.redeemCdpWithLease(lease, exact),
+      ),
+    ).resolves.toMatchObject(exact);
+    await expect(
+      gate.withBrowserStateMutationLease("filesystem_and_database", lease =>
+        capabilities.redeemCdpWithLease(lease, exact),
+      ),
+    ).rejects.toMatchObject({ category: "capability_denied" });
+    const stored = await pool.query<{ operations: string[] }>(
+      `SELECT operations FROM browser_capabilities WHERE run_id = $1`,
+      [pending.runId],
+    );
+    expect(stored.rows[0]?.operations).not.toContain("cdp");
+  });
+
+  it("executes once under lease and atomically advances the session epoch", async () => {
+    const pending = await fixture();
+    const binding = {
+      adapterJobId: pending.adapterJobId,
+      adapterSupervisorId: pending.adapterSupervisorId,
+      adapterProcessId: 4242,
+    };
+    await capabilities.activate(pending.runId, binding);
+    const runtimeSessionId = randomUUID();
+    await pool.query(
+      `UPDATE browser_sessions
+          SET browser_id = $2, runtime_epoch = 1
+        WHERE id = $1`,
+      [pending.sessionId, runtimeSessionId],
+    );
+    const operation = { kind: "get_url" } as const;
+    const normalized = normalizeBrowserAction(operation);
+    const proposal = {
+      version: 1 as const,
+      adapterJobId: pending.adapterJobId,
+      sequence: 1,
+      actionId: randomUUID(),
+      proposalHash: normalized.normalizedProposalHash,
+      effect: normalized.effect,
+      operation,
+    };
+
+    const prepared = await Promise.allSettled([
+      actions.prepare(pending.runId, proposal),
+      actions.prepare(pending.runId, proposal),
+    ]);
+    expect(
+      prepared.filter(result => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      prepared.filter(result => result.status === "rejected"),
+    ).toHaveLength(1);
+    await actions.markExecuting(pending.runId, proposal.actionId);
+    await expect(
+      actions.complete({
+        runId: pending.runId,
+        actionId: proposal.actionId,
+        proposalHash: proposal.proposalHash,
+        expectedSessionVersion: 1,
+        sessionVersion: 3,
+        outcome: "succeeded",
+        result: { kind: "get_url", url: "https://example.com/" },
+        page: {
+          url: "https://example.com/",
+          title: "Example",
+          snapshotExcerpt: "",
+        },
+      }),
+    ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
+    const rolledBack = await pool.query(
+      `SELECT a.state, s.runtime_epoch
+         FROM browser_interact_actions a
+         JOIN browser_sessions s ON s.id = a.session_id
+        WHERE a.run_id = $1`,
+      [pending.runId],
+    );
+    expect(rolledBack.rows).toEqual([{ state: "executing", runtime_epoch: 1 }]);
+
+    const observation = await actions.complete({
+      runId: pending.runId,
+      actionId: proposal.actionId,
+      proposalHash: proposal.proposalHash,
+      expectedSessionVersion: 1,
+      sessionVersion: 2,
+      outcome: "succeeded",
+      result: { kind: "get_url", url: "https://example.com/" },
+      page: {
+        url: "https://example.com/",
+        title: "Example",
+        snapshotExcerpt: "",
+      },
+    });
+    await expect(actions.prepare(pending.runId, proposal)).resolves.toEqual({
+      kind: "cached",
+      observation,
+    });
+    const terminal = await pool.query(
+      `SELECT count(*)::int AS count, min(a.state) AS state,
+              min(s.runtime_epoch)::int AS runtime_epoch
+         FROM browser_interact_actions a
+         JOIN browser_sessions s ON s.id = a.session_id
+        WHERE a.run_id = $1`,
+      [pending.runId],
+    );
+    expect(terminal.rows).toEqual([
+      { count: 1, state: "succeeded", runtime_epoch: 2 },
+    ]);
+  });
+
+  it("enforces durable side-effect replay and action-count policy", async () => {
+    const pending = await fixture();
+    await capabilities.activate(pending.runId, {
+      adapterJobId: pending.adapterJobId,
+      adapterSupervisorId: pending.adapterSupervisorId,
+      adapterProcessId: 4242,
+    });
+    const page = {
+      url: "https://example.com/",
+      title: "Example",
+      snapshotExcerpt: "",
+    };
+    const makeProposal = (
+      sequence: number,
+      operation: { kind: "get_url" } | { kind: "click"; ref: string },
+    ) => {
+      const normalized = normalizeBrowserAction(operation);
+      return {
+        version: 1 as const,
+        adapterJobId: pending.adapterJobId,
+        sequence,
+        actionId: randomUUID(),
+        proposalHash: normalized.normalizedProposalHash,
+        effect: normalized.effect,
+        operation,
+      };
+    };
+    const click = makeProposal(1, { kind: "click", ref: "submit" });
+    await actions.prepare(pending.runId, click);
+    await actions.complete({
+      runId: pending.runId,
+      actionId: click.actionId,
+      proposalHash: click.proposalHash,
+      expectedSessionVersion: 1,
+      sessionVersion: 1,
+      outcome: "rejected_no_effect",
+      error: { category: "target_blocked", message: "Blocked" },
+      page,
+    });
+    await expect(
+      actions.prepare(
+        pending.runId,
+        makeProposal(2, { kind: "click", ref: "submit" }),
+      ),
+    ).rejects.toMatchObject({ name: "DuplicateSideEffectError" });
+
+    for (let sequence = 2; sequence <= 25; sequence += 1) {
+      const read = makeProposal(sequence, { kind: "get_url" });
+      await actions.prepare(pending.runId, read);
+      await actions.complete({
+        runId: pending.runId,
+        actionId: read.actionId,
+        proposalHash: read.proposalHash,
+        expectedSessionVersion: 1,
+        sessionVersion: 1,
+        outcome: "rejected_no_effect",
+        error: { category: "coverage", message: "No dispatch" },
+        page,
+      });
+    }
+    await expect(
+      actions.prepare(pending.runId, makeProposal(26, { kind: "get_url" })),
+    ).rejects.toMatchObject({ name: "ActionLimitExceededError" });
+    const count = await pool.query(
+      `SELECT count(*)::int AS count
+         FROM browser_interact_actions
+        WHERE run_id = $1`,
+      [pending.runId],
+    );
+    expect(count.rows).toEqual([{ count: 25 }]);
   });
 
   it("persists accepted adapter action counts and terminal results", async () => {

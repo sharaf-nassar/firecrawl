@@ -13,6 +13,7 @@ import {
 } from "vitest";
 
 import { runApplicationMigrations } from "../../db/migrate";
+import type { BrowserStartupGate } from "../browser-runtime/startup-gate";
 import type { BrowserOperation, SubmitBrowserActionV1 } from "./types";
 
 const databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
@@ -41,7 +42,16 @@ function proposalHash(operation: BrowserOperation): string {
 describeWithDatabase("durable browser state store", () => {
   const pool = new Pool({ connectionString: databaseUrl, max: 8 });
   const database = drizzle({ client: pool });
-  let store: typeof import("./store");
+  type StoreModule = typeof import("./store");
+  type ActionFacade = ReturnType<StoreModule["createBrowserActionStore"]>;
+  type StoreUnderTest = StoreModule & {
+    prepareBrowserAction: ActionFacade["prepare"];
+    markBrowserActionExecuting: ActionFacade["markExecuting"];
+    completeBrowserAction(
+      input: import("./store").CompleteBrowserActionInput,
+    ): ReturnType<ActionFacade["complete"]>;
+  };
+  let store: StoreUnderTest;
   let currentAdapterJobId = adapterJobId;
 
   async function createFixture(options?: { state?: "ready" | "executing" }) {
@@ -180,6 +190,41 @@ describeWithDatabase("durable browser state store", () => {
     }
   }
 
+  async function loadStoreUnderTest(): Promise<StoreUnderTest> {
+    const module = await import("./store.js");
+    const actions = module.createBrowserActionStore({
+      gate: {
+        withBrowserStateMutationLease: (_scope, operation) =>
+          withMutationLease(operation),
+      } as BrowserStartupGate,
+    });
+    return {
+      ...module,
+      prepareBrowserAction: actions.prepare,
+      markBrowserActionExecuting: actions.markExecuting,
+      completeBrowserAction: async input => {
+        const version = await pool.query<{ runtime_epoch: number }>(
+          `SELECT s.runtime_epoch
+             FROM browser_interact_actions a
+             JOIN browser_sessions s ON s.id = a.session_id
+            WHERE a.run_id = $1 AND a.action_id = $2`,
+          [input.runId, input.actionId],
+        );
+        const expectedSessionVersion = Number(
+          version.rows[0]?.runtime_epoch ?? 0,
+        );
+        return actions.complete({
+          ...input,
+          expectedSessionVersion,
+          sessionVersion:
+            input.outcome === "succeeded"
+              ? expectedSessionVersion + 1
+              : expectedSessionVersion,
+        });
+      },
+    };
+  }
+
   beforeAll(async () => {
     await pool.query("DROP SCHEMA public CASCADE");
     await pool.query("CREATE SCHEMA public");
@@ -191,7 +236,7 @@ describeWithDatabase("durable browser state store", () => {
       USE_DB_AUTHENTICATION: false,
     });
     vi.doMock("../../db/connection", () => ({ db: database }));
-    store = await import("./store.js");
+    store = await loadStoreUnderTest();
   });
 
   beforeEach(async () => {
@@ -239,7 +284,7 @@ describeWithDatabase("durable browser state store", () => {
     await store.markSessionPromptUsed(session.id);
     vi.resetModules();
     vi.doMock("../../db/connection", () => ({ db: database }));
-    store = await import("./store.js");
+    store = await loadStoreUnderTest();
     expect(await store.didSessionUsePrompt(session.id)).toBe(true);
 
     await store.appendBrowserActivity({
@@ -463,7 +508,7 @@ describeWithDatabase("durable browser state store", () => {
         ...request(2, { kind: "get_url" }),
         proposalHash: "0".repeat(64),
       }),
-    ).rejects.toThrow(/proposal hash/i);
+    ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
     await expect(
       store.prepareBrowserAction(run.id, {
         ...request(2, { kind: "get_url" }),
@@ -486,7 +531,7 @@ describeWithDatabase("durable browser state store", () => {
         gapFixture.run.id,
         request(2, { kind: "get_url" }),
       ),
-    ).rejects.toThrow(/sequence/i);
+    ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
 
     const wrongJobFixture = await createFixture({ state: "executing" });
     await expect(
