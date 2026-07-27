@@ -18,7 +18,9 @@ use uuid::Uuid;
 
 use crate::action_client::{ActionClient, AdapterAuthorizationBinding};
 use crate::app_server::{AppServer, PromptJob, ProtocolBundle};
-use crate::broker_client::{BrokerCancelReason, BrokerClient, PreparedCodex, PreparedLeaseMonitor};
+use crate::broker_client::{
+    BrokerCancelReason, BrokerClient, BrokerTerminalOutcome, PreparedCodex, PreparedLeaseMonitor,
+};
 use crate::config::{AdapterConfig, effective_uid};
 use crate::observations::ObservationV1;
 use crate::protocol::{VersionOne, parse_json_strict};
@@ -369,6 +371,18 @@ fn push_terminal(registry: &mut RegistryState, terminal: TerminalJob) {
     registry.terminal.push_back(terminal);
     while registry.terminal.len() > MAX_TERMINAL_METADATA {
         registry.terminal.pop_front();
+    }
+}
+
+fn apply_broker_terminal_outcome<T>(
+    run_result: Result<T, AdapterError>,
+    outcome: BrokerTerminalOutcome,
+) -> Result<T, AdapterError> {
+    match outcome {
+        BrokerTerminalOutcome::Completed => run_result,
+        BrokerTerminalOutcome::Cancelled => Err(AdapterError::cancelled()),
+        BrokerTerminalOutcome::TimedOut => Err(AdapterError::timed_out()),
+        BrokerTerminalOutcome::Failed => run_result.and(Err(AdapterError::sandbox_unavailable())),
     }
 }
 
@@ -1077,8 +1091,21 @@ impl AdapterService {
             broker.finish(&mut prepared, adapter_boot_id, reason)
         })
         .await
-        .map_err(|_| AdapterError::sandbox_unavailable())?;
-        if cleanup.is_ok()
+        .map_err(|_| AdapterError::sandbox_unavailable())
+        .and_then(|result| result);
+        let terminal_outcome = match cleanup {
+            Ok(terminal) => {
+                let outcome = terminal.outcome;
+                let _artifacts = terminal.artifacts;
+                run_result = apply_broker_terminal_outcome(run_result, outcome);
+                Some(outcome)
+            }
+            Err(error) => {
+                run_result = Err(error);
+                None
+            }
+        };
+        if terminal_outcome == Some(BrokerTerminalOutcome::Completed)
             && let Err(error) = app_server
                 .verify_terminated_stdout(Instant::now() + MAX_AUTHORIZATION_WAIT)
                 .await
@@ -1088,7 +1115,6 @@ impl AdapterService {
         }
         let category = run_result.as_ref().err().map(|error| error.category);
         self.registry.complete(body.run_id, binding, category);
-        cleanup?;
         match run_result {
             Ok(result) => {
                 let body =
@@ -1494,8 +1520,12 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use super::{JobKind, JobRegistry, publish_boot_id, read_prior_boot_id};
+    use super::{
+        JobKind, JobRegistry, apply_broker_terminal_outcome, publish_boot_id, read_prior_boot_id,
+    };
     use crate::action_client::AdapterAuthorizationBinding;
+    use crate::broker_client::BrokerTerminalOutcome;
+    use crate::redaction::{AdapterError, AdapterErrorCategory};
     use uuid::Uuid;
 
     #[test]
@@ -1519,6 +1549,36 @@ mod tests {
         ));
         assert!(*completion.borrow());
         assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn broker_terminal_outcome_is_authoritative_over_local_success() {
+        for (outcome, expected) in [
+            (
+                BrokerTerminalOutcome::Cancelled,
+                AdapterErrorCategory::Cancelled,
+            ),
+            (
+                BrokerTerminalOutcome::TimedOut,
+                AdapterErrorCategory::TimedOut,
+            ),
+            (
+                BrokerTerminalOutcome::Failed,
+                AdapterErrorCategory::SandboxUnavailable,
+            ),
+        ] {
+            let result = apply_broker_terminal_outcome::<()>(Ok(()), outcome).unwrap_err();
+            assert_eq!(result.category, expected);
+        }
+        let local_error = AdapterError::model_protocol();
+        assert_eq!(
+            apply_broker_terminal_outcome::<()>(
+                Err(local_error.clone()),
+                BrokerTerminalOutcome::Failed,
+            )
+            .unwrap_err(),
+            local_error
+        );
     }
 
     #[test]

@@ -9,18 +9,22 @@ use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use firecrawl_browser_execution_adapter::app_server::ProtocolBundle;
 use firecrawl_browser_execution_adapter::broker_client::{
-    BrokerClient, BrokerPhase, BrokerRuncState, validate_shared_contract,
-    validate_shared_contract_bytes,
+    BrokerCancelReason, BrokerClient, BrokerPhase, BrokerRuncState, BrokerTerminal,
+    BrokerTerminalOutcome, validate_shared_contract, validate_shared_contract_bytes,
 };
 use firecrawl_browser_execution_adapter::config::AdapterConfig;
 use firecrawl_browser_execution_adapter::jobs::{AdapterService, JobRegistry};
 use firecrawl_browser_execution_adapter::redaction::AdapterErrorCategory;
 use nix::cmsg_space;
+use nix::fcntl::{FcntlArg, OFlag, SealFlag, fcntl};
+use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::sys::socket::{
-    AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
-    UnixAddr, accept, bind, listen, recv, recvmsg, send, sendmsg, socket,
+    AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, Shutdown, SockFlag,
+    SockType, UnixAddr, accept, bind, listen, recv, recvmsg, send, sendmsg, shutdown, socket,
 };
+use nix::unistd::{Whence, lseek, pipe2, write};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::Duration;
@@ -74,11 +78,18 @@ fn send_packet(fd: RawFd, value: Value) {
 }
 
 fn send_packet_with_fd(fd: RawFd, value: Value, descriptor: RawFd) {
+    send_packet_with_fds(fd, value, &[descriptor]);
+}
+
+fn send_packet_with_fds(fd: RawFd, value: Value, descriptors: &[RawFd]) {
     let frame = value.to_string();
     let iov = [IoSlice::new(frame.as_bytes())];
-    let descriptors = [descriptor];
-    let control = [ControlMessage::ScmRights(&descriptors)];
-    sendmsg::<()>(fd, &iov, &control, MsgFlags::empty(), None).unwrap();
+    if descriptors.is_empty() {
+        sendmsg::<()>(fd, &iov, &[], MsgFlags::empty(), None).unwrap();
+    } else {
+        let control = [ControlMessage::ScmRights(descriptors)];
+        sendmsg::<()>(fd, &iov, &control, MsgFlags::empty(), None).unwrap();
+    }
 }
 
 fn receive_packet(fd: RawFd) -> Value {
@@ -265,7 +276,8 @@ fn run_fake_broker(
                 "type":"terminal",
                 "job_id":prepare["job_id"],
                 "init_pid":INIT_PID,
-                "outcome":"completed"
+                "outcome":"completed",
+                "artifacts":[]
             }),
         );
     })
@@ -494,7 +506,12 @@ fn run_poststart_failure_broker(
                 "type": "terminal",
                 "job_id": prepare["job_id"],
                 "init_pid": INIT_PID,
-                "outcome": "failed"
+                "outcome": if matches!(failure, PoststartFailure::Protocol) {
+                    "failed"
+                } else {
+                    "timed_out"
+                },
+                "artifacts": []
             }),
         );
     })
@@ -1610,6 +1627,339 @@ fn diagnose_round_trips_exact_correlation_and_state() {
     }
 }
 
+#[derive(Clone)]
+struct TerminalArtifactFixture {
+    id: Uuid,
+    name: String,
+    kind: &'static str,
+    content_type: &'static str,
+    content: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalArtifactFault {
+    None,
+    CountMismatch,
+    WrongOrder,
+    WrongChecksum,
+    WrongSize,
+    WrongContentType,
+    InvalidContent,
+    FailedOutcome,
+    ProactiveFailed,
+    CancelledOutcome,
+    Unsealed,
+    NonMemfd,
+    ExtraDescriptor,
+    NonzeroOffset,
+}
+
+fn checksum(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn artifact_record(fixture: &TerminalArtifactFixture) -> Value {
+    json!({
+        "artifactId": fixture.id,
+        "name": fixture.name,
+        "kind": fixture.kind,
+        "contentType": fixture.content_type,
+        "byteSize": fixture.content.len(),
+        "checksum": checksum(&fixture.content)
+    })
+}
+
+fn artifact_memfd(fixture: &TerminalArtifactFixture, sealed: bool, offset: u64) -> OwnedFd {
+    let descriptor = memfd_create(
+        format!("firecrawl-artifact-{}", fixture.id).as_str(),
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )
+    .unwrap();
+    let mut written = 0;
+    while written < fixture.content.len() {
+        written += write(&descriptor, &fixture.content[written..]).unwrap();
+    }
+    if sealed {
+        fcntl(
+            &descriptor,
+            FcntlArg::F_ADD_SEALS(
+                SealFlag::F_SEAL_WRITE
+                    | SealFlag::F_SEAL_GROW
+                    | SealFlag::F_SEAL_SHRINK
+                    | SealFlag::F_SEAL_SEAL,
+            ),
+        )
+        .unwrap();
+    }
+    lseek(&descriptor, offset as i64, Whence::SeekSet).unwrap();
+    descriptor
+}
+
+fn count_artifact_memfds(ids: &[Uuid]) -> usize {
+    fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .filter(|target| {
+            ids.iter()
+                .any(|id| target.to_string_lossy().contains(&id.to_string()))
+        })
+        .count()
+}
+
+fn run_terminal_artifact_exchange(
+    fixtures: Vec<TerminalArtifactFixture>,
+    fault: TerminalArtifactFault,
+) -> Result<BrokerTerminal, ()> {
+    let root = temporary_root();
+    let socket_path = root.join("broker.sock");
+    let auth_path = root.join("auth.json");
+    write_private(&auth_path, br#"{"OPENAI_API_KEY":"fixture"}"#);
+    let broker_path = socket_path.clone();
+    let broker_fixtures = fixtures.clone();
+    let broker = std::thread::spawn(move || {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(&broker_path).unwrap()).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let connection = accept(listener.as_raw_fd()).unwrap();
+        let (prepare, _prepare_descriptors) = receive_prepare(connection);
+        send_packet(
+            connection,
+            json!({
+                "type":"prepared",
+                "job_id":prepare["job_id"],
+                "init_pid":INIT_PID
+            }),
+        );
+        if matches!(fault, TerminalArtifactFault::ProactiveFailed) {
+            send_packet(
+                connection,
+                json!({
+                    "type":"terminal",
+                    "job_id":prepare["job_id"],
+                    "init_pid":INIT_PID,
+                    "outcome":"failed",
+                    "artifacts":[]
+                }),
+            );
+            shutdown(connection, Shutdown::Read).unwrap();
+            return;
+        }
+        let cancel = receive_packet(connection);
+        assert_eq!(cancel["method"], "cancel");
+
+        let mut records = broker_fixtures
+            .iter()
+            .map(artifact_record)
+            .collect::<Vec<_>>();
+        if matches!(fault, TerminalArtifactFault::WrongChecksum) {
+            records[0]["checksum"] =
+                json!("0000000000000000000000000000000000000000000000000000000000000000");
+        }
+        if matches!(fault, TerminalArtifactFault::WrongSize) {
+            records[0]["byteSize"] = json!(broker_fixtures[0].content.len() + 1);
+        }
+        if matches!(fault, TerminalArtifactFault::WrongContentType) {
+            records[0]["contentType"] = json!("application/x-firecrawl");
+        }
+        if matches!(fault, TerminalArtifactFault::InvalidContent) {
+            records[0]["kind"] = json!("screenshot");
+            records[0]["contentType"] = json!("image/jpeg");
+        }
+
+        let mut descriptors = broker_fixtures
+            .iter()
+            .map(|fixture| {
+                artifact_memfd(
+                    fixture,
+                    !matches!(fault, TerminalArtifactFault::Unsealed),
+                    u64::from(matches!(fault, TerminalArtifactFault::NonzeroOffset)),
+                )
+            })
+            .collect::<Vec<_>>();
+        if matches!(fault, TerminalArtifactFault::NonMemfd) {
+            let (read_end, write_end) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            write(&write_end, &broker_fixtures[0].content).unwrap();
+            drop(write_end);
+            descriptors[0] = read_end;
+        }
+        if matches!(fault, TerminalArtifactFault::WrongOrder) {
+            descriptors.swap(0, 1);
+        }
+        if matches!(fault, TerminalArtifactFault::CountMismatch) {
+            descriptors.pop();
+        }
+        if matches!(fault, TerminalArtifactFault::ExtraDescriptor) {
+            descriptors.push(artifact_memfd(&broker_fixtures[0], true, 0));
+        }
+        let descriptor_numbers = descriptors
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
+        send_packet_with_fds(
+            connection,
+            json!({
+                "type":"terminal",
+                "job_id":prepare["job_id"],
+                "init_pid":INIT_PID,
+                "outcome":if matches!(fault, TerminalArtifactFault::FailedOutcome) {
+                    "failed"
+                } else if matches!(fault, TerminalArtifactFault::CancelledOutcome) {
+                    "cancelled"
+                } else {
+                    "completed"
+                },
+                "artifacts":records
+            }),
+            &descriptor_numbers,
+        );
+    });
+    while !socket_path.exists() {
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    let client = BrokerClient::new(socket_path).unwrap();
+    let mut prepared = client
+        .prepare_codex(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+                + 30_000,
+            &auth_path,
+        )
+        .unwrap();
+    let result = client
+        .finish(&mut prepared, Uuid::new_v4(), BrokerCancelReason::Shutdown)
+        .map_err(|_| ());
+    broker.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    result
+}
+
+#[tokio::test]
+async fn terminal_artifacts_accept_zero_and_multiple_in_descriptor_order() {
+    let empty = run_terminal_artifact_exchange(Vec::new(), TerminalArtifactFault::None).unwrap();
+    assert_eq!(empty.outcome, BrokerTerminalOutcome::Completed);
+    assert!(empty.artifacts.is_empty());
+
+    let fixtures = vec![
+        TerminalArtifactFixture {
+            id: Uuid::new_v4(),
+            name: "result.png".to_owned(),
+            kind: "screenshot",
+            content_type: "image/png",
+            content: b"\x89PNG\r\n\x1a\nfirst artifact".to_vec(),
+        },
+        TerminalArtifactFixture {
+            id: Uuid::new_v4(),
+            name: "trace.zip".to_owned(),
+            kind: "trace",
+            content_type: "application/zip",
+            content: b"PK\x03\x04trace artifact".to_vec(),
+        },
+        TerminalArtifactFixture {
+            id: Uuid::new_v4(),
+            name: "screen.jpg".to_owned(),
+            kind: "screenshot",
+            content_type: "image/jpeg",
+            content: b"\xff\xd8\xffjpeg artifact".to_vec(),
+        },
+        TerminalArtifactFixture {
+            id: Uuid::new_v4(),
+            name: "recording.webm".to_owned(),
+            kind: "recording",
+            content_type: "video/webm",
+            content: b"\x1a\x45\xdf\xa3webm artifact".to_vec(),
+        },
+    ];
+    let ids = fixtures
+        .iter()
+        .map(|fixture| fixture.id)
+        .collect::<Vec<_>>();
+    let artifacts =
+        run_terminal_artifact_exchange(fixtures.clone(), TerminalArtifactFault::None).unwrap();
+    assert_eq!(artifacts.outcome, BrokerTerminalOutcome::Completed);
+    assert_eq!(artifacts.artifacts.len(), ids.len());
+    for (artifact, fixture) in artifacts.artifacts.iter().zip(fixtures) {
+        assert_eq!(artifact.artifact_id, fixture.id);
+        assert_eq!(artifact.name, fixture.name);
+        assert_eq!(artifact.content, fixture.content);
+    }
+    assert_eq!(count_artifact_memfds(&ids), 0);
+}
+
+#[tokio::test]
+async fn terminal_artifacts_reject_invalid_descriptor_transport_without_leaks() {
+    for fault in [
+        TerminalArtifactFault::CountMismatch,
+        TerminalArtifactFault::WrongOrder,
+        TerminalArtifactFault::WrongChecksum,
+        TerminalArtifactFault::WrongSize,
+        TerminalArtifactFault::WrongContentType,
+        TerminalArtifactFault::InvalidContent,
+        TerminalArtifactFault::FailedOutcome,
+        TerminalArtifactFault::CancelledOutcome,
+        TerminalArtifactFault::Unsealed,
+        TerminalArtifactFault::NonMemfd,
+        TerminalArtifactFault::ExtraDescriptor,
+        TerminalArtifactFault::NonzeroOffset,
+    ] {
+        let fixtures = vec![
+            TerminalArtifactFixture {
+                id: Uuid::new_v4(),
+                name: "first.png".to_owned(),
+                kind: "screenshot",
+                content_type: "image/png",
+                content: b"\x89PNG\r\n\x1a\nfirst".to_vec(),
+            },
+            TerminalArtifactFixture {
+                id: Uuid::new_v4(),
+                name: "second.jpg".to_owned(),
+                kind: "screenshot",
+                content_type: "image/jpeg",
+                content: b"\xff\xd8\xffsecond".to_vec(),
+            },
+        ];
+        let ids = fixtures
+            .iter()
+            .map(|fixture| fixture.id)
+            .collect::<Vec<_>>();
+        assert!(run_terminal_artifact_exchange(fixtures, fault).is_err());
+        assert_eq!(count_artifact_memfds(&ids), 0);
+    }
+}
+
+#[tokio::test]
+async fn finish_consumes_proactive_failed_terminal_after_cancel_send_failure() {
+    let terminal =
+        run_terminal_artifact_exchange(Vec::new(), TerminalArtifactFault::ProactiveFailed).unwrap();
+    assert_eq!(terminal.outcome, BrokerTerminalOutcome::Failed);
+    assert!(terminal.artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn finish_returns_authoritative_failed_outcome_after_cancel() {
+    let terminal =
+        run_terminal_artifact_exchange(Vec::new(), TerminalArtifactFault::FailedOutcome).unwrap();
+    assert_eq!(terminal.outcome, BrokerTerminalOutcome::Failed);
+    assert!(terminal.artifacts.is_empty());
+}
+
 #[test]
 fn shared_contract_rejects_closed_wire_mutations() {
     validate_shared_contract().unwrap();
@@ -1660,6 +2010,11 @@ fn shared_contract_rejects_closed_wire_mutations() {
         {
             let mut value = original.clone();
             value["messages"]["terminal"]["requiredFields"] = json!(["job_id", "outcome", "type"]);
+            value
+        },
+        {
+            let mut value = original.clone();
+            value["messages"]["terminal"]["descriptorRoles"] = json!([]);
             value
         },
         {

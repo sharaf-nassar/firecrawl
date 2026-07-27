@@ -1,4 +1,4 @@
-use std::io::{IoSlice, IoSliceMut};
+use std::io::{IoSlice, IoSliceMut, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
@@ -10,8 +10,9 @@ use nix::sys::socket::{
     UnixAddr, connect, recv, recvmsg, sendmsg, setsockopt, shutdown, socket, sockopt,
 };
 use nix::sys::time::{TimeVal, TimeValLike};
-use nix::unistd::{dup, pipe2, write};
+use nix::unistd::{Whence, dup, lseek, pipe2, write};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
 use tokio::net::unix::pipe::{Receiver, Sender};
 use uuid::Uuid;
@@ -23,6 +24,9 @@ use crate::redaction::AdapterError;
 const MAX_BROKER_FRAME_BYTES: usize = 64 * 1024;
 const MAX_AUTH_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_ARTIFACT_COUNT: usize = 8;
+const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ARTIFACT_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const BROKER_IO_TIMEOUT_SECONDS: i64 = 30;
 const CODEX_BUNDLE: &str = "codex-v1";
 const BROKER_CONTRACT: &str =
@@ -96,6 +100,34 @@ pub struct PreparedLeaseMonitor {
 
 pub struct PreparedStartInterrupter {
     fd: OwnedFd,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerArtifact {
+    pub artifact_id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub content_type: String,
+    pub byte_size: u64,
+    pub checksum: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerTerminal {
+    pub outcome: BrokerTerminalOutcome,
+    pub artifacts: Vec<BrokerArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ArtifactRecord {
+    artifact_id: Uuid,
+    name: String,
+    kind: String,
+    content_type: String,
+    byte_size: u64,
+    checksum: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -172,7 +204,8 @@ enum BrokerResponse {
     Terminal {
         job_id: Uuid,
         init_pid: u32,
-        outcome: BrokerOutcome,
+        outcome: BrokerTerminalOutcome,
+        artifacts: Vec<ArtifactRecord>,
     },
     Diagnostic {
         #[serde(flatten)]
@@ -188,7 +221,7 @@ enum BrokerResponse {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum BrokerOutcome {
+pub enum BrokerTerminalOutcome {
     Completed,
     Cancelled,
     TimedOut,
@@ -449,12 +482,12 @@ impl BrokerClient {
         prepared: &mut PreparedCodex,
         adapter_boot_id: Uuid,
         reason: BrokerCancelReason,
-    ) -> Result<(), AdapterError> {
+    ) -> Result<BrokerTerminal, AdapterError> {
         let control = prepared
             .control
             .as_ref()
             .ok_or_else(AdapterError::sandbox_unavailable)?;
-        self.send_request(
+        let _cancel_send_result = self.send_request(
             control,
             &BrokerRequest::Cancel {
                 job_id: prepared.job_id,
@@ -462,24 +495,21 @@ impl BrokerClient {
                 reason,
             },
             &[],
-        )?;
-        match self.receive_response(control)? {
+        );
+        let (response, artifacts) = self.receive_terminal_response(control)?;
+        match response {
             BrokerResponse::Terminal {
                 job_id,
                 init_pid,
                 outcome,
-            } if job_id == prepared.job_id
-                && init_pid == prepared.init_pid
-                && matches!(
-                    outcome,
-                    BrokerOutcome::Completed
-                        | BrokerOutcome::Cancelled
-                        | BrokerOutcome::TimedOut
-                        | BrokerOutcome::Failed
-                ) =>
-            {
+                ..
+            } if job_id == prepared.job_id && init_pid == prepared.init_pid => {
                 prepared.control.take();
-                Ok(())
+                if terminal_outcome_allowed_for_reason(reason, outcome) {
+                    Ok(BrokerTerminal { outcome, artifacts })
+                } else {
+                    Err(AdapterError::sandbox_unavailable())
+                }
             }
             _ => Err(AdapterError::sandbox_unavailable()),
         }
@@ -587,8 +617,39 @@ impl BrokerClient {
     }
 
     fn receive_response(&self, socket_fd: &OwnedFd) -> Result<BrokerResponse, AdapterError> {
+        let (response, descriptors) = self.receive_response_packet(socket_fd)?;
+        if !descriptors.is_empty() {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        Ok(response)
+    }
+
+    fn receive_terminal_response(
+        &self,
+        socket_fd: &OwnedFd,
+    ) -> Result<(BrokerResponse, Vec<BrokerArtifact>), AdapterError> {
+        let (response, descriptors) = self.receive_response_packet(socket_fd)?;
+        let BrokerResponse::Terminal {
+            outcome, artifacts, ..
+        } = &response
+        else {
+            return Err(AdapterError::sandbox_unavailable());
+        };
+        if *outcome != BrokerTerminalOutcome::Completed
+            && (!artifacts.is_empty() || !descriptors.is_empty())
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let artifacts = validate_terminal_artifacts(artifacts, descriptors)?;
+        Ok((response, artifacts))
+    }
+
+    fn receive_response_packet(
+        &self,
+        socket_fd: &OwnedFd,
+    ) -> Result<(BrokerResponse, Vec<OwnedFd>), AdapterError> {
         let mut response = vec![0_u8; MAX_BROKER_FRAME_BYTES + 1];
-        let read = {
+        let (read, received_descriptors) = {
             let mut iov = [IoSliceMut::new(&mut response)];
             let mut control = cmsg_space!([RawFd; 253], nix::libc::ucred);
             let message = recvmsg::<()>(
@@ -600,24 +661,25 @@ impl BrokerClient {
             .map_err(|_| AdapterError::sandbox_unavailable())?;
             let read = message.bytes;
             let flags = message.flags;
-            let mut control_present = false;
+            let mut unexpected_control = false;
             let mut received_descriptors = Vec::new();
             for control_message in message
                 .cmsgs()
                 .map_err(|_| AdapterError::sandbox_unavailable())?
             {
-                control_present = true;
-                if let ControlMessageOwned::ScmRights(descriptors) = control_message {
-                    received_descriptors.extend(
-                        descriptors
-                            .into_iter()
-                            .map(|descriptor| unsafe { OwnedFd::from_raw_fd(descriptor) }),
-                    );
+                match control_message {
+                    ControlMessageOwned::ScmRights(descriptors) => {
+                        received_descriptors.extend(
+                            descriptors
+                                .into_iter()
+                                .map(|descriptor| unsafe { OwnedFd::from_raw_fd(descriptor) }),
+                        );
+                    }
+                    _ => unexpected_control = true,
                 }
             }
-            drop(received_descriptors);
-            validate_response_transport(flags, control_present)?;
-            read
+            validate_response_transport(flags, unexpected_control)?;
+            (read, received_descriptors)
         };
         if read == 0 || read > MAX_BROKER_FRAME_BYTES {
             return Err(AdapterError::sandbox_unavailable());
@@ -629,8 +691,149 @@ impl BrokerClient {
             let _ = (category, message);
             return Err(AdapterError::sandbox_unavailable());
         }
-        Ok(parsed)
+        Ok((parsed, received_descriptors))
     }
+}
+
+const fn terminal_outcome_allowed_for_reason(
+    reason: BrokerCancelReason,
+    outcome: BrokerTerminalOutcome,
+) -> bool {
+    matches!(
+        (reason, outcome),
+        (
+            BrokerCancelReason::Shutdown,
+            BrokerTerminalOutcome::Completed
+        ) | (
+            BrokerCancelReason::Cancelled,
+            BrokerTerminalOutcome::Cancelled
+        ) | (
+            _,
+            BrokerTerminalOutcome::TimedOut | BrokerTerminalOutcome::Failed
+        )
+    )
+}
+
+fn validate_terminal_artifacts(
+    records: &[ArtifactRecord],
+    descriptors: Vec<OwnedFd>,
+) -> Result<Vec<BrokerArtifact>, AdapterError> {
+    if records.len() > MAX_ARTIFACT_COUNT || descriptors.len() != records.len() {
+        return Err(AdapterError::sandbox_unavailable());
+    }
+    let required_seals = SealFlag::F_SEAL_WRITE
+        | SealFlag::F_SEAL_GROW
+        | SealFlag::F_SEAL_SHRINK
+        | SealFlag::F_SEAL_SEAL;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut total = 0_u64;
+    let mut output = Vec::with_capacity(records.len());
+    for (record, descriptor) in records.iter().zip(descriptors) {
+        if record.artifact_id.is_nil()
+            || !ids.insert(record.artifact_id)
+            || !names.insert(record.name.as_str())
+            || !safe_artifact_name(&record.name)
+            || !valid_artifact_kind_content_type(&record.kind, &record.content_type)
+            || !valid_checksum(&record.checksum)
+            || record.byte_size == 0
+            || record.byte_size > MAX_ARTIFACT_BYTES
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        total = total
+            .checked_add(record.byte_size)
+            .ok_or_else(AdapterError::sandbox_unavailable)?;
+        if total > MAX_ARTIFACT_TOTAL_BYTES {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let target = std::fs::read_link(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+            .map_err(|_| AdapterError::sandbox_unavailable())?;
+        let expected_target = format!("/memfd:firecrawl-artifact-{} (deleted)", record.artifact_id);
+        if target.as_os_str() != std::ffi::OsStr::new(&expected_target)
+            || fcntl(&descriptor, FcntlArg::F_GET_SEALS)
+                .ok()
+                .and_then(SealFlag::from_bits)
+                != Some(required_seals)
+            || lseek(&descriptor, 0, Whence::SeekCur).ok() != Some(0)
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let mut file = std::fs::File::from(descriptor);
+        let metadata = file
+            .metadata()
+            .map_err(|_| AdapterError::sandbox_unavailable())?;
+        if !metadata.file_type().is_file() || metadata.len() != record.byte_size {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let mut content = Vec::with_capacity(record.byte_size as usize);
+        file.read_to_end(&mut content)
+            .map_err(|_| AdapterError::sandbox_unavailable())?;
+        if content.len() as u64 != record.byte_size
+            || hex_sha256(&content) != record.checksum
+            || !valid_artifact_content(&record.content_type, &content)
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        output.push(BrokerArtifact {
+            artifact_id: record.artifact_id,
+            name: record.name.clone(),
+            kind: record.kind.clone(),
+            content_type: record.content_type.clone(),
+            byte_size: record.byte_size,
+            checksum: record.checksum.clone(),
+            content,
+        });
+    }
+    Ok(output)
+}
+
+fn safe_artifact_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_artifact_kind_content_type(kind: &str, content_type: &str) -> bool {
+    matches!(
+        (kind, content_type),
+        ("screenshot", "image/png")
+            | ("screenshot", "image/jpeg")
+            | ("trace", "application/zip")
+            | ("recording", "video/webm")
+    )
+}
+
+fn valid_checksum(checksum: &str) -> bool {
+    checksum.len() == 64
+        && checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_artifact_content(content_type: &str, content: &[u8]) -> bool {
+    match content_type {
+        "image/jpeg" => content.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => content.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "application/zip" => {
+            content.starts_with(b"PK\x03\x04")
+                || content.starts_with(b"PK\x05\x06")
+                || content.starts_with(b"PK\x07\x08")
+        }
+        "video/webm" => content.starts_with(b"\x1a\x45\xdf\xa3"),
+        _ => false,
+    }
+}
+
+fn hex_sha256(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn validate_response_transport(flags: MsgFlags, control_present: bool) -> Result<(), AdapterError> {
@@ -817,7 +1020,11 @@ pub fn validate_shared_contract() -> Result<(), AdapterError> {
         serde_json::json!({"type":"started","job_id":job_id,"init_pid":7}),
         serde_json::json!({"type":"aborted","job_id":job_id}),
         serde_json::json!({
-            "type":"terminal","job_id":job_id,"init_pid":7,"outcome":"completed"
+            "type":"terminal",
+            "job_id":job_id,
+            "init_pid":7,
+            "outcome":"completed",
+            "artifacts":[]
         }),
         serde_json::json!({
             "type":"diagnostic",
@@ -1054,7 +1261,7 @@ pub fn validate_shared_contract_bytes(raw: &[u8]) -> Result<serde_json::Value, A
                 "type",
             ],
             "owner_cancelled" | "health" | "healthy" => &[expected_field],
-            "terminal" => &["init_pid", "job_id", "outcome", "type"],
+            "terminal" => &["artifacts", "init_pid", "job_id", "outcome", "type"],
             "error" => &["category", "message", "type"],
             _ => return Err(AdapterError::sandbox_unavailable()),
         };
@@ -1137,12 +1344,25 @@ pub fn validate_shared_contract_bytes(raw: &[u8]) -> Result<serde_json::Value, A
                     return Err(AdapterError::sandbox_unavailable());
                 }
             }
-        } else if message
-            .get("descriptorRoles")
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(|roles| !roles.is_empty())
-        {
-            return Err(AdapterError::sandbox_unavailable());
+        } else {
+            let expected_roles: &[&str] = if name == "terminal" {
+                &["artifacts"]
+            } else {
+                &[]
+            };
+            if message
+                .get("descriptorRoles")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|roles| {
+                    roles
+                        != &expected_roles
+                            .iter()
+                            .map(|role| serde_json::Value::String((*role).to_owned()))
+                            .collect::<Vec<_>>()
+                })
+            {
+                return Err(AdapterError::sandbox_unavailable());
+            }
         }
     }
     Ok(contract)
@@ -1245,7 +1465,8 @@ mod tests {
                 "type":"terminal",
                 "job_id":job_id,
                 "init_pid":7,
-                "outcome":"failed"
+                "outcome":"failed",
+                "artifacts":[]
             }),
             json!({"type":"error","category":"invalid","message":"rejected"}),
         ] {

@@ -1,0 +1,165 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_X32"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept",
+        "accept4",
+        "access",
+        "arch_prctl",
+        "bind",
+        "brk",
+        "chdir",
+        "clock_getres",
+        "clock_gettime",
+        "clock_nanosleep",
+        "close",
+        "close_range",
+        "connect",
+        "dup",
+        "dup2",
+        "dup3",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "epoll_wait",
+        "eventfd2",
+        "execve",
+        "exit",
+        "exit_group",
+        "faccessat",
+        "faccessat2",
+        "fadvise64",
+        "fchdir",
+        "fcntl",
+        "fdatasync",
+        "fstat",
+        "fstatfs",
+        "fsync",
+        "ftruncate",
+        "futex",
+        "futex_waitv",
+        "getcwd",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getpeername",
+        "getpid",
+        "getppid",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getsockname",
+        "getsockopt",
+        "gettid",
+        "getuid",
+        "ioctl",
+        "listen",
+        "lseek",
+        "madvise",
+        "memfd_create",
+        "mmap",
+        "mprotect",
+        "mremap",
+        "munmap",
+        "newfstatat",
+        "openat",
+        "openat2",
+        "pipe2",
+        "poll",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "prlimit64",
+        "pselect6",
+        "read",
+        "readlink",
+        "readlinkat",
+        "recvfrom",
+        "recvmmsg",
+        "recvmsg",
+        "restart_syscall",
+        "rseq",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "sched_getaffinity",
+        "sched_yield",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "set_robust_list",
+        "set_tid_address",
+        "setgid",
+        "setgroups",
+        "setsockopt",
+        "setuid",
+        "shutdown",
+        "sigaltstack",
+        "statx",
+        "sysinfo",
+        "tgkill",
+        "uname",
+        "wait4",
+        "waitid",
+        "write",
+        "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": ["clone"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 2114060416, "valueTwo": 0, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 1, "op": "SCMP_CMP_EQ" }
+      ]
+    },
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 2, "op": "SCMP_CMP_EQ" },
+        { "index": 1, "value": 15, "valueTwo": 1, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 2, "op": "SCMP_CMP_EQ" },
+        { "index": 1, "value": 15, "valueTwo": 2, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 10, "op": "SCMP_CMP_EQ" },
+        { "index": 1, "value": 15, "valueTwo": 1, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    },
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 10, "op": "SCMP_CMP_EQ" },
+        { "index": 1, "value": 15, "valueTwo": 2, "op": "SCMP_CMP_MASKED_EQ" }
+      ]
+    }
+  ]
+}

@@ -1868,6 +1868,11 @@ neutral Codex artifact name, strict source-identity manifest and protocol
 checksums, atomic generation switch, fixed unit text, and refusal of
 symlink/world-writable staging. Reject a SemVer embedded in installed artifact
 or generation path names and any artifact/schema/manifest identity mismatch.
+Require systemd 254 or newer and assert `DelegateSubgroup=broker`. The broker
+main process must run only in the fixed `broker/` control subgroup while job
+cgroups live below the sibling `jobs/firecrawl-<uuid>` subtree. Tests require
+that exact process/job separation and reject either jobs nested below
+`broker/` or a broker process left in the delegated service root.
 Also assert the installed broker contract matches
 `COMPATIBILITY_SHA256SUMS` and both embedded Rust digests.
 
@@ -1922,6 +1927,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 Delegate=cpu memory pids io
+DelegateSubgroup=broker
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
@@ -1932,6 +1938,10 @@ ReadWritePaths=/run/firecrawl-sandbox /sys/fs/cgroup/system.slice/firecrawl-sand
 Do not set `PrivateNetwork=yes`; Codex bundle requires OpenAI connectivity.
 Broker itself opens no internet socket. Do not set `ProtectControlGroups=yes`
 or `MemoryDenyWriteExecute=yes`; they break delegated cgroups or V8 JIT.
+The root installer rejects systemd older than 254 before publishing units.
+The broker enables delegated controllers on the empty service root and fixed
+`jobs/` subtree, then reconciles only canonical `jobs/firecrawl-<uuid>`
+children. It preserves the systemd-owned `broker/` control subgroup.
 
 User adapter unit uses rendered `/run/user/1000/firecrawl`, `UMask=0077`,
 `Restart=on-failure`, `NoNewPrivileges=yes`, `PrivateTmp=yes`,
