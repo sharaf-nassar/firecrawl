@@ -749,7 +749,7 @@ function createStartupStateImpl(
       const commit = (execution: ReconciliationExecutionResult): void => {
         if (committedResult !== null) {
           throw error(
-            "reconciliation_execution_failed",
+            "reconciliation_cleanup_failed",
             "reconciliation commit was repeated",
           );
         }
@@ -760,7 +760,7 @@ function createStartupStateImpl(
           result = reconciliationResultV1Schema.parse(execution.publicResult);
         } catch {
           throw error(
-            "reconciliation_execution_failed",
+            "reconciliation_cleanup_failed",
             "reconciliation returned an invalid result",
           );
         }
@@ -770,7 +770,7 @@ function createStartupStateImpl(
           result.snapshotDigest !== request.snapshotDigest
         ) {
           throw error(
-            "reconciliation_execution_failed",
+            "reconciliation_nonce_mismatch",
             "reconciliation result identity does not match",
           );
         }
@@ -786,7 +786,7 @@ function createStartupStateImpl(
             )
           ) {
             throw error(
-              "reconciliation_execution_failed",
+              "reconciliation_cleanup_failed",
               "generation authority compare-and-swap failed",
             );
           }
@@ -869,7 +869,7 @@ function createStartupStateImpl(
           )
         ) {
           throw error(
-            "reconciliation_execution_failed",
+            "reconciliation_cleanup_failed",
             "generation authority installation cannot be retried",
           );
         }
@@ -896,7 +896,7 @@ function createStartupStateImpl(
               );
             } catch {
               throw error(
-                "reconciliation_execution_failed",
+                "reconciliation_cleanup_failed",
                 "reconciliation returned an invalid result",
               );
             }
@@ -907,7 +907,7 @@ function createStartupStateImpl(
               publicResult.snapshotDigest !== request.snapshotDigest
             ) {
               throw error(
-                "reconciliation_execution_failed",
+                "reconciliation_nonce_mismatch",
                 "reconciliation result identity does not match",
               );
             }

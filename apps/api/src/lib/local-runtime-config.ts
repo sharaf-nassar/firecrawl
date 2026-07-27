@@ -2,6 +2,11 @@ import path from "node:path";
 
 import { z } from "zod";
 
+import {
+  canonicalUuidSchema,
+  httpUrlSchema,
+} from "./scrape-interact/browser-service-contracts";
+
 export type LocalRuntimeConfigSource = {
   LOCAL_PERSISTENCE_ENABLED?: boolean;
   LOCAL_BROWSER_SERVICE_ENABLED?: boolean;
@@ -95,9 +100,15 @@ export class LocalRuntimeConfigurationError extends Error {
   }
 }
 
-const databaseUrlSchema = z.string().url();
-const ownerIdSchema = z.string().uuid();
-const endpointUrlSchema = z.string().url();
+const databaseUrlSchema = z.string().superRefine((value, context) => {
+  try {
+    new URL(value);
+  } catch {
+    context.addIssue({ code: "custom", message: "absolute URL required" });
+  }
+});
+const ownerIdSchema = canonicalUuidSchema;
+const endpointUrlSchema = httpUrlSchema;
 
 function boundedInteger(
   source: number | string | undefined,

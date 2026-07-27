@@ -365,11 +365,14 @@ export async function browserCreateController(
 
   // 0a. Check if team has enough credits for the full TTL
   const estimatedCredits = calculateBrowserSessionCredits(ttl * 1000);
-  const autumnResult = await autumnService.checkCredits({
-    teamId: req.auth.team_id,
-    value: estimatedCredits,
-    properties: { source: "browserCreate", path: req.path },
-  });
+  const autumnResult =
+    config.LOCAL_PERSISTENCE_ENABLED === true
+      ? null
+      : await autumnService.checkCredits({
+          teamId: req.auth.team_id,
+          value: estimatedCredits,
+          properties: { source: "browserCreate", path: req.path },
+        });
 
   if (autumnResult !== null && !autumnResult.allowed) {
     logger.warn("Insufficient credits for browser session TTL", {
@@ -445,6 +448,8 @@ export async function browserCreateController(
           lockdown: true,
         },
         concurrencyLimit,
+        billingSubscriptionId: req.acuc?.sub_id ?? null,
+        billingApiKeyId: req.acuc?.api_key_id ?? null,
         ...configuredPublicBrowserOrigins(),
       });
       invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
@@ -790,26 +795,6 @@ export async function browserDeleteController(
     try {
       const result = await runtime.stopSession(req.auth.team_id, id);
       invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
-      if (result.stopped) {
-        mirrorExternalSlotRelease(req.auth.team_id, id).catch(() => {});
-      }
-      if (result.stopped && result.creditsBilled !== undefined) {
-        billTeam(
-          req.auth.team_id,
-          req.acuc?.sub_id ?? undefined,
-          result.creditsBilled,
-          req.acuc?.api_key_id ?? null,
-          {
-            endpoint: result.usedPrompt ? "interact" : "browser",
-            jobId: id,
-          },
-        ).catch(error => {
-          logger.error("Failed to bill local browser session", {
-            error,
-            creditsBilled: result.creditsBilled,
-          });
-        });
-      }
       return res.status(200).json({
         success: true,
         ...(result.sessionDurationMs === undefined

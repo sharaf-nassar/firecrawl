@@ -257,7 +257,8 @@ async function beginAdapterRun(
   };
 }
 
-async function activateAdapter(
+/** @public Atomically binds one accepted adapter process to its run and capability. */
+export async function activateAdapterProcess(
   lease: BrowserStateMutationLease,
   untrustedRunId: string,
   untrustedBinding: AdapterAuthorizationBinding,
@@ -559,14 +560,14 @@ export function createCapabilityStore(deps: { gate: BrowserStartupGate }) {
       );
     },
 
-    activate(
+    activateAdapterProcess(
       runId: string,
       binding: AdapterAuthorizationBinding,
       now = new Date(),
     ): Promise<AdapterCapabilityBinding> {
       return deps.gate.withBrowserStateMutationLease(
         "filesystem_and_database",
-        lease => activateAdapter(lease, runId, binding, now),
+        lease => activateAdapterProcess(lease, runId, binding, now),
       );
     },
 

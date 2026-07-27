@@ -163,8 +163,8 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterProcessId: 4242,
     };
     const results = await Promise.allSettled([
-      capabilities.activate(pending.runId, binding),
-      capabilities.activate(pending.runId, binding),
+      capabilities.activateAdapterProcess(pending.runId, binding),
+      capabilities.activateAdapterProcess(pending.runId, binding),
     ]);
     expect(
       results.filter(result => result.status === "fulfilled"),
@@ -194,7 +194,7 @@ describeWithDatabase("durable browser capability bindings", () => {
     const pending = await fixture();
     await capabilities.revoke(pending.runId);
     await expect(
-      capabilities.activate(pending.runId, {
+      capabilities.activateAdapterProcess(pending.runId, {
         adapterJobId: pending.adapterJobId,
         adapterSupervisorId: pending.adapterSupervisorId,
         adapterProcessId: 4242,
@@ -216,7 +216,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterSupervisorId: pending.adapterSupervisorId,
       adapterProcessId: 4242,
     };
-    await capabilities.activate(pending.runId, binding);
+    await capabilities.activateAdapterProcess(pending.runId, binding);
     const exact = {
       token: pending.token,
       ownerId,
@@ -258,7 +258,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterSupervisorId: pending.adapterSupervisorId,
       adapterProcessId: 4242,
     };
-    await capabilities.activate(pending.runId, binding);
+    await capabilities.activateAdapterProcess(pending.runId, binding);
     const exact = {
       ownerId,
       sessionId: pending.sessionId,
@@ -311,7 +311,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterSupervisorId: pending.adapterSupervisorId,
       adapterProcessId: 4242,
     };
-    await capabilities.activate(pending.runId, binding);
+    await capabilities.activateAdapterProcess(pending.runId, binding);
     const exact = {
       ownerId,
       sessionId: pending.sessionId,
@@ -342,7 +342,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterSupervisorId: pending.adapterSupervisorId,
       adapterProcessId: 4242,
     };
-    await capabilities.activate(pending.runId, binding);
+    await capabilities.activateAdapterProcess(pending.runId, binding);
     const runtimeSessionId = randomUUID();
     await pool.query(
       `UPDATE browser_sessions
@@ -431,7 +431,7 @@ describeWithDatabase("durable browser capability bindings", () => {
 
   it("enforces durable side-effect replay and action-count policy", async () => {
     const pending = await fixture();
-    await capabilities.activate(pending.runId, {
+    await capabilities.activateAdapterProcess(pending.runId, {
       adapterJobId: pending.adapterJobId,
       adapterSupervisorId: pending.adapterSupervisorId,
       adapterProcessId: 4242,
@@ -508,7 +508,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterSupervisorId: successful.adapterSupervisorId,
       adapterProcessId: 4242,
     };
-    await capabilities.activate(successful.runId, binding);
+    await capabilities.activateAdapterProcess(successful.runId, binding);
     await expect(
       capabilities.authorize({
         token: successful.token,
@@ -586,7 +586,7 @@ describeWithDatabase("durable browser capability bindings", () => {
     });
 
     const failed = await fixture();
-    await capabilities.activate(failed.runId, {
+    await capabilities.activateAdapterProcess(failed.runId, {
       adapterJobId: failed.adapterJobId,
       adapterSupervisorId: failed.adapterSupervisorId,
       adapterProcessId: 4343,
@@ -664,7 +664,7 @@ describeWithDatabase("durable browser capability bindings", () => {
     await expect(capabilities.authorize(exact)).rejects.toMatchObject({
       category: "capability_denied",
     });
-    await capabilities.activate(pending.runId, binding);
+    await capabilities.activateAdapterProcess(pending.runId, binding);
     await pool.query(
       `UPDATE browser_interact_runs
           SET state = 'succeeded', finished_at = now()
@@ -685,7 +685,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       adapterSupervisorId: expired.adapterSupervisorId,
       adapterProcessId: 4343,
     };
-    await capabilities.activate(expired.runId, expiredBinding);
+    await capabilities.activateAdapterProcess(expired.runId, expiredBinding);
     await pool.query(
       `UPDATE browser_capabilities
           SET expires_at = now() - interval '1 second',
@@ -722,7 +722,7 @@ describeWithDatabase("durable browser capability bindings", () => {
       revoked_at: expect.any(Date),
     });
     await expect(
-      capabilities.activate(pending.runId, {
+      capabilities.activateAdapterProcess(pending.runId, {
         adapterJobId: pending.adapterJobId,
         adapterSupervisorId: pending.adapterSupervisorId,
         adapterProcessId: 4242,

@@ -9,6 +9,7 @@ import {
 } from "../../controllers/v2/types";
 import { countries } from "../validate-country";
 import { rewriteUrl } from "../../scraper/scrapeURL/lib/rewriteUrl";
+import { httpUrlSchema } from "./browser-service-contracts";
 
 /** @public */
 export type ReplayAction =
@@ -480,10 +481,9 @@ export const replayScrapeOptionsSchema = z.strictObject({
   __forceFirePDF: z.unknown().optional(),
 });
 
-const retainedUrlSchema = z
-  .url()
-  .regex(/^https?:\/\//i)
-  .refine(value => isAllowedRetainedUrl(value));
+const retainedUrlSchema = httpUrlSchema.refine(value =>
+  isAllowedRetainedUrl(value),
+);
 
 const storageCookieSchema = z.strictObject({
   name: z.string(),

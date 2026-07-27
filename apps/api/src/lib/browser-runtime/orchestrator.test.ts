@@ -20,6 +20,8 @@ vi.mock("../browser-state/store", () => ({
     testComposition.stores.failAdapterRun(...args),
   claimBrowserSessionStop: (...args: unknown[]) =>
     testComposition.stores.claimStop(...args),
+  renewBrowserSessionStop: (...args: unknown[]) =>
+    testComposition.stores.renewStop?.(...args) ?? true,
   finishBrowserSessionStop: (...args: unknown[]) =>
     testComposition.stores.finishStop(...args),
   commitPreparedProfileGeneration: (...args: unknown[]) => {
@@ -57,7 +59,7 @@ function testCapabilities(
   gate: ReturnType<typeof openGate>,
   stores: {
     beginAdapterRun(lease: unknown, input: any): Promise<any>;
-    activateAdapterRun(
+    activateAdapterProcess(
       lease: unknown,
       runId: string,
       binding: any,
@@ -93,7 +95,7 @@ function testCapabilities(
         },
       };
     },
-    activate(
+    activateAdapterProcess(
       runId: string,
       binding: {
         adapterJobId: string;
@@ -104,7 +106,7 @@ function testCapabilities(
       return gate.withBrowserStateMutationLease(
         "filesystem_and_database",
         async lease => {
-          await stores.activateAdapterRun(lease, runId, binding);
+          await stores.activateAdapterProcess(lease, runId, binding);
           return {
             id: randomUUID(),
             ownerId: randomUUID(),
@@ -174,7 +176,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -232,7 +234,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -274,7 +276,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -324,7 +326,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -398,7 +400,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -447,7 +449,7 @@ describe("browser session orchestrator", () => {
         await bindingBlocked;
         return input;
       }),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -502,7 +504,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -540,6 +542,7 @@ describe("browser session orchestrator", () => {
     );
     expect(stores.finishStop).toHaveBeenCalledWith(
       expect.anything(),
+      expect.anything(),
       sessionId,
       "requested",
       "interrupted",
@@ -561,7 +564,7 @@ describe("browser session orchestrator", () => {
     const gate = openGate();
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -602,7 +605,7 @@ describe("browser session orchestrator", () => {
     const gate = openGate();
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -645,7 +648,7 @@ describe("browser session orchestrator", () => {
     const gate = openGate();
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -685,14 +688,14 @@ describe("browser session orchestrator", () => {
       category: "capability_denied",
       message: "Browser capability was denied",
     });
-    expect(stores.activateAdapterRun).not.toHaveBeenCalled();
+    expect(stores.activateAdapterProcess).not.toHaveBeenCalled();
   });
 
   it("reserves interact lifetime and advances every creation phase", async () => {
     const gate = openGate();
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -761,7 +764,7 @@ describe("browser session orchestrator", () => {
     const sessionId = randomUUID();
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -791,6 +794,7 @@ describe("browser session orchestrator", () => {
     expect(adapter.cancelExecutionRun).not.toHaveBeenCalled();
     expect(stores.finishStop).toHaveBeenCalledWith(
       expect.anything(),
+      expect.anything(),
       sessionId,
       "requested",
       "destroyed",
@@ -802,7 +806,7 @@ describe("browser session orchestrator", () => {
     const sessionId = randomUUID();
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -833,6 +837,7 @@ describe("browser session orchestrator", () => {
     ).rejects.toThrow("Browser stop cleanup failed");
     expect(stores.finishStop).toHaveBeenCalledWith(
       expect.anything(),
+      expect.anything(),
       sessionId,
       "requested",
       "interrupted",
@@ -858,7 +863,7 @@ describe("browser session orchestrator", () => {
     };
     const stores = {
       beginAdapterRun: vi.fn(async (_lease, input) => input),
-      activateAdapterRun: vi.fn(),
+      activateAdapterProcess: vi.fn(),
       countInteractActions: vi.fn(async () => 0),
       finishAdapterRun: vi.fn(),
       failAdapterRun: vi.fn(),
@@ -894,6 +899,7 @@ describe("browser session orchestrator", () => {
     ).rejects.toThrow("Browser stop cleanup failed");
     expect(discardProfile).toHaveBeenCalledWith(prepared);
     expect(stores.finishStop).toHaveBeenCalledWith(
+      expect.anything(),
       expect.anything(),
       sessionId,
       "requested",

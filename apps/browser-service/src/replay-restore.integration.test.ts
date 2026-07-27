@@ -28,6 +28,7 @@ import { createSessionRegistry } from "./session-registry.js";
 
 const roots: string[] = [];
 const CHECKPOINT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const SESSION_V7 = "019fa263-7912-7438-9837-60c547ecb22a";
 
 afterEach(async () => {
   await Promise.all(
@@ -638,7 +639,7 @@ describe("real Playwright 1.61.1 restore", () => {
     try {
       const session = await registry.create({
         version: 1,
-        sessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        sessionId: SESSION_V7,
         initialUrl: finalUrl,
         allowedDomains: ["public.test"],
         ttlSeconds: 60,

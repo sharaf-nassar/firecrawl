@@ -241,7 +241,7 @@ describe("resolveLocalRuntimeConfig", () => {
     expect(() =>
       resolveLocalRuntimeConfig({
         ...validLocalSettings,
-        LOCAL_OWNER_ID: "not-a-uuid",
+        LOCAL_OWNER_ID: validLocalSettings.LOCAL_OWNER_ID!.toUpperCase(),
       }),
     ).toThrowError(/LOCAL_OWNER_ID/);
   });

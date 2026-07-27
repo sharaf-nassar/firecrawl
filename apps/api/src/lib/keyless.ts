@@ -209,6 +209,66 @@ return next
 }
 
 /**
+ * Reconciles one durable Browser reservation exactly once in Redis.
+ *
+ * The non-expiring marker and counter update share one Lua transaction. The
+ * billing worker assigns marker expiry only after PostgreSQL acknowledges the
+ * adjustment, so outages longer than local retention cannot reapply a delta.
+ */
+export async function reconcileBrowserKeylessCreditsOnce(
+  teamId: string,
+  reservedCredits: number,
+  actualCredits: number,
+  sessionId: string,
+): Promise<boolean> {
+  const ip = keylessIpFromTeamId(teamId);
+  if (
+    !ip ||
+    !Number.isFinite(reservedCredits) ||
+    !Number.isFinite(actualCredits)
+  ) {
+    return false;
+  }
+  const reserved = Math.max(0, Math.ceil(reservedCredits));
+  const actual = Math.max(0, Math.ceil(actualCredits));
+  const applied = (await redisRateLimitClient.eval(
+    `
+if redis.call("EXISTS", KEYS[2]) == 1 then
+  return 0
+end
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+local next = current + tonumber(ARGV[1])
+if next < 0 then
+  next = 0
+end
+redis.call("SET", KEYS[1], next, "EX", ARGV[2])
+redis.call("SET", KEYS[2], "1")
+return 1
+`,
+    2,
+    creditsKey(ip),
+    `keyless_browser_reconcile:${sessionId}`,
+    actual - reserved,
+    DAY_SECONDS,
+  )) as number;
+  return applied === 1;
+}
+
+/** Assigns bounded GC only after durable adjustment acknowledgement. */
+export async function expireBrowserKeylessReconcileReceipt(
+  sessionId: string,
+  ttlSeconds: number,
+): Promise<void> {
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < DAY_SECONDS) {
+    throw new TypeError("Browser keyless receipt TTL is outside safe bounds");
+  }
+  await redisRateLimitClient.expire(
+    `keyless_browser_reconcile:${sessionId}`,
+    ttlSeconds,
+  );
+}
+
+/**
  * Read-only check of whether an IP could currently use the keyless tier (no
  * consumption). Used by the hosted MCP to decide, at connect time, whether to
  * serve keyless (eligible) or throw so FastMCP emits the OAuth challenge (not).

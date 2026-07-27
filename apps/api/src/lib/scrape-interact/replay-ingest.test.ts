@@ -175,6 +175,32 @@ describe("replay ingest authority boundary", () => {
     await postAuthorized(app, body, {
       "x-firecrawl-deadline-ms": String(Date.now() - 1),
     }).expect(400, { error: "invalid_protocol" });
+    await postAuthorized(app, body, {
+      "x-firecrawl-correlation-id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    }).expect(400, { error: "invalid_protocol" });
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-HTTP checkpoint URLs at the canonical schema boundary", async () => {
+    const app = express();
+    const persist = vi.fn(async () => ({ persisted: true }));
+    registerReplayIngestTransportRoute(app, {
+      apiKey,
+      getGate: () =>
+        ({
+          withBrowserStateMutationLease: vi.fn(async (_scope, operation) =>
+            operation({}),
+          ),
+        }) as never,
+      persist,
+    });
+    const body = authorizedBody();
+    body.replayCheckpoint = {
+      ...input.replayCheckpoint!,
+      finalUrl: "ftp://example.test/checkpoint",
+    };
+
+    await postAuthorized(app, body).expect(400, { error: "invalid_request" });
     expect(persist).not.toHaveBeenCalled();
   });
 

@@ -1764,6 +1764,68 @@ describeWithDatabase("PostgreSQL local retention", () => {
     return id;
   }
 
+  it("retains requests until billing and admission terminal work completes", async () => {
+    const requestId = randomUUID();
+    const sessionId = randomUUID();
+    await insertRequest(requestId, new Date("2026-07-17T00:00:00.000Z"));
+    await pool.query(
+      `INSERT INTO browser_sessions (
+         id, request_id, owner_id, state, absolute_deadline_at,
+         idle_deadline_at, last_activity_at, billing_endpoint,
+         admission_backend, terminal_at, terminal_reason
+       ) VALUES (
+         $1, $2, $3, 'destroyed', now(), now(), now(), 'browser',
+         'redis', now(), 'requested'
+       )`,
+      [sessionId, requestId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO browser_billing_outbox (
+         session_id, owner_id, endpoint, session_duration_ms, credits,
+         used_prompt
+       ) VALUES ($1, $2, 'browser', 1000, 1, false)`,
+      [sessionId, ownerId],
+    );
+    await pool.query(
+      `INSERT INTO browser_admission_cleanup (
+         session_id, owner_id, backend
+       ) VALUES ($1, $2, 'redis')`,
+      [sessionId, ownerId],
+    );
+
+    await expect(
+      database.deleteExpiredOperationalRows(
+        new Date("2026-07-18T00:00:00.000Z"),
+        50,
+      ),
+    ).resolves.toMatchObject({ requestsDeleted: 0 });
+    await pool.query(
+      `UPDATE browser_billing_outbox
+          SET state = 'delivered', delivered_at = now()
+        WHERE session_id = $1`,
+      [sessionId],
+    );
+    await expect(
+      database.deleteExpiredOperationalRows(
+        new Date("2026-07-18T00:00:00.000Z"),
+        50,
+      ),
+    ).resolves.toMatchObject({ requestsDeleted: 0 });
+    await pool.query(
+      `UPDATE browser_admission_cleanup
+          SET redis_released_at = now()
+        WHERE session_id = $1`,
+      [sessionId],
+    );
+    await expect(
+      database.deleteExpiredOperationalRows(
+        new Date("2026-07-18T00:00:00.000Z"),
+        50,
+      ),
+    ).resolves.toMatchObject({ requestsDeleted: 1 });
+    fixtureIds.delete(requestId);
+  });
+
   it("retains a failed cleanup intent and clears it after a missing-file retry", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "retention-intent-"));
     const filesystem = new BrowserStateFilesystem(root);

@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   logRequest: vi.fn(),
   reserveKeyless: vi.fn(),
   adjustKeyless: vi.fn(),
+  logKeyless: vi.fn(),
   checkCredits: vi.fn(),
   activeCount: vi.fn(),
   mirrorAcquire: vi.fn(),
@@ -56,9 +57,13 @@ vi.mock("../../lib/browser-sessions", () => ({
 vi.mock("../../lib/keyless", () => ({
   KEYLESS_CREDITS_MESSAGE: "Insufficient credits",
   adjustKeylessCredits: mocks.adjustKeyless,
-  logKeylessCreditUsage: vi.fn(async () => undefined),
+  logKeylessCreditUsage: mocks.logKeyless,
   reserveKeylessCredits: mocks.reserveKeyless,
   keylessTeamUuid: vi.fn(() => null),
+}));
+vi.mock("../../lib/local-owner", () => ({
+  isScrapeOwnedBy: (persistedTeamId: string, requestTeamId: string) =>
+    persistedTeamId === requestTeamId,
 }));
 vi.mock("../../services/worker/nuq-router", () => ({
   getCombinedTeamActiveCount: mocks.activeCount,
@@ -168,12 +173,16 @@ describe("local scrape Interact compatibility", () => {
       config as { LOCAL_BROWSER_SERVICE_ENABLED?: boolean }
     ).LOCAL_BROWSER_SERVICE_ENABLED = true;
     (
+      config as { LOCAL_PERSISTENCE_ENABLED?: boolean }
+    ).LOCAL_PERSISTENCE_ENABLED = true;
+    (
       config as { BROWSER_PUBLIC_API_ORIGIN?: string }
     ).BROWSER_PUBLIC_API_ORIGIN = "http://api.example.test";
     mocks.getRuntime.mockReturnValue(mocks.runtime);
     mocks.logRequest.mockResolvedValue(undefined);
     mocks.reserveKeyless.mockResolvedValue({ ok: true });
     mocks.adjustKeyless.mockResolvedValue(undefined);
+    mocks.logKeyless.mockResolvedValue(undefined);
     mocks.checkCredits.mockResolvedValue(null);
     mocks.activeCount.mockResolvedValue(0);
     mocks.mirrorAcquire.mockResolvedValue(undefined);
@@ -193,6 +202,12 @@ describe("local scrape Interact compatibility", () => {
     expect(
       browserExecuteRequestSchema.safeParse({ prompt: "read" }).success,
     ).toBe(true);
+    expect(
+      browserExecuteRequestSchema.safeParse({
+        prompt: "read",
+        existingSessionId: randomUUID().toUpperCase(),
+      }).success,
+    ).toBe(false);
     expect(
       browserExecuteRequestSchema.safeParse({
         code: "1",
@@ -506,14 +521,16 @@ describe("local scrape Interact compatibility", () => {
     );
 
     expect(mocks.reserveKeyless).toHaveBeenCalledTimes(1);
-    expect(mocks.checkCredits).toHaveBeenCalledTimes(1);
+    expect(mocks.checkCredits).not.toHaveBeenCalled();
     expect(mocks.runtime.interact).toHaveBeenCalledWith(
       expect.objectContaining({ concurrencyLimit: 2 }),
     );
     expect(mocks.activeCount).not.toHaveBeenCalled();
     expect(mocks.mirrorAcquire).not.toHaveBeenCalled();
     expect(mocks.updateCredits).not.toHaveBeenCalled();
-    expect(mocks.billTeam).toHaveBeenCalledTimes(1);
-    expect(mocks.mirrorRelease).toHaveBeenCalledTimes(1);
+    expect(mocks.adjustKeyless).not.toHaveBeenCalled();
+    expect(mocks.logKeyless).not.toHaveBeenCalled();
+    expect(mocks.billTeam).not.toHaveBeenCalled();
+    expect(mocks.mirrorRelease).not.toHaveBeenCalled();
   });
 });

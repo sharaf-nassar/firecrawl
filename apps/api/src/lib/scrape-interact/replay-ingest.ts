@@ -17,6 +17,10 @@ import {
   replayScrapeOptionsSchema,
   replayStorageStateV1Schema,
 } from "./replay-envelope";
+import {
+  canonicalUuidSchema,
+  httpUrlSchema,
+} from "./browser-service-contracts";
 
 const REPLAY_INGEST_PATH = "/internal/v1/browser/replay-checkpoints";
 const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
@@ -32,18 +36,18 @@ const replayProtocol = Symbol("replayIngestProtocol");
 
 const requestSchema = z.strictObject({
   version: z.literal(1),
-  requestId: z.string().uuid(),
-  scrapeId: z.string().uuid(),
-  ownerId: z.string().uuid(),
-  url: z.url().regex(/^https?:\/\//i),
+  requestId: canonicalUuidSchema,
+  scrapeId: canonicalUuidSchema,
+  ownerId: canonicalUuidSchema,
+  url: httpUrlSchema,
   options: replayScrapeOptionsSchema,
   callerOrigin: z.string().trim().min(1).max(256),
   replayCheckpoint: z.strictObject({
     version: z.literal(1),
     storageState: replayStorageStateV1Schema,
-    finalUrl: z.url().regex(/^https?:\/\//i),
+    finalUrl: httpUrlSchema,
     fingerprint: z.strictObject({
-      finalUrl: z.url().regex(/^https?:\/\//i),
+      finalUrl: httpUrlSchema,
       titleSha256: z.string().regex(HEX_SHA256),
       bodyTextSha256: z.string().regex(HEX_SHA256),
     }),
@@ -325,7 +329,7 @@ export function registerReplayIngestTransportRoute(
         idempotencyKey === undefined ||
         !HEX_SHA256.test(idempotencyKey) ||
         correlationId === undefined ||
-        !z.string().uuid().safeParse(correlationId).success ||
+        !canonicalUuidSchema.safeParse(correlationId).success ||
         !Number.isSafeInteger(deadline) ||
         deadline <= now ||
         deadline > now + MAX_DEADLINE_FUTURE_MS

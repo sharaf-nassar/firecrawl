@@ -240,7 +240,12 @@ export async function createBrowserSession(
 ): Promise<BrowserSessionRow> {
   const [row] = await db
     .insert(schema.browser_sessions)
-    .values({ ...input, state: input.state ?? "creating" })
+    .values({
+      ...input,
+      state: input.state ?? "creating",
+      billing_endpoint:
+        input.billing_endpoint ?? (input.scrape_id ? "interact" : "browser"),
+    })
     .returning();
   return asSession(row);
 }
@@ -1548,14 +1553,26 @@ export async function claimBrowserSessionStop(
 ): Promise<BrowserSessionStopClaim | null> {
   const parsedSessionId = runtimeUuidSchema.parse(sessionId);
   const terminalReason = z.string().min(1).max(128).parse(reason);
+  const stopAttemptId = randomUUID();
+  const stopLeaseExpiresAt = new Date(Date.now() + 30_000).toISOString();
   const result = await lease.transaction.query(
     `UPDATE browser_sessions
         SET state = 'stopping',
             terminal_reason = $2,
+            stop_attempt_id = $4,
+            stop_lease_expires_at = $5,
+            stop_owner_instance_id = $6,
+            stop_owner_generation_nonce = $7,
             updated_at = now()
       WHERE id = $1
         AND ($3::uuid IS NULL OR owner_id = $3::uuid)
-        AND state IN ('creating', 'replaying', 'ready', 'executing')
+        AND (
+          state IN ('creating', 'replaying', 'ready', 'executing')
+          OR (
+            state = 'stopping'
+            AND stop_lease_expires_at <= now()
+          )
+        )
       RETURNING current_run_id, profile_id, browser_id, runtime_epoch,
         profile_id IS NOT NULL AND EXISTS (
           SELECT 1
@@ -1563,7 +1580,15 @@ export async function claimBrowserSessionStop(
            WHERE id = browser_sessions.profile_id
              AND writer_session_id = browser_sessions.id
         ) AS requires_prepared_profile`,
-    [parsedSessionId, terminalReason, ownerId ?? null],
+    [
+      parsedSessionId,
+      terminalReason,
+      ownerId ?? null,
+      stopAttemptId,
+      stopLeaseExpiresAt,
+      lease.binding.apiInstanceId,
+      lease.binding.controlGenerationNonce,
+    ],
   );
   if (result.rows.length !== 1) return null;
   const row = result.rows[0] as {
@@ -1574,12 +1599,39 @@ export async function claimBrowserSessionStop(
     requires_prepared_profile: boolean;
   };
   return {
+    stopAttemptId,
     runId: row.current_run_id,
     profileId: row.profile_id,
     requiresPreparedProfile: row.requires_prepared_profile,
     browserId: row.browser_id,
     runtimeEpoch: row.runtime_epoch,
   };
+}
+
+/** @public Renews stop ownership while external cleanup remains in flight. */
+export async function renewBrowserSessionStop(
+  lease: BrowserStateMutationLease,
+  claim: BrowserSessionStopClaim,
+  sessionId: string,
+): Promise<boolean> {
+  const result = await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET stop_lease_expires_at = now() + interval '30 seconds',
+            updated_at = now()
+      WHERE id = $1
+        AND state = 'stopping'
+        AND stop_attempt_id = $2
+        AND stop_owner_instance_id = $3
+        AND stop_owner_generation_nonce = $4
+      RETURNING id`,
+    [
+      runtimeUuidSchema.parse(sessionId),
+      claim.stopAttemptId,
+      lease.binding.apiInstanceId,
+      lease.binding.controlGenerationNonce,
+    ],
+  );
+  return result.rows.length === 1;
 }
 
 /** @public Immutable external billing work elected by durable stop ownership. */
@@ -1592,6 +1644,396 @@ export type BrowserSessionBillingClaim = Readonly<{
   usedPrompt: boolean;
   ttlTotalSeconds: number | null;
 }>;
+
+type ClaimlessTerminalSession = {
+  id: string;
+  owner_id: string;
+  created_at: string | Date;
+  absolute_deadline_at: string | Date;
+  idle_deadline_at: string | Date;
+  prompt_used: boolean;
+  billing_subscription_id: string | null;
+  billing_api_key_id: number | null;
+  billing_endpoint: "browser" | "interact";
+  admission_backend: "redis" | "fdb" | "both" | null;
+  keyless_team_id: string | null;
+  keyless_reserved_credits: number;
+};
+
+async function persistClaimlessTerminalWork(
+  lease: BrowserStateMutationLease,
+  session: ClaimlessTerminalSession,
+  terminalState: "expired" | "interrupted",
+  terminalReason: string,
+  deferAdmissionCleanup = false,
+): Promise<void> {
+  const now = Date.now();
+  const terminalAt =
+    terminalState === "expired"
+      ? Math.min(
+          new Date(session.absolute_deadline_at).getTime(),
+          new Date(session.idle_deadline_at).getTime(),
+        )
+      : Math.min(now, new Date(session.absolute_deadline_at).getTime());
+  const sessionDurationMs = Math.max(
+    0,
+    terminalAt - new Date(session.created_at).getTime(),
+  );
+  const credits = calculateBrowserSessionCredits(
+    sessionDurationMs,
+    session.prompt_used ? INTERACT_CREDITS_PER_HOUR : BROWSER_CREDITS_PER_HOUR,
+  );
+  const terminalized = await lease.transaction.query(
+    `UPDATE browser_sessions
+        SET state = $2,
+            status = 'error',
+            current_run_id = NULL,
+            terminal_at = COALESCE(terminal_at, $5),
+            terminal_reason = $3,
+            credits_used = $4,
+            prompt_used = false,
+            stop_attempt_id = NULL,
+            stop_lease_expires_at = NULL,
+            stop_owner_instance_id = NULL,
+            stop_owner_generation_nonce = NULL,
+            updated_at = now()
+      WHERE id = $1
+        AND state IN ('creating', 'replaying', 'ready', 'executing')
+      RETURNING id`,
+    [
+      session.id,
+      terminalState,
+      terminalReason,
+      credits,
+      new Date(terminalAt).toISOString(),
+    ],
+  );
+  if (terminalized.rows.length !== 1) return;
+  await lease.transaction.query(
+    `UPDATE browser_interact_runs
+        SET state = 'interrupted',
+            error_category = $2,
+            error_detail = $3,
+            finished_at = COALESCE(finished_at, now())
+      WHERE session_id = $1
+        AND state IN ('queued', 'starting', 'running')`,
+    [
+      session.id,
+      terminalReason,
+      terminalState === "expired"
+        ? "Browser session lifetime expired"
+        : "Browser session creation was rolled back",
+    ],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_capabilities
+        SET revoked_at = COALESCE(revoked_at, now())
+      WHERE session_id = $1
+        AND revoked_at IS NULL`,
+    [session.id],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_proxy_grants
+        SET revoked_at = COALESCE(revoked_at, now())
+      WHERE session_id = $1
+        AND revoked_at IS NULL`,
+    [session.id],
+  );
+  await lease.transaction.query(
+    `UPDATE browser_profiles
+        SET writer_session_id = NULL,
+            updated_at = now()
+      WHERE writer_session_id = $1`,
+    [session.id],
+  );
+  await lease.transaction.query(
+    `INSERT INTO browser_billing_outbox (
+       session_id, owner_id, subscription_id, api_key_id, endpoint,
+       session_duration_ms, credits, used_prompt, keyless_team_id,
+       keyless_reserved_credits
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (session_id) DO NOTHING`,
+    [
+      session.id,
+      session.owner_id,
+      session.billing_subscription_id,
+      session.billing_api_key_id,
+      session.billing_endpoint,
+      sessionDurationMs,
+      credits,
+      session.prompt_used,
+      session.keyless_team_id,
+      session.keyless_reserved_credits,
+    ],
+  );
+  if (session.admission_backend) {
+    await lease.transaction.query(
+      `INSERT INTO browser_admission_cleanup (
+         session_id, owner_id, backend, next_attempt_at
+       ) VALUES (
+         $1, $2, $3,
+         CASE
+           WHEN $4 THEN now() + interval '30 seconds'
+           ELSE now()
+         END
+       )
+       ON CONFLICT (session_id) DO NOTHING`,
+      [
+        session.id,
+        session.owner_id,
+        session.admission_backend,
+        deferAdmissionCleanup,
+      ],
+    );
+  }
+}
+
+/** @public Atomically terminalizes every expired active Browser session. */
+export async function terminalizeExpiredBrowserSessions(
+  lease: BrowserStateMutationLease,
+  ownerId?: string,
+  scrapeId?: string,
+): Promise<number> {
+  const expired = await lease.transaction.query<ClaimlessTerminalSession>(
+    `SELECT id, owner_id, created_at, absolute_deadline_at,
+            idle_deadline_at, prompt_used,
+            billing_subscription_id, billing_api_key_id, billing_endpoint,
+            admission_backend, keyless_team_id, keyless_reserved_credits
+       FROM browser_sessions
+      WHERE state IN ('creating', 'replaying', 'ready', 'executing')
+        AND (absolute_deadline_at <= now() OR idle_deadline_at <= now())
+        AND ($1::uuid IS NULL OR owner_id = $1)
+        AND ($2::uuid IS NULL OR scrape_id = $2)
+      ORDER BY created_at, id
+      FOR UPDATE`,
+    [ownerId ? runtimeUuidSchema.parse(ownerId) : null, scrapeId ?? null],
+  );
+  for (const session of expired.rows) {
+    await persistClaimlessTerminalWork(lease, session, "expired", "expired");
+  }
+  return expired.rows.length;
+}
+
+/** @public Converts a failed creation into durable terminal cleanup work. */
+export async function terminalizeFailedBrowserSession(
+  lease: BrowserStateMutationLease,
+  sessionId: string,
+): Promise<boolean> {
+  const result = await lease.transaction.query<ClaimlessTerminalSession>(
+    `SELECT id, owner_id, created_at, absolute_deadline_at,
+            idle_deadline_at, prompt_used,
+            billing_subscription_id, billing_api_key_id, billing_endpoint,
+            admission_backend, keyless_team_id, keyless_reserved_credits
+       FROM browser_sessions
+      WHERE id = $1
+        AND state IN ('creating', 'replaying', 'ready', 'executing')
+      FOR UPDATE`,
+    [runtimeUuidSchema.parse(sessionId)],
+  );
+  const session = result.rows[0];
+  if (!session) return false;
+  await persistClaimlessTerminalWork(
+    lease,
+    session,
+    "interrupted",
+    "creation_rollback",
+    true,
+  );
+  return true;
+}
+
+export type BrowserAdmissionCleanupClaim = Readonly<{
+  sessionId: string;
+  ownerId: string;
+  backend: "redis" | "fdb" | "both";
+  redisReleased: boolean;
+  fdbReleased: boolean;
+  leaseToken: string;
+}>;
+
+/** @public Claims retryable ownership of terminal admission cleanup. */
+export async function claimBrowserAdmissionCleanup(
+  lease: BrowserStateMutationLease,
+  sessionId: string,
+  ownerId: string,
+): Promise<BrowserAdmissionCleanupClaim | null> {
+  const leaseToken = randomUUID();
+  const result = await lease.transaction.query<{
+    session_id: string;
+    owner_id: string;
+    backend: "redis" | "fdb" | "both";
+    redis_released_at: string | null;
+    fdb_released_at: string | null;
+  }>(
+    `UPDATE browser_admission_cleanup
+        SET lease_token = $3,
+            lease_expires_at = now() + interval '30 seconds',
+            attempt_count = attempt_count + 1,
+            updated_at = now()
+      WHERE session_id = $1
+        AND owner_id = $2
+        AND (lease_token IS NULL OR lease_expires_at <= now())
+        AND (
+          (backend IN ('redis', 'both') AND redis_released_at IS NULL)
+          OR (backend IN ('fdb', 'both') AND fdb_released_at IS NULL)
+        )
+      RETURNING session_id, owner_id, backend, redis_released_at,
+                fdb_released_at`,
+    [
+      runtimeUuidSchema.parse(sessionId),
+      runtimeUuidSchema.parse(ownerId),
+      leaseToken,
+    ],
+  );
+  const row = result.rows[0];
+  return row
+    ? Object.freeze({
+        sessionId: row.session_id,
+        ownerId: row.owner_id,
+        backend: row.backend,
+        redisReleased: row.redis_released_at !== null,
+        fdbReleased: row.fdb_released_at !== null,
+        leaseToken,
+      })
+    : null;
+}
+
+/** @public Claims the next due admission cleanup for background recovery. */
+export async function claimNextBrowserAdmissionCleanup(
+  lease: BrowserStateMutationLease,
+): Promise<BrowserAdmissionCleanupClaim | null> {
+  const leaseToken = randomUUID();
+  const result = await lease.transaction.query<{
+    session_id: string;
+    owner_id: string;
+    backend: "redis" | "fdb" | "both";
+    redis_released_at: string | null;
+    fdb_released_at: string | null;
+  }>(
+    `UPDATE browser_admission_cleanup
+        SET lease_token = $1,
+            lease_expires_at = now() + interval '30 seconds',
+            attempt_count = attempt_count + 1,
+            updated_at = now()
+      WHERE session_id = (
+        SELECT session_id
+          FROM browser_admission_cleanup
+         WHERE next_attempt_at <= now()
+           AND (lease_token IS NULL OR lease_expires_at <= now())
+           AND (
+             (backend IN ('redis', 'both') AND redis_released_at IS NULL)
+             OR (backend IN ('fdb', 'both') AND fdb_released_at IS NULL)
+           )
+         ORDER BY next_attempt_at, created_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1
+      )
+      RETURNING session_id, owner_id, backend, redis_released_at,
+                fdb_released_at`,
+    [leaseToken],
+  );
+  const row = result.rows[0];
+  return row
+    ? Object.freeze({
+        sessionId: row.session_id,
+        ownerId: row.owner_id,
+        backend: row.backend,
+        redisReleased: row.redis_released_at !== null,
+        fdbReleased: row.fdb_released_at !== null,
+        leaseToken,
+      })
+    : null;
+}
+
+/** @public Renews admission cleanup ownership during external release. */
+export async function renewBrowserAdmissionCleanup(
+  lease: BrowserStateMutationLease,
+  claim: BrowserAdmissionCleanupClaim,
+): Promise<boolean> {
+  const result = await lease.transaction.query(
+    `UPDATE browser_admission_cleanup
+        SET lease_expires_at = now() + interval '30 seconds',
+            updated_at = now()
+      WHERE session_id = $1
+        AND lease_token = $2
+      RETURNING session_id`,
+    [claim.sessionId, claim.leaseToken],
+  );
+  return result.rows.length === 1;
+}
+
+/** @public Records one confirmed idempotent admission backend release. */
+export async function markBrowserAdmissionBackendReleased(
+  lease: BrowserStateMutationLease,
+  claim: BrowserAdmissionCleanupClaim,
+  backend: "redis" | "fdb",
+): Promise<void> {
+  const column = backend === "redis" ? "redis_released_at" : "fdb_released_at";
+  const result = await lease.transaction.query(
+    `UPDATE browser_admission_cleanup
+        SET ${column} = COALESCE(${column}, now()),
+            lease_token = CASE
+              WHEN (
+                (backend = 'redis' AND $3 = 'redis')
+                OR (backend = 'fdb' AND $3 = 'fdb')
+                OR (
+                  backend = 'both'
+                  AND (
+                    ($3 = 'redis' AND fdb_released_at IS NOT NULL)
+                    OR ($3 = 'fdb' AND redis_released_at IS NOT NULL)
+                  )
+                )
+              ) THEN NULL
+              ELSE lease_token
+            END,
+            lease_expires_at = CASE
+              WHEN (
+                (backend = 'redis' AND $3 = 'redis')
+                OR (backend = 'fdb' AND $3 = 'fdb')
+                OR (
+                  backend = 'both'
+                  AND (
+                    ($3 = 'redis' AND fdb_released_at IS NOT NULL)
+                    OR ($3 = 'fdb' AND redis_released_at IS NOT NULL)
+                  )
+                )
+              ) THEN NULL
+              ELSE lease_expires_at
+            END,
+            last_error_category = NULL,
+            updated_at = now()
+      WHERE session_id = $1
+        AND lease_token = $2
+      RETURNING session_id`,
+    [claim.sessionId, claim.leaseToken, backend],
+  );
+  if (result.rows.length !== 1) {
+    throw new Error("Browser admission cleanup lease was lost");
+  }
+}
+
+/** @public Releases a failed admission cleanup lease for bounded retry. */
+export async function failBrowserAdmissionCleanup(
+  lease: BrowserStateMutationLease,
+  claim: BrowserAdmissionCleanupClaim,
+  category: string,
+): Promise<void> {
+  await lease.transaction.query(
+    `UPDATE browser_admission_cleanup
+        SET lease_token = NULL,
+            lease_expires_at = NULL,
+            next_attempt_at = now() + interval '1 second',
+            last_error_category = $3,
+            updated_at = now()
+      WHERE session_id = $1
+        AND lease_token = $2`,
+    [
+      claim.sessionId,
+      claim.leaseToken,
+      z.string().min(1).max(128).parse(category),
+    ],
+  );
+}
 
 /** @public Commits one finalized generation with an exact profile pointer CAS. */
 export async function commitPreparedProfileGeneration(
@@ -1619,10 +2061,11 @@ export async function commitPreparedProfileGeneration(
           FROM browser_profiles
          WHERE id = $1
          FOR UPDATE
-      )
+        )
         AND state = 'stopping'
+        AND stop_attempt_id = $2
       FOR UPDATE`,
-    [prepared.profileId],
+    [prepared.profileId, claim.stopAttemptId],
   );
   if (session.rows.length !== 1) {
     throw new Error("Profile writer stop ownership is not active");
@@ -1680,14 +2123,16 @@ export async function commitPreparedProfileGeneration(
         SET profile_generation_id = $2,
             updated_at = now()
       WHERE id = $1
-        AND state = 'stopping'`,
-    [sessionRow.id, prepared.generationId],
+        AND state = 'stopping'
+        AND stop_attempt_id = $3`,
+    [sessionRow.id, prepared.generationId, claim.stopAttemptId],
   );
 }
 
 /** @public Completes stop as destroyed only after confirmed cleanup. */
 export async function finishBrowserSessionStop(
   lease: BrowserStateMutationLease,
+  claim: BrowserSessionStopClaim,
   sessionId: string,
   reason: string,
   outcome: "destroyed" | "interrupted",
@@ -1695,6 +2140,35 @@ export async function finishBrowserSessionStop(
   const parsedSessionId = runtimeUuidSchema.parse(sessionId);
   const terminalReason = z.string().min(1).max(128).parse(reason);
   const terminalState = z.enum(["destroyed", "interrupted"]).parse(outcome);
+  const locked = await lease.transaction.query<{
+    id: string;
+    owner_id: string;
+    scrape_id: string | null;
+    created_at: string | Date;
+    absolute_deadline_at: string | Date;
+    idle_deadline_at: string | Date;
+    prompt_used: boolean;
+    ttl_total: number | null;
+    billing_subscription_id: string | null;
+    billing_api_key_id: number | null;
+    billing_endpoint: "browser" | "interact";
+    admission_backend: "redis" | "fdb" | "both" | null;
+    keyless_team_id: string | null;
+    keyless_reserved_credits: number;
+  }>(
+    `SELECT id, owner_id, scrape_id, created_at, absolute_deadline_at,
+            idle_deadline_at, prompt_used, ttl_total,
+            billing_subscription_id, billing_api_key_id, billing_endpoint,
+            admission_backend, keyless_team_id, keyless_reserved_credits
+       FROM browser_sessions
+      WHERE id = $1
+        AND state = 'stopping'
+        AND stop_attempt_id = $2
+      FOR UPDATE`,
+    [parsedSessionId, claim.stopAttemptId],
+  );
+  const billing = locked.rows[0];
+  if (!billing) return null;
   await lease.transaction.query(
     `UPDATE browser_interact_runs
         SET state = CASE
@@ -1729,26 +2203,13 @@ export async function finishBrowserSessionStop(
         AND revoked_at IS NULL`,
     [parsedSessionId],
   );
-  const locked = await lease.transaction.query<{
-    id: string;
-    owner_id: string;
-    scrape_id: string | null;
-    created_at: string | Date;
-    prompt_used: boolean;
-    ttl_total: number | null;
-  }>(
-    `SELECT id, owner_id, scrape_id, created_at, prompt_used, ttl_total
-       FROM browser_sessions
-      WHERE id = $1
-        AND state = 'stopping'
-      FOR UPDATE`,
-    [parsedSessionId],
-  );
-  const billing = locked.rows[0];
-  if (!billing) return null;
   const sessionDurationMs = Math.max(
     0,
-    Date.now() - new Date(billing.created_at).getTime(),
+    Math.min(
+      Date.now(),
+      new Date(billing.absolute_deadline_at).getTime(),
+      new Date(billing.idle_deadline_at).getTime(),
+    ) - new Date(billing.created_at).getTime(),
   );
   const creditsBilled = calculateBrowserSessionCredits(
     sessionDurationMs,
@@ -1762,12 +2223,23 @@ export async function finishBrowserSessionStop(
             terminal_reason = $2,
             status = CASE WHEN $3 = 'destroyed' THEN 'closed' ELSE 'error' END,
             credits_used = $4,
+            stop_attempt_id = NULL,
+            stop_lease_expires_at = NULL,
+            stop_owner_instance_id = NULL,
+            stop_owner_generation_nonce = NULL,
             prompt_used = false,
             updated_at = now()
       WHERE id = $1
         AND state = 'stopping'
+        AND stop_attempt_id = $5
       RETURNING id`,
-    [parsedSessionId, terminalReason, terminalState, creditsBilled],
+    [
+      parsedSessionId,
+      terminalReason,
+      terminalState,
+      creditsBilled,
+      claim.stopAttemptId,
+    ],
   );
   if (result.rows.length !== 1) {
     throw new Error("Browser stop ownership is not active");
@@ -1779,6 +2251,39 @@ export async function finishBrowserSessionStop(
       WHERE writer_session_id = $1`,
     [parsedSessionId],
   );
+  if (!billing.billing_endpoint) {
+    throw new Error("Browser terminal attribution is unavailable");
+  }
+  await lease.transaction.query(
+    `INSERT INTO browser_billing_outbox (
+       session_id, owner_id, subscription_id, api_key_id, endpoint,
+       session_duration_ms, credits, used_prompt, keyless_team_id,
+       keyless_reserved_credits
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (session_id) DO NOTHING`,
+    [
+      parsedSessionId,
+      billing.owner_id,
+      billing.billing_subscription_id,
+      billing.billing_api_key_id,
+      billing.billing_endpoint,
+      sessionDurationMs,
+      creditsBilled,
+      billing.prompt_used,
+      billing.keyless_team_id,
+      billing.keyless_reserved_credits,
+    ],
+  );
+  if (billing.admission_backend) {
+    await lease.transaction.query(
+      `INSERT INTO browser_admission_cleanup (
+         session_id, owner_id, backend, next_attempt_at
+       )
+       VALUES ($1, $2, $3, now() + interval '30 seconds')
+       ON CONFLICT (session_id) DO NOTHING`,
+      [parsedSessionId, billing.owner_id, billing.admission_backend],
+    );
+  }
   return Object.freeze({
     sessionId: billing.id,
     ownerId: billing.owner_id,
@@ -1899,19 +2404,90 @@ export async function interruptUnfinishedBrowserWork(
         RETURNING id`,
     [timestamp],
   );
-  const sessions = await controlTransaction.query<{ id: string }>(
+  const sessions = await controlTransaction.query<{
+    id: string;
+    owner_id: string;
+    billing_subscription_id: string | null;
+    billing_api_key_id: number | null;
+    billing_endpoint: "browser" | "interact";
+    admission_backend: "redis" | "fdb" | "both" | null;
+    keyless_team_id: string | null;
+    keyless_reserved_credits: number;
+    created_at: string | Date;
+    terminal_at: string | Date;
+    prompt_used: boolean;
+  }>(
     `UPDATE browser_sessions
           SET state = 'interrupted',
               status = 'error',
-              terminal_at = $1,
+              terminal_at = least(
+                $1::timestamptz, absolute_deadline_at, idle_deadline_at
+              ),
               terminal_reason = 'process_interrupted',
+              stop_attempt_id = NULL,
+              stop_lease_expires_at = NULL,
+              stop_owner_instance_id = NULL,
+              stop_owner_generation_nonce = NULL,
               updated_at = $1
         WHERE state IN (
           'creating', 'replaying', 'ready', 'executing', 'stopping'
         )
-        RETURNING id`,
+        RETURNING id, owner_id, billing_subscription_id, billing_api_key_id,
+                  billing_endpoint, admission_backend, keyless_team_id,
+                  keyless_reserved_credits, created_at, terminal_at,
+                  prompt_used`,
     [timestamp],
   );
+  for (const session of sessions.rows) {
+    if (!session.billing_endpoint) {
+      throw new Error("Recovered browser session attribution is unavailable");
+    }
+    const sessionDurationMs = Math.max(
+      0,
+      new Date(session.terminal_at).getTime() -
+        new Date(session.created_at).getTime(),
+    );
+    const creditsBilled = calculateBrowserSessionCredits(
+      sessionDurationMs,
+      session.prompt_used
+        ? INTERACT_CREDITS_PER_HOUR
+        : BROWSER_CREDITS_PER_HOUR,
+    );
+    await controlTransaction.query(
+      `UPDATE browser_sessions
+          SET credits_used = $2, prompt_used = false
+        WHERE id = $1`,
+      [session.id, creditsBilled],
+    );
+    await controlTransaction.query(
+      `INSERT INTO browser_billing_outbox (
+         session_id, owner_id, subscription_id, api_key_id, endpoint,
+         session_duration_ms, credits, used_prompt, keyless_team_id,
+         keyless_reserved_credits
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (session_id) DO NOTHING`,
+      [
+        session.id,
+        session.owner_id,
+        session.billing_subscription_id,
+        session.billing_api_key_id,
+        session.billing_endpoint,
+        sessionDurationMs,
+        creditsBilled,
+        session.prompt_used,
+        session.keyless_team_id,
+        session.keyless_reserved_credits,
+      ],
+    );
+    if (session.admission_backend) {
+      await controlTransaction.query(
+        `INSERT INTO browser_admission_cleanup (session_id, owner_id, backend)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (session_id) DO NOTHING`,
+        [session.id, session.owner_id, session.admission_backend],
+      );
+    }
+  }
   const capabilities = await controlTransaction.query(
     `UPDATE browser_capabilities
           SET revoked_at = $1

@@ -1016,6 +1016,39 @@ export class PgLocalRetentionDatabase implements LocalRetentionDatabase {
                 JOIN scrapes scrape ON scrape.id = intent.scrape_id
                WHERE scrape.request_id = requests.id
             )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM browser_sessions session
+               WHERE session.request_id = requests.id
+                 AND session.state IN (
+                   'creating', 'replaying', 'ready', 'executing', 'stopping'
+                 )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM browser_sessions session
+                JOIN browser_billing_outbox outbox
+                  ON outbox.session_id = session.id
+               WHERE session.request_id = requests.id
+                 AND outbox.state <> 'delivered'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM browser_sessions session
+                JOIN browser_admission_cleanup cleanup
+                  ON cleanup.session_id = session.id
+               WHERE session.request_id = requests.id
+                 AND (
+                   (
+                     cleanup.backend IN ('redis', 'both')
+                     AND cleanup.redis_released_at IS NULL
+                   )
+                   OR (
+                     cleanup.backend IN ('fdb', 'both')
+                     AND cleanup.fdb_released_at IS NULL
+                   )
+                 )
+            )
           ORDER BY dr_clean_by, id
           LIMIT $2
           FOR UPDATE SKIP LOCKED`,

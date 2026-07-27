@@ -15,6 +15,7 @@ import {
   failAdapterRun,
   finishAdapterRun,
   finishBrowserSessionStop,
+  renewBrowserSessionStop,
 } from "../browser-state/store";
 import type { BrowserSessionBillingClaim } from "../browser-state/store";
 import type { BrowserExecutionAdapter } from "./execution-adapter";
@@ -62,8 +63,14 @@ type BrowserOrchestratorStores = {
     reason: string,
     ownerId?: string,
   ): Promise<BrowserSessionStopClaim | null>;
+  renewStop?(
+    lease: BrowserStateMutationLease,
+    claim: BrowserSessionStopClaim,
+    sessionId: string,
+  ): Promise<boolean>;
   finishStop(
     lease: BrowserStateMutationLease,
+    claim: BrowserSessionStopClaim,
     sessionId: string,
     reason: string,
     outcome: "destroyed" | "interrupted",
@@ -79,7 +86,7 @@ type OrchestratorCapabilityStore = {
   beginAdapterRun(
     input: Omit<PendingRun, "capabilityToken"> & { adapterProcessId: null },
   ): Promise<IssuedAdapterCapability>;
-  activate(
+  activateAdapterProcess(
     runId: string,
     binding: AdapterAuthorizationBinding,
   ): Promise<AdapterCapabilityBinding>;
@@ -88,6 +95,7 @@ type OrchestratorCapabilityStore = {
 
 /** @public */
 export type BrowserSessionStopClaim = {
+  stopAttemptId: string;
   runId: string | null;
   profileId: string | null;
   requiresPreparedProfile?: boolean;
@@ -287,7 +295,7 @@ function createBrowserSessionOrchestratorCore(
           category: "capability_denied",
         });
       }
-      await capabilities.activate(pending.runId, binding);
+      await capabilities.activateAdapterProcess(pending.runId, binding);
       if (signal.aborted) throw signal.reason;
       markAccepted();
     };
@@ -624,6 +632,29 @@ function createBrowserSessionOrchestratorCore(
         );
         if (claim === null) return null;
         const errors: unknown[] = [];
+        let heartbeatFailure: unknown;
+        let heartbeatPending = Promise.resolve();
+        const heartbeat =
+          deps.stores.renewStop === undefined
+            ? undefined
+            : setInterval(() => {
+                heartbeatPending = heartbeatPending
+                  .then(async () => {
+                    const renewed =
+                      await deps.gate.withBrowserStateMutationLease(
+                        "filesystem_and_database",
+                        lease =>
+                          deps.stores.renewStop!(lease, claim, sessionId),
+                      );
+                    if (!renewed) {
+                      throw new Error("Browser stop lease ownership was lost");
+                    }
+                  })
+                  .catch(error => {
+                    heartbeatFailure ??= error;
+                  });
+              }, 5_000);
+        heartbeat?.unref();
         if (claim.runId !== null) {
           const execution = active.get(claim.runId);
           execution?.controller.abort(
@@ -692,6 +723,9 @@ function createBrowserSessionOrchestratorCore(
             errors.push(error);
           }
         }
+        if (heartbeat) clearInterval(heartbeat);
+        await heartbeatPending;
+        if (heartbeatFailure !== undefined) errors.push(heartbeatFailure);
         let billingClaim: BrowserSessionBillingClaim | null = null;
         try {
           billingClaim = await deps.gate.withBrowserStateMutationLease(
@@ -699,6 +733,7 @@ function createBrowserSessionOrchestratorCore(
             lease =>
               deps.stores.finishStop(
                 lease,
+                claim,
                 sessionId,
                 reason,
                 errors.length === 0 ? "destroyed" : "interrupted",
@@ -732,6 +767,7 @@ export function createBrowserSessionOrchestrator(
         finishAdapterRun,
         failAdapterRun,
         claimStop: claimBrowserSessionStop,
+        renewStop: renewBrowserSessionStop,
         finishStop: finishBrowserSessionStop,
         commitPreparedProfile: commitPreparedProfileGeneration,
       },

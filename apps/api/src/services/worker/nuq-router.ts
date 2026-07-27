@@ -44,6 +44,7 @@ import {
 //    this class still tracks in-flight backend for direct/router test consumers
 
 export type QueueBackend = "pg" | "fdb";
+export type ExternalSlotBackend = "redis" | "fdb";
 
 export type { NuQJob, NuQJobStatus, NuQGroupStatus, NuQJobGroupInstance };
 
@@ -174,35 +175,67 @@ export async function mirrorExternalSlotAcquire(
   teamId: string,
   holderId: string,
   ttlMs: number,
-): Promise<void> {
+): Promise<ExternalSlotBackend> {
   if (await isFdbTeam(teamId)) {
     try {
       await optionalFdb(() =>
         externalSlotsFdb.acquire(teamId, holderId, ttlMs),
       );
-      return;
+      return "fdb";
     } catch (error) {
       if (fdbForced()) throw error;
       logFdbFallback(_logger, "mirrorExternalSlotAcquire", error);
     }
   }
   await pushConcurrencyLimitActiveJob(teamId, holderId, ttlMs);
+  return "redis";
+}
+
+export async function releaseExternalSlotBackend(
+  teamId: string,
+  holderId: string,
+  backend: ExternalSlotBackend,
+): Promise<void> {
+  if (backend === "redis") {
+    await removeConcurrencyLimitActiveJob(teamId, holderId);
+    return;
+  }
+  if (!fdbQueueEnabled()) {
+    throw Object.assign(new Error("FDB external slot backend is unavailable"), {
+      category: "external_slot_release_failed",
+    });
+  }
+  try {
+    await optionalFdb(() => externalSlotsFdb.release(teamId, holderId));
+  } catch (error) {
+    throw Object.assign(new Error("FDB external slot release failed"), {
+      category: "external_slot_release_failed",
+      cause: error,
+    });
+  }
 }
 
 export async function mirrorExternalSlotRelease(
   teamId: string,
   holderId: string,
 ): Promise<void> {
-  if (await isFdbTeam(teamId)) {
+  const errors: unknown[] = [];
+  for (const backend of ["redis", "fdb"] as const) {
+    if (backend === "fdb" && !fdbQueueEnabled()) continue;
     try {
-      await optionalFdb(() => externalSlotsFdb.release(teamId, holderId));
-      return;
+      await releaseExternalSlotBackend(teamId, holderId, backend);
     } catch (error) {
-      if (fdbForced()) throw error;
-      logFdbFallback(_logger, "mirrorExternalSlotRelease", error);
+      errors.push(error);
     }
   }
-  await removeConcurrencyLimitActiveJob(teamId, holderId);
+  if (errors.length > 0) {
+    throw Object.assign(
+      new AggregateError(errors, "External slot release failed"),
+      {
+        category: "external_slot_release_failed",
+      },
+    );
+  }
 }
 
 // Active count across both ledgers; a migrating team has load on both while

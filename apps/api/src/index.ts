@@ -75,8 +75,10 @@ import { registerBrowserProxyRuntime } from "./controllers/v2/browser-proxy";
 import {
   getCombinedTeamActiveCount,
   mirrorExternalSlotAcquire,
-  mirrorExternalSlotRelease,
+  releaseExternalSlotBackend,
 } from "./services/worker/nuq-router";
+import { startBrowserBillingOutboxWorker } from "./services/browser-billing-outbox";
+import { startBrowserAdmissionCleanupWorker } from "./services/browser-admission-cleanup";
 
 type LocalBrowserRuntime = {
   pool: Pool;
@@ -88,6 +90,8 @@ type LocalBrowserRuntime = {
 
 let localBrowserRuntime: LocalBrowserRuntime | undefined;
 let localRetentionService: LocalRetentionService | undefined;
+let localBrowserBillingWorker: { stop(): Promise<void> } | undefined;
+let localBrowserAdmissionWorker: { stop(): Promise<void> } | undefined;
 let localRuntimeStop: Promise<void> | undefined;
 
 const { createBullBoard } = require("@bull-board/api");
@@ -269,7 +273,7 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
         browserClient: serviceClient,
         getActiveCount: getCombinedTeamActiveCount,
         acquireAdmission: mirrorExternalSlotAcquire,
-        releaseAdmission: mirrorExternalSlotRelease,
+        releaseAdmissionBackend: releaseExternalSlotBackend,
       }),
     );
     registerBrowserProxyRuntime(
@@ -340,17 +344,29 @@ async function initializeLocalBrowserAfterMigrations(
     throw new Error("Browser runtime handoff is unavailable");
   }
   await localBrowserRuntime.coordinator.initializeAfterMigrations(handoff);
+  localBrowserBillingWorker = startBrowserBillingOutboxWorker(
+    localBrowserRuntime.gate,
+  );
+  localBrowserAdmissionWorker = startBrowserAdmissionCleanupWorker(
+    localBrowserRuntime.gate,
+  );
 }
 
 async function stopLocalRuntime(): Promise<void> {
   localRuntimeStop ??= (async () => {
     registerPublicBrowserRuntime(undefined);
     registerBrowserProxyRuntime(undefined);
+    await Promise.all([
+      localBrowserBillingWorker?.stop(),
+      localBrowserAdmissionWorker?.stop(),
+    ]);
     await localBrowserRuntime?.coordinator.stop();
     await localRetentionService?.stop();
     await localBrowserRuntime?.pool.end();
     localBrowserRuntime = undefined;
     localRetentionService = undefined;
+    localBrowserBillingWorker = undefined;
+    localBrowserAdmissionWorker = undefined;
   })();
   return localRuntimeStop;
 }

@@ -4291,7 +4291,7 @@ async function openCompletedAbsentSuffix(
       const active = current;
       if (active === undefined || parent === undefined) {
         throw err(
-          "reconciliation_execution_failed",
+          "reconciliation_cleanup_failed",
           "completed cleanup proof lost ownership",
         );
       }
@@ -4578,7 +4578,7 @@ async function executeManifestEntry(
     }
     if (destinationParent === undefined) {
       throw err(
-        "reconciliation_execution_failed",
+        "reconciliation_cleanup_failed",
         "cleanup destination parent was not opened",
       );
     }
@@ -5903,14 +5903,7 @@ async function reconcileBrowserStateCore(
     const actual =
       error instanceof BrowserServiceError
         ? error
-        : err(
-            state === "planning" ||
-              state === "executing" ||
-              state === "recovering"
-              ? "reconciliation_cleanup_failed"
-              : "reconciliation_execution_failed",
-            "reconciliation failed",
-          );
+        : err("reconciliation_cleanup_failed", "reconciliation failed");
     deps.logger?.error(
       safeLog(deps.correlationId, {
         category: actual.category,

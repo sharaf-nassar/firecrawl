@@ -105,6 +105,9 @@ describe("local direct Browser compatibility", () => {
       config as { LOCAL_BROWSER_SERVICE_ENABLED?: boolean }
     ).LOCAL_BROWSER_SERVICE_ENABLED = true;
     (
+      config as { LOCAL_PERSISTENCE_ENABLED?: boolean }
+    ).LOCAL_PERSISTENCE_ENABLED = true;
+    (
       config as { BROWSER_PUBLIC_API_ORIGIN?: string }
     ).BROWSER_PUBLIC_API_ORIGIN = "http://api.example.test";
     mocks.getRuntime.mockReturnValue(mocks.runtime);
@@ -265,6 +268,37 @@ describe("local direct Browser compatibility", () => {
     expect(mocks.runtime.stopSession).toHaveBeenCalledTimes(2);
   });
 
+  it("does not complete delete before runtime cleanup finishes", async () => {
+    const id = randomUUID();
+    let finishStop:
+      | ((result: { stopped: boolean; sessionId: string }) => void)
+      | undefined;
+    mocks.runtime.stopSession.mockReturnValue(
+      new Promise(resolve => {
+        finishStop = resolve;
+      }),
+    );
+    const res = response();
+    const deleting = browserDeleteController(
+      request({}, { sessionId: id }),
+      res as never,
+    );
+
+    await vi.waitFor(() =>
+      expect(mocks.runtime.stopSession).toHaveBeenCalledWith(
+        expect.any(String),
+        id,
+      ),
+    );
+    expect(res.statusCode).toBe(0);
+    expect(res.body).toBeUndefined();
+
+    finishStop!({ stopped: true, sessionId: id });
+    await deleting;
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ success: true });
+  });
+
   it("routes create, execute, delete, and list failures to typed 503", async () => {
     const unavailable = Object.assign(new Error("closed"), {
       category: "browser_state_unavailable",
@@ -336,15 +370,15 @@ describe("local direct Browser compatibility", () => {
       response() as never,
     );
 
-    expect(mocks.checkCredits).toHaveBeenCalledTimes(1);
+    expect(mocks.checkCredits).not.toHaveBeenCalled();
     expect(mocks.activeCount).toHaveBeenCalledTimes(1);
     expect(mocks.runtime.createSession).toHaveBeenCalledWith(
       expect.objectContaining({ concurrencyLimit: 2 }),
     );
     expect(mocks.mirrorAcquire).not.toHaveBeenCalled();
     expect(mocks.updateCredits).not.toHaveBeenCalled();
-    expect(mocks.billTeam).toHaveBeenCalledTimes(1);
-    expect(mocks.mirrorRelease).toHaveBeenCalledTimes(1);
+    expect(mocks.billTeam).not.toHaveBeenCalled();
+    expect(mocks.mirrorRelease).not.toHaveBeenCalled();
   });
 
   it("passes strict execute domains with a fresh request attribution", async () => {

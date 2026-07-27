@@ -1066,14 +1066,14 @@ const semanticRuleImplementations: Record<string, () => void> = {
     for (const detail of ERROR_CUSTOM_CONSTANTS.internalErrorDetailAllowlist)
       expect(
         () =>
-          new BrowserServiceError("reconciliation_execution_failed", "safe", {
+          new BrowserServiceError("reconciliation_cleanup_failed", "safe", {
             detail,
           }),
       ).not.toThrow();
     for (const detail of ["outside", "bad\n"])
       expect(
         () =>
-          new BrowserServiceError("reconciliation_execution_failed", "safe", {
+          new BrowserServiceError("reconciliation_cleanup_failed", "safe", {
             detail: detail as never,
           }),
       ).toThrow();
@@ -1949,7 +1949,7 @@ describe("private V1 contracts", () => {
 
   test("private errors sanitize controls, surrogates, and encoded overflow", () => {
     const error = new BrowserServiceError(
-      "reconciliation_execution_failed",
+      "reconciliation_cleanup_failed",
       `\ud800bad\u0000${"界".repeat(2_000)}`,
       { detail: "close_failed" },
     );
@@ -1963,7 +1963,7 @@ describe("private V1 contracts", () => {
     expect(response).not.toHaveProperty("detail");
     expect(
       () =>
-        new BrowserServiceError("reconciliation_execution_failed", "safe", {
+        new BrowserServiceError("reconciliation_cleanup_failed", "safe", {
           detail: "raw-cause" as never,
         }),
     ).toThrow(/detail/i);

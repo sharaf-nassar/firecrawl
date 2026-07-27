@@ -12,8 +12,12 @@ import {
   vi,
 } from "vitest";
 
+import { config } from "../../config";
 import { runApplicationMigrations } from "../../db/migrate";
-import type { ClosedSessionV1 } from "../scrape-interact/browser-service-contracts";
+import type {
+  ClosedSessionV1,
+  CloseSessionV1,
+} from "../scrape-interact/browser-service-contracts";
 import type { BrowserExecutionAdapter } from "./execution-adapter";
 import { createPublicBrowserRuntime } from "./public-browser-runtime";
 import type {
@@ -86,9 +90,17 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
   const secondGate = gateFor(secondPool);
   const runtimeSessions = new Map<string, { sessionVersion: number }>();
   const closeSession = vi.fn(
-    async (runtimeSessionId: string): Promise<ClosedSessionV1> => {
+    async (
+      runtimeSessionId: string,
+      request: CloseSessionV1,
+    ): Promise<ClosedSessionV1> => {
       const session = runtimeSessions.get(runtimeSessionId);
       if (!session) throw new Error("missing runtime");
+      if (session.sessionVersion !== request.expectedSessionVersion) {
+        throw Object.assign(new Error("session version does not match"), {
+          category: "concurrency_exceeded",
+        });
+      }
       runtimeSessions.delete(runtimeSessionId);
       return {
         version: 1 as const,
@@ -372,6 +384,57 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
     ).toEqual([]);
   });
 
+  it("persists the Browser Service touch epoch before stopping", async () => {
+    const created = await createSession();
+    const runtimeSessionId = [...runtimeSessions.keys()][0]!;
+    browserClient.getSession.mockImplementationOnce(async id => {
+      const session = runtimeSessions.get(id);
+      if (!session) throw new Error("missing runtime");
+      session.sessionVersion += 1;
+      return {
+        version: 1 as const,
+        runtimeSessionId: id,
+        state: "ready" as const,
+        sessionVersion: session.sessionVersion,
+        page: {
+          url: "https://fixture.example/",
+          title: "Fixture",
+          snapshotExcerpt: "ready",
+        },
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+        idleExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+      };
+    });
+    const executeRequestId = randomUUID();
+    await createRequest(executeRequestId);
+
+    await runtime.executeSession({
+      requestId: executeRequestId,
+      ownerId,
+      sessionId: created.id,
+      language: "node",
+      source: "return 1",
+      timeoutSeconds: 30,
+      correlationId: randomUUID(),
+      allowedDomains: ["fixture.example"],
+    });
+
+    await expect(
+      pool.query<{ runtime_epoch: number }>(
+        "SELECT runtime_epoch FROM browser_sessions WHERE id = $1",
+        [created.id],
+      ),
+    ).resolves.toMatchObject({ rows: [{ runtime_epoch: 2 }] });
+    await expect(
+      runtime.stopSession(ownerId, created.id),
+    ).resolves.toMatchObject({ stopped: true });
+    expect(closeSession).toHaveBeenCalledWith(
+      runtimeSessionId,
+      expect.objectContaining({ expectedSessionVersion: 2 }),
+      expect.any(Object),
+    );
+  });
+
   it("durably extends an about:blank session authority and rejects overflow", async () => {
     const created = await createSession({
       initialUrl: "about:blank",
@@ -428,7 +491,7 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
       acquireAdmission: async () => {
         throw new Error("mirror unavailable");
       },
-      releaseAdmission,
+      releaseAdmissionBackend: releaseAdmission,
     });
     await expect(
       createSession({ concurrencyLimit: 2 }, rejectingRuntime),
@@ -447,8 +510,9 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
       getActiveCount: vi.fn(async () => holders.size),
       acquireAdmission: vi.fn(async (_owner: string, id: string) => {
         holders.add(id);
+        return "redis" as const;
       }),
-      releaseAdmission: vi.fn(async (_owner: string, id: string) => {
+      releaseAdmissionBackend: vi.fn(async (_owner: string, id: string) => {
         holders.delete(id);
       }),
     };
@@ -483,11 +547,404 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
     expect(rows.rows[0]?.count).toBe(1);
   });
 
+  it("awaits stop admission release before admitting an immediate replacement", async () => {
+    const holders = new Set<string>();
+    let finishRelease: (() => void) | undefined;
+    let blockFirstRelease = true;
+    const releaseGate = new Promise<void>(resolve => {
+      finishRelease = resolve;
+    });
+    const releaseAdmission = vi.fn(async (_owner: string, id: string) => {
+      if (blockFirstRelease) {
+        blockFirstRelease = false;
+        await releaseGate;
+      }
+      holders.delete(id);
+    });
+    const admissionRuntime = createPublicBrowserRuntime({
+      gate,
+      browserClient: browserClient as never,
+      adapter,
+      getActiveCount: async () => holders.size,
+      acquireAdmission: async (_owner, id) => {
+        holders.add(id);
+        return "redis" as const;
+      },
+      releaseAdmissionBackend: releaseAdmission,
+    });
+    const created = await createSession(
+      { concurrencyLimit: 1 },
+      admissionRuntime,
+    );
+    let stopSettled = false;
+    const stop = admissionRuntime
+      .stopSession(ownerId, created.id)
+      .finally(() => {
+        stopSettled = true;
+      });
+    await vi.waitFor(() => expect(releaseAdmission).toHaveBeenCalledTimes(1));
+    expect(stopSettled).toBe(false);
+    expect(holders.has(created.id)).toBe(true);
+
+    finishRelease!();
+    await expect(stop).resolves.toMatchObject({ stopped: true });
+    expect(releaseAdmission).toHaveBeenCalledWith(ownerId, created.id, "redis");
+    const replacement = await createSession(
+      { concurrencyLimit: 1 },
+      admissionRuntime,
+    );
+    expect(holders.has(replacement.id)).toBe(true);
+
+    await expect(
+      admissionRuntime.stopSession(ownerId, created.id),
+    ).resolves.toMatchObject({ stopped: false });
+    expect(holders.has(replacement.id)).toBe(true);
+    await admissionRuntime.stopSession(ownerId, replacement.id);
+  });
+
+  it("releases the persisted FDB backend after admission routing changes", async () => {
+    const releaseAdmissionBackend = vi.fn(async () => undefined);
+    const fdbRuntime = createPublicBrowserRuntime({
+      gate,
+      browserClient: browserClient as never,
+      adapter,
+      acquireAdmission: async () => "fdb",
+      releaseAdmissionBackend,
+    });
+    const created = await createSession({}, fdbRuntime);
+
+    await expect(
+      fdbRuntime.stopSession(ownerId, created.id),
+    ).resolves.toMatchObject({ stopped: true });
+    expect(releaseAdmissionBackend).toHaveBeenCalledTimes(1);
+    expect(releaseAdmissionBackend).toHaveBeenCalledWith(
+      ownerId,
+      created.id,
+      "fdb",
+    );
+  });
+
+  it("releases Redis and acknowledges disabled FDB for historical foreground cleanup", async () => {
+    const releaseAdmissionBackend = vi.fn(async () => undefined);
+    const historicalRuntime = createPublicBrowserRuntime({
+      gate,
+      browserClient: browserClient as never,
+      adapter,
+      acquireAdmission: async () => "redis",
+      releaseAdmissionBackend,
+    });
+    const created = await createSession({}, historicalRuntime);
+    await pool.query(
+      "ALTER TABLE browser_sessions DISABLE TRIGGER browser_sessions_attribution_immutable",
+    );
+    try {
+      await pool.query(
+        `UPDATE browser_sessions
+            SET admission_backend = 'both'
+          WHERE id = $1`,
+        [created.id],
+      );
+    } finally {
+      await pool.query(
+        "ALTER TABLE browser_sessions ENABLE TRIGGER browser_sessions_attribution_immutable",
+      );
+    }
+    const mutableConfig = config as {
+      NUQ_BACKEND?: "pg" | "fdb";
+      FDB_CLUSTER_FILE?: string;
+    };
+    const previousBackend = mutableConfig.NUQ_BACKEND;
+    const previousClusterFile = mutableConfig.FDB_CLUSTER_FILE;
+    mutableConfig.NUQ_BACKEND = undefined;
+    mutableConfig.FDB_CLUSTER_FILE = undefined;
+    try {
+      await expect(
+        historicalRuntime.stopSession(ownerId, created.id),
+      ).resolves.toMatchObject({ stopped: true });
+    } finally {
+      mutableConfig.NUQ_BACKEND = previousBackend;
+      mutableConfig.FDB_CLUSTER_FILE = previousClusterFile;
+    }
+
+    expect(releaseAdmissionBackend.mock.calls).toEqual([
+      [ownerId, created.id, "redis"],
+    ]);
+    await expect(
+      pool.query(
+        `SELECT 1
+           FROM browser_admission_cleanup
+          WHERE session_id = $1
+            AND redis_released_at IS NOT NULL
+            AND fdb_released_at IS NOT NULL`,
+        [created.id],
+      ),
+    ).resolves.toMatchObject({ rowCount: 1 });
+  });
+
+  it("fails closed when exact foreground FDB release fails", async () => {
+    const releaseAdmissionBackend = vi.fn(async () => {
+      throw new Error("fdb unavailable");
+    });
+    const fdbRuntime = createPublicBrowserRuntime({
+      gate,
+      browserClient: browserClient as never,
+      adapter,
+      acquireAdmission: async () => "fdb",
+      releaseAdmissionBackend,
+    });
+    const created = await createSession({}, fdbRuntime);
+
+    await expect(
+      fdbRuntime.stopSession(ownerId, created.id),
+    ).rejects.toMatchObject({ category: "browser_state_unavailable" });
+    expect(releaseAdmissionBackend).toHaveBeenCalledWith(
+      ownerId,
+      created.id,
+      "fdb",
+    );
+    await expect(
+      pool.query(
+        `SELECT 1
+           FROM browser_admission_cleanup
+          WHERE session_id = $1
+            AND fdb_released_at IS NULL
+            AND last_error_category = 'external_slot_release_failed'`,
+        [created.id],
+      ),
+    ).resolves.toMatchObject({ rowCount: 1 });
+  });
+
+  it("does not treat missing admission cleanup as success before terminalization", async () => {
+    let finishClose!: () => void;
+    const closeGate = new Promise<void>(resolve => {
+      finishClose = resolve;
+    });
+    browserClient.closeSession.mockImplementationOnce(
+      async (runtimeSessionId: string) => {
+        await closeGate;
+        runtimeSessions.delete(runtimeSessionId);
+        return {
+          version: 1 as const,
+          runtimeSessionId,
+          closed: true as const,
+          sessionVersion: 1,
+          preparedProfile: null,
+        };
+      },
+    );
+    const created = await createSession();
+
+    const ownerStop = runtime.stopSession(ownerId, created.id);
+    await vi.waitFor(() =>
+      expect(browserClient.closeSession).toHaveBeenCalledTimes(1),
+    );
+    let duplicateSettled = false;
+    const duplicate = secondRuntime
+      .stopSession(ownerId, created.id)
+      .finally(() => {
+        duplicateSettled = true;
+      });
+    await new Promise(resolve => setTimeout(resolve, 75));
+
+    expect(duplicateSettled).toBe(false);
+    await expect(
+      pool.query(
+        `SELECT 1
+           FROM browser_sessions session
+           LEFT JOIN browser_admission_cleanup cleanup
+             ON cleanup.session_id = session.id
+          WHERE session.id = $1
+            AND session.state = 'stopping'
+            AND cleanup.session_id IS NULL`,
+        [created.id],
+      ),
+    ).resolves.toMatchObject({ rowCount: 1 });
+
+    finishClose();
+    await expect(ownerStop).resolves.toMatchObject({ stopped: true });
+    await expect(duplicate).resolves.toEqual({
+      stopped: false,
+      sessionId: created.id,
+    });
+  });
+
+  it("reclaims an expired same-generation stop after transient finish failure", async () => {
+    const created = await createSession();
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION browser_finish_stop_test_fail()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.state = 'stopping'
+           AND NEW.state IN ('destroyed', 'interrupted') THEN
+          RAISE EXCEPTION 'forced finish stop failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `);
+    await pool.query(`
+      CREATE TRIGGER browser_finish_stop_test_fail
+      BEFORE UPDATE ON browser_sessions
+      FOR EACH ROW EXECUTE FUNCTION browser_finish_stop_test_fail()
+    `);
+    try {
+      await expect(runtime.stopSession(ownerId, created.id)).rejects.toThrow(
+        "Browser stop cleanup failed",
+      );
+    } finally {
+      await pool.query(
+        "DROP TRIGGER browser_finish_stop_test_fail ON browser_sessions",
+      );
+      await pool.query("DROP FUNCTION browser_finish_stop_test_fail()");
+    }
+    await pool.query(
+      `UPDATE browser_sessions
+          SET stop_lease_expires_at = now() - interval '1 second'
+        WHERE id = $1`,
+      [created.id],
+    );
+    browserClient.closeSession.mockImplementationOnce(
+      async (runtimeSessionId: string) => ({
+        version: 1 as const,
+        runtimeSessionId,
+        closed: true as const,
+        sessionVersion: 1,
+        preparedProfile: null,
+      }),
+    );
+
+    await expect(
+      runtime.stopSession(ownerId, created.id),
+    ).resolves.toMatchObject({
+      stopped: true,
+      sessionId: created.id,
+    });
+    expect(browserClient.closeSession).toHaveBeenCalledTimes(2);
+    await expect(
+      pool.query(
+        `SELECT count(*)::int AS count
+           FROM browser_billing_outbox
+          WHERE session_id = $1`,
+        [created.id],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  });
+
+  it("does not reclaim external cleanup after the stop lease age exceeds 30 seconds", async () => {
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>(resolve => {
+      releaseCleanup = resolve;
+    });
+    const releaseAdmissionBackend = vi.fn(async () => cleanupGate);
+    const dependencies = {
+      browserClient: browserClient as never,
+      adapter,
+      acquireAdmission: async () => "redis" as const,
+      releaseAdmissionBackend,
+    };
+    const firstRuntime = createPublicBrowserRuntime({
+      gate,
+      ...dependencies,
+    });
+    const otherRuntime = createPublicBrowserRuntime({
+      gate: secondGate,
+      ...dependencies,
+    });
+    const created = await createSession({}, firstRuntime);
+
+    const firstStop = firstRuntime.stopSession(ownerId, created.id);
+    await vi.waitFor(() =>
+      expect(releaseAdmissionBackend).toHaveBeenCalledTimes(1),
+    );
+    await pool.query(
+      `UPDATE browser_admission_cleanup
+          SET lease_expires_at = now() - interval '1 second'
+        WHERE session_id = $1`,
+      [created.id],
+    );
+    await vi.waitFor(
+      async () => {
+        const result = await pool.query<{ renewed: boolean }>(
+          `SELECT lease_expires_at > now() AS renewed
+             FROM browser_admission_cleanup
+            WHERE session_id = $1`,
+          [created.id],
+        );
+        expect(result.rows[0]?.renewed).toBe(true);
+      },
+      { timeout: 7_000 },
+    );
+    let followerSettled = false;
+    const follower = otherRuntime
+      .stopSession(ownerId, created.id)
+      .finally(() => {
+        followerSettled = true;
+      });
+    await new Promise(resolve => setTimeout(resolve, 75));
+    expect(followerSettled).toBe(false);
+    expect(releaseAdmissionBackend).toHaveBeenCalledTimes(1);
+
+    releaseCleanup();
+    await expect(firstStop).resolves.toMatchObject({ stopped: true });
+    await expect(follower).resolves.toEqual({
+      stopped: false,
+      sessionId: created.id,
+    });
+    expect(releaseAdmissionBackend).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries failed admission cleanup without re-owning terminal billing", async () => {
+    const holders = new Set<string>();
+    let rejectRelease = true;
+    const releaseAdmission = vi.fn(async (_owner: string, id: string) => {
+      if (rejectRelease) throw new Error("admission unavailable");
+      holders.delete(id);
+    });
+    const admissionRuntime = createPublicBrowserRuntime({
+      gate,
+      browserClient: browserClient as never,
+      adapter,
+      getActiveCount: async () => holders.size,
+      acquireAdmission: async (_owner, id) => {
+        holders.add(id);
+        return "redis" as const;
+      },
+      releaseAdmissionBackend: releaseAdmission,
+    });
+    const created = await createSession(
+      { concurrencyLimit: 1 },
+      admissionRuntime,
+    );
+
+    await expect(
+      admissionRuntime.stopSession(ownerId, created.id),
+    ).rejects.toMatchObject({ category: "browser_state_unavailable" });
+    expect(holders.has(created.id)).toBe(true);
+
+    rejectRelease = false;
+    await expect(
+      admissionRuntime.stopSession(ownerId, created.id),
+    ).resolves.toMatchObject({
+      stopped: true,
+      sessionId: created.id,
+      creditsBilled: undefined,
+    });
+    expect(holders.size).toBe(0);
+    expect(releaseAdmission).toHaveBeenCalledTimes(2);
+    await expect(
+      admissionRuntime.stopSession(ownerId, created.id),
+    ).resolves.toEqual({
+      stopped: false,
+      sessionId: created.id,
+    });
+  });
+
   it("admits one implicit session for parallel Interact requests", async () => {
     const scrapeId = await createScrape();
     const holders = new Set<string>();
     const acquireAdmission = vi.fn(async (_owner: string, id: string) => {
       holders.add(id);
+      return "redis" as const;
     });
     const releaseAdmission = vi.fn(async (_owner: string, id: string) => {
       holders.delete(id);
@@ -498,7 +955,7 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
       adapter,
       getActiveCount: async () => holders.size,
       acquireAdmission,
-      releaseAdmission,
+      releaseAdmissionBackend: releaseAdmission,
     });
     const otherRuntime = createPublicBrowserRuntime({
       gate: secondGate,
@@ -506,7 +963,7 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
       adapter,
       getActiveCount: async () => holders.size,
       acquireAdmission,
-      releaseAdmission,
+      releaseAdmissionBackend: releaseAdmission,
     });
     const [firstInput, secondInput] = await Promise.all([
       interactInput(scrapeId, { concurrencyLimit: 10 }),
@@ -629,7 +1086,9 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
     const first = await runtime.interact(firstInput);
     await pool.query(
       `UPDATE browser_sessions
-          SET idle_deadline_at = now() - interval '1 second'
+          SET created_at = '2026-01-01T00:00:00.000Z',
+              absolute_deadline_at = '2026-03-01T00:00:00.000Z',
+              idle_deadline_at = '2026-01-02T00:00:00.000Z'
         WHERE id = $1`,
       [first.session.id],
     );
@@ -651,6 +1110,16 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
     const fresh = await runtime.interact(freshInput);
     expect(fresh.session.id).not.toBe(first.session.id);
     expect(browserClient.createSession).toHaveBeenCalledTimes(2);
+    await expect(
+      pool.query(
+        `SELECT session_duration_ms
+           FROM browser_billing_outbox
+          WHERE session_id = $1`,
+        [first.session.id],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ session_duration_ms: 86_400_000 }],
+    });
   });
 
   it("stops a read-only profile snapshot without a prepared generation", async () => {

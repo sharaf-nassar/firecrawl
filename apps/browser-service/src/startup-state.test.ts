@@ -884,7 +884,7 @@ describe("startup admission", () => {
     await expect(
       state.reconcileWithAuthority(input, execute),
     ).rejects.toMatchObject({
-      category: "reconciliation_execution_failed",
+      category: "reconciliation_cleanup_failed",
     });
     expect(createProfileStore).toHaveBeenCalledOnce();
     expect(() => state.requireReady(generation)).toThrow(
@@ -918,7 +918,7 @@ describe("startup admission", () => {
         reconcileBrowserStateWithAuthority(root, requestValue, { admission }),
       ),
     ).rejects.toMatchObject({
-      category: "reconciliation_execution_failed",
+      category: "reconciliation_cleanup_failed",
     });
     expect(createProfileStore).toHaveBeenCalledOnce();
     expect(compareAndSwapInstall).toHaveBeenCalledOnce();

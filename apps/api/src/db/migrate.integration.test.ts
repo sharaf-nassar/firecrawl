@@ -34,6 +34,7 @@ const preflightUpgradeSchema = "migration_preflight_upgrade_test";
 const asyncPlaceholderSchema = "migration_async_placeholder_test";
 const migrationBudgetSchema = "migration_budget_test";
 const adapterUpgradeSchema = "migration_adapter_upgrade_test";
+const browserStopUpgradeSchema = "migration_browser_stop_upgrade_test";
 const baselineFilename = "0001_persistence_foundation.sql";
 const asyncPlaceholderFilename = "0002_async_request_placeholders.sql";
 const preflightFilename = "0002_preflight_orphan_webhooks.sql";
@@ -46,6 +47,9 @@ const replayCleanupHandoffFilename =
 const replayWriterLeasesFilename = "0006_replay_checkpoint_writer_leases.sql";
 const browserControlFilename = "0007_browser_control_generation.sql";
 const browserAdapterBindingsFilename = "0008_browser_adapter_bindings.sql";
+const browserActiveScrapeAdmissionFilename =
+  "0009_browser_active_scrape_admission.sql";
+const browserStopBillingFilename = "0010_browser_stop_billing_claim.sql";
 
 function databaseUrlForSchema(schema: string): string | undefined {
   if (!databaseUrl) {
@@ -192,6 +196,7 @@ describeWithDatabase("application migrations", () => {
       asyncPlaceholderSchema,
       migrationBudgetSchema,
       adapterUpgradeSchema,
+      browserStopUpgradeSchema,
     ]) {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.query(`CREATE SCHEMA ${schema}`);
@@ -221,6 +226,8 @@ describeWithDatabase("application migrations", () => {
       replayWriterLeasesFilename,
       browserControlFilename,
       browserAdapterBindingsFilename,
+      browserActiveScrapeAdmissionFilename,
+      browserStopBillingFilename,
     ]);
     expect(ledger.rows.every(row => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(
       true,
@@ -1582,15 +1589,23 @@ describeWithDatabase("application migrations", () => {
         join(__dirname, "migrations", browserAdapterBindingsFilename),
         join(migrationsDirectory, browserAdapterBindingsFilename),
       );
+      await copyFile(
+        join(__dirname, "migrations", browserActiveScrapeAdmissionFilename),
+        join(migrationsDirectory, browserActiveScrapeAdmissionFilename),
+      );
+      await copyFile(
+        join(__dirname, "migrations", browserStopBillingFilename),
+        join(migrationsDirectory, browserStopBillingFilename),
+      );
       await writeFile(
-        join(migrationsDirectory, "0009_failure.sql"),
+        join(migrationsDirectory, "0011_failure.sql"),
         `CREATE TABLE migration_rollback_probe (id integer PRIMARY KEY);
          SELECT missing_migration_function();`,
       );
 
       await expect(
         runApplicationMigrations(migrationConfig, { migrationsDirectory }),
-      ).rejects.toThrow(/0009_failure\.sql/);
+      ).rejects.toThrow(/0011_failure\.sql/);
 
       const result = await client.query<{
         table_name: string | null;
@@ -1601,7 +1616,7 @@ describeWithDatabase("application migrations", () => {
                 EXISTS (
                   SELECT 1
                     FROM application_schema_migrations
-                   WHERE filename = '0009_failure.sql'
+                   WHERE filename = '0011_failure.sql'
                 ) AS ledgered`,
       );
       expect(result.rows).toEqual([{ table_name: null, ledgered: false }]);
@@ -2480,6 +2495,183 @@ describeWithDatabase("application migrations", () => {
           row => row.filename !== asyncPlaceholderFilename,
         ),
       ).toEqual(after.rows);
+    } finally {
+      await upgradeClient.end().catch(() => undefined);
+      await rm(migrationsDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades active and terminal browser sessions into durable cleanup work", async () => {
+    const migrationsDirectory = await mkdtemp(
+      join(tmpdir(), "firecrawl-browser-stop-upgrade-"),
+    );
+    const upgradeDatabaseUrl = databaseUrlForSchema(browserStopUpgradeSchema);
+    const upgradeClient = new Client({ connectionString: upgradeDatabaseUrl });
+    const upgradeConfig = {
+      ...migrationConfig,
+      APPLICATION_DATABASE_URL: upgradeDatabaseUrl,
+    };
+    const preUpgradeMigrations = [
+      baselineFilename,
+      asyncPlaceholderFilename,
+      preflightFilename,
+      retentionFkFilename,
+      resolvedWebhookDeadlineFilename,
+      browserInteractFilename,
+      replayCleanupHandoffFilename,
+      replayWriterLeasesFilename,
+      browserControlFilename,
+      browserAdapterBindingsFilename,
+      browserActiveScrapeAdmissionFilename,
+    ];
+
+    try {
+      for (const filename of preUpgradeMigrations) {
+        await copyFile(
+          join(__dirname, "migrations", filename),
+          join(migrationsDirectory, filename),
+        );
+      }
+      await runApplicationMigrations(upgradeConfig, { migrationsDirectory });
+      await upgradeClient.connect();
+
+      const states = [
+        "ready",
+        "stopping",
+        "interrupted",
+        "destroyed",
+        "expired",
+        "error",
+      ];
+      const sessionIds: string[] = [];
+      for (const state of states) {
+        const upgradeRequestId = randomUUID();
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        await upgradeClient.query(
+          `INSERT INTO requests (
+             id, kind, api_version, team_id, origin, target_hint
+           ) VALUES ($1, 'browser', 'v2', $2, 'test', 'browser upgrade')`,
+          [upgradeRequestId, ownerId],
+        );
+        await upgradeClient.query(
+          `INSERT INTO browser_sessions (
+             id, request_id, owner_id, state, absolute_deadline_at,
+             idle_deadline_at, last_activity_at, terminal_at, terminal_reason
+           ) VALUES (
+             $1, $2, $3, $4, now() + interval '1 hour',
+             now() + interval '30 minutes', now(),
+             CASE WHEN $4 IN (
+               'interrupted', 'destroyed', 'expired', 'error'
+             ) THEN now() END,
+             CASE WHEN $4 IN (
+               'interrupted', 'destroyed', 'expired', 'error'
+             )
+               THEN 'pre_upgrade' END
+           )`,
+          [sessionId, upgradeRequestId, ownerId, state],
+        );
+      }
+
+      await copyFile(
+        join(__dirname, "migrations", browserStopBillingFilename),
+        join(migrationsDirectory, browserStopBillingFilename),
+      );
+      await runApplicationMigrations(upgradeConfig, { migrationsDirectory });
+
+      const upgraded = await upgradeClient.query<{
+        state: string;
+        billing_endpoint: string | null;
+        admission_backend: string | null;
+        billing_state: string | null;
+        sinks_acked: boolean;
+        admission_pending: boolean;
+      }>(
+        `SELECT s.state, s.billing_endpoint, s.admission_backend,
+                o.state AS billing_state,
+                (
+                  r.legacy_acked_at IS NOT NULL
+                  AND r.autumn_acked_at IS NOT NULL
+                  AND r.keyless_adjustment_acked_at IS NOT NULL
+                  AND r.keyless_logging_acked_at IS NOT NULL
+                  AND r.keyless_receipt_gc_acked_at IS NOT NULL
+                  AND r.keyless_acked_at IS NOT NULL
+                ) AS sinks_acked,
+                (
+                  c.session_id IS NOT NULL
+                  AND (
+                    (c.backend IN ('redis', 'both')
+                      AND c.redis_released_at IS NULL)
+                    OR (c.backend IN ('fdb', 'both')
+                      AND c.fdb_released_at IS NULL)
+                  )
+                ) AS admission_pending
+           FROM browser_sessions s
+           LEFT JOIN browser_billing_outbox o ON o.session_id = s.id
+           LEFT JOIN browser_billing_sink_receipts r ON r.session_id = s.id
+           LEFT JOIN browser_admission_cleanup c ON c.session_id = s.id
+          WHERE s.id = ANY($1::uuid[])
+          ORDER BY array_position($1::uuid[], s.id)`,
+        [sessionIds],
+      );
+      expect(upgraded.rows).toEqual([
+        {
+          state: "ready",
+          billing_endpoint: "browser",
+          admission_backend: "both",
+          billing_state: null,
+          sinks_acked: false,
+          admission_pending: true,
+        },
+        {
+          state: "stopping",
+          billing_endpoint: "browser",
+          admission_backend: "both",
+          billing_state: null,
+          sinks_acked: false,
+          admission_pending: true,
+        },
+        {
+          state: "interrupted",
+          billing_endpoint: "browser",
+          admission_backend: "both",
+          billing_state: "delivered",
+          sinks_acked: true,
+          admission_pending: false,
+        },
+        {
+          state: "destroyed",
+          billing_endpoint: "browser",
+          admission_backend: "both",
+          billing_state: "delivered",
+          sinks_acked: true,
+          admission_pending: false,
+        },
+        {
+          state: "expired",
+          billing_endpoint: "browser",
+          admission_backend: "both",
+          billing_state: "delivered",
+          sinks_acked: true,
+          admission_pending: false,
+        },
+        {
+          state: "error",
+          billing_endpoint: "browser",
+          admission_backend: "both",
+          billing_state: "delivered",
+          sinks_acked: true,
+          admission_pending: false,
+        },
+      ]);
+      await expect(
+        upgradeClient.query(
+          `UPDATE browser_sessions
+              SET billing_endpoint = 'interact'
+            WHERE id = $1`,
+          [sessionIds[0]],
+        ),
+      ).rejects.toMatchObject({ code: "23000" });
     } finally {
       await upgradeClient.end().catch(() => undefined);
       await rm(migrationsDirectory, { recursive: true, force: true });

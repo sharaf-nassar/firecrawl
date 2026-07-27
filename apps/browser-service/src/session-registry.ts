@@ -1377,7 +1377,7 @@ export function createSessionRegistry(options: {
       runtimeByRequest.set(request.sessionId, runtimeSessionId);
       pendingSessionIds.delete(request.sessionId);
       const profile = request.profile;
-      const profileId = profile?.profileId ?? request.sessionId;
+      const profileId = profile?.profileId ?? runtimeSessionId;
       const mode = profile?.mode ?? "snapshot";
       const base =
         profile?.generationId === undefined || profile.generationId === null

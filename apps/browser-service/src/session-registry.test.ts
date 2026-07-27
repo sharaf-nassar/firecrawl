@@ -694,6 +694,25 @@ describe("persistent session registry", () => {
     expect(h.profileStore.prepareWorkingCopy).not.toHaveBeenCalled();
   });
 
+  test("a default UUIDv7 session owns and discards service-local work", async () => {
+    const h = harness();
+    const sessionId = "019fa364-b9bd-75da-baa6-e9c96915ae98";
+    const session = await h.registry.create(request({ sessionId }));
+
+    expect(h.profileStore.createWorkingCopy).toHaveBeenCalledWith(
+      session.runtimeSessionId,
+      null,
+      "snapshot",
+      sessionId,
+    );
+    expect(session.runtimeSessionId).toBe(IDS[1]);
+    expect(session.runtimeSessionId).not.toBe(sessionId);
+
+    await h.registry.close(session.runtimeSessionId, "requested");
+    expect(h.profileStore.discardWorkingCopy).toHaveBeenCalledOnce();
+    expect(h.profileStore.prepareWorkingCopy).not.toHaveBeenCalled();
+  });
+
   test("close linearizes admission before its runtime cleanup snapshot", async () => {
     let snapshotReached!: () => void;
     const reached = new Promise<void>((resolve) => {

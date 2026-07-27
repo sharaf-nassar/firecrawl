@@ -28,7 +28,6 @@ export const BROWSER_SERVICE_ERROR_STATUS = {
   reconciliation_reference_corrupt: 409,
   reconciliation_filesystem_unsafe: 503,
   reconciliation_deadline_exceeded: 408,
-  reconciliation_execution_failed: 503,
   reconciliation_cleanup_failed: 503,
   profile_prepare_failed: 503,
   profile_finalize_failed: 409,

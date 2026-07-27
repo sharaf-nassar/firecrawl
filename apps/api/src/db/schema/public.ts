@@ -442,8 +442,20 @@ export const browser_sessions = pgTable(
       (): AnyPgColumn => browser_interact_runs.id,
       { onDelete: "set null" },
     ),
+    stop_attempt_id: uuid("stop_attempt_id"),
+    stop_lease_expires_at: ts("stop_lease_expires_at"),
+    stop_owner_instance_id: uuid("stop_owner_instance_id"),
+    stop_owner_generation_nonce: text("stop_owner_generation_nonce"),
     prompt_used: boolean("prompt_used").notNull().default(false),
     credits_used: integer("credits_used").default(0),
+    billing_subscription_id: text("billing_subscription_id"),
+    billing_api_key_id: bigintNum("billing_api_key_id"),
+    billing_endpoint: text("billing_endpoint").notNull().default("browser"),
+    admission_backend: text("admission_backend"),
+    keyless_team_id: text("keyless_team_id"),
+    keyless_reserved_credits: integer("keyless_reserved_credits")
+      .notNull()
+      .default(0),
     prompt_credits_used: integer("prompt_credits_used").notNull().default(0),
     stream_web_view: boolean("stream_web_view").notNull().default(false),
     workspace_id: text("workspace_id"),
@@ -479,6 +491,29 @@ export const browser_sessions = pgTable(
       sql`${table.credits_used} >= 0`,
     ),
     check(
+      "browser_sessions_billing_endpoint_check",
+      sql`${table.billing_endpoint} IN ('browser', 'interact')`,
+    ),
+    check(
+      "browser_sessions_admission_backend_check",
+      sql`${table.admission_backend} IS NULL OR ${table.admission_backend} IN ('redis', 'fdb', 'both')`,
+    ),
+    check(
+      "browser_sessions_stop_lease_check",
+      sql`(${table.stop_attempt_id} IS NULL) =
+          (${table.stop_lease_expires_at} IS NULL)
+          AND (${table.stop_attempt_id} IS NULL) =
+          (${table.stop_owner_instance_id} IS NULL)
+          AND (${table.stop_attempt_id} IS NULL) =
+          (${table.stop_owner_generation_nonce} IS NULL)`,
+    ),
+    check(
+      "browser_sessions_keyless_reserved_credits_check",
+      sql`${table.keyless_reserved_credits} >= 0
+          AND (${table.keyless_reserved_credits} = 0
+            OR ${table.keyless_team_id} IS NOT NULL)`,
+    ),
+    check(
       "browser_sessions_prompt_credits_used_check",
       sql`${table.prompt_credits_used} >= 0`,
     ),
@@ -496,6 +531,134 @@ export const browser_sessions = pgTable(
     index("browser_sessions_absolute_deadline_at_idx").on(
       table.absolute_deadline_at,
     ),
+  ],
+);
+
+export const browser_billing_outbox = pgTable(
+  "browser_billing_outbox",
+  {
+    session_id: uuid("session_id")
+      .primaryKey()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id").notNull(),
+    subscription_id: text("subscription_id"),
+    api_key_id: bigintNum("api_key_id"),
+    endpoint: text("endpoint").notNull(),
+    session_duration_ms: integer("session_duration_ms").notNull(),
+    credits: integer("credits").notNull(),
+    used_prompt: boolean("used_prompt").notNull(),
+    keyless_team_id: text("keyless_team_id"),
+    keyless_reserved_credits: integer("keyless_reserved_credits")
+      .notNull()
+      .default(0),
+    state: text("state").notNull().default("pending"),
+    attempt_count: integer("attempt_count").notNull().default(0),
+    lease_token: uuid("lease_token"),
+    lease_expires_at: ts("lease_expires_at"),
+    next_attempt_at: ts("next_attempt_at").notNull().defaultNow(),
+    last_error_category: text("last_error_category"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+    delivered_at: ts("delivered_at"),
+  },
+  table => [
+    check(
+      "browser_billing_outbox_endpoint_check",
+      sql`${table.endpoint} IN ('browser', 'interact')`,
+    ),
+    check(
+      "browser_billing_outbox_state_check",
+      sql`${table.state} IN ('pending', 'delivered')`,
+    ),
+    check(
+      "browser_billing_outbox_values_check",
+      sql`${table.session_duration_ms} >= 0
+          AND ${table.credits} >= 0
+          AND ${table.attempt_count} >= 0
+          AND ${table.keyless_reserved_credits} >= 0`,
+    ),
+    check(
+      "browser_billing_outbox_lease_check",
+      sql`(${table.lease_token} IS NULL) = (${table.lease_expires_at} IS NULL)`,
+    ),
+    check(
+      "browser_billing_outbox_delivery_check",
+      sql`(${table.state} = 'delivered') = (${table.delivered_at} IS NOT NULL)`,
+    ),
+    index("browser_billing_outbox_due_idx").on(
+      table.state,
+      table.next_attempt_at,
+    ),
+  ],
+);
+
+export const browser_billing_sink_receipts = pgTable(
+  "browser_billing_sink_receipts",
+  {
+    session_id: uuid("session_id")
+      .primaryKey()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    legacy_acked_at: ts("legacy_acked_at"),
+    autumn_acked_at: ts("autumn_acked_at"),
+    keyless_adjustment_acked_at: ts("keyless_adjustment_acked_at"),
+    keyless_logging_acked_at: ts("keyless_logging_acked_at"),
+    keyless_receipt_gc_acked_at: ts("keyless_receipt_gc_acked_at"),
+    keyless_acked_at: ts("keyless_acked_at"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+  },
+);
+
+export const browser_keyless_usage_log = pgTable(
+  "browser_keyless_usage_log",
+  {
+    session_id: uuid("session_id")
+      .primaryKey()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    keyless_team_id: text("keyless_team_id").notNull(),
+    credits: integer("credits").notNull(),
+    created_at: ts("created_at").notNull().defaultNow(),
+  },
+  table => [
+    check(
+      "browser_keyless_usage_log_credits_check",
+      sql`${table.credits} >= 0`,
+    ),
+  ],
+);
+
+export const browser_admission_cleanup = pgTable(
+  "browser_admission_cleanup",
+  {
+    session_id: uuid("session_id")
+      .primaryKey()
+      .references(() => browser_sessions.id, { onDelete: "cascade" }),
+    owner_id: uuid("owner_id").notNull(),
+    backend: text("backend").notNull(),
+    redis_released_at: ts("redis_released_at"),
+    fdb_released_at: ts("fdb_released_at"),
+    lease_token: uuid("lease_token"),
+    lease_expires_at: ts("lease_expires_at"),
+    attempt_count: integer("attempt_count").notNull().default(0),
+    next_attempt_at: ts("next_attempt_at").notNull().defaultNow(),
+    last_error_category: text("last_error_category"),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+  },
+  table => [
+    check(
+      "browser_admission_cleanup_backend_check",
+      sql`${table.backend} IN ('redis', 'fdb', 'both')`,
+    ),
+    check(
+      "browser_admission_cleanup_attempt_check",
+      sql`${table.attempt_count} >= 0`,
+    ),
+    check(
+      "browser_admission_cleanup_lease_check",
+      sql`(${table.lease_token} IS NULL) = (${table.lease_expires_at} IS NULL)`,
+    ),
+    index("browser_admission_cleanup_due_idx").on(table.next_attempt_at),
   ],
 );
 

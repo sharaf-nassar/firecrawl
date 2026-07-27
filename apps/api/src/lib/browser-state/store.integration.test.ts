@@ -54,6 +54,7 @@ describeWithDatabase("durable browser state store", () => {
   };
   let store: StoreUnderTest;
   let currentAdapterJobId = adapterJobId;
+  const controlInstanceId = randomUUID();
 
   async function createFixture(options?: { state?: "ready" | "executing" }) {
     const requestId = randomUUID();
@@ -88,6 +89,7 @@ describeWithDatabase("durable browser state store", () => {
       absolute_deadline_at: new Date(now.getTime() + 300_000).toISOString(),
       idle_deadline_at: new Date(now.getTime() + 60_000).toISOString(),
       last_activity_at: now.toISOString(),
+      admission_backend: "redis",
     });
     const run = await store.createInteractRun({
       id: runId,
@@ -162,6 +164,10 @@ describeWithDatabase("durable browser state store", () => {
     operation: (
       lease: Parameters<typeof store.claimBrowserSessionStop>[0],
     ) => Promise<T>,
+    bindingOverride?: {
+      apiInstanceId: string;
+      controlGenerationNonce: string;
+    },
   ): Promise<T> {
     const client = await pool.connect();
     try {
@@ -170,10 +176,11 @@ describeWithDatabase("durable browser state store", () => {
         epoch: 1,
         scope: "filesystem_and_database",
         binding: {
-          apiInstanceId: randomUUID(),
+          apiInstanceId: bindingOverride?.apiInstanceId ?? controlInstanceId,
           databaseControlEpoch: 1,
           processNonce: "a".repeat(43),
-          controlGenerationNonce: "b".repeat(43),
+          controlGenerationNonce:
+            bindingOverride?.controlGenerationNonce ?? "b".repeat(43),
           snapshotDigest: "c".repeat(64),
         },
         transaction: {
@@ -348,18 +355,20 @@ describeWithDatabase("durable browser state store", () => {
         store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
       ),
     ]);
-    expect(claims.filter(Boolean)).toEqual([
-      {
-        runId: fixture.run.id,
-        profileId: null,
-        browserId: null,
-        runtimeEpoch: 1,
-        requiresPreparedProfile: false,
-      },
-    ]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const claim = claims.find(Boolean)!;
+    expect(claim).toMatchObject({
+      runId: fixture.run.id,
+      profileId: null,
+      browserId: null,
+      runtimeEpoch: 1,
+      requiresPreparedProfile: false,
+      stopAttemptId: expect.any(String),
+    });
     await withMutationLease(lease =>
       store.finishBrowserSessionStop(
         lease,
+        claim,
         fixture.session.id,
         "requested",
         "destroyed",
@@ -390,6 +399,50 @@ describeWithDatabase("durable browser state store", () => {
     });
   });
 
+  it("reclaims an expired stop lease and fences the abandoned attempt", async () => {
+    const fixture = await createFixture({ state: "ready" });
+    const abandoned = await withMutationLease(lease =>
+      store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
+    );
+    expect(abandoned).toMatchObject({ stopAttemptId: expect.any(String) });
+    await pool.query(
+      `UPDATE browser_sessions
+          SET stop_lease_expires_at = now() - interval '1 second'
+        WHERE id = $1`,
+      [fixture.session.id],
+    );
+
+    const reclaimed = await withMutationLease(lease =>
+      store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
+    );
+    expect(reclaimed).toMatchObject({
+      stopAttemptId: expect.any(String),
+    });
+    expect(reclaimed?.stopAttemptId).not.toBe(abandoned?.stopAttemptId);
+    await expect(
+      withMutationLease(lease =>
+        store.finishBrowserSessionStop(
+          lease,
+          abandoned!,
+          fixture.session.id,
+          "requested",
+          "destroyed",
+        ),
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      withMutationLease(lease =>
+        store.finishBrowserSessionStop(
+          lease,
+          reclaimed!,
+          fixture.session.id,
+          "requested",
+          "destroyed",
+        ),
+      ),
+    ).resolves.toMatchObject({ sessionId: fixture.session.id });
+  });
+
   it("claims and terminalizes a direct session with no run", async () => {
     const requestId = randomUUID();
     const sessionId = randomUUID();
@@ -403,20 +456,24 @@ describeWithDatabase("durable browser state store", () => {
       `INSERT INTO browser_sessions
          (id, request_id, owner_id, state, absolute_deadline_at,
           idle_deadline_at, last_activity_at, ttl_total,
-          ttl_without_activity)
+          ttl_without_activity, billing_endpoint)
        VALUES ($1, $2, $3, 'ready', now() + interval '10 minutes',
-               now() + interval '5 minutes', now(), 600, 300)`,
+               now() + interval '5 minutes', now(), 600, 300, 'browser')`,
       [sessionId, requestId, ownerId],
     );
 
-    await expect(
-      withMutationLease(lease =>
-        store.claimBrowserSessionStop(lease, sessionId, "requested"),
-      ),
-    ).resolves.toMatchObject({ runId: null, runtimeEpoch: 1 });
+    const claim = await withMutationLease(lease =>
+      store.claimBrowserSessionStop(lease, sessionId, "requested"),
+    );
+    expect(claim).toMatchObject({
+      runId: null,
+      runtimeEpoch: 1,
+      stopAttemptId: expect.any(String),
+    });
     await withMutationLease(lease =>
       store.finishBrowserSessionStop(
         lease,
+        claim!,
         sessionId,
         "requested",
         "destroyed",
@@ -426,6 +483,42 @@ describeWithDatabase("durable browser state store", () => {
       state: "destroyed",
       current_run_id: null,
       terminal_at: expect.any(String),
+    });
+  });
+
+  it("caps requested stop billing at an already-expired idle deadline", async () => {
+    const fixture = await createFixture({ state: "ready" });
+    await pool.query(
+      `UPDATE browser_sessions
+          SET created_at = '2026-01-01T00:00:00.000Z',
+              idle_deadline_at = '2026-01-02T00:00:00.000Z',
+              absolute_deadline_at = '2026-03-01T00:00:00.000Z'
+        WHERE id = $1`,
+      [fixture.session.id],
+    );
+
+    const claim = await withMutationLease(lease =>
+      store.claimBrowserSessionStop(lease, fixture.session.id, "requested"),
+    );
+    await withMutationLease(lease =>
+      store.finishBrowserSessionStop(
+        lease,
+        claim!,
+        fixture.session.id,
+        "requested",
+        "destroyed",
+      ),
+    );
+
+    await expect(
+      pool.query(
+        `SELECT session_duration_ms
+           FROM browser_billing_outbox
+          WHERE session_id = $1`,
+        [fixture.session.id],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ session_duration_ms: 86_400_000 }],
     });
   });
 
@@ -966,6 +1059,45 @@ describeWithDatabase("durable browser state store", () => {
       capabilitiesRevoked: 0,
       grantsRevoked: 0,
       writerLeasesCleared: 0,
+    });
+    const recoveryOutbox = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+         FROM browser_billing_outbox
+        WHERE session_id IN ($1, $2)`,
+      [preparedFixture.session.id, executingFixture.session.id],
+    );
+    expect(recoveryOutbox.rows[0]?.count).toBe(2);
+    const recoveryAdmission = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+         FROM browser_admission_cleanup
+        WHERE session_id IN ($1, $2)`,
+      [preparedFixture.session.id, executingFixture.session.id],
+    );
+    expect(recoveryAdmission.rows[0]?.count).toBe(2);
+  });
+
+  it("caps startup recovery billing at the persisted lifetime deadline", async () => {
+    const fixture = await createFixture({ state: "ready" });
+    await pool.query(
+      `UPDATE browser_sessions
+          SET created_at = '2026-01-01T00:00:00.000Z',
+              absolute_deadline_at = '2026-01-02T00:00:00.000Z',
+              idle_deadline_at = '2026-03-01T00:00:00.000Z'
+        WHERE id = $1`,
+      [fixture.session.id],
+    );
+
+    await interruptUnfinishedBrowserWork(new Date("2026-07-20T23:00:00.000Z"));
+
+    await expect(
+      pool.query(
+        `SELECT session_duration_ms
+           FROM browser_billing_outbox
+          WHERE session_id = $1`,
+        [fixture.session.id],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ session_duration_ms: 86_400_000 }],
     });
   });
 

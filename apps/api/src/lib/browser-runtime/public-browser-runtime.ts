@@ -27,6 +27,18 @@ import type {
 import type { StoredReplayCheckpoint } from "../scrape-interact/replay-envelope";
 import type { ReplayResolution } from "../scrape-interact/replay-envelope";
 import { loadScrapeReplayState } from "../scrape-interact/replay-store";
+import type { ExternalSlotBackend } from "../../services/worker/nuq-router";
+import { executeBrowserAdmissionCleanupClaim } from "../../services/browser-admission-cleanup";
+import {
+  claimBrowserAdmissionCleanup,
+  failBrowserAdmissionCleanup,
+  markBrowserAdmissionBackendReleased,
+  renewBrowserAdmissionCleanup,
+  terminalizeExpiredBrowserSessions,
+  terminalizeFailedBrowserSession,
+  type BrowserAdmissionCleanupClaim,
+  type BrowserSessionBillingClaim,
+} from "../browser-state/store";
 
 type PublicOrigins = { publicBase: string; publicWsBase: string };
 
@@ -49,6 +61,11 @@ type PublicProfileInput = {
   generationId?: string;
 };
 
+type BrowserBillingReservation = {
+  keylessTeamId: string;
+  keylessReservedCredits: number;
+};
+
 type CreatePublicSessionInput = PublicOrigins & {
   requestId: string;
   ownerId: string;
@@ -62,7 +79,10 @@ type CreatePublicSessionInput = PublicOrigins & {
   replay: StoredReplayCheckpoint | null;
   settings: ReplayBrowserSettingsV1;
   concurrencyLimit?: number;
-  admitSession?: () => Promise<void>;
+  billingSubscriptionId?: string | null;
+  billingApiKeyId?: number | null;
+  admitSession?: () => Promise<BrowserBillingReservation | void>;
+  rollbackKeylessReservation?: () => Promise<void>;
 };
 
 type ExecutePublicSessionInput = {
@@ -93,7 +113,10 @@ type InteractInput = PublicOrigins & {
   settings: ReplayBrowserSettingsV1;
   profile?: PublicProfileInput;
   concurrencyLimit?: number;
-  admitSession?: () => Promise<void>;
+  billingSubscriptionId?: string | null;
+  billingApiKeyId?: number | null;
+  admitSession?: () => Promise<BrowserBillingReservation | void>;
+  rollbackKeylessReservation?: () => Promise<void>;
   sessionCreated?: (session: PublicBrowserSession) => Promise<void>;
 };
 
@@ -288,9 +311,46 @@ export function createPublicBrowserRuntime(deps: {
     ownerId: string,
     sessionId: string,
     ttlMs: number,
+  ) => Promise<ExternalSlotBackend>;
+  releaseAdmissionBackend?: (
+    ownerId: string,
+    sessionId: string,
+    backend: ExternalSlotBackend,
   ) => Promise<void>;
-  releaseAdmission?: (ownerId: string, sessionId: string) => Promise<void>;
 }): PublicBrowserRuntime {
+  const withAdmissionCleanupHeartbeat = async <T>(
+    claim: BrowserAdmissionCleanupClaim,
+    action: () => Promise<T>,
+  ): Promise<T> => {
+    let heartbeatError: unknown;
+    let pendingHeartbeat = Promise.resolve();
+    const interval = setInterval(() => {
+      pendingHeartbeat = pendingHeartbeat
+        .then(async () => {
+          const renewed = await deps.gate.withBrowserStateMutationLease(
+            "filesystem_and_database",
+            lease => renewBrowserAdmissionCleanup(lease, claim),
+          );
+          if (!renewed) {
+            throw new Error("Browser admission cleanup lease was lost");
+          }
+        })
+        .catch(error => {
+          heartbeatError = error;
+        });
+    }, 5_000);
+    interval.unref();
+    try {
+      const result = await action();
+      await pendingHeartbeat;
+      if (heartbeatError) throw heartbeatError;
+      return result;
+    } finally {
+      clearInterval(interval);
+      await pendingHeartbeat;
+    }
+  };
+
   const grants = createBrowserProxyGrantStore({ gate: deps.gate });
   const adapter = deps.adapter ?? unavailableExecutionAdapter;
   const closeSession = async (
@@ -433,7 +493,8 @@ export function createPublicBrowserRuntime(deps: {
     let profileId: string | null = null;
     let runtimeSession: SessionV1 | undefined;
     let profileInput: ProfileInputV1 = null;
-    let admissionAcquired = false;
+    let admissionBackend: ExternalSlotBackend | undefined;
+    let billingReservation: BrowserBillingReservation | undefined;
     if (input.profile?.generationId && input.replay !== null) {
       throw runtimeError("replay_unavailable");
     }
@@ -449,24 +510,13 @@ export function createPublicBrowserRuntime(deps: {
             [ownerId],
           );
           if (mode === "interact" && input.scrapeId !== undefined) {
-            await lease.transaction.query(
-              `UPDATE browser_sessions
-                  SET state = 'expired',
-                      status = 'closed',
-                      terminal_at = COALESCE(terminal_at, now()),
-                      terminal_reason = 'expired',
-                      updated_at = now()
-                WHERE owner_id = $1
-                  AND scrape_id = $2
-                  AND state = 'ready'
-                  AND (
-                    absolute_deadline_at <= now()
-                    OR idle_deadline_at <= now()
-                  )`,
-              [ownerId, input.scrapeId],
+            await terminalizeExpiredBrowserSessions(
+              lease,
+              ownerId,
+              input.scrapeId,
             );
           }
-          await input.admitSession?.();
+          billingReservation = (await input.admitSession?.()) || undefined;
           if (
             input.concurrencyLimit !== undefined &&
             deps.getActiveCount !== undefined &&
@@ -477,12 +527,11 @@ export function createPublicBrowserRuntime(deps: {
             });
           }
           if (deps.acquireAdmission !== undefined) {
-            await deps.acquireAdmission(
+            admissionBackend = await deps.acquireAdmission(
               ownerId,
               sessionId,
               lifetime.ttlSeconds * 1_000,
             );
-            admissionAcquired = true;
           }
         },
         createDurable: async (lease, lifetime) => {
@@ -533,10 +582,14 @@ export function createPublicBrowserRuntime(deps: {
              idle_deadline_at, last_activity_at, stream_web_view,
              team_id, status, ttl_total, ttl_without_activity,
              workspace_id, context_id,
+             billing_subscription_id, billing_api_key_id, billing_endpoint,
+             admission_backend, keyless_team_id, keyless_reserved_credits,
              created_at, updated_at
            ) VALUES (
              $1, $2, $3::uuid, $4, 1, $5, 1, 'creating', $6, $7, now(), $8,
-             $3::text, 'active', $9, $10, $11, $12, now(), now()
+             $3::text, 'active', $9, $10, $11, $12, $13, $14, $15, $16,
+             $17, $18,
+             now(), now()
            )`,
             [
               sessionId,
@@ -551,6 +604,12 @@ export function createPublicBrowserRuntime(deps: {
               lifetime.activityTtlSeconds,
               JSON.stringify([...input.allowedDomains].sort()),
               contextDigest,
+              input.billingSubscriptionId ?? null,
+              input.billingApiKeyId ?? null,
+              mode === "interact" ? "interact" : "browser",
+              admissionBackend ?? null,
+              billingReservation?.keylessTeamId ?? null,
+              billingReservation?.keylessReservedCredits ?? 0,
             ],
           );
         },
@@ -647,22 +706,77 @@ export function createPublicBrowserRuntime(deps: {
           }
         },
         rollbackDurable: async lease => {
-          await lease.transaction.query(
-            `DELETE FROM browser_sessions WHERE id = $1`,
-            [sessionId],
-          );
+          await terminalizeFailedBrowserSession(lease, sessionId);
         },
       });
     } catch (error) {
-      if (admissionAcquired && deps.releaseAdmission !== undefined) {
+      let admissionReleaseError: unknown;
+      if (
+        admissionBackend !== undefined &&
+        deps.releaseAdmissionBackend !== undefined
+      ) {
+        const durableClaim = await deps.gate.withBrowserStateMutationLease(
+          "filesystem_and_database",
+          lease => claimBrowserAdmissionCleanup(lease, sessionId, ownerId),
+        );
         try {
-          await deps.releaseAdmission(ownerId, sessionId);
+          const release = () =>
+            deps.releaseAdmissionBackend!(
+              ownerId,
+              sessionId,
+              admissionBackend!,
+            );
+          if (durableClaim) {
+            await withAdmissionCleanupHeartbeat(durableClaim, release);
+          } else {
+            await release();
+          }
+          if (durableClaim) {
+            await deps.gate.withBrowserStateMutationLease(
+              "filesystem_and_database",
+              lease =>
+                markBrowserAdmissionBackendReleased(
+                  lease,
+                  durableClaim,
+                  admissionBackend!,
+                ),
+            );
+          }
         } catch (releaseError) {
-          throw new AggregateError(
-            [error, releaseError],
-            "Browser admission rollback failed",
-          );
+          if (durableClaim) {
+            await deps.gate
+              .withBrowserStateMutationLease("filesystem_and_database", lease =>
+                failBrowserAdmissionCleanup(
+                  lease,
+                  durableClaim,
+                  "external_slot_release_failed",
+                ),
+              )
+              .catch(() => undefined);
+          }
+          admissionReleaseError = releaseError;
         }
+      }
+      const durableTerminalWork = await deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        async lease =>
+          (
+            await lease.transaction.query(
+              `SELECT 1
+                   FROM browser_billing_outbox
+                  WHERE session_id = $1`,
+              [sessionId],
+            )
+          ).rows.length === 1,
+      );
+      if (!durableTerminalWork) {
+        await input.rollbackKeylessReservation?.();
+      }
+      if (admissionReleaseError) {
+        throw new AggregateError(
+          [error, admissionReleaseError],
+          "Browser admission rollback failed",
+        );
       }
       throw error;
     }
@@ -722,10 +836,12 @@ export function createPublicBrowserRuntime(deps: {
         );
         await lease.transaction.query(
           `UPDATE browser_sessions
-              SET workspace_id = $2, updated_at = now()
+              SET runtime_epoch = $2,
+                  workspace_id = $3,
+                  updated_at = now()
             WHERE id = $1
               AND state = 'ready'`,
-          [row.id, JSON.stringify(exactAllowedDomains)],
+          [row.id, service.sessionVersion, JSON.stringify(exactAllowedDomains)],
         );
         await lease.transaction.query(
           `INSERT INTO browser_interact_runs (
@@ -796,27 +912,150 @@ export function createPublicBrowserRuntime(deps: {
     });
   };
 
+  const waitForAdmissionCleanup = async (
+    sessionId: string,
+    ownerId?: string,
+    timeoutMs = 35_000,
+  ): Promise<{
+    existed: boolean;
+    retryClaim: BrowserAdmissionCleanupClaim | null;
+  }> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const state = await deps.gate.withBrowserStateMutationLease(
+        "filesystem_and_database",
+        async lease => {
+          const result = await lease.transaction.query<{
+            backend: "redis" | "fdb" | "both";
+            redis_released_at: string | null;
+            fdb_released_at: string | null;
+            retryable: boolean;
+          }>(
+            `SELECT backend, redis_released_at, fdb_released_at,
+                    last_error_category IS NOT NULL
+                      AND next_attempt_at <= now()
+                      AND (
+                        lease_token IS NULL OR lease_expires_at <= now()
+                      ) AS retryable
+               FROM browser_admission_cleanup
+              WHERE session_id = $1`,
+            [sessionId],
+          );
+          const row = result.rows[0];
+          if (!row) {
+            return { exists: false, complete: true, retryable: false };
+          }
+          return {
+            exists: true,
+            complete:
+              (row.backend === "fdb" || row.redis_released_at !== null) &&
+              (row.backend === "redis" || row.fdb_released_at !== null),
+            retryable: row.retryable,
+          };
+        },
+      );
+      if (state.complete) {
+        return { existed: state.exists, retryClaim: null };
+      }
+      if (ownerId && state.retryable) {
+        const retryClaim = await deps.gate.withBrowserStateMutationLease(
+          "filesystem_and_database",
+          lease => claimBrowserAdmissionCleanup(lease, sessionId, ownerId),
+        );
+        if (retryClaim) return { existed: true, retryClaim };
+      }
+      if (Date.now() >= deadline) {
+        throw runtimeError("browser_state_unavailable");
+      }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+
+  const waitForTerminalSessionOrReclaim = async (
+    ownerId: string,
+    sessionId: string,
+    timeoutMs = 35_000,
+  ): Promise<BrowserSessionBillingClaim | null> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const row = await loadSession(sessionId);
+      if (!row) throw runtimeError("browser_not_found");
+      if (row.owner_id !== ownerId) throw runtimeError("browser_forbidden");
+      if (
+        ["destroyed", "expired", "interrupted", "error"].includes(row.state)
+      ) {
+        return null;
+      }
+      const reclaimed = await orchestrator.stopSession(
+        sessionId,
+        "requested",
+        ownerId,
+      );
+      if (reclaimed) {
+        return reclaimed;
+      }
+      if (Date.now() >= deadline) {
+        throw runtimeError("browser_state_unavailable");
+      }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+
   const stopSession = async (ownerId: string, sessionId: string) => {
     runtimeUuidSchema.parse(ownerId);
     runtimeUuidSchema.parse(sessionId);
-    const claim = await orchestrator.stopSession(
+    let cleanupClaim = await orchestrator.stopSession(
       sessionId,
       "requested",
       ownerId,
     );
-    if (claim === null) {
-      const row = await loadSession(sessionId);
-      if (!row) throw runtimeError("browser_not_found");
-      if (row.owner_id !== ownerId) throw runtimeError("browser_forbidden");
-      return { stopped: false, sessionId };
+    if (cleanupClaim === null) {
+      cleanupClaim = await waitForTerminalSessionOrReclaim(ownerId, sessionId);
+    }
+    let admissionClaim =
+      cleanupClaim !== null
+        ? await deps.gate.withBrowserStateMutationLease(
+            "filesystem_and_database",
+            lease => claimBrowserAdmissionCleanup(lease, sessionId, ownerId),
+          )
+        : null;
+    if (admissionClaim === null) {
+      const waited = await waitForAdmissionCleanup(
+        sessionId,
+        cleanupClaim === null ? ownerId : undefined,
+      );
+      admissionClaim = waited.retryClaim;
+      if (admissionClaim === null && cleanupClaim !== null && !waited.existed) {
+        return {
+          stopped: true,
+          sessionId,
+          sessionDurationMs: cleanupClaim.sessionDurationMs,
+          creditsBilled: cleanupClaim.creditsBilled,
+          usedPrompt: cleanupClaim.usedPrompt,
+          ttlTotalSeconds: cleanupClaim.ttlTotalSeconds,
+        };
+      }
+      if (admissionClaim === null) return { stopped: false, sessionId };
+    }
+    try {
+      if (!deps.releaseAdmissionBackend) {
+        throw new Error("Browser admission release is unavailable");
+      }
+      await executeBrowserAdmissionCleanupClaim(
+        deps.gate,
+        admissionClaim,
+        deps.releaseAdmissionBackend,
+      );
+    } catch (error) {
+      throw runtimeError("browser_state_unavailable");
     }
     return {
       stopped: true,
-      sessionId: claim.sessionId,
-      sessionDurationMs: claim.sessionDurationMs,
-      creditsBilled: claim.creditsBilled,
-      usedPrompt: claim.usedPrompt,
-      ttlTotalSeconds: claim.ttlTotalSeconds,
+      sessionId,
+      sessionDurationMs: cleanupClaim?.sessionDurationMs,
+      creditsBilled: cleanupClaim?.creditsBilled,
+      usedPrompt: cleanupClaim?.usedPrompt,
+      ttlTotalSeconds: cleanupClaim?.ttlTotalSeconds,
     };
   };
 

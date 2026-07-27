@@ -35,6 +35,7 @@ import {
   buildReplayContextFromScrape,
   estimateReplayTimeoutSeconds,
   buildReplayScript,
+  browserSessionIdSchema,
 } from "../../lib/scrape-interact/scrape-replay";
 import {
   executePromptViaBrowserAgent,
@@ -116,7 +117,7 @@ export const browserExecuteRequestSchema = z
     timeout: z.number().int().min(1).max(300).default(30),
     origin: z.string().optional(),
     integration: integrationSchema.optional().transform(val => val || null),
-    existingSessionId: z.string().uuid().optional(),
+    existingSessionId: browserSessionIdSchema.optional(),
     allowedDomains: z.array(interactAllowedDomainSchema).max(8).default([]),
   })
   .superRefine((data, context) => {
@@ -262,7 +263,6 @@ export async function scrapeInteractController(
       });
     }
     let keylessReserved = 0;
-    let localSessionCreated = false;
     try {
       const replay = await runtime.loadReplayState(req.auth.team_id, scrapeId);
       if (replay.kind !== "checkpoint") {
@@ -320,6 +320,8 @@ export async function scrapeInteractController(
         settings: replay.envelope.browserSettings,
         profile: replay.envelope.profile,
         concurrencyLimit: req.acuc?.concurrency ?? 2,
+        billingSubscriptionId: req.acuc?.sub_id ?? null,
+        billingApiKeyId: req.acuc?.api_key_id ?? null,
         ...publicOrigins,
         admitSession: async () => {
           const reservation = await reserveKeylessCredits(
@@ -331,20 +333,37 @@ export async function scrapeInteractController(
               category: "keyless_credits",
             });
           }
-          keylessReserved = estimatedCredits;
-          const autumnResult = await autumnService.checkCredits({
-            teamId: req.auth.team_id,
-            value: estimatedCredits,
-            properties: { source: "scrapeBrowserCreate", path: req.path },
-          });
+          keylessReserved = reservation.creditsUsed > 0 ? estimatedCredits : 0;
+          const autumnResult =
+            config.LOCAL_PERSISTENCE_ENABLED === true
+              ? null
+              : await autumnService.checkCredits({
+                  teamId: req.auth.team_id,
+                  value: estimatedCredits,
+                  properties: {
+                    source: "scrapeBrowserCreate",
+                    path: req.path,
+                  },
+                });
           if (autumnResult !== null && !autumnResult.allowed) {
             throw Object.assign(new Error("Insufficient credits"), {
               category: "insufficient_credits",
             });
           }
+          return keylessReserved > 0
+            ? {
+                keylessTeamId: req.auth.team_id,
+                keylessReservedCredits: keylessReserved,
+              }
+            : undefined;
         },
-        sessionCreated: async session => {
-          localSessionCreated = true;
+        rollbackKeylessReservation: async () => {
+          if (keylessReserved > 0) {
+            await adjustKeylessCredits(req.auth.team_id, -keylessReserved);
+            keylessReserved = 0;
+          }
+        },
+        sessionCreated: async () => {
           invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
         },
       });
@@ -375,11 +394,6 @@ export async function scrapeInteractController(
         ...(hasError ? { error: result.stderr || "Execution failed" } : {}),
       });
     } catch (error) {
-      if (keylessReserved > 0 && !localSessionCreated) {
-        adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(
-          () => {},
-        );
-      }
       const mapped = mapLocalInteractError(error);
       if (
         error &&
@@ -654,40 +668,6 @@ export async function scrapeStopInteractiveBrowserController(
         req.params.jobId,
       );
       invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
-      if (result.stopped && result.sessionId) {
-        mirrorExternalSlotRelease(req.auth.team_id, result.sessionId).catch(
-          () => {},
-        );
-      }
-      if (
-        result.stopped &&
-        result.sessionId !== undefined &&
-        result.creditsBilled !== undefined
-      ) {
-        billTeam(
-          req.auth.team_id,
-          req.acuc?.sub_id ?? undefined,
-          result.creditsBilled,
-          req.acuc?.api_key_id ?? null,
-          { endpoint: "interact", jobId: result.sessionId },
-        ).catch(error => {
-          logger.error("Failed to bill local interact session", {
-            error,
-            creditsBilled: result.creditsBilled,
-          });
-        });
-        const reservedCredits = calculateBrowserSessionCredits(
-          (result.ttlTotalSeconds ?? 3_600) * 1_000,
-          BROWSER_CREDITS_PER_HOUR,
-        );
-        adjustKeylessCredits(
-          req.auth.team_id,
-          result.creditsBilled - reservedCredits,
-        ).catch(() => {});
-        logKeylessCreditUsage(req.auth.team_id, result.creditsBilled).catch(
-          () => {},
-        );
-      }
       return res.status(200).json({
         success: true,
         ...(result.sessionDurationMs === undefined

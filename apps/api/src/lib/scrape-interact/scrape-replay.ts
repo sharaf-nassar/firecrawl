@@ -1,5 +1,7 @@
 import { rewriteUrl } from "../../scraper/scrapeURL/lib/rewriteUrl";
 
+export { canonicalUuidSchema as browserSessionIdSchema } from "./browser-service-contracts";
+
 /** @public */
 export type {
   ReplayAction,
