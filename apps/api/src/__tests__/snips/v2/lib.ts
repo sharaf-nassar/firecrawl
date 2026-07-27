@@ -315,12 +315,7 @@ export async function scrapeStatus(
 
 export async function scrapeInteractRaw(
   jobId: string,
-  body: {
-    code: string;
-    language?: "python" | "node" | "bash";
-    timeout?: number;
-    origin?: string;
-  },
+  body: ScrapeInteractInput,
   identity: Identity,
 ) {
   return await request(TEST_API_URL)
@@ -330,6 +325,27 @@ export async function scrapeInteractRaw(
     .send(body);
 }
 
+type InteractCommonInput = {
+  language?: "python" | "node" | "bash";
+  timeout?: number;
+  origin?: string;
+  integration?: string;
+  existingSessionId?: string;
+  allowedDomains?: string[];
+};
+
+export type ScrapeInteractInput = InteractCommonInput &
+  (
+    | {
+        prompt: string;
+        code?: never;
+      }
+    | {
+        code: string;
+        prompt?: never;
+      }
+  );
+
 export async function scrapeStopInteractiveBrowserRaw(
   jobId: string,
   identity: Identity,
@@ -338,6 +354,106 @@ export async function scrapeStopInteractiveBrowserRaw(
     .delete("/v2/scrape/" + encodeURIComponent(jobId) + "/interact")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
+}
+
+// =========================================
+// Browser API
+// =========================================
+
+export type BrowserCreateInput = {
+  ttl?: number;
+  activityTtl?: number;
+  allowedDomains?: string[];
+  streamWebView?: boolean;
+  integration?: string;
+  profile?: {
+    name: string;
+    saveChanges?: boolean;
+  };
+};
+
+export type BrowserExecuteInput = {
+  code: string;
+  language?: "python" | "node" | "bash";
+  timeout?: number;
+  origin?: string;
+  allowedDomains?: string[];
+};
+
+export async function browserCreateRaw(
+  body: BrowserCreateInput,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/browser")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function browserListRaw(
+  identity: Identity,
+  status?: "active" | "destroyed",
+) {
+  const response = request(TEST_API_URL)
+    .get("/v2/browser")
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+  return await (status === undefined ? response : response.query({ status }));
+}
+
+export async function browserExecuteRaw(
+  id: string,
+  body: BrowserExecuteInput,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post(`/v2/browser/${encodeURIComponent(id)}/execute`)
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function browserDeleteRaw(id: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .delete(`/v2/browser/${encodeURIComponent(id)}`)
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
+export async function browserHarnessRestartRaw(): Promise<Response> {
+  const controlUrl = process.env.TEST_BROWSER_HARNESS_CONTROL_URL;
+  const controlToken = process.env.TEST_BROWSER_HARNESS_CONTROL_TOKEN;
+  if (
+    controlUrl === undefined ||
+    controlToken === undefined ||
+    !/^[A-Za-z0-9_-]{43}$/.test(controlToken)
+  ) {
+    throw new Error("Local Browser harness restart control is unavailable");
+  }
+  const base = new URL(controlUrl);
+  if (
+    base.protocol !== "http:" ||
+    base.hostname !== "127.0.0.1" ||
+    base.port === "" ||
+    base.username !== "" ||
+    base.password !== "" ||
+    base.pathname !== "/" ||
+    base.search !== "" ||
+    base.hash !== ""
+  ) {
+    throw new Error("Local Browser harness restart control URL is unsafe");
+  }
+  return await fetch(new URL("/v1/browser-service/restart", base), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${controlToken}`,
+    },
+    signal: AbortSignal.timeout(120_000),
+  });
+}
+
+export function scrapeIdFromRawResponse(body: any): string | undefined {
+  return body?.scrape_id ?? body?.data?.metadata?.scrapeId;
 }
 
 // =========================================

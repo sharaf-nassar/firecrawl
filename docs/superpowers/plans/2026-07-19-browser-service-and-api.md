@@ -8370,8 +8370,10 @@ and code cases return typed `codex_unavailable`/`sandbox_unavailable` 503.
 
 - [ ] **Step 3: Add post-host real Codex smoke**
 
-Skip unless `RUN_REAL_CODEX_BROWSER_SMOKE=1`. Use a controlled fixture whose
-prompt requires at least one side-effecting typed action and exact final text.
+Skip unless `RUN_REAL_CODEX_BROWSER_SMOKE=1` and the dedicated harness has
+injected its invocation token and restart-control credentials. Use a controlled
+fixture whose prompt requires at least one side-effecting typed action and exact
+final text.
 After success, query the test database by returned run/session IDs and assert:
 
 ```ts
@@ -8421,9 +8423,23 @@ connect failure must create no source process and leave no active relay grant.
 
 The host-execution plan must run:
 
+Start the installed host adapter and its authenticated test-control fixture
+first. The fixture must listen on an exact `http://127.0.0.1:<port>` origin and
+issue a canonical 32-byte base64url bearer token. Pass that same origin and
+token to the smoke:
+
 ```bash
-RUN_REAL_CODEX_BROWSER_SMOKE=1 pnpm --dir apps/api harness pnpm vitest run src/__tests__/snips/v2/browser-real-codex.test.ts
+REAL_CODEX_BROWSER_TEST_ADAPTER_URL=http://127.0.0.1:<port> \
+REAL_CODEX_BROWSER_TEST_ADAPTER_TOKEN=<32-byte-base64url-token> \
+RUN_REAL_CODEX_BROWSER_SMOKE=1 \
+pnpm --dir apps/api harness pnpm test:snips:real-codex-browser
 ```
+
+The dedicated package script is part of the security boundary: it provisions
+an isolated Browser Service and application database before importing the smoke
+suite. Direct `vitest` execution, or any command other than the dedicated
+harness script, intentionally skips the smoke even when
+`RUN_REAL_CODEX_BROWSER_SMOKE=1`.
 
 Expected after host adapter installation: PASS with one active installed Codex
 process under rolling capability gate,

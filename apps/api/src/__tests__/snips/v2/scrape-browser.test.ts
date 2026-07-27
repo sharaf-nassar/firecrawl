@@ -1,8 +1,10 @@
 import crypto from "crypto";
 import { config } from "../../../config";
+import { isHarnessControlledBrowserEnvironment } from "../../../harness-browser-command";
 import {
   ALLOW_TEST_SUITE_WEBSITE,
   HAS_FIRE_ENGINE,
+  HAS_PLAYWRIGHT,
   TEST_PRODUCTION,
   TEST_SELF_HOST,
   TEST_SUITE_WEBSITE,
@@ -13,9 +15,14 @@ import {
   idmux,
   scrapeStopInteractiveBrowserRaw,
   scrapeInteractRaw,
+  scrapeIdFromRawResponse,
   scrapeRaw,
   scrapeTimeout,
 } from "./lib";
+import {
+  cleanupTrackedResources,
+  throwTrackedCleanupFailures,
+} from "./tracked-cleanup";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -44,6 +51,29 @@ async function interactWithReplicaRetry(
 describe("Scrape browser interact replay", () => {
   let identity: Identity;
   let otherIdentity: Identity;
+  const scrapes = new Set<string>();
+
+  async function cleanupScrapes() {
+    if (!identity) return [];
+    return cleanupTrackedResources(scrapes, "scrape", async scrapeId => {
+      const response = await scrapeStopInteractiveBrowserRaw(
+        scrapeId,
+        identity,
+      );
+      if (response.statusCode !== 200 || response.body.success !== true) {
+        throw new Error(
+          `Scrape ${scrapeId} cleanup returned ${response.statusCode}`,
+        );
+      }
+    });
+  }
+
+  async function stopTrackedScrape(scrapeId: string): Promise<void> {
+    const response = await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+    expect(response.statusCode).toBe(200);
+    expect(response.body.success).toBe(true);
+    scrapes.delete(scrapeId);
+  }
 
   beforeAll(async () => {
     identity = await idmux({
@@ -58,10 +88,26 @@ describe("Scrape browser interact replay", () => {
     });
   }, 10000 + scrapeTimeout);
 
+  afterEach(async () => {
+    throwTrackedCleanupFailures(await cleanupScrapes());
+  });
+
+  afterAll(async () => {
+    throwTrackedCleanupFailures(await cleanupScrapes());
+  });
+
   const canRunReplayHappyPath =
     ALLOW_TEST_SUITE_WEBSITE &&
     !!config.BROWSER_SERVICE_URL &&
     (TEST_PRODUCTION || HAS_FIRE_ENGINE);
+  const canRunLocalBrowserContracts =
+    isHarnessControlledBrowserEnvironment(process.env) &&
+    TEST_SELF_HOST &&
+    ALLOW_TEST_SUITE_WEBSITE &&
+    config.LOCAL_BROWSER_SERVICE_ENABLED === true &&
+    !!config.BROWSER_SERVICE_URL;
+  const canRunLocalReplayContracts =
+    canRunLocalBrowserContracts && HAS_PLAYWRIGHT;
 
   itIf(canRunReplayHappyPath)(
     "replays scrape URL/waitFor/actions before interactive code runs",
@@ -90,6 +136,7 @@ describe("Scrape browser interact replay", () => {
         expect(scrapeResponse.body.success).toBe(true);
         expect(typeof scrapeResponse.body.scrape_id).toBe("string");
         scrapeId = scrapeResponse.body.scrape_id as string;
+        scrapes.add(scrapeId);
 
         const executeResponse = await interactWithReplicaRetry(
           scrapeId,
@@ -111,7 +158,7 @@ describe("Scrape browser interact replay", () => {
         expect(executeResponse.body.cdpUrl.length).toBeGreaterThan(0);
       } finally {
         if (scrapeId) {
-          await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+          await stopTrackedScrape(scrapeId);
         }
       }
     },
@@ -143,6 +190,7 @@ describe("Scrape browser interact replay", () => {
         expect(scrapeResponse.body.success).toBe(true);
         expect(typeof scrapeResponse.body.scrape_id).toBe("string");
         scrapeId = scrapeResponse.body.scrape_id as string;
+        scrapes.add(scrapeId);
 
         const executeResponse = await interactWithReplicaRetry(
           scrapeId,
@@ -184,7 +232,7 @@ describe("Scrape browser interact replay", () => {
         expect(visibleUrl).toContain(TEST_SUITE_WEBSITE);
       } finally {
         if (scrapeId) {
-          await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+          await stopTrackedScrape(scrapeId);
         }
       }
     },
@@ -292,6 +340,126 @@ describe("Scrape browser interact replay", () => {
       expect(executeResponse.body.error).toContain(
         "Replay context is unavailable",
       );
+    },
+    scrapeTimeout,
+  );
+
+  itIf(canRunLocalBrowserContracts)(
+    "enforces prompt/code XOR before looking up replay state",
+    async () => {
+      const both = await scrapeInteractRaw(
+        crypto.randomUUID(),
+        {
+          prompt: "read",
+          code: "console.log('must not run')",
+        } as never,
+        identity,
+      );
+      const neither = await scrapeInteractRaw(
+        crypto.randomUUID(),
+        {} as never,
+        identity,
+      );
+
+      expect(both.statusCode).toBe(400);
+      expect(both.body.success).toBe(false);
+      expect(neither.statusCode).toBe(400);
+      expect(neither.body.success).toBe(false);
+    },
+  );
+
+  itIf(canRunLocalReplayContracts)(
+    "loads controlled replay state and enforces the combined origin limit",
+    async () => {
+      let scrapeId: string | undefined;
+      try {
+        const scrapeResponse = await scrapeRaw(
+          {
+            url: `${TEST_SUITE_WEBSITE}?browserReplay=${crypto.randomUUID()}`,
+            origin: "website-local-browser-snip",
+            formats: ["markdown"],
+          },
+          identity,
+        );
+        expect(scrapeResponse.statusCode).toBe(200);
+        expect(scrapeResponse.body.success).toBe(true);
+        scrapeId = scrapeIdFromRawResponse(scrapeResponse.body);
+        expect(typeof scrapeId).toBe("string");
+        scrapes.add(scrapeId!);
+
+        const response = await scrapeInteractRaw(
+          scrapeId!,
+          {
+            prompt: "Read the controlled fixture heading.",
+            language: "node",
+            timeout: 5,
+            origin: "local-browser-snip",
+            integration: "_local-browser-snip",
+            allowedDomains: Array.from(
+              { length: 8 },
+              (_, index) => `origin-${index}.fixture.example`,
+            ),
+          },
+          identity,
+        );
+
+        expect(response.statusCode).toBe(400);
+        expect(response.body).toEqual({
+          success: false,
+          error:
+            "allowedDomains and replay origins may contain at most 8 hosts.",
+        });
+      } finally {
+        if (scrapeId) {
+          await stopTrackedScrape(scrapeId);
+        }
+      }
+    },
+    scrapeTimeout,
+  );
+
+  itIf(canRunLocalReplayContracts)(
+    "returns typed unavailability for a controlled prompt replay",
+    async () => {
+      let scrapeId: string | undefined;
+      try {
+        const scrapeResponse = await scrapeRaw(
+          {
+            url: `${TEST_SUITE_WEBSITE}?browserPrompt=${crypto.randomUUID()}`,
+            origin: "website-local-browser-snip",
+            formats: ["markdown"],
+          },
+          identity,
+        );
+        expect(scrapeResponse.statusCode).toBe(200);
+        expect(scrapeResponse.body.success).toBe(true);
+        scrapeId = scrapeIdFromRawResponse(scrapeResponse.body);
+        expect(typeof scrapeId).toBe("string");
+        scrapes.add(scrapeId!);
+
+        const response = await scrapeInteractRaw(
+          scrapeId!,
+          {
+            prompt: "Read the controlled fixture heading.",
+            language: "node",
+            timeout: 5,
+            origin: "local-browser-snip",
+            integration: "_local-browser-snip",
+            allowedDomains: [],
+          },
+          identity,
+        );
+
+        expect(response.statusCode).toBe(503);
+        expect(response.body).toEqual({
+          success: false,
+          error: "Browser state is temporarily unavailable.",
+        });
+      } finally {
+        if (scrapeId) {
+          await stopTrackedScrape(scrapeId);
+        }
+      }
     },
     scrapeTimeout,
   );
