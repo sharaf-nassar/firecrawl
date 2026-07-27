@@ -1,13 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  assertNoHarnessBrowserUserOverrides,
   createBrowserContainerInvocation,
   createDefaultHarnessBrowserServiceDependencies,
   createHarnessBrowserShutdownCoordinator,
+  createHarnessPublicBrowserEnvironment,
   HARNESS_BROWSER_EXTERNAL_OVERRIDES,
+  HARNESS_BROWSER_PUBLIC_ORIGIN_OVERRIDE,
+  startHarnessBrowserControlServer,
   startHarnessBrowserService,
   type HarnessBrowserServiceDependencies,
 } from "./harness-browser-service";
@@ -148,6 +153,44 @@ describe("startHarnessBrowserService", () => {
       expect(deps.runContainer).not.toHaveBeenCalled();
     }
   });
+
+  it("binds the public Browser origin to the exact dynamic API origin", () => {
+    const environment = createHarnessPublicBrowserEnvironment(
+      "http://127.0.0.1:39122",
+    );
+
+    expect(environment).toEqual({
+      BROWSER_PUBLIC_API_ORIGIN: "http://127.0.0.1:39122",
+    });
+    expect(environment).not.toHaveProperty("BROWSER_SERVICE_URL");
+    expect(HARNESS_BROWSER_PUBLIC_ORIGIN_OVERRIDE).toBe(
+      "BROWSER_PUBLIC_API_ORIGIN",
+    );
+    expect(() =>
+      assertNoHarnessBrowserUserOverrides({
+        BROWSER_PUBLIC_API_ORIGIN: "http://attacker.example:3010",
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        category: "harness_external_browser_override_rejected",
+      }),
+    );
+  });
+
+  for (const unsafe of [
+    "http://browser-service:3010",
+    "http://127.0.0.1:3010/private",
+    "https://127.0.0.1:3010",
+    "http://attacker.example:3010",
+  ]) {
+    it(`rejects unsafe public Browser origin ${unsafe}`, () => {
+      expect(() => createHarnessPublicBrowserEnvironment(unsafe)).toThrowError(
+        expect.objectContaining({
+          category: "harness_browser_public_origin_unsafe",
+        }),
+      );
+    });
+  }
 
   it("uses fresh owned identities and environment each run", async () => {
     const firstDeps = dependencies();
@@ -420,6 +463,78 @@ describe("startHarnessBrowserService", () => {
     expect(invocation.env.BROWSER_SERVICE_API_KEY).toBe(serviceKey);
   });
 
+  it("coalesces exact-container restarts and waits for replacement readiness", async () => {
+    const deps = dependencies();
+    const firstNonce = Buffer.alloc(32, 7).toString("base64url");
+    const replacementNonce = Buffer.alloc(32, 8).toString("base64url");
+    vi.mocked(deps.waitForLive)
+      .mockResolvedValueOnce({ processNonce: firstNonce })
+      .mockImplementationOnce(async () => {
+        deps.events.push("replacement-live");
+        return { processNonce: replacementNonce };
+      });
+    deps.waitForReady = vi.fn(async (_identity, live) => {
+      deps.events.push(`ready:${live.processNonce}`);
+    });
+    const handle = await startHarnessBrowserService(deps);
+
+    const [first, coalesced] = await Promise.all([
+      handle.restart(),
+      handle.restart(),
+    ]);
+
+    expect(first).toEqual({
+      oldProcessNonce: firstNonce,
+      newProcessNonce: replacementNonce,
+    });
+    expect(coalesced).toEqual(first);
+    expect(handle.processNonce).toBe(replacementNonce);
+    expect(deps.removeContainer).toHaveBeenCalledTimes(1);
+    expect(deps.runContainer).toHaveBeenCalledTimes(2);
+    expect(deps.events).toContain("replacement-live");
+    expect(deps.events).toContain(`ready:${replacementNonce}`);
+
+    await handle.cleanup();
+    expect(deps.removeContainer).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for an active restart before cleaning the replacement", async () => {
+    const deps = dependencies();
+    const replacementReached = deferred<void>();
+    const releaseReplacement = deferred<void>();
+    vi.mocked(deps.waitForLive)
+      .mockResolvedValueOnce({
+        processNonce: Buffer.alloc(32, 7).toString("base64url"),
+      })
+      .mockImplementationOnce(async () => {
+        replacementReached.resolve();
+        await releaseReplacement.promise;
+        return {
+          processNonce: Buffer.alloc(32, 8).toString("base64url"),
+        };
+      });
+    deps.waitForReady = vi.fn(async () => undefined);
+    const handle = await startHarnessBrowserService(deps);
+
+    const restart = handle.restart();
+    await replacementReached.promise;
+    const cleanup = handle.cleanup();
+    await Promise.resolve();
+    expect(deps.dropDatabase).not.toHaveBeenCalled();
+    expect(deps.removeRoot).not.toHaveBeenCalled();
+
+    releaseReplacement.resolve();
+    await restart;
+    await cleanup;
+    expect(deps.removeContainer).toHaveBeenCalledTimes(2);
+    expect(deps.cleanupEvents).toEqual([
+      "remove-container",
+      "remove-container",
+      "drop-database",
+      "remove-root",
+    ]);
+  });
+
   it("default root cleanup verifies identity and removes its exact root", async () => {
     const tempParent = await mkdtemp(join(tmpdir(), "browser-harness-test-"));
     const stateRoot = join(tempParent, "state-owned");
@@ -450,9 +565,76 @@ describe("startHarnessBrowserService", () => {
         publishedIdentity = identity;
       });
       expect(publishedIdentity).toEqual(rootIdentity);
+      expect((await readdir(stateRoot)).sort()).toEqual([
+        ".profile-publish-staging",
+        "profiles",
+      ]);
+      expect(
+        (await readdir(join(stateRoot, ".profile-publish-staging"))).sort(),
+      ).toEqual(["bundles", "intents"]);
+      for (const relative of [
+        ".",
+        "profiles",
+        ".profile-publish-staging",
+        ".profile-publish-staging/bundles",
+        ".profile-publish-staging/intents",
+      ]) {
+        const metadata = await lstat(join(stateRoot, relative));
+        expect(metadata.isDirectory(), relative).toBe(true);
+        expect(metadata.isSymbolicLink(), relative).toBe(false);
+        expect(metadata.uid, relative).toBe(1000);
+        expect(metadata.gid, relative).toBe(1000);
+        expect(metadata.mode & 0o7777, relative).toBe(0o700);
+        expect(metadata.dev, relative).toBe(rootIdentity.dev);
+      }
       await writeFile(join(stateRoot, "canary"), "owned");
       await deps.removeRoot(identity, rootIdentity);
 
+      await expect(stat(stateRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(identity.ownershipMarker)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(tempParent, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes root identity before layout failure so cleanup stays exact", async () => {
+    const tempParent = await mkdtemp(join(tmpdir(), "browser-harness-test-"));
+    const stateRoot = join(tempParent, "state-partial");
+    const identity = {
+      invocationId: "invocation",
+      ownershipToken: "ownership-token",
+      serviceKey: "service-key",
+      replayIngestKey: "replay-key",
+      stateRoot,
+      ownershipMarker: `${stateRoot}.owner`,
+      databaseName: "database",
+      databaseContainerName: "database-container",
+      databasePort: 39123,
+      containerName: "browser-container",
+      projectName: "browser-project",
+      browserPort: 39124,
+    };
+    const deps = createDefaultHarnessBrowserServiceDependencies({
+      env: {},
+      tempParent,
+      monorepoRoot: "/repo",
+      shutdownCoordinator: createHarnessBrowserShutdownCoordinator(),
+    });
+    let publishedIdentity: { dev: number; ino: number } | undefined;
+
+    try {
+      await expect(
+        deps.createRoot(identity, rootIdentity => {
+          publishedIdentity = rootIdentity;
+          mkdirSync(join(stateRoot, "foreign"), { mode: 0o700 });
+        }),
+      ).rejects.toMatchObject({
+        category: "harness_browser_root_collision",
+      });
+      expect(publishedIdentity).toBeDefined();
+      await deps.removeRoot(identity, publishedIdentity);
       await expect(stat(stateRoot)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(stat(identity.ownershipMarker)).rejects.toMatchObject({
         code: "ENOENT",
@@ -554,5 +736,99 @@ describe("startHarnessBrowserService", () => {
     } finally {
       await rm(tempParent, { recursive: true, force: true });
     }
+  });
+});
+
+describe("startHarnessBrowserControlServer", () => {
+  it("authenticates the exact restart route and rejects other requests", async () => {
+    const restart = vi.fn(async () => ({
+      oldProcessNonce: Buffer.alloc(32, 7).toString("base64url"),
+      newProcessNonce: Buffer.alloc(32, 8).toString("base64url"),
+    }));
+    const control = await startHarnessBrowserControlServer({ restart });
+    const authorization = `Bearer ${control.token}`;
+
+    try {
+      expect(control.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(control.url).not.toContain(control.token);
+
+      const unauthorized = await fetch(
+        `${control.url}/v1/browser-service/restart`,
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wrong" },
+        },
+      );
+      expect(unauthorized.status).toBe(401);
+
+      const method = await fetch(`${control.url}/v1/browser-service/restart`, {
+        method: "GET",
+        headers: { authorization },
+      });
+      expect(method.status).toBe(405);
+
+      const path = await fetch(`${control.url}/v1/browser-service/other`, {
+        method: "POST",
+        headers: { authorization },
+      });
+      expect(path.status).toBe(404);
+
+      const body = await fetch(`${control.url}/v1/browser-service/restart`, {
+        method: "POST",
+        headers: { authorization },
+        body: "not accepted",
+      });
+      expect(body.status).toBe(400);
+
+      const success = await fetch(`${control.url}/v1/browser-service/restart`, {
+        method: "POST",
+        headers: { authorization },
+      });
+      expect(success.status).toBe(200);
+      expect(await success.json()).toEqual({
+        oldProcessNonce: Buffer.alloc(32, 7).toString("base64url"),
+        newProcessNonce: Buffer.alloc(32, 8).toString("base64url"),
+      });
+      expect(restart).toHaveBeenCalledTimes(1);
+    } finally {
+      await control.close();
+    }
+  });
+
+  it("rejects concurrent restarts and drains the active request on close", async () => {
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    const restart = vi.fn(async () => {
+      reached.resolve();
+      await release.promise;
+      return {
+        oldProcessNonce: Buffer.alloc(32, 7).toString("base64url"),
+        newProcessNonce: Buffer.alloc(32, 8).toString("base64url"),
+      };
+    });
+    const control = await startHarnessBrowserControlServer({ restart });
+    const request = () =>
+      fetch(`${control.url}/v1/browser-service/restart`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${control.token}` },
+      });
+
+    const active = request();
+    await reached.promise;
+    const concurrent = await request();
+    expect(concurrent.status).toBe(409);
+
+    let closed = false;
+    const close = control.close().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+
+    release.resolve();
+    expect((await active).status).toBe(200);
+    await close;
+    expect(restart).toHaveBeenCalledTimes(1);
+    await expect(request()).rejects.toThrow();
   });
 });

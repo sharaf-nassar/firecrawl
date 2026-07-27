@@ -1,18 +1,27 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import {
+  chmod,
+  chown,
   mkdir,
   lstat,
+  readdir,
   readFile,
   realpath,
   rm,
-  stat,
   writeFile,
 } from "node:fs/promises";
 import { lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import type { AddressInfo } from "node:net";
 
 import { Client } from "pg";
+import { BROWSER_HARNESS_MARKER } from "./harness-browser-command";
 
 export const HARNESS_BROWSER_EXTERNAL_OVERRIDES = [
   "TEST_BROWSER_SERVICE_URL",
@@ -24,10 +33,24 @@ export const HARNESS_BROWSER_EXTERNAL_OVERRIDES = [
   "LOCAL_BROWSER_STATE_ROOT",
   "TEST_APPLICATION_DATABASE_URL",
   "APPLICATION_DATABASE_URL",
+  "TEST_BROWSER_HARNESS_CONTROL_URL",
+  "TEST_BROWSER_HARNESS_CONTROL_TOKEN",
+  BROWSER_HARNESS_MARKER,
 ] as const;
+
+export const HARNESS_BROWSER_PUBLIC_ORIGIN_OVERRIDE =
+  "BROWSER_PUBLIC_API_ORIGIN" as const;
 
 const PROCESS_NONCE = /^[A-Za-z0-9_-]{43}$/;
 const IMAGE = "firecrawl-local-browser-service:harness";
+const BROWSER_UID = 1000;
+const BROWSER_GID = 1000;
+const BROWSER_STATE_MODE = 0o700;
+const BROWSER_STATE_CHILDREN = Object.freeze([
+  ".profile-publish-staging",
+  "profiles",
+]);
+const BROWSER_STAGING_CHILDREN = Object.freeze(["bundles", "intents"]);
 
 type HarnessIdentity = Readonly<{
   invocationId: string;
@@ -112,10 +135,43 @@ export type HarnessBrowserServiceHandle = Readonly<
     processNonce: string;
     databaseUrl: string;
     environment: Record<string, string>;
+    restart(): Promise<{
+      oldProcessNonce: string;
+      newProcessNonce: string;
+    }>;
     cleanup(): Promise<void>;
     waitForReady(): Promise<void>;
   }
 >;
+
+export type HarnessBrowserControlServer = Readonly<{
+  url: string;
+  token: string;
+  close(): Promise<void>;
+}>;
+
+export function createHarnessPublicBrowserEnvironment(
+  testApiUrl: string,
+): Readonly<{ BROWSER_PUBLIC_API_ORIGIN: string }> {
+  const parsed = new URL(testApiUrl);
+  if (
+    parsed.protocol !== "http:" ||
+    parsed.hostname !== "127.0.0.1" ||
+    parsed.port === "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.pathname !== "/" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    parsed.origin !== testApiUrl
+  ) {
+    throw categorized(
+      "harness_browser_public_origin_unsafe",
+      "Harness Browser public origin must be an exact loopback API origin",
+    );
+  }
+  return Object.freeze({ BROWSER_PUBLIC_API_ORIGIN: testApiUrl });
+}
 
 export function createHarnessBrowserShutdownCoordinator(): HarnessBrowserShutdownCoordinator {
   let registered:
@@ -158,8 +214,353 @@ export function createHarnessBrowserShutdownCoordinator(): HarnessBrowserShutdow
   };
 }
 
+const CONTROL_RESTART_PATH = "/v1/browser-service/restart";
+const CONTROL_BODY_LIMIT_BYTES = 1024;
+const CONTROL_BODY_TIMEOUT_MS = 2_000;
+
+class HarnessControlRequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly category: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function writeControlJson(
+  response: ServerResponse,
+  status: number,
+  body: Readonly<Record<string, unknown>>,
+): void {
+  const bytes = JSON.stringify(body);
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(bytes),
+    connection: "close",
+  });
+  response.end(bytes);
+}
+
+function controlTokenMatches(
+  authorization: string | undefined,
+  token: string,
+): boolean {
+  if (authorization === undefined) return false;
+  const expected = Buffer.from(`Bearer ${token}`);
+  const received = Buffer.from(authorization);
+  return (
+    expected.length === received.length && timingSafeEqual(expected, received)
+  );
+}
+
+function requireEmptyControlBody(request: IncomingMessage): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let bytes = 0;
+    let hasBody = false;
+    let settled = false;
+    const finish = (failure?: HarnessControlRequestError): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("aborted", onAborted);
+      request.off("error", onError);
+      if (failure === undefined) {
+        resolvePromise();
+      } else {
+        request.resume();
+        rejectPromise(failure);
+      }
+    };
+    const onData = (chunk: Buffer | string): void => {
+      hasBody = true;
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > CONTROL_BODY_LIMIT_BYTES) {
+        finish(
+          new HarnessControlRequestError(
+            413,
+            "harness_browser_control_body_too_large",
+            "Harness Browser control request body is too large",
+          ),
+        );
+      }
+    };
+    const onEnd = (): void => {
+      finish(
+        hasBody
+          ? new HarnessControlRequestError(
+              400,
+              "harness_browser_control_body_rejected",
+              "Harness Browser restart does not accept a request body",
+            )
+          : undefined,
+      );
+    };
+    const onAborted = (): void => {
+      finish(
+        new HarnessControlRequestError(
+          400,
+          "harness_browser_control_request_aborted",
+          "Harness Browser control request was aborted",
+        ),
+      );
+    };
+    const onError = (): void => {
+      finish(
+        new HarnessControlRequestError(
+          400,
+          "harness_browser_control_request_failed",
+          "Harness Browser control request failed",
+        ),
+      );
+    };
+    const timer = setTimeout(() => {
+      finish(
+        new HarnessControlRequestError(
+          408,
+          "harness_browser_control_body_timeout",
+          "Harness Browser control request body timed out",
+        ),
+      );
+    }, CONTROL_BODY_TIMEOUT_MS);
+    timer.unref();
+    request.on("data", onData);
+    request.once("end", onEnd);
+    request.once("aborted", onAborted);
+    request.once("error", onError);
+  });
+}
+
+export async function startHarnessBrowserControlServer(
+  browser: Pick<HarnessBrowserServiceHandle, "restart">,
+): Promise<HarnessBrowserControlServer> {
+  const token = randomBytes(32).toString("base64url");
+  let restartActive = false;
+  let closing = false;
+  let closePromise: Promise<void> | undefined;
+  const server = createServer(async (request, response) => {
+    if (!controlTokenMatches(request.headers.authorization, token)) {
+      request.resume();
+      writeControlJson(response, 401, {
+        success: false,
+        category: "harness_browser_control_unauthorized",
+      });
+      return;
+    }
+    if (request.method !== "POST") {
+      request.resume();
+      response.setHeader("allow", "POST");
+      writeControlJson(response, 405, {
+        success: false,
+        category: "harness_browser_control_method_rejected",
+      });
+      return;
+    }
+    if (request.url !== CONTROL_RESTART_PATH) {
+      request.resume();
+      writeControlJson(response, 404, {
+        success: false,
+        category: "harness_browser_control_path_rejected",
+      });
+      return;
+    }
+    if (closing) {
+      request.resume();
+      writeControlJson(response, 503, {
+        success: false,
+        category: "harness_browser_control_closing",
+      });
+      return;
+    }
+    if (restartActive) {
+      request.resume();
+      writeControlJson(response, 409, {
+        success: false,
+        category: "harness_browser_restart_in_progress",
+      });
+      return;
+    }
+    try {
+      await requireEmptyControlBody(request);
+    } catch (cause) {
+      const failure =
+        cause instanceof HarnessControlRequestError
+          ? cause
+          : new HarnessControlRequestError(
+              400,
+              "harness_browser_control_request_failed",
+              "Harness Browser control request failed",
+            );
+      writeControlJson(response, failure.status, {
+        success: false,
+        category: failure.category,
+      });
+      return;
+    }
+
+    if (closing) {
+      writeControlJson(response, 503, {
+        success: false,
+        category: "harness_browser_control_closing",
+      });
+      return;
+    }
+    if (restartActive) {
+      writeControlJson(response, 409, {
+        success: false,
+        category: "harness_browser_restart_in_progress",
+      });
+      return;
+    }
+    restartActive = true;
+    try {
+      const restarted = await browser.restart();
+      writeControlJson(response, 200, restarted);
+    } catch (cause) {
+      writeControlJson(response, 500, {
+        success: false,
+        category:
+          cause instanceof Error &&
+          "category" in cause &&
+          typeof cause.category === "string"
+            ? cause.category
+            : "harness_browser_restart_failed",
+      });
+    } finally {
+      restartActive = false;
+    }
+  });
+  server.requestTimeout = CONTROL_BODY_TIMEOUT_MS;
+  server.headersTimeout = CONTROL_BODY_TIMEOUT_MS;
+  server.keepAliveTimeout = 1_000;
+
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const onError = (cause: Error): void => {
+      server.off("listening", onListening);
+      rejectPromise(cause);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolvePromise();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, "127.0.0.1");
+  });
+  const address = server.address() as AddressInfo;
+  const close = (): Promise<void> => {
+    closing = true;
+    if (closePromise !== undefined) return closePromise;
+    closePromise = new Promise((resolvePromise, rejectPromise) => {
+      server.close(error =>
+        error === undefined ? resolvePromise() : rejectPromise(error),
+      );
+      server.closeIdleConnections();
+    });
+    return closePromise;
+  };
+  return Object.freeze({
+    url: `http://127.0.0.1:${address.port}`,
+    token,
+    close,
+  });
+}
+
 function categorized(category: string, message: string): Error {
   return Object.assign(new Error(message), { category });
+}
+
+async function provisionBrowserStateDirectory(path: string): Promise<void> {
+  await mkdir(path, { mode: BROWSER_STATE_MODE });
+  await chown(path, BROWSER_UID, BROWSER_GID);
+  await chmod(path, BROWSER_STATE_MODE);
+}
+
+async function validateBrowserStateDirectory(
+  path: string,
+  expectedDevice: number,
+  label: string,
+): Promise<void> {
+  const metadata = await lstat(path);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    metadata.dev !== expectedDevice ||
+    metadata.uid !== BROWSER_UID ||
+    metadata.gid !== BROWSER_GID ||
+    (metadata.mode & 0o7777) !== BROWSER_STATE_MODE
+  ) {
+    throw categorized(
+      "harness_browser_root_unsafe",
+      `Harness ${label} does not match the Browser state layout policy`,
+    );
+  }
+}
+
+async function assertExactDirectoryChildren(
+  path: string,
+  expected: readonly string[],
+  label: string,
+): Promise<void> {
+  const children = (await readdir(path)).sort();
+  if (
+    children.length !== expected.length ||
+    children.some((child, index) => child !== expected[index])
+  ) {
+    throw categorized(
+      "harness_browser_root_collision",
+      `Harness ${label} layout is partial or unknown`,
+    );
+  }
+}
+
+async function provisionBrowserStateLayout(
+  stateRoot: string,
+  expectedDevice: number,
+): Promise<void> {
+  const profiles = join(stateRoot, "profiles");
+  const staging = join(stateRoot, ".profile-publish-staging");
+  const bundles = join(staging, "bundles");
+  const intents = join(staging, "intents");
+
+  await provisionBrowserStateDirectory(profiles);
+  await provisionBrowserStateDirectory(staging);
+  await provisionBrowserStateDirectory(bundles);
+  await provisionBrowserStateDirectory(intents);
+
+  await validateBrowserStateDirectory(stateRoot, expectedDevice, "state root");
+  await assertExactDirectoryChildren(
+    stateRoot,
+    BROWSER_STATE_CHILDREN,
+    "state root",
+  );
+  await validateBrowserStateDirectory(
+    profiles,
+    expectedDevice,
+    "profiles directory",
+  );
+  await validateBrowserStateDirectory(
+    staging,
+    expectedDevice,
+    "publication staging directory",
+  );
+  await assertExactDirectoryChildren(
+    staging,
+    BROWSER_STAGING_CHILDREN,
+    "publication staging",
+  );
+  await validateBrowserStateDirectory(
+    bundles,
+    expectedDevice,
+    "publication bundles directory",
+  );
+  await validateBrowserStateDirectory(
+    intents,
+    expectedDevice,
+    "publication intents directory",
+  );
 }
 
 function assertNoExternalOverrides(env: NodeJS.ProcessEnv): void {
@@ -170,6 +571,18 @@ function assertNoExternalOverrides(env: NodeJS.ProcessEnv): void {
         `Harness rejects inherited ${name}`,
       );
     }
+  }
+}
+
+export function assertNoHarnessBrowserUserOverrides(
+  env: NodeJS.ProcessEnv,
+): void {
+  assertNoExternalOverrides(env);
+  if (env[HARNESS_BROWSER_PUBLIC_ORIGIN_OVERRIDE] !== undefined) {
+    throw categorized(
+      "harness_external_browser_override_rejected",
+      `Harness rejects inherited ${HARNESS_BROWSER_PUBLIC_ORIGIN_OVERRIDE}`,
+    );
   }
 }
 
@@ -235,6 +648,13 @@ export async function startHarnessBrowserService(
   let cleanupRequested = false;
   let cleanupPromise: Promise<void> | undefined;
   let cleanupComplete = false;
+  let restartPromise:
+    | Promise<{
+        oldProcessNonce: string;
+        newProcessNonce: string;
+      }>
+    | undefined;
+  let currentLive: HarnessBrowserLive | undefined;
   let unregister = (): void => {};
   const runStartupPhase = async <T>(
     operation: (signal: AbortSignal) => Promise<T>,
@@ -265,6 +685,7 @@ export async function startHarnessBrowserService(
     if (cleanupPromise !== undefined) return cleanupPromise;
     const attempt = (async () => {
       await activeStartupPhase.catch(() => undefined);
+      await restartPromise?.catch(() => undefined);
       const failures: unknown[] = [];
       if (state.container) {
         try {
@@ -365,6 +786,7 @@ export async function startHarnessBrowserService(
         "Browser Service returned a noncanonical process nonce",
       );
     }
+    currentLive = live;
     const environment = Object.freeze({
       LOCAL_BROWSER_SERVICE_ENABLED: "true",
       LOCAL_BROWSER_STATE_ROOT: identity.stateRoot,
@@ -373,16 +795,77 @@ export async function startHarnessBrowserService(
       BROWSER_REPLAY_INGEST_API_KEY: identity.replayIngestKey,
       APPLICATION_DATABASE_URL: database.databaseUrl,
     });
-    return Object.freeze({
+    const handle = {
       ...identity,
-      processNonce: live.processNonce,
+      get processNonce() {
+        return currentLive!.processNonce;
+      },
       databaseUrl: database.databaseUrl,
       environment,
+      restart(): Promise<{
+        oldProcessNonce: string;
+        newProcessNonce: string;
+      }> {
+        if (cleanupRequested || cleanupComplete) {
+          return Promise.reject(
+            categorized(
+              "harness_browser_restart_unavailable",
+              "Harness Browser restart is unavailable during cleanup",
+            ),
+          );
+        }
+        if (restartPromise !== undefined) return restartPromise;
+        const restart = (async () => {
+          const oldProcessNonce = currentLive!.processNonce;
+          await deps.removeContainer(runtime, identity);
+          state.container = false;
+          if (cleanupRequested) {
+            throw categorized(
+              "harness_browser_restart_unavailable",
+              "Harness Browser restart was interrupted by cleanup",
+            );
+          }
+          // A failed run may create the container before returning an error.
+          state.container = true;
+          await deps.runContainer(runtime, identity);
+          const replacement = await deps.waitForLive(identity);
+          if (
+            !PROCESS_NONCE.test(replacement.processNonce) ||
+            replacement.processNonce === oldProcessNonce
+          ) {
+            throw categorized(
+              "harness_browser_process_nonce_invalid",
+              "Restarted Browser Service returned an invalid process nonce",
+            );
+          }
+          await deps.waitForReady?.(
+            identity,
+            replacement,
+            database.databaseUrl,
+          );
+          currentLive = replacement;
+          return Object.freeze({
+            oldProcessNonce,
+            newProcessNonce: replacement.processNonce,
+          });
+        })();
+        restartPromise = restart;
+        void restart.then(
+          () => {
+            if (restartPromise === restart) restartPromise = undefined;
+          },
+          () => {
+            if (restartPromise === restart) restartPromise = undefined;
+          },
+        );
+        return restart;
+      },
       cleanup,
       waitForReady: async () => {
-        await deps.waitForReady?.(identity, live, database.databaseUrl);
+        await deps.waitForReady?.(identity, currentLive!, database.databaseUrl);
       },
-    });
+    } satisfies HarnessBrowserServiceHandle;
+    return Object.freeze(handle);
   } catch (cause) {
     try {
       await cleanup();
@@ -626,10 +1109,16 @@ export function createDefaultHarnessBrowserServiceDependencies(options: {
         );
       }
       await mkdir(identity.stateRoot, { mode: 0o700 });
-      const rootIdentity = await stat(identity.stateRoot);
-      const contents = await import("node:fs/promises").then(fs =>
-        fs.readdir(identity.stateRoot),
-      );
+      await chown(identity.stateRoot, BROWSER_UID, BROWSER_GID);
+      await chmod(identity.stateRoot, BROWSER_STATE_MODE);
+      const rootIdentity = await lstat(identity.stateRoot);
+      if (!rootIdentity.isDirectory() || rootIdentity.isSymbolicLink()) {
+        throw categorized(
+          "harness_browser_root_unsafe",
+          "Harness state root is not a directory",
+        );
+      }
+      const contents = await readdir(identity.stateRoot);
       if (contents.length !== 0) {
         throw categorized(
           "harness_browser_root_collision",
@@ -646,6 +1135,7 @@ export function createDefaultHarnessBrowserServiceDependencies(options: {
         ino: rootIdentity.ino,
       });
       publishIdentity(authority);
+      await provisionBrowserStateLayout(identity.stateRoot, rootIdentity.dev);
       return authority;
     },
     async createDatabase(runtime, identity) {

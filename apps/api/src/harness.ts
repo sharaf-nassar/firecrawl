@@ -7,12 +7,19 @@ import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
 import {
+  assertNoHarnessBrowserUserOverrides,
   createHarnessBrowserShutdownCoordinator,
   createDefaultHarnessBrowserServiceDependencies,
-  HARNESS_BROWSER_EXTERNAL_OVERRIDES,
+  createHarnessPublicBrowserEnvironment,
+  startHarnessBrowserControlServer,
   startHarnessBrowserService,
+  type HarnessBrowserControlServer,
   type HarnessBrowserServiceHandle,
 } from "./harness-browser-service";
+import {
+  createHarnessBrowserCommandEnvironment,
+  localPersistenceHarnessMode,
+} from "./harness-browser-command";
 import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
 import { createSharedShutdown } from "./harness-shutdown";
 
@@ -41,6 +48,8 @@ let applicationPostgresContainer: {
 let localPersistenceHarness = false;
 let localBrowserHarness = false;
 let harnessBrowserService: HarnessBrowserServiceHandle | null = null;
+let harnessBrowserControlServer: HarnessBrowserControlServer | null = null;
+let harnessBrowserCommandEnvironment: Record<string, string> = {};
 const harnessBrowserShutdown = createHarnessBrowserShutdownCoordinator();
 let fixtureServerPort: number | null = null;
 // Get the monorepo root for both tsx source execution and compiled dist execution.
@@ -311,28 +320,15 @@ async function availablePortRange(count: number): Promise<number> {
   throw new Error("Unable to allocate an available worker port range");
 }
 
-function isLocalPersistenceCommand(command: string[]): boolean {
-  return (
-    command[0] === "pnpm" &&
-    (command[1] === "test:snips:local-persistence" ||
-      command[1] === "test:snips:local-browser")
-  );
-}
-
 async function configureLocalPersistenceHarness(
   command: string[],
 ): Promise<void> {
-  if (!isLocalPersistenceCommand(command)) return;
+  const mode = localPersistenceHarnessMode(command);
+  if (mode === null) return;
 
-  localBrowserHarness = command[1] === "test:snips:local-browser";
+  localBrowserHarness = mode === "browser" || mode === "real-codex-browser";
   if (localBrowserHarness) {
-    for (const name of HARNESS_BROWSER_EXTERNAL_OVERRIDES) {
-      if (process.env[name] !== undefined) {
-        throw Object.assign(new Error(`Harness rejects inherited ${name}`), {
-          category: "harness_external_browser_override_rejected",
-        });
-      }
-    }
+    assertNoHarnessBrowserUserOverrides(process.env);
   }
   localPersistenceHarness = true;
   clearLocalPersistenceExternalSettings(process.env, config);
@@ -348,9 +344,13 @@ async function configureLocalPersistenceHarness(
 
   const ownerId =
     process.env.LOCAL_OWNER_ID ?? "7c70fd9c-4b7f-4d5f-87a6-91af0588623c";
+  const testApiUrl = `http://127.0.0.1:${PORT}`;
   const values: Record<string, string> = {
     PORT: String(PORT),
-    TEST_API_URL: `http://127.0.0.1:${PORT}`,
+    TEST_API_URL: testApiUrl,
+    ...(localBrowserHarness
+      ? createHarnessPublicBrowserEnvironment(testApiUrl)
+      : {}),
     TEST_SUITE_WEBSITE: `http://127.0.0.1:${fixtureServerPort}`,
     TEST_SUITE_SELF_HOSTED: "true",
     USE_DB_AUTHENTICATION: "false",
@@ -368,6 +368,9 @@ async function configureLocalPersistenceHarness(
   Object.assign(config, {
     PORT,
     TEST_API_URL: values.TEST_API_URL,
+    ...(localBrowserHarness
+      ? { BROWSER_PUBLIC_API_ORIGIN: values.BROWSER_PUBLIC_API_ORIGIN }
+      : {}),
     TEST_SUITE_WEBSITE: values.TEST_SUITE_WEBSITE,
     TEST_SUITE_SELF_HOSTED: true,
     USE_DB_AUTHENTICATION: false,
@@ -700,6 +703,13 @@ async function setupHarnessBrowserService(): Promise<void> {
       monorepoRoot: MONOREPO_ROOT,
       shutdownCoordinator: harnessBrowserShutdown,
     }),
+  );
+  harnessBrowserControlServer = await startHarnessBrowserControlServer(
+    harnessBrowserService,
+  );
+  harnessBrowserCommandEnvironment = createHarnessBrowserCommandEnvironment(
+    harnessBrowserControlServer.url,
+    harnessBrowserControlServer.token,
   );
   Object.assign(process.env, harnessBrowserService.environment);
   process.env.BROWSER_REPLAY_INGEST_URL = `http://127.0.0.1:${PORT}`;
@@ -1236,7 +1246,7 @@ async function startServices(command?: string[]): Promise<Services> {
 
   const commandProcess =
     command && !command?.[0].startsWith("--")
-      ? execForward("command", command)
+      ? execForward("command", command, harnessBrowserCommandEnvironment)
       : undefined;
 
   return {
@@ -1445,6 +1455,13 @@ const gracefulShutdown = createSharedShutdown(async () => {
   restartSignal?.abort();
 
   logger.section("Shutting down");
+  if (harnessBrowserControlServer) {
+    logger.info("Stopping harness Browser control server");
+    await harnessBrowserControlServer.close();
+    harnessBrowserControlServer = null;
+    harnessBrowserCommandEnvironment = {};
+    logger.success("Harness Browser control server stopped");
+  }
   const forceTerminate = IS_DEV;
   const terminationPromises = Array.from(childProcesses).map(proc =>
     terminateProcess(proc, forceTerminate),
