@@ -191,6 +191,10 @@ descriptor and use the existing page-oriented code contract.
   `host/browser-runtime/protocol/compatibility/required-v2-contract.json` as a
   version-neutral authoritative compatibility contract. Do not check in active
   generated app-server schemas or host identity.
+- Create
+  `host/browser-runtime/protocol/sandbox-broker-v1.contract.json` as the
+  version-neutral authoritative adapter/broker wire and descriptor-role
+  contract.
 - Create `scripts/codex-browser-gate/app-server-compatibility.mjs` and
   `app-server-compatibility.test.mjs` as the only loader/validator for that
   contract.
@@ -204,12 +208,17 @@ descriptor and use the existing page-oriented code contract.
 - Create `scripts/codex-browser-gate/snapshot-protocol.mjs` and
   `snapshot-protocol.test.mjs` for build-staging-only snapshot publication.
 - Create `host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS` covering only
-  version-neutral checked-in compatibility material.
+  version-neutral checked-in compatibility material, including the exact
+  `sandbox-broker-v1.contract.json`; active generated Codex schemas remain
+  excluded.
 - Create
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`.
 - Create `apps/sandbox-broker/Cargo.toml`, `Cargo.lock`, and
   `src/{main,protocol,peer,bundles,oci,registry,redaction}.rs`.
+- Create
+  `apps/sandbox-broker/src/bin/acceptance_restart_broker.rs`.
 - Create `apps/sandbox-broker/tests/{protocol,policy,oci_config,lifecycle}.rs`.
+- Create `apps/sandbox-broker/tests/acceptance_restart.rs`.
 - Create `host/browser-runtime/bundles/{codex,code}/Dockerfile`.
 - Create code-only bundle files
   `host/browser-runtime/bundles/code/{job-relay-supervisor.mjs,run-node.mjs,run-python.py,run-bash.sh,agent-browser.py,cdp-relay.mjs}`.
@@ -232,6 +241,7 @@ descriptor and use the existing page-oriented code contract.
   `scripts/local-firecrawl-restore`.
 - Modify `LOCAL_DEPLOYMENT.md`.
 - Modify `apps/api/package.json` and browser snips.
+- Create `scripts/accept-firecrawl-host-authorization.mjs`.
 - Create `scripts/accept-firecrawl-mcp-clients.mjs`.
 
 ## Commit procedure for every task
@@ -403,9 +413,11 @@ type AdapterAuthorizationAck = {
 Accepted binding must echo the request's canonical job and supervisor UUIDs
 and add a positive OS PID. The client validates exact equality, awaits
 `input.onAccepted(binding)`, then sends the exact acknowledgement. The host
-must not launch Codex, execute source, open a relay, or send callbacks before
-that acknowledgement. `onAccepted` is mandatory for prompt and code inputs;
-there is no optional observer or opaque process string.
+must not launch Codex, execute source, open CDP or a relay listener, transfer
+relay data, or send callbacks before that acknowledgement. A code job may hold
+only its inert created-state relay endpoint. `onAccepted` is mandatory for
+prompt and code inputs; there is no optional observer or opaque process
+string.
 
 Prompt result remains canonical locked `PromptRunResult`: `{ output,
 turnCount, actionCount, usage, protocol }`. Except for deadline serialization,
@@ -946,7 +958,17 @@ shared authority without storing host identity or release-specific bytes."
 
 - Create: `apps/browser-execution-adapter/src/{main,config,jobs,broker_client,app_server,action_client,redaction}.rs`
 - Create: `apps/browser-execution-adapter/tests/{socket_contract,jobs,app_server_protocol,action_client}.rs`
+- Create:
+  `host/browser-runtime/protocol/sandbox-broker-v1.contract.json`
+- Create:
+  `host/browser-runtime/protocol/execution-adapter-authorization-v1.fixture.json`
+- Create:
+  `host/browser-runtime/protocol/browser-operation-hash-v1.vectors.json`
+- Modify:
+  `host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS`
 - Modify: `apps/browser-execution-adapter/src/lib.rs`
+- Modify:
+  `apps/api/src/lib/browser-runtime/{execution-adapter-client,action-normalization}.test.ts`
 
 - [ ] **Step 1: Write failing fake app-server tests**
 
@@ -960,6 +982,41 @@ SIGTERM/SIGKILL, and complete cleanup.
 Also assert accepted binding echoes request job/supervisor UUIDs plus the
 broker-returned positive PID, and no app-server spawn occurs before the
 matching `authorized` acknowledgement.
+
+Rust and TypeScript consume one canonical authorization transport fixture.
+After writing the single exact `authorized` JSON line, the API shuts down its
+write half. The adapter reads through EOF under the authorization deadline,
+rejects missing EOF, duplicate frames, extra newlines, trailing bytes, and
+duplicate JSON keys, then keeps its write half open through one terminal
+response.
+
+Use a fake two-phase broker and the shared closed
+`sandbox-broker-v1.contract.json`. It is the canonical authority for exact
+snake-case `Prepare`, `Prepared`, `Start`, `Abort`, `Started`, terminal/error
+fields, phase ordering, and per-phase descriptor roles; both Rust crates load
+the same fixture in tests. Each crate must serialize its real production wire
+types into every canonical packet, deserialize them back, and derive its
+production descriptor-role table from the contract-checked bundle table.
+Mutation cases for method case, unknown/missing fields, owner boot ID,
+descriptor count/order/phase, terminal/error fields, and phase ordering must
+fail in both crates; merely parsing or snapshotting the fixture is
+insufficient. Assert exact
+`Prepare -> Prepared -> accepted -> authorized -> Start -> Started` ordering.
+Every `Prepare` includes the request correlation UUID. The contract also
+defines exact `Diagnose { correlation_id, job_id }` and bounded `Diagnostic`
+state packets, with direction validated for every method and response.
+`Prepared { job_id, init_pid }` carries the positive host init PID obtained
+while the OCI container is in `created` state. Hold the API authorization
+callback open and prove the fake broker receives no `Start`, the
+app-server/code marker is absent, no CDP or relay listener is opened, no inert
+code relay descriptor transfers data, and no callback is sent. Only the exact
+matching `authorized` acknowledgement permits `Start`.
+
+Add failure cases for API EOF, callback rejection, malformed or mismatched
+authorization, duplicate authorization, authorization timeout, cancellation,
+broker EOF, prepared-init death, and PID mismatch. Every pre-start failure
+must send `Abort` when possible, close the retained broker connection, observe
+broker cleanup, and leave the user-process marker absent.
 
 ```rust
 #[tokio::test]
@@ -1095,13 +1152,17 @@ The implementation builds JSON values, never string-replaces IDs or text.
 Validate every response/notification against the active installed V2 schemas
 whose digest is bound by the installed generation manifest. Buffer
 only bounded notifications for the current turn and correlate `threadId` and
-`turnId` wherever present. Exactly one active-turn `item/completed` must carry
+`turnId` wherever present, including nested `thread.id` and `turn.id`.
+`thread/started` is accepted only while collecting the initial thread/start
+response and is fatal during an active turn. Exactly one active-turn
+`item/completed` must carry
 an `agentMessage` item with string `text`; that text is the authoritative model
 output. Validate it against the closed `ModelDecisionEnvelopeV1` schema,
 deserialize only the distinct wire types, and call
 `normalize_model_decision_envelope` to produce unchanged `ModelDecisionV1`.
 
-Use `turn/completed` only for active thread/turn identity, terminal
+Use bounded incremental JSONL reads and reject duplicate keys at every nested
+object. Use `turn/completed` only for active thread/turn identity, terminal
 status/error, usage, and timing metadata. Never read model output from
 `turn.items`; accept `itemsView` `notLoaded`, `summary`, or `full`, including an
 empty array for `notLoaded`. Refusal, failed/interrupted turn, unknown method,
@@ -1116,7 +1177,11 @@ at 256 KiB.
 
 For every structurally valid action, increment action and turn counts before
 policy handling. Assign UUID action ID, monotonic sequence, canonical JSON
-SHA-256, and server-owned effect. Reject a normalized duplicate side effect
+SHA-256, and server-owned effect. Canonical JSON recursively sorts object keys
+by UTF-16 code units and preserves array order. Rust and TypeScript consume
+`browser-operation-hash-v1.vectors.json` for every operation. Require callback
+`actionKind` to match the submitted operation even when the result is
+internally consistent. Reject a normalized duplicate side effect
 locally; repeated read-only actions remain allowed. POST with adapter bearer
 authentication:
 
@@ -1139,6 +1204,11 @@ returns cached known result. A mismatch, `action_outcome_unknown`, or response
 that cannot prove an outcome terminates process and run and is never sent to
 Codex. `rejected_no_effect` and `failed_no_effect` are sent once; Codex may
 choose a materially different action. Never retry the browser operation.
+Serialize the callback proposal once. If the first attempt fails while reading
+or detecting truncation of an incomplete response body, replay those exact
+bytes once under the original absolute deadline so the API can return its
+durable cached observation. Never retry a complete malformed, oversized, or
+proof-mismatched response.
 
 - [ ] **Step 6: Implement adapter registry and socket server**
 
@@ -1169,36 +1239,106 @@ FIRECRAWL_MAX_PROMPT_RUNS=1
 FIRECRAWL_MAX_CODE_RUNS=2
 ```
 
-Socket is UID-owned mode `0600`. Bind registry entries to the request's
-canonical job/supervisor UUIDs and broker-returned positive OS PID. Emit strict
-`accepted` with that exact `AdapterAuthorizationBinding`, then wait for the
-matching strict `authorized` acknowledgement before starting app-server/code,
-opening relay, or sending callbacks. EOF, mismatch, timeout, or error before
-authorization terminates the admitted process tree and removes the entry.
-Reject duplicate active run/job identities and keep bounded terminal metadata.
-Cancellation wins once, interrupts active turn, terminates
-app-server/container, and compare-removes registry entry. Startup calls broker
-`cancel_owner` and never resumes a thread.
+Socket is UID-owned mode `0600`. The broker client first sends `Prepare` with
+the fixed descriptors and retains that exact authenticated `SOCK_SEQPACKET`
+connection in a `PreparedJob`. `Prepared` returns the positive host init PID
+of an OCI container in `created` state; the configured Codex/code executable
+has not run. Bind the adapter registry entry to the request's canonical
+job/supervisor UUIDs and that broker-attested PID.
+
+Reserve run identity and per-kind capacity before calling `Prepare`; a second
+prompt cannot pass capacity while the first is still preparing. Cancellation
+during Prepare sends one Abort when the in-flight broker exchange becomes
+abortable, completes the reserved entry once, and unblocks its waiter.
+After authorization, atomically linearize cancellation against Start under the
+registry lock. `begin_start` either observes prior cancellation and sends zero
+Start, or changes `Authorized -> Starting`. Coordinate the broker Start future
+against cancellation and the hard deadline. Cancellation/deadline during a
+stalled Start shuts down the exclusive control lease once, invoking broker EOF
+cancellation semantics and completing one terminal registry result. Repeated
+cancel requests subscribe to the same completion.
+
+Emit strict `accepted` with the exact `AdapterAuthorizationBinding`, then wait
+for the matching strict `authorized` acknowledgement. Only after it arrives
+may the adapter send `Start { job_id, expected_init_pid }` on the same prepared
+broker connection. Await `Started` with the same PID before consuming protocol
+traffic. The broker invokes `runc start`; the adapter itself never spawns the
+app-server/code process. Before Start, it may hold only the inert code relay
+socketpair endpoint required by the created OCI init; it must not open CDP,
+create a relay listener, transfer relay data, send a callback, or write
+app-server/code input.
+
+API EOF, callback rejection, mismatch, duplicate acknowledgement, timeout,
+broker EOF, or cancellation before Start aborts the prepared job and removes
+the registry entry. Reject duplicate active run/job identities and keep
+bounded terminal metadata. Cancellation wins once, interrupts an active turn,
+terminates app-server/container, and compare-removes the registry entry.
+Monitor a duplicate of the same prepared control lease while authorization is
+pending. EOF, queued broker error, or unexpected broker packet prevents
+authorization and Start. Start observes EOF/error/PID mismatch on that same
+lease. Once Started is accepted, every local failure converges on exactly one
+broker Finish; callback, stdin write/flush, stdout, and stderr waits remain
+interruptible by cancellation and the hard deadline. After broker terminal,
+the adapter requires child stdout EOF before returning the API result; any
+buffered, kernel-queued, or delayed post-turn byte fails closed.
+
+Receive every broker response with `recvmsg`. Reject `MSG_TRUNC`,
+`MSG_CTRUNC`, every ancillary control message, and every attached
+`SCM_RIGHTS` descriptor. Size ancillary storage for Linux's maximum rights
+payload and close every installed descriptor before returning rejection.
+Mutation tests attach descriptors to Prepared, Started, Aborted, Terminal, and
+error responses, prove no FD leak, and prove a descriptor-bearing Prepared
+cannot reach Start.
+
+Read callback tokens and Codex auth through owner-checked, mode-0600,
+regular-file opens with `O_NOFOLLOW`; hold secret bytes in zeroizing buffers.
+Reject noncanonical absolute configuration paths lexically. Verify the bound
+adapter socket's effective UID and mode after bind.
+
+Before Start, load the exact installed ProtocolBundle from its dynamic
+manifest, schema inventory, digest, and SHA256SUMS. An unconditional temporary
+bundle test proves a valid generated layout loads and exact digest, inventory,
+schema-byte, symlink, and extra-file mutations fail. A separate explicitly
+gated installed-snapshot test validates the active Codex generation.
+At startup, generate a new canonical adapter boot UUID only after reading the
+prior mode-0600 runtime boot-ID file. Cancel that exact prior owner before
+atomically publishing the new boot ID or admitting jobs; a crash before boot-ID
+publication cannot have sent `Prepare`. Every `Prepare` carries the current
+boot ID. Startup never resumes a prepared or running job.
+Adapter job tests cover first boot, prior-owner cleanup, malformed/duplicate/
+symlink/unsafe-mode boot-ID files, failed `CancelOwner`, crash before and after
+atomic publication, and prove no `Prepare` can precede completed prior-owner
+cleanup.
+
+Emit bounded structured lifecycle audit events `broker_prepared`,
+`api_authorized`, `broker_started`, and `payload_started`, carrying only
+correlation ID, job ID, and the broker-attested host init PID as
+`hostInitPid`; never call that value a broker PID. `payload_started` is emitted
+on the first observed child stdout/stderr byte without logging that byte.
+These events exist to prove the installed authorization fence and must never
+contain prompt, output, paths, credentials, FDs, or environment values.
 
 - [ ] **Step 7: Run adapter checks**
 
 ```bash
+sha256sum --check host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS
 cargo fmt --manifest-path apps/browser-execution-adapter/Cargo.toml --check
 cargo clippy --manifest-path apps/browser-execution-adapter/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml
 ```
 
-Expected: format/Clippy exit 0; socket, lifecycle, app-server, decision, action,
-limit, cancellation, and redaction tests PASS.
+Expected: shared contract checksum, format, and Clippy exit 0; socket,
+lifecycle, app-server, broker-contract, decision, action, limit, cancellation,
+and redaction tests PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add apps/browser-execution-adapter/Cargo.toml apps/browser-execution-adapter/Cargo.lock apps/browser-execution-adapter/src apps/browser-execution-adapter/tests
+git add apps/browser-execution-adapter/Cargo.toml apps/browser-execution-adapter/Cargo.lock apps/browser-execution-adapter/src apps/browser-execution-adapter/tests apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts apps/api/src/lib/browser-runtime/action-normalization.test.ts host/browser-runtime/protocol/browser-operation-hash-v1.vectors.json host/browser-runtime/protocol/execution-adapter-authorization-v1.fixture.json host/browser-runtime/protocol/sandbox-broker-v1.contract.json host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS
 sh apps/api/.husky/pre-commit
 git commit -m "feat: add deterministic Codex browser loop" -m "Drive one captured app-server process and ephemeral thread through strict
-schema-constrained turns. Authorize and execute each proposed browser
-action through durable API callbacks without model tools or relays."
+schema-constrained turns. Prepare its isolated process before publishing
+identity, then start it only after durable API authorization."
 ```
 
 ## Task 4: Implement fixed-bundle root broker
@@ -1208,14 +1348,25 @@ action through durable API callbacks without model tools or relays."
 - Create: `apps/sandbox-broker/Cargo.toml`
 - Create: `apps/sandbox-broker/Cargo.lock`
 - Create: `apps/sandbox-broker/src/{main,protocol,peer,bundles,oci,registry,redaction}.rs`
-- Create: `apps/sandbox-broker/tests/{protocol,policy,oci_config,lifecycle}.rs`
+- Create:
+  `apps/sandbox-broker/src/bin/acceptance_restart_broker.rs`
+- Create:
+  `apps/sandbox-broker/tests/{protocol,policy,oci_config,lifecycle,acceptance_restart}.rs`
 - Create: `host/browser-runtime/policy/{bundles.json,codex-seccomp.json,code-seccomp.json}`
+- Test against:
+  `host/browser-runtime/protocol/sandbox-broker-v1.contract.json`
 
 - [ ] **Step 1: Write failing protocol and OCI tests**
 
-Cover `SO_PEERCRED`, exact adapter UID, unknown fields, stale/reused job IDs,
-bundle allowlist, deadlines, descriptor count/type/order, sealed memfds,
-symlink/path attacks, checksums, cancellation ownership, and orphan cleanup.
+Cover `SO_PEERCRED`, exact adapter UID, the shared canonical wire contract,
+unknown fields, stale/reused job IDs, bundle allowlist, deadlines, descriptor
+count/type/order, sealed memfds, symlink/path attacks, checksums, cancellation
+ownership, and orphan cleanup.
+Both crates' real production serializers, deserializers, and descriptor-role
+tables must conform to the same fixture. Apply the same closed mutation corpus
+in both crates and require identical rejection for method case,
+unknown/missing fields, adapter boot identity, descriptor count/order/phase,
+and invalid terminal/error transitions.
 
 Codex assertions must include no relay FD and fixed app-server argv:
 
@@ -1233,6 +1384,28 @@ Code bundles require `input`, `stdout`, `stderr`, and `relay`. Their OCI config
 has a fresh network namespace, 1 CPU, 512 MiB, 64 PIDs, and 64 MiB tmpfs.
 Codex uses host network, 2 CPUs, 2 GiB, 128 PIDs, and 128 MiB tmpfs.
 
+Lifecycle tests use a fixed executable that writes a marker as its first user
+instruction. Assert `Prepare` runs `runc create`, returns only after exact
+`runc state` reports `created`, and returns a positive host init PID matching
+the root-owned pid file and received pidfd. The marker, relay listener path,
+CDP connection, relay traffic, and callbacks must remain absent; only code's
+inert FD 3 endpoint may exist. `Start` on the same authenticated connection
+then runs `runc start`; assert `running`, unchanged host PID, and exactly one
+marker.
+
+Cover API authorization timeout, prepared connection EOF, `Abort`, init death,
+pid-file/state/pidfd mismatch, duplicate or cross-connection Start, stale PID,
+Start failure, deadline during create/start, and every Start/Cancel ordering.
+Each case must leave no runc state, pidfd, cgroup, job directory, open
+descriptor, relay, marker from an unstarted payload, or child. Assert OCI
+`hooks` is absent so create-time hooks cannot execute before authorization.
+Include a hung fake `runc create`, hung fake `runc start`, connection EOF in
+every state, PID reuse after init death, and adapter-boot-owner mismatch.
+Capture the broker and created-init FD tables: Codex has no descriptor at or
+above FD 3, while code has exactly the expected relay endpoint at FD 3 and no
+broker listener, control connection, pidfd socket, pidfd, or materialization
+memfd.
+
 - [ ] **Step 2: Run tests and confirm red state**
 
 ```bash
@@ -1248,16 +1421,83 @@ Use systemd FD 3 with `SOCK_SEQPACKET`:
 ```rust
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 enum BrokerRequest {
-    Launch { job_id: Uuid, bundle_id: BundleId, deadline_unix_ms: u64 },
-    Cancel { job_id: Uuid, reason: CancelReason },
-    CancelOwner { adapter_uid: u32, boot_id: Uuid },
+    Prepare {
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        correlation_id: Uuid,
+        bundle_id: BundleId,
+        deadline_unix_ms: u64,
+    },
+    Cancel {
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        reason: CancelReason,
+    },
+    CancelOwner { adapter_boot_id: Uuid },
+    Diagnose { correlation_id: Uuid, job_id: Uuid },
     Health,
+}
+
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+enum PreparedControl {
+    Start { job_id: Uuid, expected_init_pid: u32 },
+    Abort { job_id: Uuid, reason: CancelReason },
 }
 ```
 
+`Prepare` is not a detached one-shot request. The broker retains the exact
+peer-authenticated connection as the prepared job's control lease and returns
+one strict `Prepared { job_id, init_pid }`. That connection then accepts exactly
+one `PreparedControl` packet and no descriptors. A `Start` received on another
+connection, before `Prepared`, with another job/PID, or after Abort/timeout is
+a protocol error and cannot start a container. `Started` echoes the same
+job/PID only after `runc start` succeeds and post-start state is verified.
+The registry owner key is exactly
+`(SO_PEERCRED uid, adapter_boot_id, job_id)`. The broker derives UID from the
+authenticated socket and never accepts a caller-supplied UID. `Cancel` must
+match that complete owner key. `CancelOwner` removes only the exact peer UID
+and boot ID supplied by the newly started adapter from its prior mode-0600
+boot-ID file. `Diagnose` neither mutates nor enumerates jobs: it returns a
+closed redacted record only for an exact high-entropy correlation/job pair
+owned by the peer UID, including bounded terminal cleanup metadata.
+
+After all `created`/PID/pidfd checks succeed and immediately before publishing
+`Prepared`, atomically publish a root-owned mode-0600 acceptance attestation
+below the root-owned mode-0700 job directory containing only version,
+correlation ID, job ID, `phase: "prepared"`, and host init PID. Remove it
+before atomically entering `starting`, Abort, timeout, EOF cleanup, or any
+terminal state. Normal runtime never consumes it; only the fixed root
+acceptance restart helper may open it with
+`openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` and compare it with exact
+`runc state`/pid-file identity immediately before the deliberate broker kill.
+
+Keep the registry in the closed state machine
+`creating -> prepared -> starting -> running -> stopping -> terminal`.
+Serialize Start, Cancel, deadline, and connection EOF per job. If Cancel wins
+while prepared, never call `runc start`. If Start has atomically entered
+`starting`, record any concurrent cancellation, deadline, or EOF, terminate
+and reap a hung in-flight `runc start` CLI within a fixed bound, inspect exact
+container state, and clean it without publishing `Started`. Bound the
+authorization wait to the smaller of the job deadline and 30 seconds.
+
+The same peer-authenticated connection remains the exclusive control lease
+from `Prepare` through terminal cleanup, including after `Started`. EOF in
+`creating` or `prepared` is an implicit Abort. EOF in `starting` or `running`
+is cancellation and terminates the container. No reconnect may acquire,
+resume, or Start a job. Startup `CancelOwner` removes both prepared and running
+jobs from the prior adapter boot.
+
+Broker startup performs root-owned orphan discovery before accepting any
+request from systemd FD 3. It reconciles every exact container under the fixed
+runc root with root-owned job directories, force-cleans created/running/stale
+containers plus cgroups, attestations, descriptors, and job files, and reports
+unhealthy instead of serving if any residue remains. It never resumes or
+starts an orphan.
+
 Broker never accepts commands, args, env, paths, mounts, images, network,
-UIDs, capabilities, seccomp, cgroup, or resource values. Descriptor roles are
-selected only by bundle ID. `codex-v1` accepts exactly five descriptors:
+caller-supplied UIDs, capabilities, seccomp, cgroup, or resource values.
+Descriptor roles are selected only by bundle ID. `codex-v1` accepts exactly
+five descriptors:
 child stdin read pipe, child stdout write pipe, child stderr write pipe, sealed
 auth JSON memfd, and sealed config TOML memfd. Any sixth/relay descriptor is a
 protocol error. Code bundles accept exactly sealed input, stdout, stderr, and
@@ -1272,28 +1512,87 @@ root-owned mode-0700 job directory using
 
 - [ ] **Step 4: Generate fixed OCI jobs and cleanup**
 
-Call `runc` without a shell:
+Call `runc` without a shell. `Prepare` uses:
 
 ```text
 /usr/bin/runc --root /run/firecrawl-sandbox/runc
-  run --bundle /run/firecrawl-sandbox/jobs/<uuid>
-  --pid-file /run/firecrawl-sandbox/jobs/<uuid>/pid <uuid>
+  create --bundle /run/firecrawl-sandbox/jobs/<uuid>
+  --pid-file /run/firecrawl-sandbox/jobs/<uuid>/pid
+  --pidfd-socket /run/firecrawl-sandbox/jobs/<uuid>/pidfd.sock
+  [--preserve-fds 1 for code only] <uuid>
+
+/usr/bin/runc --root /run/firecrawl-sandbox/runc state <uuid>
 ```
 
-For Codex, map supplied pipes to standard FDs 0/1/2. Do not use
-`--preserve-fds`; there is no browser relay. Rootfs contains the build-staged
-active app-server schemas and dynamic checksum file bound to its installed
-manifest. Set only fixed `CODEX_HOME`, `HOME`,
-`PATH`, locale, and TLS certificate variables. Empty work directory is tmpfs.
+Require state `created`, exact container/bundle identity, and one positive host
+PID equal to the strictly parsed pid file. Receive exactly one pidfd from the
+root-owned pidfd socket. Strictly parse `/proc/self/fdinfo/<pidfd>` and require
+its positive host `Pid:` value to equal both the pid file and `runc state.pid`;
+also require a successful pidfd liveness probe. Any missing, duplicate,
+negative, reused, or mismatched identity fails closed. Remove the pidfd socket
+path only after receipt and retain that exact pidfd through terminal cleanup.
+The
+`adapterProcessId` is this host-namespace init PID: not the runc CLI PID,
+broker PID, or container-namespace PID 1. The created init is stopped behind
+runc's start barrier and has not executed `process.args`.
 
-For code, preserve exactly relay FD 3 and start fixed
+On exact same-connection Start, re-check pidfd liveness, require its fdinfo
+`Pid:` still equals the expected init PID, and require `runc state` remains
+`created` with that PID, then call:
+
+```text
+/usr/bin/runc --root /run/firecrawl-sandbox/runc start <uuid>
+/usr/bin/runc --root /run/firecrawl-sandbox/runc state <uuid>
+```
+
+Require post-start state `running`, the same host PID, the same live pidfd, and
+the same fdinfo `Pid:` before returning `Started`. The created init directly
+execs the fixed Codex/code command, so the PID remains stable across the
+barrier. Never use the numeric PID alone for signalling; retain pidfd and
+address lifecycle operations by exact container ID. Durable API identity
+remains the job UUID, supervisor UUID, and this PID.
+
+Before spawning any `runc` CLI, construct an explicit child FD table rather
+than inheriting the broker's table. Map only supplied stdin/stdout/stderr to
+0/1/2. For code, duplicate the validated relay endpoint to child FD 3 and pass
+`--preserve-fds 1`. Close the systemd broker listener that arrived as broker
+FD 3, accepted/control sockets, pidfd listener and received pidfd, auth/config/
+input memfds, directory FDs, and every unrelated descriptor in the runc child
+before exec. Prove FD 3 is the expected relay socket identity, not merely a
+socket. For Codex, do not use `--preserve-fds` and prove no descriptor at or
+above FD 3 reaches the created init.
+
+For Codex, map supplied pipes to standard FDs 0/1/2 during `runc create`. Do
+not use `--preserve-fds`; there is no browser relay. Rootfs contains the
+build-staged active app-server schemas and dynamic checksum file bound to its
+installed manifest. Set only fixed `CODEX_HOME`, `HOME`, `PATH`, locale, and
+TLS certificate variables. Empty work directory is tmpfs.
+
+For code, preserve exactly the inert relay endpoint as FD 3 during
+`runc create` and start fixed
 `job-relay-supervisor.mjs`, which creates mode-0600
 `/run/firecrawl-job/relay.sock`. Code network namespace has loopback only and
-no external route.
+no external route. Holding that inert descriptor behind runc's created-state
+barrier is permitted before authorization; opening CDP, creating the relay
+listener path, transferring relay data, or consuming the descriptor is not.
+Use this precise meaning for every preauthorization “no relay” assertion.
 
-On cancellation/deadline: `runc kill <uuid> TERM`, wait 2 seconds, then KILL,
-`runc delete --force`, remove cgroup/job files, close FDs, and return one
-terminal result. Broker never invokes a shell.
+Abort, EOF, or deadline in `creating`/`prepared` uses
+`runc delete --force`; the user payload never ran. While `creating`, first
+terminate and reap the in-flight runc CLI within a fixed bound, then inspect
+exact container state and force-delete only if the ID exists. In `starting`,
+first terminate and reap a still-running `runc start` CLI within the same
+bound, then inspect exact state; kill the container only if Start crossed into
+`running`. Never run create/state/start/kill/delete concurrently for one ID.
+Cancellation/deadline in `starting`/`running` uses
+`runc kill <uuid> TERM`, waits at most 2 seconds, then KILL and
+`runc delete --force`. Every path waits a fixed bounded interval for pidfd
+exit, removes runc/cgroup/job state, closes descriptors, and returns at most
+one terminal result. Residue or a pidfd that remains live after escalation
+records a bounded terminal cleanup failure, makes broker/deep health
+unhealthy, and blocks new work; it never reports successful cleanup or loops
+forever. Cleanup also removes the acceptance attestation. Broker never invokes
+a shell.
 
 For code bundles, open `artifacts/manifest.json` with
 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`. Require a closed array of at
@@ -1321,7 +1620,9 @@ Seccomp defaults to `SCMP_ACT_ERRNO`. Deny mount, namespace creation, ptrace,
 BPF, perf, keyring, modules, reboot, raw/packet sockets, and every syscall not
 needed by fixture traces. Both configs use read-only root, masked sensitive
 `/proc`, read-only `/sys`, non-root UID 65532, empty capabilities, and
-`noNewPrivileges`.
+`noNewPrivileges`. Generated OCI configs omit `hooks` entirely; bundle policy
+validation rejects any hook so no create/start lifecycle hook can bypass the
+authorization barrier.
 
 - [ ] **Step 6: Run broker checks**
 
@@ -1339,9 +1640,9 @@ redaction tests PASS.
 ```bash
 git add apps/sandbox-broker host/browser-runtime/policy
 sh apps/api/.husky/pre-commit
-git commit -m "feat: add fixed runc sandbox broker" -m "Launch only checksummed Codex and code bundles through a root-owned
-peer-authenticated broker. Give Codex protocol pipes without a browser
-relay and retain the relay only for isolated code runners."
+git commit -m "feat: add fixed runc sandbox broker" -m "Prepare checksummed OCI jobs through a root-owned peer-authenticated
+broker, publish their stable init identity, and start user processes only
+after durable authorization. Retain relay access only for code runners."
 ```
 
 ## Task 5: Build rolling Codex and pinned code-runner bundles
@@ -1508,7 +1809,16 @@ removes containers immediately; and writes sorted SHA-256 manifests for the
 captured staging snapshot.
 
 The top manifest embeds the complete Codex artifact manifest plus rootfs and
-policy hashes. The builder re-resolves the original inherited PATH and
+policy hashes plus the checked-in broker contract SHA-256. Staging copies the
+exact `sandbox-broker-v1.contract.json` into
+`/opt/firecrawl/protocol/sandbox-broker-v1.contract.json`. Both Rust binaries
+embed its build-time canonical digest and refuse startup or health if the
+installed file is missing or differs. `COMPATIBILITY_SHA256SUMS`, the staged
+top manifest, fake-root installer tests, installed identity verification, and
+shallow/deep health all cover that same byte digest; it is never part of the
+dynamic Codex-schema digest.
+
+The builder re-resolves the original inherited PATH and
 revalidates real path/device/inode/SemVer before publication. Any drift
 discards all staging. It never copies auth. Rust tools verify and consume
 canonical on-disk bytes; they never implement a second canonicalizer.
@@ -1558,6 +1868,23 @@ neutral Codex artifact name, strict source-identity manifest and protocol
 checksums, atomic generation switch, fixed unit text, and refusal of
 symlink/world-writable staging. Reject a SemVer embedded in installed artifact
 or generation path names and any artifact/schema/manifest identity mismatch.
+Also assert the installed broker contract matches
+`COMPATIBILITY_SHA256SUMS` and both embedded Rust digests.
+
+Install `acceptance-restart-broker` root-owned mode `0755` at the fixed
+`/usr/local/libexec/firecrawl-acceptance-restart-broker`. It accepts only
+`--check` or `--restart-prepared <canonical-correlation-id>
+<canonical-job-id>`, requires EUID 0, resolves and validates the exact active
+broker service and socket units, confirms the named job is currently
+`prepared` by opening the fixed root-owned acceptance attestation with
+`openat2`, matching its exact correlation/job/init PID to strict pid-file and
+`runc state` `created` identity, then sends SIGKILL only to that service's
+systemd MainPID. It waits for the old PID to disappear, starts the fixed unit,
+and waits for a new healthy MainPID. It accepts no unit, signal, path, PID,
+command, environment, or timeout override. It is an operator-run acceptance
+aid, never called by normal start/restart or exposed through API. Fake-root
+tests reject extra arguments, symlinks, attestation/state/PID mismatch, a job
+not in `prepared`, and any attempt to act on another service.
 
 ```ini
 [Socket]
@@ -1775,8 +2102,12 @@ for isolated code jobs and preserve terminal cleanup ownership."
 - Modify: `apps/api/src/lib/browser-runtime/execution-adapter-client.ts`
 - Modify:
   `apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts`
-- Modify: `apps/browser-execution-adapter/src/protocol.rs`
-- Modify: `apps/browser-execution-adapter/tests/socket_contract.rs`
+- Modify:
+  `apps/browser-execution-adapter/src/{protocol,jobs,broker_client}.rs`
+- Modify:
+  `apps/browser-execution-adapter/tests/{socket_contract,jobs}.rs`
+- Modify: `apps/sandbox-broker/src/{protocol,registry}.rs`
+- Modify: `apps/sandbox-broker/tests/{protocol,lifecycle}.rs`
 
 - [ ] **Step 1: Write failing lifecycle tests**
 
@@ -1786,7 +2117,7 @@ and atomic reinstall, manifest/protocol drift, stale socket, Codex auth, broker
 down,
 API-owned post-handoff migration failure, start/drain/forced stop/restart
 order, status counts, strict shallow and deep health, bounded/redacted logs,
-lock contention, env creation/upgrade, and
+correlation-scoped host-job diagnostics, lock contention, env creation/upgrade, and
 API-only published port.
 
 The fake wrapper trace must prove drift performs exactly one build and one
@@ -1843,6 +2174,7 @@ Expose:
 scripts/local-firecrawl {install-host|start|stop|restart|status|health|logs|lock-path}
 scripts/local-firecrawl {status|health} --json
 scripts/local-firecrawl logs [all|api|browser-service|adapter|broker] [correlation-id]
+scripts/local-firecrawl diagnose-host-job --correlation-id <uuid> --job-id <uuid> --json
 ```
 
 `start` and `restart` first capture active PATH-selected Codex identity and
@@ -1877,6 +2209,37 @@ effort `medium`. It performs no app-server/model call. Adapter answers only
 after checking its authenticated socket ownership, broker heartbeat, readable
 auth/config inputs, installed artifact manifest, and all local checksums.
 Malformed/extra response fields map to `adapter_protocol_error`/HTTP 502.
+The closed health result also includes `brokerProtocolSha256`, equal to the
+installed shared broker contract and both embedded binary digests.
+
+Add strict private adapter method `diagnose_host_job` with exact canonical
+`correlationId` and `jobId`. It proxies a read-only exact-match broker
+`Diagnose` and combines it with bounded adapter lifecycle metadata. The
+wrapper's `diagnose-host-job` command also reads the API's redacted durable
+run status and returns one closed non-enumerable record:
+
+```text
+version, correlationId, jobId, phase, hostInitPid,
+pidfdLive, pidfdPidMatches, controlLeaseConnected,
+inertRelayFdPresent, relayListenerPresent, cdpRelayOpened,
+payloadStartedCount, payloadMarkerPresent, callbackCount,
+browserEffectCount, runcState, cgroupPresent, jobDirectoryPresent,
+childCount, cleanupFailure
+```
+
+`phase` is one of `creating`, `prepared`, `starting`, `running`, `stopping`,
+`terminal`, or `absent`; `runcState` is closed and nullable. Before Start, a
+code job may report only `inertRelayFdPresent: true`; listener/CDP/data
+activity remain false. The broker checks its retained pidfd and fdinfo identity
+at query time. Terminal metadata is bounded and retained long enough for the
+acceptance watchdog to prove absence after cleanup. Unknown pairs return one
+closed `not_found` error and never reveal other jobs, paths, FDs, prompts,
+output, credentials, or environment.
+
+Lifecycle tests cover active and terminal diagnostics, unknown/cross-owner
+pairs, PID/pidfd mismatch, extra fields, broker EOF, cleanup failure, retention
+expiry, and redaction. They prove diagnostics cannot mutate, enumerate,
+resume, Start, Cancel, or extend a job/deadline.
 
 Deep health verifies migration ledger, database, MinIO, disposable Browser
 Service session, adapter socket, exact installed rolling identity and fixed
@@ -1893,8 +2256,9 @@ volumes.
 
 JSON status is closed and includes `codexCliVersion`,
 `codexExecutablePath`, `codexResolvedPath`, `codexDevice`, `codexInode`,
-`codexArtifactSha256`, `codexProtocolSchemaSha256`, `activePromptJobs`,
-`activeCodeJobs`,
+`codexArtifactSha256`, `codexProtocolSchemaSha256`,
+`brokerProtocolSha256`, `activePromptJobs`,
+`activeCodeJobs`, `preparedHostJobs`, `startingHostJobs`, `runningHostJobs`,
 `activeBrowserSessions`, `activeCapabilities`, `activeProxyGrants`,
 `activeWriterLeases`, `unknownActionOutcomes`, `orphanProcesses`, and
 `firecrawlCloudFallbackAttempts`. Logs cap 200 lines and redact secrets/page
@@ -1908,6 +2272,8 @@ docker compose --project-name firecrawl --project-directory . -f compose.yaml -f
 node --test scripts/local-firecrawl.test.mjs
 pnpm --dir apps/api exec vitest run src/cli/browser-runtime-cli.test.ts
 pnpm --dir apps/api build
+cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml
+cargo test --manifest-path apps/sandbox-broker/Cargo.toml
 ```
 
 Expected: shell/Compose validation exits 0; lifecycle tests PASS; API builds.
@@ -1915,12 +2281,13 @@ Rendered default Compose keeps migration sidecar behind an explicit profile,
 API does not depend on it, and fake-wrapper trace proves Browser Service and
 MinIO initialization precede API-owned handoff/migrations/readiness. Drift
 trace proves one lock, one build, one direct helper publication, and zero
-nested wrapper invocations.
+nested wrapper invocations. Adapter/broker protocol, diagnostic, ownership,
+EOF/race, and redaction tests pass.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add compose.local.yaml .env.example.local scripts/init-local-env.sh scripts/upgrade-local-env-browser-runtime scripts/local-firecrawl scripts/local-firecrawl.test.mjs apps/api/src/cli/browser-runtime-drain.ts apps/api/src/cli/browser-runtime-status.ts apps/api/src/cli/browser-runtime-cli.test.ts apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts apps/api/src/lib/browser-runtime/execution-adapter-client.ts apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts apps/browser-execution-adapter/src/protocol.rs apps/browser-execution-adapter/tests/socket_contract.rs
+git add compose.local.yaml .env.example.local scripts/init-local-env.sh scripts/upgrade-local-env-browser-runtime scripts/local-firecrawl scripts/local-firecrawl.test.mjs apps/api/src/cli/browser-runtime-drain.ts apps/api/src/cli/browser-runtime-status.ts apps/api/src/cli/browser-runtime-cli.test.ts apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts apps/api/src/lib/browser-runtime/execution-adapter-client.ts apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts apps/browser-execution-adapter/src/protocol.rs apps/browser-execution-adapter/src/jobs.rs apps/browser-execution-adapter/src/broker_client.rs apps/browser-execution-adapter/tests/socket_contract.rs apps/browser-execution-adapter/tests/jobs.rs apps/sandbox-broker/src/protocol.rs apps/sandbox-broker/src/registry.rs apps/sandbox-broker/tests/protocol.rs apps/sandbox-broker/tests/lifecycle.rs
 sh apps/api/.husky/pre-commit
 git commit -m "feat: orchestrate local browser runtime" -m "Manage Compose, Browser Service, API-owned migrations, app-server
 adapter, and sandbox broker as one locked lifecycle.
@@ -2014,6 +2381,7 @@ Codex processes, credentials, and runtime state."
 - Modify: `apps/api/package.json`
 - Modify: `apps/api/src/__tests__/snips/v2/scrape-browser.test.ts`
 - Create: `apps/api/src/__tests__/snips/v2/browser-runtime-security.test.ts`
+- Create: `scripts/accept-firecrawl-host-authorization.mjs`
 - Create: `scripts/accept-firecrawl-mcp-clients.mjs`
 - Modify: `LOCAL_DEPLOYMENT.md`
 
@@ -2029,6 +2397,56 @@ escapes, output/artifact limits, and zero Gemini/Fireworks/cloud fallback.
 Prompt injection fixtures request shell, filesystem, MCP, browser relay,
 credentials, arbitrary network, schema escape, and multiple decisions. Assert
 zero app-server tool/approval events and no broker Codex relay descriptor.
+
+Add `scripts/accept-firecrawl-host-authorization.mjs` as an installed
+two-phase probe. It acts as a minimal strict API peer on the private adapter
+socket with an isolated controlled code request and unique correlation ID.
+Its fixed source creates `/run/firecrawl-job/authorization.marker` as its first
+user instruction, writes one marker byte to stdout, and then blocks until
+cancelled; it cannot choose a host path. Diagnostics expose only the boolean
+existence of that fixed in-sandbox marker, never its path or content. It reads
+`accepted`, deliberately withholds `authorized`, and queries only redacted
+lifecycle/status output through `diagnose-host-job`. Assert one
+`broker_prepared` event, `created`, a positive `hostInitPid`,
+`pidfdLive: true`, `pidfdPidMatches: true`, and no `broker_started`, payload
+marker, relay listener, CDP relay, callback, or browser effect. A code probe
+may have only its inert created-state relay FD. Send the exact matching
+`authorized` acknowledgement, then require `broker_started`, `running`, the
+identical host PID, exactly one `payload_started` event, and exactly one
+marker. The probe never reads credentials or logs child output.
+
+Repeat with API EOF, acceptance rejection, authorization mismatch/timeout,
+adapter restart, broker restart, and concurrent stop at the prepared/start
+boundary. No failure may write the marker before authorization. Every case
+must end with zero prepared/running registry entries, runc containers, live
+pidfds, cgroups, job directories, relays, capabilities, grants, leases, or
+children. Adapter startup `cancel_owner` must clean an injected prepared job
+from the prior boot without starting it.
+
+Before creating any job, the script runs only
+`sudo -n /usr/local/libexec/firecrawl-acceptance-restart-broker --check` and
+fails closed with an operator-facing prerequisite if exact noninteractive
+authority is unavailable. For the abrupt broker case, after diagnostics prove
+the exact correlation/job is `prepared`, invoke only:
+
+```text
+sudo -n /usr/local/libexec/firecrawl-acceptance-restart-broker \
+  --restart-prepared <correlation-id> <job-id>
+```
+
+No direct `systemctl`, arbitrary
+signal/PID, broad sudo command, or normal lifecycle restart substitutes for
+this test. Require broker orphan discovery to delete the old created
+container before accepting new work, adapter EOF cleanup, a new healthy broker
+MainPID, and terminal/absent diagnostics with zero residue.
+
+Run the probe once with authorization and once by closing the adapter
+connection while prepared. It uses a process-group watchdog and `finally`
+cleanup. The watchdog bounds every child and sudo probe; `finally` always
+aborts/closes the adapter connection and queries correlated cleanup before
+requiring shallow/deep health plus zero host jobs. The normal public snips
+separately prove that real API durable activation precedes the same
+acknowledgement.
 
 - [ ] **Step 2: Run deterministic gates first**
 
@@ -2048,7 +2466,8 @@ node scripts/codex-browser-gate/run.mjs --runs 3
 Expected: all deterministic tests PASS; installed artifact/schema identity
 matches active PATH selection; Gate0 reports three exact two-turn runs, one
 marker each, cached matching callbacks, mismatch rejection, exact finals,
-zero tool/approval events, and no leftover processes/directories.
+zero tool/approval events, strict Prepare/Start fencing with a stable host PID,
+and no leftover processes/directories.
 
 - [ ] **Step 3: Perform explicit host install and start**
 
@@ -2076,13 +2495,16 @@ Snips require `TEST_API_URL=http://127.0.0.1:3002`,
 They never start another API/harness or access in-process DB helpers.
 
 ```bash
+node scripts/accept-firecrawl-host-authorization.mjs
 TEST_API_URL=http://127.0.0.1:3002 TEST_SUITE_WEBSITE=https://example.com TEST_SUITE_SELF_HOSTED=true LOCAL_BROWSER_HOST_RUNTIME_INSTALLED=true pnpm --dir apps/api test:snips:local-browser-host
 scripts/local-firecrawl restart
 scripts/local-firecrawl health --live-codex
 ```
 
 Expected: prompt, code, Browser API, security, stop, restart/replay PASS; all
-active process/grant/lease counts return zero.
+active process/grant/lease counts return zero. Installed authorization probes
+prove no payload marker before Start, unchanged Prepared/Started PID, and zero
+broker/runc/pidfd/cgroup/job-directory residue after every success and failure.
 
 - [ ] **Step 5: Validate fresh Claude Code and Codex MCP clients**
 
@@ -2141,10 +2563,10 @@ orphan process/lock/grant; only API port published; only Task 10 files differ.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add apps/api/package.json apps/api/src/__tests__/snips/v2/scrape-browser.test.ts apps/api/src/__tests__/snips/v2/browser-runtime-security.test.ts scripts/accept-firecrawl-mcp-clients.mjs LOCAL_DEPLOYMENT.md
+git add apps/api/package.json apps/api/src/__tests__/snips/v2/scrape-browser.test.ts apps/api/src/__tests__/snips/v2/browser-runtime-security.test.ts scripts/accept-firecrawl-host-authorization.mjs scripts/accept-firecrawl-mcp-clients.mjs LOCAL_DEPLOYMENT.md
 sh apps/api/.husky/pre-commit
 git commit -m "test: verify isolated browser runtime acceptance" -m "Exercise deterministic Codex actions, code Interact, direct Browser APIs,
-restart replay, stop cleanup, and hostile inputs through local services.
+restart replay, stop cleanup, and the prepared-process authorization fence.
 Validate fresh public MCP clients with no provider fallback."
 ```
 
@@ -2152,7 +2574,8 @@ Validate fresh public MCP clients with no provider fallback."
 
 - [ ] `git diff --check` exits 0.
 - [ ] `COMPATIBILITY_SHA256SUMS` covers only version-neutral checked-in
-      normalization, compatibility, and model-decision fixtures.
+      normalization, compatibility, broker-wire, and model-decision fixtures;
+      it includes `sandbox-broker-v1.contract.json`.
 - [ ] `required-v2-contract.json` is the only definition/field/vocabulary
       authority; Gate0 and snapshot/build both call
       `app-server-compatibility.mjs`, and mutation tests prove identical
@@ -2171,7 +2594,29 @@ Validate fresh public MCP clients with no provider fallback."
 - [ ] Three consecutive live Gate0 structured-action runs pass.
 - [ ] Adapter Cargo format, Clippy, and tests pass.
 - [ ] Broker Cargo format, Clippy, and tests pass.
+- [ ] Adapter and broker validate the same closed
+      `sandbox-broker-v1.contract.json` using their production serializers,
+      deserializers, descriptor-role tables, and identical mutation corpus.
+- [ ] Installed broker contract bytes match `COMPATIBILITY_SHA256SUMS`, staged
+      manifest, and both embedded Rust digests.
 - [ ] Focused API tests and TypeScript build pass.
+- [ ] Broker `Prepare` reaches only runc `created`; exact API `authorized`
+      precedes same-connection `Start` and `runc start`.
+- [ ] Prepared and running state report one unchanged host init PID backed by
+      a retained pidfd whose fdinfo PID matches pid file and runc state;
+      generated OCI config contains no hooks.
+- [ ] Registry ownership is exact peer UID, adapter boot ID, and job ID; the
+      original authenticated connection remains control owner through terminal
+      state and EOF cleans every state without reconnect/resume.
+- [ ] runc child FD tables contain only 0/1/2 for Codex and only the validated
+      inert relay at FD 3 for code; broker listener/control/pidfd/materialization
+      descriptors never enter a container.
+- [ ] Hung create/start, cancel/deadline/EOF races, PID reuse, and residue
+      produce bounded cleanup or explicit unhealthy state, never execution or
+      false cleanup success.
+- [ ] Every pre-authorization EOF, rejection, mismatch, timeout, cancellation,
+      or restart leaves no payload marker, runc state, pidfd, cgroup, job
+      directory, relay, callback, or child.
 - [ ] One prompt request uses one app-server process and ephemeral thread.
 - [ ] Every turn uses closed root `ModelDecisionEnvelopeV1` `outputSchema`,
   validates distinct wire types, and normalizes unchanged internal
@@ -2188,8 +2633,13 @@ Validate fresh public MCP clients with no provider fallback."
   outcome terminates run/session and never reaches Codex.
 - [ ] Inner Codex has zero MCP/tool/approval events and no browser relay.
 - [ ] Code runners alone receive relay FD 3 and have no external network.
-- [ ] Stop/restart leave no app-server, code, browser, capability, grant, or
-  writer lease active.
+- [ ] Stop/restart leave no prepared/running broker job, runc state, pidfd,
+      cgroup, job directory, app-server, code, browser, capability, grant, or
+      writer lease active.
+- [ ] Correlation-scoped diagnostics prove preauthorization and terminal
+      state without exposing paths, FDs, content, credentials, or other jobs.
+- [ ] Root broker abrupt-restart acceptance uses only the fixed validated
+      root helper and proves orphan cleanup before broker health returns.
 - [ ] Backup/restore preserves DB, MinIO, and committed profile generations.
 - [ ] Fresh Claude Code and Codex MCP sessions exercise only local API.
 - [ ] No Gemini, Fireworks, Firecrawl Cloud, or API-key fallback remains.
