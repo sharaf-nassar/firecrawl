@@ -162,6 +162,8 @@ function grantInput(
     permission,
     expiresAt,
     useLimit: 1 as const,
+    expectedSessionVersion: 1,
+    allowedDomains: [],
   };
 }
 
@@ -598,7 +600,7 @@ describe("live streams", () => {
     expect(h.runtimeApi.closeCdp).toHaveBeenCalledOnce();
   });
 
-  test.each(["socket", "revoke", "expiry", "drain"] as const)(
+  test.each(["socket", "revoke", "drain"] as const)(
     "%s cancellation detaches early and drops queued interactive input",
     { timeout: 1_000 },
     async (mode) => {
@@ -649,9 +651,6 @@ describe("live streams", () => {
           version: 1,
           grantId: grant.grantId,
         });
-      } else if (mode === "expiry") {
-        h.advanceNow(30_001);
-        expect(h.manager.sweepExpired()).toBe(1);
       } else {
         drained = h.manager.drain();
       }
@@ -668,7 +667,7 @@ describe("live streams", () => {
       expect(calls).toEqual(["first", "detach"]);
       expect(h.runtimeApi.closeCdp).toHaveBeenCalledOnce();
       expect(socket.closes[0]?.code).toBe(
-        mode === "revoke" || mode === "expiry"
+        mode === "revoke"
           ? STREAM_CLOSE_CODES.policyViolation
           : mode === "drain"
             ? STREAM_CLOSE_CODES.serviceRestart
@@ -706,7 +705,7 @@ describe("live streams", () => {
     });
   });
 
-  test.each(["revoke", "expiry", "drain"] as const)(
+  test.each(["revoke", "drain"] as const)(
     "%s fail-stops within the cleanup bound when input remains unresolved",
     { timeout: 1_000 },
     async (mode) => {
@@ -747,9 +746,6 @@ describe("live streams", () => {
           version: 1,
           grantId: grant.grantId,
         });
-      } else if (mode === "expiry") {
-        h.advanceNow(30_001);
-        expect(h.manager.sweepExpired()).toBe(1);
       } else {
         drained = h.manager.drain();
       }
@@ -763,7 +759,7 @@ describe("live streams", () => {
     },
   );
 
-  test.each(["revoke", "expiry", "drain"] as const)(
+  test.each(["revoke", "drain"] as const)(
     "%s completes bounded fail-stop when CDP channel opening hangs",
     { timeout: 1_000 },
     async (mode) => {
@@ -790,9 +786,6 @@ describe("live streams", () => {
           version: 1,
           grantId: grant.grantId,
         });
-      } else if (mode === "expiry") {
-        h.advanceNow(30_001);
-        expect(h.manager.sweepExpired()).toBe(1);
       } else {
         drained = h.manager.drain();
       }
@@ -1171,9 +1164,9 @@ test("drain revokes unused grants, aborts active streams, and leaves no inventor
   expect(h.manager.inventory()).toEqual({ grants: 0, streams: 0 });
 });
 
-test.each(["revoke", "expiry"] as const)(
-  "%s closes an active stream with policy code before generic abort cleanup",
-  async (mode) => {
+test(
+  "revoke closes an active stream with policy code before generic abort cleanup",
+  async () => {
     const h = harness();
     const grant = h.manager.create(IDS[0], grantInput("passive"));
     const socket = new FakeSocket();
@@ -1187,19 +1180,39 @@ test.each(["revoke", "expiry"] as const)(
       async () => socket as unknown as WebSocket,
     );
     await settle();
-    if (mode === "revoke") {
-      await h.manager.revoke(IDS[0], {
-        version: 1,
-        grantId: grant.grantId,
-      });
-    } else {
-      h.advanceNow(30_001);
-      expect(h.manager.sweepExpired()).toBe(1);
-    }
+    await h.manager.revoke(IDS[0], {
+      version: 1,
+      grantId: grant.grantId,
+    });
     await opened;
     expect(socket.closes[0]?.code).toBe(STREAM_CLOSE_CODES.policyViolation);
   },
 );
+
+test("grant expiry bounds redemption but not an already active stream", async () => {
+  const h = harness();
+  const grant = h.manager.create(IDS[0], grantInput("passive"));
+  const socket = new FakeSocket();
+  const opened = h.manager.open(
+    {
+      runtimeSessionId: IDS[0],
+      permission: "passive",
+      relayToken: grant.relayToken,
+      authority: authority(),
+    },
+    async () => socket as unknown as WebSocket,
+  );
+  await settle();
+
+  h.advanceNow(30_001);
+  expect(h.manager.sweepExpired()).toBe(0);
+  expect(socket.readyState).toBe(WebSocket.OPEN);
+  expect(h.manager.inventory()).toEqual({ grants: 1, streams: 1 });
+
+  socket.close();
+  await opened;
+  expect(h.manager.inventory()).toEqual({ grants: 0, streams: 0 });
+});
 
 test("post-upgrade setup failure closes the socket and retains inventory until cleanup", async () => {
   const h = harness();

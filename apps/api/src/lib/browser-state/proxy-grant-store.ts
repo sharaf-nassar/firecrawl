@@ -223,6 +223,14 @@ export function createBrowserProxyGrantStore(deps: {
       );
     },
 
+    redeemWithLease(
+      lease: BrowserStateMutationLease,
+      token: string,
+      permission: BrowserProxyPermission,
+    ): Promise<BrowserProxyGrant | null> {
+      return redeemWithLease(lease, token, permission, now());
+    },
+
     revokeSession(sessionId: string): Promise<number> {
       const parsedSessionId = runtimeUuidSchema.parse(sessionId);
       const revokedAt = now();

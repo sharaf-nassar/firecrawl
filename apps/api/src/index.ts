@@ -69,6 +69,8 @@ import {
   createPublicBrowserRuntime,
   registerPublicBrowserRuntime,
 } from "./lib/browser-runtime/public-browser-runtime";
+import { createBrowserProxyGrantStore } from "./lib/browser-state/proxy-grant-store";
+import { registerBrowserProxyRuntime } from "./controllers/v2/browser-proxy";
 import {
   getCombinedTeamActiveCount,
   mirrorExternalSlotAcquire,
@@ -264,6 +266,16 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
         releaseAdmission: mirrorExternalSlotRelease,
       }),
     );
+    registerBrowserProxyRuntime(
+      config.BROWSER_PUBLIC_API_ORIGIN
+        ? {
+            gate,
+            grantStore: createBrowserProxyGrantStore({ gate }),
+            browserClient: serviceClient,
+            publicApiOrigin: config.BROWSER_PUBLIC_API_ORIGIN,
+          }
+        : undefined,
+    );
     return handoff;
   } catch (error) {
     await coordinator.stop().catch(() => undefined);
@@ -298,6 +310,7 @@ async function initializeLocalBrowserAfterMigrations(
 async function stopLocalRuntime(): Promise<void> {
   localRuntimeStop ??= (async () => {
     registerPublicBrowserRuntime(undefined);
+    registerBrowserProxyRuntime(undefined);
     await localBrowserRuntime?.coordinator.stop();
     await localRetentionService?.stop();
     await localBrowserRuntime?.pool.end();

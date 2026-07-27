@@ -1366,16 +1366,6 @@ export function createRelayGrantManager(options: {
     if (record.state === "active") {
       record.state = "expired";
       grantsByHash.delete(record.tokenHash.toString("hex"));
-    } else if (record.state === "redeemed") {
-      record.state = "expired";
-      if (record.active?.socket !== undefined) {
-        closeSocket(
-          record.active.socket,
-          STREAM_CLOSE_CODES.policyViolation,
-          "relay grant expired",
-        );
-      }
-      record.active?.abort.abort();
     }
   };
 
@@ -1522,11 +1512,7 @@ export function createRelayGrantManager(options: {
       };
       record.active = active;
       activeStreams.add(active);
-      let expiryTimer: NodeJS.Timeout | undefined;
       let streamFailure: unknown;
-      const expiryDelay = Math.max(0, record.expiresAtMs - now());
-      expiryTimer = setTimeout(() => expireRecord(record), expiryDelay);
-      expiryTimer.unref();
       try {
         const mode = request.permission === "passive" ? "passive" : "writer";
         await options.registry.withRuntime(
@@ -1595,7 +1581,6 @@ export function createRelayGrantManager(options: {
         }
         throw cause;
       } finally {
-        if (expiryTimer !== undefined) clearTimeout(expiryTimer);
         activeStreams.delete(active);
         delete record.active;
         if (record.state === "redeemed") record.state = "consumed";
@@ -1607,10 +1592,7 @@ export function createRelayGrantManager(options: {
       let count = 0;
       const timestamp = now();
       for (const record of grantsById.values()) {
-        if (
-          (record.state === "active" || record.state === "redeemed") &&
-          record.expiresAtMs <= timestamp
-        ) {
+        if (record.state === "active" && record.expiresAtMs <= timestamp) {
           expireRecord(record);
           count += 1;
         }

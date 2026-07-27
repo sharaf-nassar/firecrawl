@@ -68,6 +68,12 @@ import {
   scrapeStopInteractiveBrowserController,
 } from "../controllers/v2/scrape-browser";
 import {
+  browserProxyRelayController,
+  browserProxyScriptController,
+  browserProxyStyleController,
+  browserProxyViewController,
+} from "../controllers/v2/browser-proxy";
+import {
   confirmMonitorEmailController,
   createMonitorController,
   deleteMonitorController,
@@ -576,6 +582,11 @@ v2Router.post(
   "/browser/webhook/destroyed",
   wrap(browserWebhookDestroyedController),
 );
+
+v2Router.get("/browser/proxy/view.js", browserProxyScriptController);
+v2Router.get("/browser/proxy/view.css", browserProxyStyleController);
+v2Router.get("/browser/proxy/:token/view", browserProxyViewController);
+v2Router.ws("/browser/proxy/:token/:permission", browserProxyRelayController);
 
 // Support agent proxy — forwards to the support-agent service.
 v2Router.post(
