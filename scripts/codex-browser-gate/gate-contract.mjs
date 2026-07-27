@@ -57,6 +57,7 @@ request_permissions_tool = false
 shell_snapshot = false
 shell_tool = false
 skill_mcp_dependency_install = false
+skill_search = false
 standalone_web_search = false
 tool_call_mcp_elicitation = false
 tool_suggest = false
@@ -89,6 +90,7 @@ const disabledFeatures = Object.freeze([
   "shell_snapshot",
   "shell_tool",
   "skill_mcp_dependency_install",
+  "skill_search",
   "standalone_web_search",
   "tool_call_mcp_elicitation",
   "tool_suggest",

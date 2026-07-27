@@ -7,15 +7,17 @@ unprivileged host adapter and fixed root-owned `runc` sandboxes, then operate
 the full local runtime through `scripts/local-firecrawl`.
 
 **Architecture:** Firecrawl API submits strict jobs over a private Unix socket.
-For each prompt job, the adapter starts one pinned Codex app-server 0.144.5
-process and one ephemeral thread, validates a schema-constrained action or
+For each prompt job, the adapter starts one compatibility-gated Codex
+app-server process from the rolling host snapshot and one ephemeral thread,
+validates a schema-constrained action or
 final decision on every turn, and asks the API to durably authorize and
 execute each action. Codex receives no browser relay or tools. Code jobs keep
 the session-scoped relay and run in disposable no-network bundles. A
 root-owned broker accepts only fixed bundles and resource presets.
 
 **Tech Stack:** TypeScript 5.9, Node.js 22, Rust 1.94, Tokio, Serde, JSON-RPC
-2.0, Codex app-server V2 protocol from CLI 0.144.5, `runc` 1.3.6, OCI Runtime
+2.0, Codex app-server V2 protocol from the active PATH-selected CLI, `runc`
+1.3.6, OCI Runtime
 Spec 1.2.1, systemd 255, Vitest, Cargo tests, Docker Compose.
 
 ---
@@ -37,8 +39,9 @@ Browser Service, and these API boundaries:
 - `WS /internal/browser-runs/:runId/cdp`
 - `POST /internal/browser-runs/:runId/artifacts`
 
-Do not start Task 1 until Gate0 passes three consecutive live runs against
-Codex CLI 0.144.5. Gate0 must prove one process, one ephemeral thread, two
+Do not start Task 1 until Gate0 passes three consecutive live runs against one
+captured identity of the first `codex` executable selected by inherited
+`PATH`. Gate0 must prove one process, one ephemeral thread, two
 schema-constrained turns, one marker write, matching callback deduplication,
 mismatch rejection, exact final output, zero tool/approval events, and full
 cleanup. A failed gate blocks this entire plan; do not weaken isolation,
@@ -47,12 +50,32 @@ schema validation, model, reasoning effort, or event checks.
 Tests in this plan are explicitly authorized by the Phase 2 design. Use
 focused tests; do not run the entire Firecrawl suite locally.
 
+Run prerequisites from repository root:
+
+```bash
+node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
+node scripts/codex-browser-gate/gate-characterization.test.mjs
+node scripts/codex-browser-gate/run.mjs --runs 3
+```
+
+Expected: deterministic suites pass; Gate0 reports the active PATH-selected
+SemVer, fixed `gpt-5.6-terra`/`medium`, three compatible runs, stable schema
+and feature hashes within the invocation, zero tools/approvals, and no
+surviving process or temporary root.
+
 ## Verified interfaces and host facts
 
-- `codex-cli 0.144.5` is `/home/mamba/.local/bin/codex`.
-- `codex app-server --strict-config --stdio` is the pinned process entrypoint.
-- `codex app-server generate-json-schema --experimental --out <dir>` emits the
-  V2 protocol bundle used by this plan.
+- The active Codex is the first executable named `codex` selected by inherited
+  `PATH`; do not scan install roots or choose the numerically greatest inactive
+  installation.
+- Gate0 captures selected path, resolved real path, filesystem device, inode,
+  and strictly parsed SemVer from exact one-line `codex-cli <semver>` output.
+  Schema generation, feature inspection, and all app-server runs use that same
+  captured executable. Identity drift before Gate0 PASS fails closed.
+- `<captured-codex> app-server --strict-config --stdio` is the process
+  entrypoint.
+- `<captured-codex> app-server generate-json-schema --experimental --out
+  <dir>` emits the V2 protocol bundle used by this plan.
 - Node 22 is already required by the code bundle. Gate0's checked-in
   `scripts/codex-browser-gate/schema-canonicalizer.mjs` is the only
   protocol-schema canonicalizer; no new package or host tool is required.
@@ -66,7 +89,8 @@ focused tests; do not run the entire Firecrawl suite locally.
 - [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs#root-objects-must-not-be-anyof-and-must-be-an-object)
   requires a root object and forbids root `anyOf`; the same guide supports the
   nested `anyOf` used for decision and operation variants.
-- The pinned live validator requires a scalar `type` even for fixed leaves.
+- The compatibility-gated live validator requires scalar `type` even for fixed
+  leaves.
   Wire literals therefore use typed one-value enums and never bare `const`.
 - `/usr/bin/runc` is 1.3.6; host uses cgroup v2 with CPU, memory, PIDs, and I/O
   controllers.
@@ -81,7 +105,7 @@ focused tests; do not run the entire Firecrawl suite locally.
 The adapter owns these constants; public input cannot override them:
 
 ```text
-Codex CLI: 0.144.5
+Codex CLI: rolling PATH-selected snapshot; identity locked per gate/build/run
 model: gpt-5.6-terra
 reasoning effort: medium
 prompt characters: 10,000
@@ -119,6 +143,18 @@ descriptor and use the existing page-oriented code contract.
 - Create `apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts`.
 - Modify `apps/api/src/lib/browser-runtime/execution-adapter.ts` to install the
   concrete socket implementation behind its existing interface.
+- Modify `apps/api/src/lib/browser-state/types.ts` to export the canonical
+  `adapterAuthorizationBindingSchema` beside
+  `AdapterAuthorizationBinding`.
+- Modify `apps/api/src/lib/browser-runtime/protocol.ts`,
+  `apps/api/src/lib/browser-runtime/orchestrator.ts`,
+  `apps/api/src/controllers/internal/browser-runs.ts`, and their focused tests
+  to consume the same authorization binding.
+- Modify `apps/api/src/controllers/v2/browser.ts`,
+  `apps/api/src/controllers/v2/browser.test.ts`,
+  `apps/api/src/controllers/v2/scrape-browser.ts`, and
+  `apps/api/src/controllers/v2/scrape-browser.test.ts` for sanitized public
+  adapter error responses.
 - Modify `apps/api/src/config.ts` for the private socket path.
 
 ### Host adapter and app-server protocol
@@ -149,13 +185,26 @@ descriptor and use the existing page-oriented code contract.
   `socket_contract.rs`, `jobs.rs`, `app_server_protocol.rs`,
   `decision_loop.rs`, `action_client.rs`, and `code_relay.rs`.
 
-### Pinned schemas, broker, and OCI bundles
+### Version-neutral compatibility contract, broker, and OCI bundles
 
-- Generate `host/browser-runtime/protocol/codex-app-server-0.144.5/` from the
-  installed CLI and check in every generated JSON schema.
+- Create
+  `host/browser-runtime/protocol/compatibility/required-v2-contract.json` as a
+  version-neutral authoritative compatibility contract. Do not check in active
+  generated app-server schemas or host identity.
+- Create `scripts/codex-browser-gate/app-server-compatibility.mjs` and
+  `app-server-compatibility.test.mjs` as the only loader/validator for that
+  contract.
+- Modify `scripts/codex-browser-gate/app-server-protocol.mjs`,
+  `gate-contract.mjs`, `lifecycle.mjs`, and
+  `gate-characterization.test.mjs` to remove independent
+  definition/field/vocabulary ownership, call the shared validator, and derive
+  safe rendered schema details from the parsed contract.
 - Reuse `scripts/codex-browser-gate/schema-canonicalizer.mjs` for Gate and host
   protocol identity.
-- Create `host/browser-runtime/protocol/SHA256SUMS`.
+- Create `scripts/codex-browser-gate/snapshot-protocol.mjs` and
+  `snapshot-protocol.test.mjs` for build-staging-only snapshot publication.
+- Create `host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS` covering only
+  version-neutral checked-in compatibility material.
 - Create
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`.
 - Create `apps/sandbox-broker/Cargo.toml`, `Cargo.lock`, and
@@ -191,7 +240,7 @@ Run each task's focused verification before staging. Then run its three commit
 commands separately:
 
 1. Exact `git add` command.
-2. `apps/api/.husky/_/pre-commit`.
+2. `sh apps/api/.husky/pre-commit`.
 3. One bare `git commit` with literal `-m` text.
 
 If hook formats files, re-stage exact paths, rerun hook, then commit. Never
@@ -204,22 +253,53 @@ combine commands or use `--no-verify`.
 - Create: `apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts`
 - Create: `apps/api/src/lib/browser-runtime/execution-adapter-client.ts`
 - Create: `apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts`
+- Modify: `apps/api/src/lib/browser-state/types.ts`
+- Modify: `apps/api/src/lib/browser-runtime/protocol.ts`
+- Modify: `apps/api/src/lib/browser-runtime/protocol.test.ts`
 - Modify: `apps/api/src/lib/browser-runtime/execution-adapter.ts`
+- Modify: `apps/api/src/lib/browser-runtime/execution-adapter.test.ts`
+- Modify: `apps/api/src/lib/browser-runtime/orchestrator.ts`
+- Modify: `apps/api/src/lib/browser-runtime/orchestrator.test.ts`
+- Modify: `apps/api/src/controllers/internal/browser-runs.ts`
+- Modify: `apps/api/src/controllers/internal/browser-runs.test.ts`
+- Modify: `apps/api/src/controllers/v2/browser.ts`
+- Modify: `apps/api/src/controllers/v2/browser.test.ts`
+- Modify: `apps/api/src/controllers/v2/scrape-browser.ts`
+- Modify: `apps/api/src/controllers/v2/scrape-browser.test.ts`
 - Modify: `apps/api/src/config.ts`
+- Modify: `apps/api/src/index.ts`
 
 - [ ] **Step 1: Write failing strict socket tests**
 
 Use a temporary `node:net` Unix server. Test prompt and code success,
-accepted-process observation, cancellation, abort, deadline, 2 MiB line cap,
-malformed JSON, mismatched request ID, duplicate terminal responses, and
-unknown fields.
+exact accepted authorization binding, awaited authorization acknowledgement,
+cancellation, abort, deadline, 2 MiB line cap, malformed JSON, mismatched
+request ID, duplicate accepted/terminal responses, and unknown fields. Prove
+no terminal result is consumed and the host peer receives no authorization
+acknowledgement until `input.onAccepted(binding)` resolves. Rejection destroys
+the connection and dispatches no host work.
 
 ```ts
 it("rejects unknown response fields", async () => {
-  const server = await fakeAdapter(socketPath, socket => {
+  const requestId = "0198f37a-5a9c-7b20-8000-000000000001";
+  // validBinding exactly echoes validPromptRequest job/supervisor IDs.
+  const server = await fakeAdapter(socketPath, async socket => {
+    await readFrame(socket);
+    socket.write(JSON.stringify({
+      version: 1,
+      requestId,
+      type: "accepted",
+      binding: validBinding,
+    }) + "\n");
+    expect(await readFrame(socket)).toEqual({
+      version: 1,
+      requestId,
+      type: "authorized",
+      binding: validBinding,
+    });
     socket.end(JSON.stringify({
       version: 1,
-      requestId: "request-1",
+      requestId,
       type: "result",
       body: validPromptResult,
       surprise: true,
@@ -227,13 +307,18 @@ it("rejects unknown response fields", async () => {
   });
   const adapter = createSocketExecutionAdapter({
     socketPath,
-    requestIdFactory: () => "request-1",
+    requestIdFactory: () => requestId,
   });
   await expect(adapter.executePromptRun(validPromptRequest, signal))
     .rejects.toMatchObject({ category: "adapter_protocol_error" });
   await server.close();
 });
 ```
+
+Keep a separate test where the peer sends `result` before `accepted`; expect
+`adapter_protocol_error`, no `onAccepted` call, and immediate connection
+destruction. Unknown-field coverage must not accidentally test only that
+premature-result rule.
 
 - [ ] **Step 2: Run tests and confirm red state**
 
@@ -247,117 +332,157 @@ Expected: FAIL because contract/client modules do not exist.
 
 - [ ] **Step 3: Define closed request and response schemas**
 
-Use strict Zod objects. Reuse `browserOperationKindSchema`,
-`promptLoopPolicyV1Schema`, and the other locked schemas from
-`apps/api/src/lib/browser-runtime/protocol.ts`; do not fork their definitions.
-The socket request serializes `deadline: Date` as ISO text. Prompt request must
-carry initial bounded state; it must not carry a model-selected endpoint,
-tool, credential, or policy.
+Use strict Zod objects. Export one canonical
+`adapterAuthorizationBindingSchema` from
+`apps/api/src/lib/browser-state/types.ts`, using `canonicalUuidSchema` for
+`adapterJobId` and `adapterSupervisorId` plus a positive safe integer for
+`adapterProcessId`. Infer `AdapterAuthorizationBinding` from that schema and
+reuse it in protocol, orchestrator, controller, socket client, and tests.
+
+Do not fork Browser runtime schemas in the socket module. Derive request bodies
+from canonical `promptRunInputSchema` and `codeRunInputSchema` by omitting only
+the non-serializable `onAccepted` callback and replacing `deadline: Date` with
+the same instant as ISO text. Reuse `promptRunResultSchema`,
+`codeRunResultSchema`, `runtimeUuidSchema`, and every observation/loop policy
+validator from `apps/api/src/lib/browser-runtime/protocol.ts`.
 
 ```ts
-export const boundedPageStateSchema = z.object({
-  url: z.string().url().max(8_192),
-  title: z.string().max(4_096),
-  snapshotExcerpt: z.string().max(40_000),
-}).strict();
+export const adapterAuthorizationBindingSchema = z.strictObject({
+  adapterJobId: canonicalUuidSchema,
+  adapterSupervisorId: canonicalUuidSchema,
+  adapterProcessId: z.number().int().positive().safe(),
+});
 
-export const initialObservationV1Schema = z.object({
-  version: z.literal(1), type: z.literal("initial"), sequence: z.literal(0),
-  page: boundedPageStateSchema,
-}).strict();
-export const actionResultObservationV1Schema = z.object({
-  version: z.literal(1), type: z.literal("action_result"),
-  sequence: z.number().int().min(1).max(25), actionId: z.string().uuid(),
-  actionKind: browserOperationKindSchema,
-  outcome: z.enum(["succeeded", "rejected_no_effect", "failed_no_effect"]),
-  result: z.unknown().optional(),
-  error: z.object({ category: z.string().max(64), message: z.string().max(2_048) }).strict().optional(),
-  page: boundedPageStateSchema,
-}).strict();
-export const observationV1Schema = z.discriminatedUnion("type", [
-  initialObservationV1Schema,
-  actionResultObservationV1Schema,
-]);
+export type AdapterAuthorizationBinding = z.infer<
+  typeof adapterAuthorizationBindingSchema
+>;
 
-export const promptRunRequestSchema = z.object({
-  runId: z.string().uuid(), adapterJobId: z.string().uuid(),
-  prompt: z.string().min(1).max(10_000), model: z.literal("gpt-5.6-terra"),
-  reasoningEffort: z.literal("medium"),
-  decisionSchemaVersion: z.literal(1), observationSchemaVersion: z.literal(1),
-  loopPolicy: promptLoopPolicyV1Schema,
-  deadline: z.string().datetime(),
-  initialObservation: initialObservationV1Schema,
-  correlationId: z.string().uuid(),
-}).strict();
+export const promptRunRequestSchema = promptRunInputSchema
+  .omit({ onAccepted: true, deadline: true })
+  .extend({ deadline: z.string().datetime({ offset: true }) });
+
+export const codeRunRequestSchema = codeRunInputSchema
+  .omit({ onAccepted: true, deadline: true })
+  .extend({ deadline: z.string().datetime({ offset: true }) });
 ```
 
-Wire envelopes are newline-delimited JSON, one request per connection:
+The derived prompt body therefore carries exactly `adapterJobId`,
+`adapterSupervisorId`, `capabilityToken`, `runId`, `prompt`,
+`initialObservation`, fixed `model: "gpt-5.6-terra"`, fixed
+`reasoningEffort: "medium"`, both schema versions, exact loop policy,
+`deadline`, and `correlationId`. The code body carries exactly
+`adapterJobId`, `adapterSupervisorId`, `capabilityToken`, `runId`, `language`,
+`source`, `deadline`, and `correlationId`. Public callers cannot add model,
+effort, command, endpoint, token, mount, environment, or network fields.
+Cancellation carries exactly canonical `runId` plus a sanitized non-empty
+reason capped at 256 characters. Request IDs are canonical UUIDs.
+
+Wire envelopes are newline-delimited JSON, one initial request per connection.
+After `accepted`, the API client sends one strict authorization
+acknowledgement only after its durable callback resolves:
 
 ```ts
 type AdapterRequest = {
   version: 1; requestId: string;
-  method: "execute_prompt" | "execute_code" | "cancel" | "health";
+  method: "execute_prompt" | "execute_code" | "cancel";
   body: unknown;
 };
 type AdapterResponse =
-  | { version: 1; requestId: string; type: "accepted"; processId: string }
+  | {
+      version: 1; requestId: string; type: "accepted";
+      binding: AdapterAuthorizationBinding;
+    }
   | { version: 1; requestId: string; type: "result"; body: unknown }
   | { version: 1; requestId: string; type: "error"; error: AdapterError };
+type AdapterAuthorizationAck = {
+  version: 1; requestId: string; type: "authorized";
+  binding: AdapterAuthorizationBinding;
+};
 ```
 
-Prompt result is the locked strict `PromptRunResult`: `{ output, turnCount,
-actionCount, usage, protocol }`. `output` is at most 256 KiB, `turnCount` is
-1..26, and `actionCount` is 0..25. `protocol` contains zero-enforced tool and
-approval event counts plus both schema versions. Except for serializing
-`deadline: Date` as ISO text, the socket preserves `PromptRunInput` and
-`PromptRunResult` field names unchanged. Extend the existing adapter interface
-with optional `observer.onAccepted(processId)`. API persists that ID before
-`starting -> running`.
+Accepted binding must echo the request's canonical job and supervisor UUIDs
+and add a positive OS PID. The client validates exact equality, awaits
+`input.onAccepted(binding)`, then sends the exact acknowledgement. The host
+must not launch Codex, execute source, open a relay, or send callbacks before
+that acknowledgement. `onAccepted` is mandatory for prompt and code inputs;
+there is no optional observer or opaque process string.
+
+Prompt result remains canonical locked `PromptRunResult`: `{ output,
+turnCount, actionCount, usage, protocol }`. Except for deadline serialization,
+socket bodies preserve canonical input/result field names unchanged.
 
 - [ ] **Step 4: Implement bounded socket transport**
 
 Use `net.createConnection`. Destroy connection on `AbortSignal`, set timeout
 to smaller of request deadline and 300 seconds, cap each line at 2 MiB, and
-accept exactly one terminal response after optional one `accepted`. Map absent
-socket to `codex_unavailable` for prompt and `sandbox_unavailable` for code.
+require exactly one `accepted` before one terminal response for prompt/code;
+cancellation accepts only its one terminal response. Map absent
+socket (`ENOENT` or `ECONNREFUSED`) to `codex_unavailable` for prompt and
+`sandbox_unavailable` for code. Permission, malformed framing/schema,
+identity mismatch, duplicate frames, premature terminal result, or any other
+protocol failure is `adapter_protocol_error`; controller mapping returns
+sanitized HTTP 502 from both public Browser and Scrape Browser controllers.
+Response body contains only the public category/message contract, never socket
+path, errno, framing bytes, stack, binding, or adapter stderr. Preserve
+existing typed 503 mappings for genuine
+`codex_unavailable` and `sandbox_unavailable`.
 
 Add:
 
 ```ts
-BROWSER_EXECUTION_ADAPTER_SOCKET: emptyStringAsUndefined(z.string()),
+BROWSER_EXECUTION_ADAPTER_SOCKET: emptyStringAsUndefined(
+  canonicalAbsoluteUnixSocketPathSchema,
+),
 ```
+
+The socket schema requires a lexically canonical absolute path:
+`path.isAbsolute(value)` and `path.normalize(value) === value`, with no NUL,
+`.`/`..`, duplicate separators, or trailing separator. Runtime configuration
+uses exactly `/run/firecrawl-adapter/adapter.sock`.
 
 Keep `unavailableExecutionAdapter` for disabled deployments and injected
 tests. Select socket adapter only when local browser runtime and socket are
-configured.
+configured. Wire it in `apps/api/src/index.ts`; no module-level default may
+silently choose the host adapter.
 
 - [ ] **Step 5: Run focused tests and build**
 
 ```bash
 pnpm --dir apps/api exec vitest run src/lib/browser-runtime/execution-adapter-client.test.ts
+pnpm --dir apps/api exec vitest run src/lib/browser-runtime/protocol.test.ts src/lib/browser-runtime/execution-adapter.test.ts src/lib/browser-runtime/orchestrator.test.ts src/controllers/internal/browser-runs.test.ts src/controllers/v2/browser.test.ts src/controllers/v2/scrape-browser.test.ts
 pnpm --dir apps/api build
 ```
 
-Expected: client tests PASS; TypeScript build exits 0.
+Expected: client and runtime tests PASS; both public controllers return
+sanitized 502 for `adapter_protocol_error`; TypeScript build exits 0.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add apps/api/src/config.ts apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts apps/api/src/lib/browser-runtime/execution-adapter-client.ts apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts
-apps/api/.husky/_/pre-commit
-git commit -m "feat: add browser execution adapter contract" -m "Define strict prompt, code, cancellation, and health messages for the
-private Unix adapter. Enforce deadlines, response bounds, and aborts
-before host execution is enabled."
+git add apps/api/src/config.ts apps/api/src/index.ts apps/api/src/lib/browser-state/types.ts apps/api/src/lib/browser-runtime/protocol.ts apps/api/src/lib/browser-runtime/protocol.test.ts apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts apps/api/src/lib/browser-runtime/execution-adapter-client.ts apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/lib/browser-runtime/orchestrator.test.ts apps/api/src/controllers/internal/browser-runs.ts apps/api/src/controllers/internal/browser-runs.test.ts apps/api/src/controllers/v2/browser.ts apps/api/src/controllers/v2/browser.test.ts apps/api/src/controllers/v2/scrape-browser.ts apps/api/src/controllers/v2/scrape-browser.test.ts
+sh apps/api/.husky/pre-commit
+git commit -m "feat: add browser execution adapter contract" -m "Define strict prompt, code, cancellation, and authorization messages
+for the private Unix adapter. Enforce durable accepted bindings,
+deadlines, response bounds, and aborts before host execution starts."
 ```
 
-## Task 2: Pin app-server V2 schemas and decision protocol
+## Task 2: Define app-server compatibility and decision protocol
 
 **Files:**
 
-- Create: `host/browser-runtime/protocol/codex-app-server-0.144.5/`
+- Create:
+  `host/browser-runtime/protocol/compatibility/required-v2-contract.json`
+- Create: `scripts/codex-browser-gate/app-server-compatibility.mjs`
+- Create: `scripts/codex-browser-gate/app-server-compatibility.test.mjs`
+- Create: `scripts/codex-browser-gate/snapshot-protocol.mjs`
+- Create: `scripts/codex-browser-gate/snapshot-protocol.test.mjs`
+- Modify: `scripts/codex-browser-gate/app-server-protocol.mjs`
+- Modify: `scripts/codex-browser-gate/gate-contract.mjs`
+- Modify: `scripts/codex-browser-gate/lifecycle.mjs`
+- Modify: `scripts/codex-browser-gate/gate-characterization.test.mjs`
 - Use: `scripts/codex-browser-gate/schema-canonicalizer.mjs`
 - Use: `scripts/codex-browser-gate/schema-canonicalizer.test.mjs`
-- Create: `host/browser-runtime/protocol/SHA256SUMS`
+- Create: `host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS`
 - Create:
   `host/browser-runtime/protocol/model-decision-envelope-v1.schema.json`
 - Create: `apps/browser-execution-adapter/Cargo.toml`
@@ -371,7 +496,27 @@ before host execution is enabled."
 Cover every operation, unknown/missing fields, malformed output, extra JSON,
 prompt/snapshot/observation/final bounds, canonical hashing, read-only versus
 side-effect classification, repeated read-only decisions, and repeated
-side-effect rejection.
+side-effect rejection. Add dependency-free compatibility tests proving the
+checked-in JSON contract is the only authority for required definitions,
+required fields, supported schema vocabulary, and event shapes.
+
+`app-server-compatibility.mjs` exports strict
+`loadRequiredV2Contract(path)` and
+`validateAppServerCompatibility(bundle, contract)`, plus
+`deriveSafeSchemaMismatchDetails(contract)`. Loader accepts only the closed
+version-neutral JSON shape and validator contains mechanics only; it must not
+embed a second required-definition list, required-field map, or
+supported-keyword set. The derived frozen allowlist contains contract-owned
+required-definition names plus fixed non-definition tokens emitted only by
+the shared validator (for example `required_field` and
+`schema_vocabulary`); names/tokens are not restated elsewhere.
+`app-server-protocol.mjs` calls this validator during Gate0 live schema
+loading/audit. `snapshot-protocol.mjs` calls the same validator before dynamic
+staging publication. `gate-contract.mjs` no longer exports
+`REQUIRED_SCHEMA_DEFINITIONS` or any schema-audit vocabulary.
+`lifecycle.mjs` no longer imports that deleted export; it obtains its safe
+schema-detail allowlist only through
+`deriveSafeSchemaMismatchDetails(loadRequiredV2Contract(...))`.
 
 ```rust
 #[test]
@@ -447,24 +592,85 @@ fn model_schema_rejects_untyped_or_const_literals() {
 }
 ```
 
+One table-driven Node mutation test starts from one compatible synthetic
+bundle and the checked-in contract, then separately changes a required
+definition, required event field, and supported schema-vocabulary entry.
+For each mutation, invoke the actual Gate schema-audit entry point and the
+actual snapshot/build validation entry point. Require identical sanitized
+`{ category: "codex_protocol_schema_mismatch", detail }` failures. Also mutate
+only a compatible release label in fixture metadata and require both paths to
+pass, proving JSON contract remains version-neutral.
+
+Feed each intended validator detail through the real lifecycle renderer:
+contract-derived required-definition detail and shared fixed field/vocabulary
+tokens must survive exactly. Feed an unexpected detail containing a fake path,
+token, and arbitrary definition name; renderer must emit only
+`codex_protocol_schema_mismatch\n` with the detail removed.
+`gate-characterization.test.mjs` also source-checks that `lifecycle.mjs`
+does not import `REQUIRED_SCHEMA_DEFINITIONS`, embed a copied definition-name
+set, or own another schema-detail vocabulary.
+
 - [ ] **Step 2: Run tests and confirm red state**
 
 ```bash
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml decision_loop
+node --check scripts/codex-browser-gate/lifecycle.mjs
+node scripts/codex-browser-gate/app-server-compatibility.test.mjs
+node scripts/codex-browser-gate/gate-characterization.test.mjs
+node scripts/codex-browser-gate/snapshot-protocol.test.mjs
 ```
 
-Expected: FAIL because crate and decision parser do not exist.
+Expected: FAIL because crate, decision parser, shared compatibility validator,
+and unified Gate/snapshot validation paths do not exist.
 
-- [ ] **Step 3: Generate and canonicalize exact 0.144.5 bundle**
+- [ ] **Step 3: Separate checked-in compatibility from build snapshots**
 
-First verify CLI version equals `codex-cli 0.144.5`; any other output exits
-78. Generate with the verified CLI command:
+Implement the dependency-free snapshot command using Gate0's existing
+executable resolver and canonicalizer. Resolve the first executable named
+`codex` from inherited `PATH` once. Capture
+its selected path, resolved real path, filesystem device, inode, and SemVer
+from strict one-line `codex-cli <semver>` output. Do not compare the SemVer to
+a pinned release, minimum, or allowlist. Generate through that captured
+executable, not a second PATH lookup:
 
 ```bash
 node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
-codex app-server generate-json-schema --experimental --out host/browser-runtime/protocol/codex-app-server-0.144.5
-node scripts/codex-browser-gate/schema-canonicalizer.mjs --canonicalize-tree host/browser-runtime/protocol/codex-app-server-0.144.5
+node --check scripts/codex-browser-gate/lifecycle.mjs
+node scripts/codex-browser-gate/app-server-compatibility.test.mjs
+node scripts/codex-browser-gate/gate-characterization.test.mjs
+node scripts/codex-browser-gate/snapshot-protocol.test.mjs
 ```
+
+`snapshot-protocol.mjs` uses the Gate's shared executable resolver, invokes
+`<captured-codex> app-server generate-json-schema --experimental`, and accepts
+only an absolute builder-owned `--out <staging>/protocol` outside the
+repository. It canonicalizes active schemas there and emits a strict staging
+manifest containing selected path, real path, device, inode, SemVer, complete
+schema inventory, and schema digest. Re-stat and re-run `--version` before
+atomic staging publication; any identity drift discards staging and exits 78.
+It refuses repository paths and never edits checked-in compatibility files.
+
+Checked-in `required-v2-contract.json` is the sole authority and contains only
+version-neutral required definitions, supported schema vocabulary, event
+fields, and normalization fixtures. It contains no generated active schema
+bytes, host paths, real paths, device/inode values, SemVer, or active schema
+digest. Tests feed synthetic compatible/incompatible bundles through
+`app-server-compatibility.mjs`. Gate0 schema loading and every snapshot/host
+build import that exact module and apply that exact parsed contract directly
+to live generated schemas; a compatible Codex upgrade requires no repository
+edit.
+
+Delete `REQUIRED_SCHEMA_DEFINITIONS` from `gate-contract.mjs` and replace
+`app-server-protocol.mjs`'s independent required-definition loop,
+required-field audit, and `SUPPORTED_SCHEMA_KEYWORDS` ownership with the
+shared validator result. Gate-specific code may consume validated definitions
+but cannot restate compatibility policy. Snapshot/build cannot import a
+different list or implement its own vocabulary walker. Replace
+`lifecycle.mjs`'s `SAFE_SCHEMA_DETAILS = new
+Set(REQUIRED_SCHEMA_DEFINITIONS)` with the shared derived frozen allowlist.
+Lifecycle rendering remains fail-closed: only contract-owned names and
+shared-validator fixed tokens are printable; every unexpected detail is
+discarded.
 
 Use only Gate0's shared dependency-free Node 22 lossless structural parser and
 serializer. It validates raw UTF-8 JSON and EOF, rejects BOMs, duplicate decoded
@@ -475,21 +681,22 @@ round-trips schema identity through JavaScript numbers or objects. This is not
 a partial RFC 8785/JCS implementation; numeric lexical changes may fail closed
 even when numerically equivalent.
 
-Canonicalize all generated schemas in place before checking them in. After
-Step 4 writes `model-decision-envelope-v1.schema.json`, canonicalize that file
-too, then sort repository-root-relative paths with the shared comparator and
-write SHA-256 lines over canonical on-disk bytes. `SHA256SUMS` therefore covers
-the bytes installed into `/opt/firecrawl/protocol`, not raw generator output.
+Canonicalize checked-in version-neutral compatibility and decision fixtures,
+then write unique sorted `COMPATIBILITY_SHA256SUMS` entries for only those
+files. Dynamic build staging separately writes its own `SHA256SUMS` over
+active canonical schema bytes and model-decision schema copy, and records that
+digest in its manifest. Neither checksum set contains itself or duplicate
+paths. Repository checksums never claim identity with installed active schema.
 
-The builder regenerates into a temporary directory, rejects non-JSON regular
-files, canonicalizes every generated `.json`, then maps both roots to sorted
-repository-relative paths and compares the complete file set and canonical
-bytes before checking `SHA256SUMS`. Added or removed files, array reordering,
-scalar or numeric-lexeme changes, duplicate keys, and malformed JSON still
-fail. The adapter validates messages against the canonical schemas but never
-re-canonicalizes them in Rust. Schema numeric constraints are converted only
-after explicit safe, finite, and range validation appropriate to the pinned
-bundle.
+The builder generates once into its private staging root through the captured
+identity, rejects non-JSON regular files, canonicalizes every generated
+`.json`, calls `validateAppServerCompatibility()` from the shared module, and
+records the complete dynamic inventory/digest. Added or removed files are accepted
+only when the structural contract still passes; malformed JSON, unsupported
+schema structure, duplicate keys, or identity drift fail. No active generated
+file is compared byte-for-byte with repository material. Adapter validates
+messages against the installed canonical schemas and manifest but never
+re-canonicalizes them in Rust.
 
 The shared tests were written before the production module in Gate Task 1.
 They cover ordinary and integer-index key order, the RFC 8785 UTF-16 ordering
@@ -497,8 +704,8 @@ vector only, arrays, changed scalars, unsafe integers, precision-sensitive
 decimals, decoded duplicate keys, invalid grammar, lone surrogates, equivalent
 string escapes, fatal raw UTF-8 decoding, BOM, overlong, truncated,
 isolated-continuation, and encoded-surrogate rejection, valid U+FFFD
-preservation, and repeated pinned-generation hashes. Run them before generating
-`SHA256SUMS` and from every builder protocol-verification path.
+preservation, repeated dynamic snapshot hashes, and version-neutral compatible
+upgrade fixtures. Run them from every builder protocol-verification path.
 
 - [ ] **Step 4: Define exact model decision and browser operations**
 
@@ -681,8 +888,10 @@ After writing the decision-envelope schema, run:
 node scripts/codex-browser-gate/schema-canonicalizer.mjs --canonicalize-file host/browser-runtime/protocol/model-decision-envelope-v1.schema.json
 ```
 
-Only then generate sorted repository-root-relative `SHA256SUMS` entries for
-the canonical protocol bundle and decision-envelope schema.
+Only then generate unique sorted repository-root-relative
+`COMPATIBILITY_SHA256SUMS` entries for the decision-envelope schema and
+version-neutral compatibility fixtures. Do not include dynamic identity,
+active schemas, or the checksum file itself.
 
 - [ ] **Step 5: Bound observations and build untrusted turn text**
 
@@ -711,19 +920,24 @@ values, internal addresses, raw headers, or stack traces.
 cargo fmt --manifest-path apps/browser-execution-adapter/Cargo.toml --check
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml decision_loop
 node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
-sha256sum --check host/browser-runtime/protocol/SHA256SUMS
+node --check scripts/codex-browser-gate/lifecycle.mjs
+node scripts/codex-browser-gate/app-server-compatibility.test.mjs
+node scripts/codex-browser-gate/gate-characterization.test.mjs
+node scripts/codex-browser-gate/snapshot-protocol.test.mjs
+sha256sum --check host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS
 ```
 
-Expected: format check and checksum verification exit 0; decision tests PASS.
+Expected: format and checksum checks exit 0; decision tests PASS; Gate and
+snapshot/build mutations fail identically through the shared validator.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add host/browser-runtime/protocol apps/browser-execution-adapter/Cargo.toml apps/browser-execution-adapter/Cargo.lock apps/browser-execution-adapter/src/lib.rs apps/browser-execution-adapter/src/protocol.rs apps/browser-execution-adapter/src/decision.rs apps/browser-execution-adapter/src/observations.rs apps/browser-execution-adapter/tests/decision_loop.rs
-apps/api/.husky/_/pre-commit
-git commit -m "feat: pin Codex structured decision protocol" -m "Check in the Codex 0.144.5 app-server V2 schemas and a closed browser
-decision schema. Bound untrusted observations and classify deterministic
-host actions without exposing a browser tool to the model."
+git add host/browser-runtime/protocol scripts/codex-browser-gate/app-server-compatibility.mjs scripts/codex-browser-gate/app-server-compatibility.test.mjs scripts/codex-browser-gate/app-server-protocol.mjs scripts/codex-browser-gate/gate-contract.mjs scripts/codex-browser-gate/gate-characterization.test.mjs scripts/codex-browser-gate/lifecycle.mjs scripts/codex-browser-gate/snapshot-protocol.mjs scripts/codex-browser-gate/snapshot-protocol.test.mjs apps/browser-execution-adapter/Cargo.toml apps/browser-execution-adapter/Cargo.lock apps/browser-execution-adapter/src/lib.rs apps/browser-execution-adapter/src/protocol.rs apps/browser-execution-adapter/src/decision.rs apps/browser-execution-adapter/src/observations.rs apps/browser-execution-adapter/tests/decision_loop.rs
+sh apps/api/.husky/pre-commit
+git commit -m "feat: define Codex structured decision protocol" -m "Check in a version-neutral app-server compatibility contract and closed
+browser decision schema. Validate Gate and build schemas through one
+shared authority without storing host identity or release-specific bytes."
 ```
 
 ## Task 3: Build one-process app-server observe/act loop
@@ -743,6 +957,9 @@ flight, definite no-effect continuation, exact final result,
 action/turn/byte/deadline limits,
 refusal, malformed JSON, duplicate decisions, premature EOF, cancellation,
 SIGTERM/SIGKILL, and complete cleanup.
+Also assert accepted binding echoes request job/supervisor UUIDs plus the
+broker-returned positive PID, and no app-server spawn occurs before the
+matching `authorized` acknowledgement.
 
 ```rust
 #[tokio::test]
@@ -798,14 +1015,15 @@ async fn unloaded_turn_items_use_item_completed_agent_message() {
 }
 ```
 
-The fake server validates the two notification `params` objects against
-`host/browser-runtime/protocol/codex-app-server-0.144.5/v2/ItemCompletedNotification.json`
-and
-`host/browser-runtime/protocol/codex-app-server-0.144.5/v2/TurnCompletedNotification.json`
-before writing them. Resolve both from the repository root and verify them via
-the checked-in `SHA256SUMS`; never depend on a temporary audit directory. Item
-completion uses Unix milliseconds; `startedAt`/`completedAt` use Unix seconds
-and `durationMs` uses milliseconds. The item notification carries both
+The fake tests build a private synthetic compatible schema bundle from
+version-neutral fixtures and validate both notification `params` objects
+against its `v2/ItemCompletedNotification.json` and
+`v2/TurnCompletedNotification.json`. They must not read a checked-in active
+Codex schema. Installed-host integration resolves those definitions only from
+the active generation under `/opt/firecrawl/protocol/codex-app-server/` and
+verifies them through that generation's dynamic manifest and `SHA256SUMS`.
+Item completion uses Unix milliseconds; `startedAt`/`completedAt` use Unix
+seconds and `durationMs` uses milliseconds. The item notification carries both
 `threadId` and `turnId`; turn completion carries `threadId` plus a `turn` whose
 `id` matches that item `turnId`.
 
@@ -874,7 +1092,8 @@ json!({"id": request_id, "method": "turn/start", "params": {
 ```
 
 The implementation builds JSON values, never string-replaces IDs or text.
-Validate every response/notification against checked-in V2 schemas. Buffer
+Validate every response/notification against the active installed V2 schemas
+whose digest is bound by the installed generation manifest. Buffer
 only bounded notifications for the current turn and correlate `threadId` and
 `turnId` wherever present. Exactly one active-turn `item/completed` must carry
 an `agentMessage` item with string `text`; that text is the authoritative model
@@ -950,11 +1169,16 @@ FIRECRAWL_MAX_PROMPT_RUNS=1
 FIRECRAWL_MAX_CODE_RUNS=2
 ```
 
-Socket is UID-owned mode `0600`. Generate process IDs as
-`adapter:<boot UUID>:<counter>`, emit `accepted` before waiting, reject duplicate
-active run IDs, and keep bounded terminal metadata. Cancellation wins once,
-interrupts active turn, terminates app-server/container, and compare-removes
-registry entry. Startup calls broker `cancel_owner` and never resumes a thread.
+Socket is UID-owned mode `0600`. Bind registry entries to the request's
+canonical job/supervisor UUIDs and broker-returned positive OS PID. Emit strict
+`accepted` with that exact `AdapterAuthorizationBinding`, then wait for the
+matching strict `authorized` acknowledgement before starting app-server/code,
+opening relay, or sending callbacks. EOF, mismatch, timeout, or error before
+authorization terminates the admitted process tree and removes the entry.
+Reject duplicate active run/job identities and keep bounded terminal metadata.
+Cancellation wins once, interrupts active turn, terminates
+app-server/container, and compare-removes registry entry. Startup calls broker
+`cancel_owner` and never resumes a thread.
 
 - [ ] **Step 7: Run adapter checks**
 
@@ -971,8 +1195,8 @@ limit, cancellation, and redaction tests PASS.
 
 ```bash
 git add apps/browser-execution-adapter/Cargo.toml apps/browser-execution-adapter/Cargo.lock apps/browser-execution-adapter/src apps/browser-execution-adapter/tests
-apps/api/.husky/_/pre-commit
-git commit -m "feat: add deterministic Codex browser loop" -m "Drive one pinned app-server process and ephemeral thread through strict
+sh apps/api/.husky/pre-commit
+git commit -m "feat: add deterministic Codex browser loop" -m "Drive one captured app-server process and ephemeral thread through strict
 schema-constrained turns. Authorize and execute each proposed browser
 action through durable API callbacks without model tools or relays."
 ```
@@ -1057,8 +1281,9 @@ Call `runc` without a shell:
 ```
 
 For Codex, map supplied pipes to standard FDs 0/1/2. Do not use
-`--preserve-fds`; there is no browser relay. Rootfs contains checked-in
-app-server schemas and checksum file. Set only fixed `CODEX_HOME`, `HOME`,
+`--preserve-fds`; there is no browser relay. Rootfs contains the build-staged
+active app-server schemas and dynamic checksum file bound to its installed
+manifest. Set only fixed `CODEX_HOME`, `HOME`,
 `PATH`, locale, and TLS certificate variables. Empty work directory is tmpfs.
 
 For code, preserve exactly relay FD 3 and start fixed
@@ -1113,17 +1338,19 @@ redaction tests PASS.
 
 ```bash
 git add apps/sandbox-broker host/browser-runtime/policy
-apps/api/.husky/_/pre-commit
+sh apps/api/.husky/pre-commit
 git commit -m "feat: add fixed runc sandbox broker" -m "Launch only checksummed Codex and code bundles through a root-owned
 peer-authenticated broker. Give Codex protocol pipes without a browser
 relay and retain the relay only for isolated code runners."
 ```
 
-## Task 5: Build pinned Codex and code-runner bundles
+## Task 5: Build rolling Codex and pinned code-runner bundles
 
 **Files:**
 
 - Create: `host/browser-runtime/bundles/codex/Dockerfile`
+- Create:
+  `host/browser-runtime/bundles/codex/codex-app-server.manifest.schema.json`
 - Create: `host/browser-runtime/bundles/code/Dockerfile`
 - Create: `host/browser-runtime/bundles/code/{job-relay-supervisor.mjs,run-node.mjs,run-python.py,run-bash.sh,agent-browser.py,cdp-relay.mjs}`
 - Create: `scripts/build-firecrawl-host`
@@ -1134,7 +1361,10 @@ relay and retain the relay only for isolated code runners."
 Use a temporary staging root. Assert deterministic manifests, fixed argv,
 exact executable set, schema/checksum inclusion, no MCP package/server, no
 Docker socket, non-root OCI identity, no Codex relay, and one-byte tamper
-rejection.
+rejection. Assert neutral artifact names, strict selected-path/realpath/device/
+inode/SemVer manifest fields, equality between Gate/schema/artifact identity,
+and drift rejection. Version labels must never enter artifact or directory
+names.
 
 Code fixtures:
 
@@ -1156,11 +1386,33 @@ scripts/test-firecrawl-host-install
 
 Expected: FAIL because builders and bundles do not exist.
 
-- [ ] **Step 3: Build Codex rootfs with strict config**
+- [ ] **Step 3: Build Codex rootfs from one captured rolling snapshot**
 
-Pin base image by digest and install exactly Codex 0.144.5. Copy the generated
-V2 schema bundle, `SHA256SUMS`, and model decision-envelope schema into
-`/opt/firecrawl/protocol`. Startup verifies all checksums before exec.
+Pin base image by digest. At builder entry, capture the first PATH-selected
+Codex executable's selected path, resolved real path, device, inode, and
+strict SemVer. Run Gate0 three times, regenerate schemas, and construct the
+Codex runtime artifact through only that captured executable identity.
+Revalidate all five identity fields between phases and immediately before
+atomic publication.
+
+Publish neutral staging artifacts named `codex-app-server.tar` and
+`codex-app-server.manifest.json`; never place SemVer in an artifact, schema
+directory, bundle directory, OCI bundle ID, or systemd path. The strict
+manifest records format version, all five source identity fields, artifact
+SHA-256, protocol SHA-256, feature SHA-256, Gate0 attestation SHA-256, fixed
+model `gpt-5.6-terra`, fixed effort `medium`, and build timestamp. Build the
+`codex-v1` rootfs from that artifact and copy
+`codex-app-server/`, `SHA256SUMS`, and
+`model-decision-envelope-v1.schema.json` into `/opt/firecrawl/protocol`.
+Startup verifies artifact, manifest, and protocol checksums before exec.
+Manifest/path inventories are sorted and unique; `SHA256SUMS` appears exactly
+once and is never included in its own checksum entries.
+
+This dynamic staging manifest becomes the installed generation's
+authoritative identity: it binds captured executable identity, live schema
+digest, feature digest, Codex artifact digest, rootfs digest, and fixed
+model/effort. Checked-in compatibility fixtures are inputs to validation only;
+their checksum is not an installed schema or bundle identity.
 
 Generated per-job config is exactly:
 
@@ -1202,6 +1454,7 @@ request_permissions_tool = false
 shell_snapshot = false
 shell_tool = false
 skill_mcp_dependency_install = false
+skill_search = false
 standalone_web_search = false
 tool_call_mcp_elicitation = false
 tool_suggest = false
@@ -1240,16 +1493,28 @@ retention.
 
 - [ ] **Step 5: Build without runtime Docker access**
 
-`scripts/build-firecrawl-host` verifies prerequisites and exact versions,
-runs the shared canonicalizer tests and Gate0 three times, regenerates protocol
-schemas into a temporary root, invokes the shared Node module before comparing
-their file set and canonical bytes with the checked-in bundle, builds release
-Rust binaries and pinned Dockerfiles, uses `docker create` plus `docker export`
-only during operator-controlled setup, removes containers immediately, and
-writes sorted SHA-256 manifests. Top manifest records format version, CLI
-version, protocol checksum, rootfs/policy hashes, Gate0 attestation hash, and
-build timestamp. It never copies auth. Rust tools verify and consume canonical
-on-disk bytes; they never implement a second canonicalizer.
+`scripts/build-firecrawl-host` verifies prerequisites and pinned non-Codex
+tool versions, captures one PATH-selected Codex identity, runs shared
+canonicalizer tests and Gate0 three times with that exact executable,
+regenerates protocol schemas into a temporary root, and applies the same
+lossless canonicalization followed by
+`app-server-compatibility.mjs` with checked-in
+`required-v2-contract.json`, exactly as Gate0 does. It does not compare the
+digest to a historical release or require a
+repository edit for compatible schema bytes. It then builds the neutral Codex
+artifact/manifest, release Rust binaries, and pinned Dockerfiles; uses
+`docker create` plus `docker export` only during operator-controlled setup;
+removes containers immediately; and writes sorted SHA-256 manifests for the
+captured staging snapshot.
+
+The top manifest embeds the complete Codex artifact manifest plus rootfs and
+policy hashes. The builder re-resolves the original inherited PATH and
+revalidates real path/device/inode/SemVer before publication. Any drift
+discards all staging. It never copies auth. Rust tools verify and consume
+canonical on-disk bytes; they never implement a second canonicalizer.
+`scripts/build-firecrawl-host --verify-installed-identity` is read-only and
+compares all five active PATH identity fields with the installed neutral
+manifest plus artifact/protocol checksums.
 
 - [ ] **Step 6: Run deterministic bundle tests**
 
@@ -1267,8 +1532,8 @@ files, Docker, or surviving children.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add host/browser-runtime/bundles scripts/build-firecrawl-host scripts/test-firecrawl-host-install
-apps/api/.husky/_/pre-commit
+git add host/browser-runtime/bundles/codex/Dockerfile host/browser-runtime/bundles/codex/codex-app-server.manifest.schema.json host/browser-runtime/bundles/code/Dockerfile host/browser-runtime/bundles/code/job-relay-supervisor.mjs host/browser-runtime/bundles/code/run-node.mjs host/browser-runtime/bundles/code/run-python.py host/browser-runtime/bundles/code/run-bash.sh host/browser-runtime/bundles/code/agent-browser.py host/browser-runtime/bundles/code/cdp-relay.mjs scripts/build-firecrawl-host scripts/test-firecrawl-host-install
+sh apps/api/.husky/pre-commit
 git commit -m "feat: add isolated browser execution bundles" -m "Build checksummed Codex app-server and Node, Python, and Bash root
 filesystems for fixed broker policies. Keep Codex tool-free while code
 runners use only a bounded session relay."
@@ -1289,8 +1554,10 @@ runners use only a bounded session relay."
 - [ ] **Step 1: Write failing installer/unit tests**
 
 Fake-root install tests assert absolute paths, owner/mode/group, adapter UID,
-manifest and protocol checksums, atomic generation switch, fixed unit text,
-and refusal of symlink/world-writable staging.
+neutral Codex artifact name, strict source-identity manifest and protocol
+checksums, atomic generation switch, fixed unit text, and refusal of
+symlink/world-writable staging. Reject a SemVer embedded in installed artifact
+or generation path names and any artifact/schema/manifest identity mismatch.
 
 ```ini
 [Socket]
@@ -1347,8 +1614,8 @@ would make them misleading.
 
 - [ ] **Step 4: Implement explicit root installer**
 
-`scripts/local-firecrawl install-host` requires TTY, builds staging, displays
-manifest/version/unit paths, then invokes exactly:
+Initial `scripts/local-firecrawl install-host` requires TTY, builds staging,
+displays manifest/version/unit paths, then invokes exactly:
 
 ```text
 sudo /home/mamba/work/firecrawl/host/browser-runtime/install-root.sh
@@ -1359,8 +1626,22 @@ sudo /home/mamba/work/firecrawl/host/browser-runtime/install-root.sh
 
 Root script revalidates hashes/modes, creates only `firecrawl-sandbox`, adds
 named user, installs a new generation atomically, reloads systemd, and enables
-broker socket and user linger. It never installs software, changes AppArmor,
-or exposes Docker. Unprivileged wrapper reloads/enables adapter unit.
+broker socket and user linger. Installed generation retains the neutral
+`codex-app-server` artifact and strict identity manifest as one inseparable
+unit. It never installs software, changes AppArmor, or exposes Docker.
+Unprivileged wrapper reloads/enables adapter unit.
+
+Implement one private shell helper
+`publish_host_from_staging_locked <absolute-staging> <initial|refresh>`.
+It is not a `scripts/local-firecrawl` subcommand, asserts the caller already
+owns the single lifecycle lock, accepts only builder-owned validated staging,
+uses exactly one `sudo` invocation (`sudo -n` for refresh) of the root
+installer, and performs complete revalidation plus atomic generation switch.
+Initial `install-host`, `start`, and `restart` call this helper directly under
+their existing lock. The wrapper must never invoke `scripts/local-firecrawl`
+from inside itself, reacquire its lock, or dispatch through `install-host`.
+Missing refresh elevation fails closed without prompting or starting an old
+generation.
 
 Uninstaller refuses active jobs, removes only installed host generations and
 units, and never deletes browser profiles, PostgreSQL, or MinIO.
@@ -1378,10 +1659,10 @@ Expected: fake install PASS; unit verification exits 0 without errors.
 
 ```bash
 git add host/browser-runtime/systemd host/browser-runtime/install-root.sh host/browser-runtime/uninstall-root.sh scripts/local-firecrawl scripts/test-firecrawl-host-install
-apps/api/.husky/_/pre-commit
+sh apps/api/.husky/pre-commit
 git commit -m "feat: install hardened browser host services" -m "Install fixed broker, bundles, protocol schemas, and user adapter through
-one explicit administrator operation. Keep normal lifecycle commands
-unprivileged and fail closed on policy or checksum drift."
+one administrator-controlled path. Keep steady-state lifecycle unprivileged
+and fail closed on policy, identity, or checksum drift."
 ```
 
 ## Task 7: Connect prompt actions and code relays to API policy
@@ -1391,6 +1672,8 @@ unprivileged and fail closed on policy or checksum drift."
 - Modify: `apps/api/src/lib/browser-runtime/execution-adapter.ts`
 - Modify: `apps/api/src/lib/browser-runtime/execution-adapter.test.ts`
 - Modify: `apps/api/src/lib/browser-runtime/orchestrator.ts`
+- Modify: `apps/api/src/lib/browser-runtime/orchestrator.test.ts`
+- Modify: `apps/api/src/controllers/internal/browser-runs.ts`
 - Modify: `apps/api/src/controllers/internal/browser-runs.test.ts`
 - Modify: `apps/browser-execution-adapter/src/{main,jobs,action_client,code_relay}.rs`
 - Modify: `apps/browser-execution-adapter/tests/{action_client,code_relay}.rs`
@@ -1430,8 +1713,10 @@ Expected: FAIL because concrete callback/relay integration is absent.
 
 - [ ] **Step 4: Connect prompt callback without relay**
 
-Adapter callback carries fixed bearer token from mode-0600 token file. API
-loads active prompt run, validates adapter job/process ID, atomically records
+Adapter callback carries fixed bearer token from mode-0600 token file plus
+canonical job UUID, supervisor UUID, and positive process-ID headers. API
+loads active prompt run, validates the complete persisted
+`AdapterAuthorizationBinding`, atomically records
 `prepared`, consumes one action/turn budget, checks normalized hash/effect,
 moves to `executing`, invokes Browser Service once, persists definite outcome,
 and returns bounded observation. Same identity/hash returns stored known
@@ -1465,8 +1750,8 @@ cancellation, and build checks PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/controllers/internal/browser-runs.test.ts apps/browser-execution-adapter/src/main.rs apps/browser-execution-adapter/src/jobs.rs apps/browser-execution-adapter/src/action_client.rs apps/browser-execution-adapter/src/code_relay.rs apps/browser-execution-adapter/tests/action_client.rs apps/browser-execution-adapter/tests/code_relay.rs
-apps/api/.husky/_/pre-commit
+git add apps/api/src/lib/browser-runtime/execution-adapter.ts apps/api/src/lib/browser-runtime/execution-adapter.test.ts apps/api/src/lib/browser-runtime/orchestrator.ts apps/api/src/lib/browser-runtime/orchestrator.test.ts apps/api/src/controllers/internal/browser-runs.ts apps/api/src/controllers/internal/browser-runs.test.ts apps/browser-execution-adapter/src/main.rs apps/browser-execution-adapter/src/jobs.rs apps/browser-execution-adapter/src/action_client.rs apps/browser-execution-adapter/src/code_relay.rs apps/browser-execution-adapter/tests/action_client.rs apps/browser-execution-adapter/tests/code_relay.rs
+sh apps/api/.husky/pre-commit
 git commit -m "feat: connect browser actions to durable policy" -m "Authorize schema-constrained Codex actions through the API action ledger
 and return only definite bounded observations. Retain session relays only
 for isolated code jobs and preserve terminal cleanup ownership."
@@ -1481,18 +1766,33 @@ for isolated code jobs and preserve terminal cleanup ownership."
 - Modify: `scripts/init-local-env.sh`
 - Create: `scripts/upgrade-local-env-browser-runtime`
 - Modify: `scripts/local-firecrawl`
+- Create: `scripts/local-firecrawl.test.mjs`
 - Create: `apps/api/src/cli/browser-runtime-drain.ts`
 - Create: `apps/api/src/cli/browser-runtime-status.ts`
 - Create: `apps/api/src/cli/browser-runtime-cli.test.ts`
+- Modify:
+  `apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts`
+- Modify: `apps/api/src/lib/browser-runtime/execution-adapter-client.ts`
+- Modify:
+  `apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts`
+- Modify: `apps/browser-execution-adapter/src/protocol.rs`
+- Modify: `apps/browser-execution-adapter/tests/socket_contract.rs`
 
 - [ ] **Step 1: Write failing lifecycle tests**
 
 Use fake `docker`, `systemctl`, `journalctl`, and sockets. Cover missing host
-install, manifest/protocol drift, stale socket, Codex auth, broker down,
+install, active PATH identity drift, automatic Gate/schema/artifact rebuild
+and atomic reinstall, manifest/protocol drift, stale socket, Codex auth, broker
+down,
 API-owned post-handoff migration failure, start/drain/forced stop/restart
-order, status counts, deep
-health, bounded/redacted logs, lock contention, env creation/upgrade, and
+order, status counts, strict shallow and deep health, bounded/redacted logs,
+lock contention, env creation/upgrade, and
 API-only published port.
+
+The fake wrapper trace must prove drift performs exactly one build and one
+`sudo -n` publication while the original lifecycle lock remains held. Fail
+the test on any nested `scripts/local-firecrawl` invocation, `install-host`
+redispatch, second lock acquisition, second build, or second root publication.
 
 - [ ] **Step 2: Run tests and confirm red state**
 
@@ -1545,8 +1845,23 @@ scripts/local-firecrawl {status|health} --json
 scripts/local-firecrawl logs [all|api|browser-service|adapter|broker] [correlation-id]
 ```
 
-`start`: verify installed manifests and protocol checksums; verify broker;
-create runtime/token; start adapter; verify shallow app-server/auth health;
+`start` and `restart` first capture active PATH-selected Codex identity and
+compare selected path, real path, device, inode, and SemVer against installed
+`codex-app-server.manifest.json`. On any drift they automatically run Gate0
+three times with that new captured identity, regenerate/canonicalize the
+dynamic staging schema snapshot, rebuild `codex-app-server.tar` and its
+manifest, rebuild the Codex rootfs, then call
+`publish_host_from_staging_locked` exactly once to atomically publish the new
+host generation.
+The same captured identity must survive every phase. If required privilege is
+unavailable or any phase fails, lifecycle fails closed before starting
+services; it never falls back to the old artifact or cloud execution.
+All work remains inside the original start/restart lifecycle lock; no nested
+wrapper command or lock acquisition is permitted.
+
+After identity convergence, `start` verifies installed artifact, manifest, and
+protocol checksums; verifies broker; creates runtime/token; starts adapter; and
+verifies strict shallow adapter health;
 start long-running dependencies and private Browser Service; run and verify
 the required MinIO bucket initialization after its long-running service is
 healthy; then start API. API alone performs control handoff first, then
@@ -1554,12 +1869,21 @@ migrations, durable-fence activation, recovery, snapshot, reconciliation, and
 readiness. After API readiness, run deep health. Normal start/restart never
 invokes migration sidecar.
 
+Shallow health is introduced here, not in Task 1. Add strict adapter method
+`health` with empty closed body and one closed result containing
+`version: 1`, `status: "ok"`, detected Codex SemVer, artifact SHA-256,
+protocol schema SHA-256, fixed model `gpt-5.6-terra`, and fixed reasoning
+effort `medium`. It performs no app-server/model call. Adapter answers only
+after checking its authenticated socket ownership, broker heartbeat, readable
+auth/config inputs, installed artifact manifest, and all local checksums.
+Malformed/extra response fields map to `adapter_protocol_error`/HTTP 502.
+
 Deep health verifies migration ledger, database, MinIO, disposable Browser
-Service session, adapter socket, exact Codex 0.144.5/model/effort, pinned V2
-schema checksum, one fake deterministic two-turn loop, broker isolation, no
-Codex relay, and API-only port policy. Installed health does not consume live
-model usage unless `--live-codex` is explicitly passed; install and acceptance
-run the three live Gate0 checks.
+Service session, adapter socket, exact installed rolling identity and fixed
+model/effort, V2 schema checksum, one fake deterministic two-turn loop, broker
+isolation, no Codex relay, and API-only port policy. Installed health does not
+consume live model usage unless `--live-codex` is explicitly passed; install,
+identity refresh, and acceptance run the three live Gate0 checks.
 
 `stop`: drain new runs; cancel app-server/code jobs; revoke grants and
 capabilities; close browsers and publish healthy profiles; stop API/Browser
@@ -1568,7 +1892,9 @@ profile generation. `restart` performs full stop/start without deleting
 volumes.
 
 JSON status is closed and includes `codexCliVersion`,
-`codexProtocolSchemaSha256`, `activePromptJobs`, `activeCodeJobs`,
+`codexExecutablePath`, `codexResolvedPath`, `codexDevice`, `codexInode`,
+`codexArtifactSha256`, `codexProtocolSchemaSha256`, `activePromptJobs`,
+`activeCodeJobs`,
 `activeBrowserSessions`, `activeCapabilities`, `activeProxyGrants`,
 `activeWriterLeases`, `unknownActionOutcomes`, `orphanProcesses`, and
 `firecrawlCloudFallbackAttempts`. Logs cap 200 lines and redact secrets/page
@@ -1587,13 +1913,15 @@ pnpm --dir apps/api build
 Expected: shell/Compose validation exits 0; lifecycle tests PASS; API builds.
 Rendered default Compose keeps migration sidecar behind an explicit profile,
 API does not depend on it, and fake-wrapper trace proves Browser Service and
-MinIO initialization precede API-owned handoff/migrations/readiness.
+MinIO initialization precede API-owned handoff/migrations/readiness. Drift
+trace proves one lock, one build, one direct helper publication, and zero
+nested wrapper invocations.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add compose.local.yaml .env.example.local scripts/init-local-env.sh scripts/upgrade-local-env-browser-runtime scripts/local-firecrawl apps/api/src/cli/browser-runtime-drain.ts apps/api/src/cli/browser-runtime-status.ts apps/api/src/cli/browser-runtime-cli.test.ts
-apps/api/.husky/_/pre-commit
+git add compose.local.yaml .env.example.local scripts/init-local-env.sh scripts/upgrade-local-env-browser-runtime scripts/local-firecrawl scripts/local-firecrawl.test.mjs apps/api/src/cli/browser-runtime-drain.ts apps/api/src/cli/browser-runtime-status.ts apps/api/src/cli/browser-runtime-cli.test.ts apps/api/src/lib/browser-runtime/execution-adapter-contracts.ts apps/api/src/lib/browser-runtime/execution-adapter-client.ts apps/api/src/lib/browser-runtime/execution-adapter-client.test.ts apps/browser-execution-adapter/src/protocol.rs apps/browser-execution-adapter/tests/socket_contract.rs
+sh apps/api/.husky/pre-commit
 git commit -m "feat: orchestrate local browser runtime" -m "Manage Compose, Browser Service, API-owned migrations, app-server
 adapter, and sandbox broker as one locked lifecycle.
 
@@ -1673,7 +2001,7 @@ tests PASS.
 
 ```bash
 git add scripts/local-firecrawl-backup scripts/local-firecrawl-restore apps/api/src/cli/browser-backup-validation.test.ts LOCAL_DEPLOYMENT.md
-apps/api/.husky/_/pre-commit
+sh apps/api/.husky/pre-commit
 git commit -m "feat: back up durable browser profiles" -m "Capture PostgreSQL, MinIO, and committed browser profiles as one locked
 generation and validate all three before restore. Exclude ephemeral
 Codex processes, credentials, and runtime state."
@@ -1706,16 +2034,21 @@ zero app-server tool/approval events and no broker Codex relay descriptor.
 
 ```bash
 node scripts/codex-browser-gate/schema-canonicalizer.test.mjs
-sha256sum --check host/browser-runtime/protocol/SHA256SUMS
+node scripts/codex-browser-gate/app-server-compatibility.test.mjs
+node scripts/codex-browser-gate/gate-characterization.test.mjs
+node scripts/codex-browser-gate/snapshot-protocol.test.mjs
+sha256sum --check host/browser-runtime/protocol/COMPATIBILITY_SHA256SUMS
+scripts/build-firecrawl-host --verify-installed-identity
 cargo test --manifest-path apps/sandbox-broker/Cargo.toml
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml
 pnpm --dir apps/api exec vitest run src/lib/browser-runtime src/controllers/internal/browser-runs.test.ts src/cli/browser-runtime-cli.test.ts
 node scripts/codex-browser-gate/run.mjs --runs 3
 ```
 
-Expected: all deterministic tests PASS; Gate0 reports three exact two-turn
-runs, one marker each, cached matching callbacks, mismatch rejection, exact
-finals, zero tool/approval events, and no leftover processes/directories.
+Expected: all deterministic tests PASS; installed artifact/schema identity
+matches active PATH selection; Gate0 reports three exact two-turn runs, one
+marker each, cached matching callbacks, mismatch rejection, exact finals,
+zero tool/approval events, and no leftover processes/directories.
 
 - [ ] **Step 3: Perform explicit host install and start**
 
@@ -1809,7 +2142,7 @@ orphan process/lock/grant; only API port published; only Task 10 files differ.
 
 ```bash
 git add apps/api/package.json apps/api/src/__tests__/snips/v2/scrape-browser.test.ts apps/api/src/__tests__/snips/v2/browser-runtime-security.test.ts scripts/accept-firecrawl-mcp-clients.mjs LOCAL_DEPLOYMENT.md
-apps/api/.husky/_/pre-commit
+sh apps/api/.husky/pre-commit
 git commit -m "test: verify isolated browser runtime acceptance" -m "Exercise deterministic Codex actions, code Interact, direct Browser APIs,
 restart replay, stop cleanup, and hostile inputs through local services.
 Validate fresh public MCP clients with no provider fallback."
@@ -1818,8 +2151,23 @@ Validate fresh public MCP clients with no provider fallback."
 ## Final verification checklist
 
 - [ ] `git diff --check` exits 0.
-- [ ] `SHA256SUMS` matches the shared losslessly canonicalized Codex 0.144.5 V2
-      schema bundle.
+- [ ] `COMPATIBILITY_SHA256SUMS` covers only version-neutral checked-in
+      normalization, compatibility, and model-decision fixtures.
+- [ ] `required-v2-contract.json` is the only definition/field/vocabulary
+      authority; Gate0 and snapshot/build both call
+      `app-server-compatibility.mjs`, and mutation tests prove identical
+      failures.
+- [ ] Lifecycle safe schema details derive from that parsed contract/shared
+      validator tokens; intended details survive and unexpected details are
+      redacted.
+- [ ] Installed dynamic manifest and `SHA256SUMS` bind the captured live V2
+      schema inventory/digest, neutral Codex artifact, and rootfs; no active
+      generated schema bytes or host identity are checked in.
+- [ ] Gate0, dynamic build snapshot, neutral Codex artifact, installed rootfs,
+      and shallow health report one selected path/realpath/device/inode/SemVer
+      identity with fixed `gpt-5.6-terra`/`medium`.
+- [ ] Start/restart automatically gates, regenerates, rebuilds, and atomically
+      reinstalls after active PATH identity drift.
 - [ ] Three consecutive live Gate0 structured-action runs pass.
 - [ ] Adapter Cargo format, Clippy, and tests pass.
 - [ ] Broker Cargo format, Clippy, and tests pass.

@@ -213,11 +213,16 @@ async function runCrossModuleHardeningSelfTest() {
   const featureFixture = [...disabledLines, ...reviewedLines].join("\n");
   assert.equal(
     hashFeatureInventory(featureFixture),
-    "543779f017f80fa9ceb4f1b99b1b2b1734dad37c5237506d000a47fdd3890c2b",
+    "c7565da62fad92c89d24aa7caed1dbcf32bdeb08fa3a8bfafeb9e5c5e9d9532c",
   );
   for (const output of [
     `${featureFixture}\n${disabledLines[0]}`,
     [...disabledLines.slice(1), ...reviewedLines].join("\n"),
+    [
+      ...disabledLines.filter(line => !line.startsWith("skill_search  ")),
+      "skill_search  stable  true",
+      ...reviewedLines,
+    ].join("\n"),
     `${featureFixture}\nunreviewed_tool  stable  true`,
     "",
   ]) {

@@ -1634,6 +1634,7 @@ request_permissions_tool = false
 shell_snapshot = false
 shell_tool = false
 skill_mcp_dependency_install = false
+skill_search = false
 standalone_web_search = false
 tool_call_mcp_elicitation = false
 tool_suggest = false
@@ -1672,6 +1673,7 @@ assert.deepEqual([...contract.DISABLED_FEATURES], [
   "shell_snapshot",
   "shell_tool",
   "skill_mcp_dependency_install",
+  "skill_search",
   "standalone_web_search",
   "tool_call_mcp_elicitation",
   "tool_suggest",
@@ -1924,7 +1926,7 @@ const reviewedLines = [...contract.REVIEWED_ENABLED_NON_TOOL_FEATURES].map(
 const featureFixture = [...disabledLines, ...reviewedLines].join("\n");
 assert.equal(
   hashFeatureInventory(featureFixture),
-  "543779f017f80fa9ceb4f1b99b1b2b1734dad37c5237506d000a47fdd3890c2b",
+  "c7565da62fad92c89d24aa7caed1dbcf32bdeb08fa3a8bfafeb9e5c5e9d9532c",
 );
 
 function assertFeatureSurfaceChanged(output) {
@@ -1940,6 +1942,13 @@ function assertFeatureSurfaceChanged(output) {
 assertFeatureSurfaceChanged(`${featureFixture}\n${disabledLines[0]}`);
 assertFeatureSurfaceChanged(
   [...disabledLines.slice(1), ...reviewedLines].join("\n"),
+);
+assertFeatureSurfaceChanged(
+  [
+    ...disabledLines.filter(line => !line.startsWith("skill_search  ")),
+    "skill_search  stable  true",
+    ...reviewedLines,
+  ].join("\n"),
 );
 assertFeatureSurfaceChanged(`${featureFixture}\nunreviewed_tool  stable  true`);
 assertFeatureSurfaceChanged("");
