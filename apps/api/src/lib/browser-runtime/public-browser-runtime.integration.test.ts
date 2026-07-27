@@ -13,6 +13,7 @@ import {
 } from "vitest";
 
 import { runApplicationMigrations } from "../../db/migrate";
+import type { ClosedSessionV1 } from "../scrape-interact/browser-service-contracts";
 import type { BrowserExecutionAdapter } from "./execution-adapter";
 import { createPublicBrowserRuntime } from "./public-browser-runtime";
 import type {
@@ -84,18 +85,20 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
   const gate = gateFor(pool);
   const secondGate = gateFor(secondPool);
   const runtimeSessions = new Map<string, { sessionVersion: number }>();
-  const closeSession = vi.fn(async (runtimeSessionId: string) => {
-    const session = runtimeSessions.get(runtimeSessionId);
-    if (!session) throw new Error("missing runtime");
-    runtimeSessions.delete(runtimeSessionId);
-    return {
-      version: 1 as const,
-      runtimeSessionId,
-      closed: true as const,
-      sessionVersion: session.sessionVersion,
-      preparedProfile: null,
-    };
-  });
+  const closeSession = vi.fn(
+    async (runtimeSessionId: string): Promise<ClosedSessionV1> => {
+      const session = runtimeSessions.get(runtimeSessionId);
+      if (!session) throw new Error("missing runtime");
+      runtimeSessions.delete(runtimeSessionId);
+      return {
+        version: 1 as const,
+        runtimeSessionId,
+        closed: true as const,
+        sessionVersion: session.sessionVersion,
+        preparedProfile: null,
+      };
+    },
+  );
   const browserClient = {
     createSession: vi.fn(async () => {
       const runtimeSessionId = randomUUID();
@@ -664,6 +667,101 @@ describeWithDatabase("public browser runtime PostgreSQL contract", () => {
     );
     expect(row.rows[0]?.state).toBe("destroyed");
     expect(browserClient.finalizeProfile).not.toHaveBeenCalled();
+  });
+
+  it("omits Browser-only byte size from the strict finalize payload", async () => {
+    const created = await createSession({
+      profile: { name: "writer-finalize", saveChanges: true },
+    });
+    const row = await pool.query<{
+      browser_id: string;
+      profile_id: string;
+      runtime_epoch: number;
+    }>(
+      `SELECT browser_id, profile_id, runtime_epoch
+         FROM browser_sessions
+        WHERE id = $1`,
+      [created.id],
+    );
+    const session = row.rows[0]!;
+    const prepared = {
+      profileId: session.profile_id,
+      generationId: randomUUID(),
+      checksum: "c".repeat(64),
+      byteSize: 4096,
+      prepareToken: Buffer.alloc(32, 3).toString("base64url"),
+    };
+    closeSession.mockResolvedValueOnce({
+      version: 1,
+      runtimeSessionId: session.browser_id,
+      closed: true,
+      sessionVersion: session.runtime_epoch,
+      preparedProfile: prepared,
+    });
+
+    await expect(
+      runtime.stopSession(ownerId, created.id),
+    ).resolves.toMatchObject({ stopped: true });
+    expect(browserClient.finalizeProfile).toHaveBeenCalledWith(
+      prepared.generationId,
+      {
+        version: 1,
+        profileId: prepared.profileId,
+        generationId: prepared.generationId,
+        checksum: prepared.checksum,
+        prepareToken: prepared.prepareToken,
+      },
+      expect.any(Object),
+    );
+  });
+
+  it("omits Browser-only byte size from the strict discard payload", async () => {
+    const created = await createSession({
+      profile: { name: "writer-discard", saveChanges: true },
+    });
+    const row = await pool.query<{
+      browser_id: string;
+      profile_id: string;
+      runtime_epoch: number;
+    }>(
+      `SELECT browser_id, profile_id, runtime_epoch
+         FROM browser_sessions
+        WHERE id = $1`,
+      [created.id],
+    );
+    const session = row.rows[0]!;
+    const prepared = {
+      profileId: session.profile_id,
+      generationId: randomUUID(),
+      checksum: "d".repeat(64),
+      byteSize: 8192,
+      prepareToken: Buffer.alloc(32, 4).toString("base64url"),
+    };
+    closeSession.mockResolvedValueOnce({
+      version: 1,
+      runtimeSessionId: session.browser_id,
+      closed: true,
+      sessionVersion: session.runtime_epoch,
+      preparedProfile: prepared,
+    });
+    browserClient.finalizeProfile.mockRejectedValueOnce(
+      new Error("finalize failed"),
+    );
+
+    await expect(runtime.stopSession(ownerId, created.id)).rejects.toThrow(
+      "Browser stop cleanup failed",
+    );
+    expect(browserClient.discardProfile).toHaveBeenCalledWith(
+      prepared.generationId,
+      {
+        version: 1,
+        profileId: prepared.profileId,
+        generationId: prepared.generationId,
+        checksum: prepared.checksum,
+        prepareToken: prepared.prepareToken,
+      },
+      expect.any(Object),
+    );
   });
 
   it.each([

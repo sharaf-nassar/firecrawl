@@ -8,12 +8,17 @@ import { config } from "../../config";
 import { db } from "../../db/connection";
 import * as schema from "../../db/schema";
 import { runWithBrowserStateFilesystemContext } from "../browser-state/filesystem-store-internal";
-import {
-  BrowserStateFilesystem,
-  canonicalizeBrowserStateCheckpoint,
-} from "../browser-state/filesystem-store";
+import { canonicalizeBrowserStateCheckpoint } from "../browser-state/filesystem-store";
 import type { BrowserStartupGate } from "../browser-runtime/startup-gate";
-import { inspectBrowserStateProcessIdentity } from "../browser-state/process-identity";
+import type { BrowserStateMutationLease } from "../browser-runtime/startup-gate";
+import type {
+  BrowserServiceClient,
+  BrowserServiceRequestContext,
+} from "./browser-service-client";
+import {
+  inspectBrowserStateProcessIdentity,
+  readBrowserStateProcessIdentity,
+} from "../browser-state/process-identity";
 import { logger as rootLogger } from "../logger";
 import {
   normalizeReplayEnvelope,
@@ -31,6 +36,16 @@ type JsonValue =
   | string
   | JsonValue[]
   | { [key: string]: JsonValue };
+
+type ReplayFilesystemTestDependency = {
+  writeCheckpoint(
+    ownerId: string,
+    scrapeId: string,
+    storageState: unknown,
+  ): Promise<{ pathId: string; byteSize: number; checksum: string }>;
+  readCheckpoint(pathId: string, expectedChecksum: string): Promise<unknown>;
+  delete(pathId: string): Promise<void>;
+};
 
 export interface ReplayCheckpointCaptureV1 {
   version: 1;
@@ -176,7 +191,7 @@ async function lockScrape(
 
 async function recoverCleanupIntents(
   tx: ReplayTransaction,
-  filesystem: BrowserStateFilesystem,
+  filesystem: ReplayFilesystemTestDependency,
   scrapeId: string,
   excludedIntentId?: string,
 ): Promise<void> {
@@ -251,7 +266,7 @@ async function recoverCleanupIntents(
 }
 
 async function recoverScrapeCleanup(
-  filesystem: BrowserStateFilesystem,
+  filesystem: ReplayFilesystemTestDependency,
   scrapeId: string,
   excludedIntentId?: string,
 ): Promise<void> {
@@ -262,7 +277,7 @@ async function recoverScrapeCleanup(
 }
 
 async function recoverWithoutMaskingPrimary(
-  filesystem: BrowserStateFilesystem,
+  filesystem: ReplayFilesystemTestDependency,
   scrapeId: string,
   prepared: Pick<
     PreparedCheckpoint,
@@ -315,7 +330,6 @@ async function recoverWithoutMaskingPrimary(
 
 type BrowserRuntimeConfig = typeof config & {
   LOCAL_BROWSER_SERVICE_ENABLED?: boolean;
-  LOCAL_BROWSER_STATE_ROOT?: string;
 };
 
 function unavailable(fields: string[]): ReplayResolution {
@@ -336,20 +350,26 @@ function isRedactedPersistedValue(value: unknown): boolean {
 
 function runtimeConfig(): {
   enabled: boolean;
-  root: string;
   retentionDays: number;
 } {
   const source = config as BrowserRuntimeConfig;
   return {
     enabled: source.LOCAL_BROWSER_SERVICE_ENABLED === true,
-    root: source.LOCAL_BROWSER_STATE_ROOT ?? "/var/lib/firecrawl-browser",
     retentionDays: source.LOCAL_RECORD_RETENTION_DAYS,
   };
 }
 
+function assertLegacyFilesystemTestRuntime(): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new ReplayUnavailableError();
+  }
+}
+
 async function persistScrapeReplayStateUnderAuthority(
   input: PersistScrapeReplayStateInput,
+  filesystem: ReplayFilesystemTestDependency,
 ): Promise<ReplayPersistenceResult> {
+  assertLegacyFilesystemTestRuntime();
   const runtime = runtimeConfig();
   if (!runtime.enabled) return { persisted: false, reason: "disabled" };
   if (input.zeroDataRetention) return { persisted: false, reason: "zdr" };
@@ -371,9 +391,9 @@ async function persistScrapeReplayStateUnderAuthority(
   );
 
   let prepared: PreparedCheckpoint | undefined;
-  const filesystem = new BrowserStateFilesystem(runtime.root);
-
-  let written: Awaited<ReturnType<BrowserStateFilesystem["writeCheckpoint"]>>;
+  let written: Awaited<
+    ReturnType<ReplayFilesystemTestDependency["writeCheckpoint"]>
+  >;
 
   try {
     written = await runWithBrowserStateFilesystemContext(
@@ -728,42 +748,534 @@ async function persistScrapeReplayStateUnderAuthority(
   return { persisted: true };
 }
 
+type ReplayByteAuthority = Pick<
+  BrowserServiceClient,
+  "persistReplayCheckpoint" | "readReplayCheckpoint" | "deleteReplayCheckpoint"
+>;
+
+function serviceContext(
+  lease: BrowserStateMutationLease,
+): BrowserServiceRequestContext {
+  return {
+    correlationId: randomUUID(),
+    deadline: new Date(Date.now() + 30_000),
+    signal: AbortSignal.timeout(30_000),
+    processNonce: lease.binding.processNonce,
+    controlGenerationNonce: lease.binding.controlGenerationNonce,
+  };
+}
+
+async function persistScrapeReplayStateThroughBrowserService(
+  input: PersistScrapeReplayStateInput,
+  authority: ReplayByteAuthority,
+  lease: BrowserStateMutationLease,
+): Promise<ReplayPersistenceResult> {
+  const runtime = runtimeConfig();
+  if (!runtime.enabled) return { persisted: false, reason: "disabled" };
+  if (input.zeroDataRetention) return { persisted: false, reason: "zdr" };
+  if (!input.replayCheckpoint) {
+    return { persisted: false, reason: "checkpoint_unavailable" };
+  }
+  const normalized = normalizeReplayEnvelope({
+    url: input.url,
+    options: input.options,
+    callerOrigin: input.callerOrigin,
+    browserSettings: input.replayCheckpoint.browserSettings,
+  });
+  if (normalized.kind === "error") {
+    return { persisted: false, reason: "checkpoint_unavailable" };
+  }
+  const canonical = canonicalizeBrowserStateCheckpoint(
+    input.replayCheckpoint.storageState,
+  );
+  const initial = await db.transaction(async tx => {
+    await lockScrape(tx, input.scrapeId);
+    const [ownedScrape] = await tx
+      .select({ id: schema.scrapes.id })
+      .from(schema.scrapes)
+      .innerJoin(
+        schema.requests,
+        eq(schema.requests.id, schema.scrapes.request_id),
+      )
+      .where(
+        and(
+          eq(schema.scrapes.id, input.scrapeId),
+          eq(schema.scrapes.request_id, input.requestId),
+          eq(schema.scrapes.team_id, input.ownerId),
+          eq(schema.requests.id, input.requestId),
+          eq(schema.requests.team_id, input.ownerId),
+        ),
+      )
+      .limit(1);
+    if (!ownedScrape) throw new ReplayOwnershipError();
+    const [existing] = await tx
+      .select({
+        id: schema.browser_replay_checkpoints.id,
+        requestId: schema.browser_replay_checkpoints.request_id,
+        ownerId: schema.browser_replay_checkpoints.owner_id,
+        statePath: schema.browser_replay_checkpoints.state_path,
+        finalUrl: schema.browser_replay_checkpoints.final_url,
+        fingerprint: schema.browser_replay_checkpoints.fingerprint,
+        checksum: schema.browser_replay_checkpoints.checksum,
+        byteSize: schema.browser_replay_checkpoints.byte_size,
+        fileDeletedAt: schema.browser_replay_checkpoints.file_deleted_at,
+        envelope: schema.browser_replay_envelopes.envelope,
+      })
+      .from(schema.browser_replay_checkpoints)
+      .innerJoin(
+        schema.browser_replay_envelopes,
+        eq(
+          schema.browser_replay_envelopes.scrape_id,
+          schema.browser_replay_checkpoints.scrape_id,
+        ),
+      )
+      .where(eq(schema.browser_replay_checkpoints.scrape_id, input.scrapeId))
+      .limit(1);
+    return existing;
+  });
+  const context = serviceContext(lease);
+  const isSameAuthority =
+    initial !== undefined &&
+    initial.requestId === input.requestId &&
+    initial.ownerId === input.ownerId &&
+    initial.fileDeletedAt === null &&
+    initial.statePath !== null &&
+    initial.finalUrl === input.replayCheckpoint.finalUrl &&
+    isDeepStrictEqual(
+      initial.fingerprint,
+      input.replayCheckpoint.fingerprint,
+    ) &&
+    initial.checksum === canonical.checksum &&
+    initial.byteSize === canonical.byteSize &&
+    isDeepStrictEqual(initial.envelope, normalized.envelope);
+  if (isSameAuthority) {
+    try {
+      const loaded = await authority.readReplayCheckpoint(
+        {
+          version: 1,
+          statePath: initial.statePath!,
+          checksum: canonical.checksum,
+          byteSize: canonical.byteSize,
+        },
+        context,
+      );
+      if (
+        isDeepStrictEqual(
+          loaded.storageState,
+          input.replayCheckpoint.storageState,
+        )
+      ) {
+        return { persisted: true };
+      }
+    } catch {
+      // A missing retained file is repaired at its existing authority path.
+    }
+  }
+  const checkpointId = isSameAuthority ? initial!.id : randomUUID();
+  const statePath = `replay/${input.ownerId}/${input.scrapeId}/${checkpointId}.json`;
+  const cleanupIntentId = randomUUID();
+  const writerLease = randomUUID();
+  const writerIdentity = await readBrowserStateProcessIdentity();
+  await db.transaction(async tx => {
+    await lockScrape(tx, input.scrapeId);
+    await tx
+      .insert(schema.browser_replay_checkpoint_cleanup_intents)
+      .values({
+        id: cleanupIntentId,
+        scrape_id: input.scrapeId,
+        owner_id: input.ownerId,
+        state_path: statePath,
+        checksum: canonical.checksum,
+        state: "preparing",
+        writer_lease: writerLease,
+        writer_pid: writerIdentity.pid,
+        writer_boot_id: writerIdentity.bootId,
+        writer_start_time: writerIdentity.startTime,
+        heartbeat_at: new Date().toISOString(),
+      })
+      .onConflictDoNothing();
+    const [ownedIntent] = await tx
+      .select({ id: schema.browser_replay_checkpoint_cleanup_intents.id })
+      .from(schema.browser_replay_checkpoint_cleanup_intents)
+      .where(
+        and(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            cleanupIntentId,
+          ),
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.writer_lease,
+            writerLease,
+          ),
+        ),
+      )
+      .limit(1);
+    if (!ownedIntent) throw new ReplayCheckpointPreparationError();
+  });
+  let written: {
+    statePath: string;
+    checksum: string;
+    byteSize: number;
+  };
+  try {
+    written = await authority.persistReplayCheckpoint(
+      {
+        version: 1,
+        ownerId: input.ownerId,
+        scrapeId: input.scrapeId,
+        checkpointId,
+        storageState: input.replayCheckpoint.storageState,
+      },
+      context,
+    );
+  } catch (cause) {
+    await db
+      .update(schema.browser_replay_checkpoint_cleanup_intents)
+      .set({ state: "cleanup" })
+      .where(
+        and(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            cleanupIntentId,
+          ),
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.writer_lease,
+            writerLease,
+          ),
+        ),
+      )
+      .catch(() => undefined);
+    throw cause;
+  }
+  const checkpoint: StoredReplayCheckpoint = {
+    version: 1,
+    statePath: written.statePath,
+    storageState: input.replayCheckpoint.storageState,
+    finalUrl: input.replayCheckpoint.finalUrl,
+    fingerprint: input.replayCheckpoint.fingerprint,
+    checksum: written.checksum,
+    byteSize: written.byteSize,
+  };
+  const validated = resolveReplayEnvelope({
+    url: input.url,
+    options: input.options,
+    callerOrigin: input.callerOrigin,
+    browserSettings: input.replayCheckpoint.browserSettings,
+    checkpoint,
+  });
+  if (validated.kind !== "checkpoint") {
+    await authority.deleteReplayCheckpoint(
+      {
+        version: 1,
+        statePath: written.statePath,
+        checksum: written.checksum,
+      },
+      context,
+    );
+    await db
+      .delete(schema.browser_replay_checkpoint_cleanup_intents)
+      .where(
+        and(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            cleanupIntentId,
+          ),
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.writer_lease,
+            writerLease,
+          ),
+        ),
+      );
+    return { persisted: false, reason: "checkpoint_unavailable" };
+  }
+  let stale:
+    | { cleanupIntentId: string; statePath: string; checksum: string }
+    | undefined;
+  try {
+    await db.transaction(async tx => {
+      await lockScrape(tx, input.scrapeId);
+      const [preparingIntent] = await tx
+        .select({ id: schema.browser_replay_checkpoint_cleanup_intents.id })
+        .from(schema.browser_replay_checkpoint_cleanup_intents)
+        .where(
+          and(
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.id,
+              cleanupIntentId,
+            ),
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.writer_lease,
+              writerLease,
+            ),
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.state,
+              "preparing",
+            ),
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.state_path,
+              written.statePath,
+            ),
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.checksum,
+              written.checksum,
+            ),
+          ),
+        )
+        .limit(1);
+      if (!preparingIntent) throw new ReplayCheckpointPreparationError();
+      const [ownedScrape] = await tx
+        .select({ drCleanBy: schema.requests.dr_clean_by })
+        .from(schema.scrapes)
+        .innerJoin(
+          schema.requests,
+          eq(schema.requests.id, schema.scrapes.request_id),
+        )
+        .where(
+          and(
+            eq(schema.scrapes.id, input.scrapeId),
+            eq(schema.scrapes.request_id, input.requestId),
+            eq(schema.scrapes.team_id, input.ownerId),
+            eq(schema.requests.id, input.requestId),
+            eq(schema.requests.team_id, input.ownerId),
+          ),
+        )
+        .limit(1);
+      if (!ownedScrape) throw new ReplayOwnershipError();
+      const [current] = await tx
+        .select({
+          statePath: schema.browser_replay_checkpoints.state_path,
+          checksum: schema.browser_replay_checkpoints.checksum,
+        })
+        .from(schema.browser_replay_checkpoints)
+        .where(eq(schema.browser_replay_checkpoints.scrape_id, input.scrapeId))
+        .limit(1);
+      if (
+        current?.statePath &&
+        (current.statePath !== written.statePath ||
+          current.checksum !== written.checksum)
+      ) {
+        stale = {
+          cleanupIntentId: randomUUID(),
+          statePath: current.statePath,
+          checksum: current.checksum,
+        };
+        await tx
+          .insert(schema.browser_replay_checkpoint_cleanup_intents)
+          .values({
+            id: stale.cleanupIntentId,
+            scrape_id: input.scrapeId,
+            owner_id: input.ownerId,
+            state_path: stale.statePath,
+            checksum: stale.checksum,
+            state: "cleanup",
+          })
+          .onConflictDoNothing();
+      }
+      const expiresAt =
+        ownedScrape.drCleanBy ??
+        new Date(Date.now() + runtime.retentionDays * 86_400_000).toISOString();
+      const now = new Date().toISOString();
+      await tx
+        .insert(schema.browser_replay_envelopes)
+        .values({
+          scrape_id: input.scrapeId,
+          request_id: input.requestId,
+          owner_id: input.ownerId,
+          version: 1,
+          navigation_policy_version: 1,
+          envelope: validated.envelope,
+        })
+        .onConflictDoUpdate({
+          target: schema.browser_replay_envelopes.scrape_id,
+          set: {
+            request_id: input.requestId,
+            owner_id: input.ownerId,
+            version: 1,
+            navigation_policy_version: 1,
+            envelope: validated.envelope,
+            updated_at: now,
+          },
+        });
+      await tx
+        .insert(schema.browser_replay_checkpoints)
+        .values({
+          id: checkpointId,
+          scrape_id: input.scrapeId,
+          request_id: input.requestId,
+          owner_id: input.ownerId,
+          envelope_version: 1,
+          state_path: written.statePath,
+          final_url: validated.checkpoint.finalUrl,
+          fingerprint: validated.checkpoint.fingerprint,
+          checksum: written.checksum,
+          byte_size: written.byteSize,
+          expires_at: expiresAt,
+        })
+        .onConflictDoUpdate({
+          target: schema.browser_replay_checkpoints.scrape_id,
+          set: {
+            request_id: input.requestId,
+            owner_id: input.ownerId,
+            envelope_version: 1,
+            state_path: written.statePath,
+            final_url: validated.checkpoint.finalUrl,
+            fingerprint: validated.checkpoint.fingerprint,
+            checksum: written.checksum,
+            byte_size: written.byteSize,
+            expires_at: expiresAt,
+            file_deleted_at: null,
+          },
+        });
+      await tx
+        .delete(schema.browser_replay_checkpoint_cleanup_intents)
+        .where(
+          and(
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.id,
+              cleanupIntentId,
+            ),
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.writer_lease,
+              writerLease,
+            ),
+          ),
+        );
+    });
+  } catch (cause) {
+    await db
+      .update(schema.browser_replay_checkpoint_cleanup_intents)
+      .set({ state: "cleanup" })
+      .where(
+        and(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            cleanupIntentId,
+          ),
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.writer_lease,
+            writerLease,
+          ),
+        ),
+      )
+      .catch(() => undefined);
+    if (!isSameAuthority) {
+      const deleted = await authority
+        .deleteReplayCheckpoint(
+          {
+            version: 1,
+            statePath: written.statePath,
+            checksum: written.checksum,
+          },
+          context,
+        )
+        .catch(() => undefined);
+      if (deleted) {
+        await db
+          .delete(schema.browser_replay_checkpoint_cleanup_intents)
+          .where(
+            eq(
+              schema.browser_replay_checkpoint_cleanup_intents.id,
+              cleanupIntentId,
+            ),
+          )
+          .catch(() => undefined);
+      }
+    }
+    throw cause;
+  }
+  if (stale) {
+    try {
+      await authority.deleteReplayCheckpoint(
+        {
+          version: 1,
+          statePath: stale.statePath,
+          checksum: stale.checksum,
+        },
+        context,
+      );
+      await db
+        .delete(schema.browser_replay_checkpoint_cleanup_intents)
+        .where(
+          eq(
+            schema.browser_replay_checkpoint_cleanup_intents.id,
+            stale.cleanupIntentId,
+          ),
+        );
+    } catch {
+      cleanupLogger.error("Replay checkpoint cleanup deferred", {
+        category: "replay_checkpoint_cleanup_deferred",
+        scrapeId: input.scrapeId,
+      });
+    }
+  }
+  return { persisted: true };
+}
+
 /** @public */
 export function registerReplayPersistenceAuthorityRoute(
   app: Application,
   deps: {
     apiKey: string | undefined;
     getGate: () => BrowserStartupGate | undefined;
+    getBrowserClient?: () => ReplayByteAuthority | undefined;
+    persistForTesting?: (
+      input: PersistScrapeReplayStateInput,
+    ) => Promise<ReplayPersistenceResult>;
   },
 ): void {
   registerReplayIngestTransportRoute(app, {
-    ...deps,
-    persist: persistScrapeReplayStateUnderAuthority,
+    apiKey: deps.apiKey,
+    getGate: deps.getGate,
+    persist: async (input, lease) => {
+      const authority = deps.getBrowserClient?.();
+      if (!authority) {
+        if (
+          process.env.NODE_ENV === "test" &&
+          deps.persistForTesting !== undefined
+        ) {
+          return deps.persistForTesting(input);
+        }
+        throw new ReplayUnavailableError();
+      }
+      return persistScrapeReplayStateThroughBrowserService(
+        input,
+        authority,
+        lease,
+      );
+    },
   });
 }
 
 /** @internal Direct persistence is available only to the test runtime. */
-export function createReplayPersistenceForTesting(): (
-  input: PersistScrapeReplayStateInput,
-) => Promise<ReplayPersistenceResult> {
+export function createReplayPersistenceForTesting(
+  filesystem: ReplayFilesystemTestDependency,
+): (input: PersistScrapeReplayStateInput) => Promise<ReplayPersistenceResult> {
   if (process.env.NODE_ENV !== "test") {
     throw new Error("Direct replay persistence is unavailable");
   }
-  return persistScrapeReplayStateUnderAuthority;
+  return input => persistScrapeReplayStateUnderAuthority(input, filesystem);
 }
 
 /** @public */
 export async function loadScrapeReplayState(
   ownerId: string,
   scrapeId: string,
+  service?: {
+    authority: Pick<BrowserServiceClient, "readReplayCheckpoint">;
+    lease: BrowserStateMutationLease;
+  },
+  testFilesystem?: ReplayFilesystemTestDependency,
 ): Promise<ReplayResolution> {
   const runtime = runtimeConfig();
   if (!runtime.enabled) return unavailable(["browserService"]);
 
-  const loaded = await db.transaction(async tx => {
+  const row = await db.transaction(async tx => {
     await lockScrape(tx, scrapeId);
-    const filesystem = new BrowserStateFilesystem(runtime.root);
-    await recoverCleanupIntents(tx, filesystem, scrapeId);
+    if (!service) {
+      assertLegacyFilesystemTestRuntime();
+      if (!testFilesystem) throw new ReplayUnavailableError();
+      await recoverCleanupIntents(tx, testFilesystem, scrapeId);
+    }
     const [row] = await tx
       .select({
         envelope: schema.browser_replay_envelopes.envelope,
@@ -827,21 +1339,36 @@ export async function loadScrapeReplayState(
     ) {
       return;
     }
-    const statePath = row.statePath;
-    try {
-      const storageState = await filesystem.readCheckpoint(
-        statePath,
-        row.checksum,
-      );
-      return { row: { ...row, statePath }, storageState };
-    } catch {
-      return;
-    }
+    return { ...row, statePath: row.statePath };
   });
-  if (!loaded) {
+  if (!row) {
     return unavailable(["checkpoint"]);
   }
-  const { row, storageState } = loaded;
+  let storageState: unknown;
+  try {
+    if (service) {
+      storageState = (
+        await service.authority.readReplayCheckpoint(
+          {
+            version: 1,
+            statePath: row.statePath,
+            checksum: row.checksum,
+            byteSize: row.byteSize,
+          },
+          serviceContext(service.lease),
+        )
+      ).storageState;
+    } else {
+      assertLegacyFilesystemTestRuntime();
+      if (!testFilesystem) throw new ReplayUnavailableError();
+      storageState = await testFilesystem.readCheckpoint(
+        row.statePath,
+        row.checksum,
+      );
+    }
+  } catch {
+    return unavailable(["checkpoint"]);
+  }
 
   if (
     row.envelope === null ||
@@ -899,11 +1426,15 @@ export async function loadReplayCheckpointForBrowserService(
   ownerId: string,
   scrapeId: string,
   gate: BrowserStartupGate,
+  authority: Pick<BrowserServiceClient, "readReplayCheckpoint">,
 ): Promise<StoredReplayCheckpoint> {
   return gate.withBrowserStateMutationLease(
     "filesystem_and_database",
     async lease => {
-      const resolution = await loadScrapeReplayState(ownerId, scrapeId);
+      const resolution = await loadScrapeReplayState(ownerId, scrapeId, {
+        authority,
+        lease,
+      });
       const after = gate.assertOpen();
       if (
         lease.binding.databaseControlEpoch !== after.databaseControlEpoch ||

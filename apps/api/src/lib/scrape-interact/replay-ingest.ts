@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import { config } from "../../config";
 import type { BrowserStartupGate } from "../browser-runtime/startup-gate";
+import type { BrowserStateMutationLease } from "../browser-runtime/startup-gate";
 import { canonicalizeBrowserStateCheckpoint } from "../browser-state/filesystem-store";
 import type {
   PersistScrapeReplayStateInput,
@@ -274,6 +275,7 @@ export function registerReplayIngestTransportRoute(
     getGate: () => BrowserStartupGate | undefined;
     persist: (
       input: PersistScrapeReplayStateInput,
+      lease: BrowserStateMutationLease,
     ) => Promise<ReplayPersistenceResult>;
   },
 ): void {
@@ -376,7 +378,7 @@ export function registerReplayIngestTransportRoute(
       try {
         const result = await gate.withBrowserStateMutationLease(
           "filesystem_and_database",
-          async () => {
+          async lease => {
             if (request.aborted || Date.now() >= protocol.deadline) {
               const error = new Error("Replay ingest deadline exceeded");
               error.name = "ReplayIngestDeadlineError";
@@ -386,10 +388,13 @@ export function registerReplayIngestTransportRoute(
             // persistence deliberately commits its preparing intent before the
             // filesystem rename so a process crash cannot create an
             // untracked file.
-            return deps.persist({
-              ...parsed.data,
-              zeroDataRetention: false,
-            });
+            return deps.persist(
+              {
+                ...parsed.data,
+                zeroDataRetention: false,
+              },
+              lease,
+            );
           },
         );
         response.status(200).json(result);

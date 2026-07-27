@@ -2,10 +2,10 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 
 import { config } from "../config";
 import { getArtifactStore, type ArtifactStore } from "../lib/artifacts";
-import { BrowserStateFilesystem } from "../lib/browser-state/filesystem-store";
 import { inspectBrowserStateProcessIdentity } from "../lib/browser-state/process-identity";
 import type {
   BrowserControlFenceTransaction,
+  BrowserStateMutationLease,
   BrowserStartupGate,
 } from "../lib/browser-runtime/startup-gate";
 import { logger as defaultLogger } from "../lib/logger";
@@ -323,7 +323,7 @@ export type RetentionLogger = Pick<
 type IterationOptions = {
   database: LocalRetentionDatabase;
   artifactStore: ArtifactStore | null;
-  browserStateFilesystem?: Pick<BrowserStateFilesystem, "delete"> | null;
+  browserStateFilesystem?: BrowserStateFileDeleter | null;
   now?: Date;
   signal?: AbortSignal;
   logger?: RetentionLogger;
@@ -345,7 +345,18 @@ type LoopOptions = {
   configSource?: LocalRuntimeConfigSource;
   database?: LocalRetentionDatabase;
   artifactStore?: ArtifactStore | null;
-  browserStateFilesystem?: Pick<BrowserStateFilesystem, "delete"> | null;
+  browserStateFilesystem?: BrowserStateFileDeleter | null;
+  deleteReplayCheckpoint?: (
+    statePath: string,
+    checksum: string,
+    lease: BrowserStateMutationLease,
+  ) => Promise<void>;
+  deleteProfileGeneration?: (
+    generationId: string,
+    statePath: string,
+    checksum: string,
+    lease: BrowserStateMutationLease,
+  ) => Promise<void>;
   logger?: RetentionLogger;
   now?: () => Date;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -371,6 +382,25 @@ export type CleanupIntentStartupRecoveryResult = {
   deadRecovered: number;
   missingConverged: number;
 };
+
+export type BrowserStateFileDeleter = {
+  delete(statePath: string): Promise<void>;
+  deleteWithChecksum?(statePath: string, checksum: string): Promise<void>;
+  deleteCandidate?(candidate: BrowserStateDeletionAuthority): Promise<void>;
+};
+
+export type BrowserStateDeletionAuthority =
+  | Readonly<{
+      kind: "replay-checkpoint" | "replay-cleanup-intent";
+      statePath: string;
+      checksum: string;
+    }>
+  | Readonly<{
+      kind: "profile-generation";
+      generationId: string;
+      statePath: string;
+      checksum: string;
+    }>;
 
 type ArtifactManifestRow = {
   object_key: string;
@@ -1207,7 +1237,7 @@ async function releaseArtifactLock(
 /** @public */
 export async function recoverBrowserCleanupIntentsBeforeSnapshot(deps: {
   pool: Pick<Pool, "connect">;
-  filesystem: BrowserStateFilesystem;
+  filesystem: BrowserStateFileDeleter;
   inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity;
   signal: AbortSignal;
 }): Promise<CleanupIntentStartupRecoveryResult> {
@@ -1320,7 +1350,14 @@ export async function recoverBrowserCleanupIntentsBeforeSnapshot(deps: {
       let missing = false;
       if (current.current_state_path !== current.state_path) {
         try {
-          await deps.filesystem.delete(current.state_path);
+          if (deps.filesystem.deleteWithChecksum) {
+            await deps.filesystem.deleteWithChecksum(
+              current.state_path,
+              current.checksum,
+            );
+          } else {
+            await deps.filesystem.delete(current.state_path);
+          }
         } catch (error) {
           if (
             error instanceof Error &&
@@ -1598,7 +1635,29 @@ export async function runLocalRetentionIteration(
       try {
         if (claim.deleteFile) {
           try {
-            await options.browserStateFilesystem.delete(claim.file.statePath);
+            if (options.browserStateFilesystem.deleteCandidate) {
+              await options.browserStateFilesystem.deleteCandidate(
+                claim.file.kind === "profile-generation"
+                  ? {
+                      kind: "profile-generation",
+                      generationId: claim.file.id,
+                      statePath: claim.file.statePath,
+                      checksum: claim.file.checksum,
+                    }
+                  : {
+                      kind: claim.file.kind,
+                      statePath: claim.file.statePath,
+                      checksum: claim.file.checksum,
+                    },
+              );
+            } else if (options.browserStateFilesystem.deleteWithChecksum) {
+              await options.browserStateFilesystem.deleteWithChecksum(
+                claim.file.statePath,
+                claim.file.checksum,
+              );
+            } else {
+              await options.browserStateFilesystem.delete(claim.file.statePath);
+            }
           } catch (error) {
             primaryOperation = "filesystem-delete";
             throw error;
@@ -1813,12 +1872,17 @@ export async function runLocalRetentionLoop(
   const browserStateFilesystem =
     runtimeSource.LOCAL_BROWSER_SERVICE_ENABLED === true
       ? options.browserStateFilesystem === undefined
-        ? new BrowserStateFilesystem(
-            runtimeSource.LOCAL_BROWSER_STATE_ROOT ??
-              "/var/lib/firecrawl-browser",
-          )
+        ? null
         : options.browserStateFilesystem
       : null;
+  if (
+    runtimeSource.LOCAL_BROWSER_SERVICE_ENABLED === true &&
+    browserStateFilesystem === null &&
+    (options.deleteReplayCheckpoint === undefined ||
+      options.deleteProfileGeneration === undefined)
+  ) {
+    throw new Error("Browser state deletion authority is unavailable");
+  }
   const database =
     options.database ??
     new PgLocalRetentionDatabase(localConfig.applicationDatabaseUrl);
@@ -1829,7 +1893,12 @@ export async function runLocalRetentionLoop(
     artifactProvider: localConfig.artifactProvider,
   });
   try {
-    if (options.browserStartupGate && browserStateFilesystem) {
+    if (
+      options.browserStartupGate &&
+      (browserStateFilesystem !== null ||
+        (options.deleteReplayCheckpoint !== undefined &&
+          options.deleteProfileGeneration !== undefined))
+    ) {
       const operationalLoop = async () => {
         while (!options.signal.aborted) {
           try {
@@ -1860,7 +1929,46 @@ export async function runLocalRetentionLoop(
               async lease =>
                 runBrowserStateRetentionIteration({
                   database,
-                  browserStateFilesystem,
+                  browserStateFilesystem:
+                    options.deleteReplayCheckpoint === undefined ||
+                    options.deleteProfileGeneration === undefined
+                      ? browserStateFilesystem
+                      : {
+                          delete: async () => {
+                            throw new Error(
+                              "Browser state checksum is unavailable",
+                            );
+                          },
+                          deleteWithChecksum: (statePath, checksum) => {
+                            return options.deleteReplayCheckpoint!(
+                              statePath,
+                              checksum,
+                              lease,
+                            );
+                          },
+                          deleteCandidate: candidate => {
+                            if (candidate.kind === "profile-generation") {
+                              if (
+                                options.deleteProfileGeneration === undefined
+                              ) {
+                                throw new Error(
+                                  "Profile generation deletion authority is unavailable",
+                                );
+                              }
+                              return options.deleteProfileGeneration(
+                                candidate.generationId,
+                                candidate.statePath,
+                                candidate.checksum,
+                                lease,
+                              );
+                            }
+                            return options.deleteReplayCheckpoint!(
+                              candidate.statePath,
+                              candidate.checksum,
+                              lease,
+                            );
+                          },
+                        },
                   browserControlTransaction: lease.transaction,
                   now: now(),
                   signal: options.signal,

@@ -512,6 +512,37 @@ describe("BrowserServiceClient", () => {
     );
   });
 
+  it("deletes an exact retained profile generation and rejects response drift", async () => {
+    const request = {
+      version: 1 as const,
+      generationId: ID_2,
+      statePath: `profiles/${ID}/committed/${ID_2}`,
+      checksum: HASH,
+    };
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { ...request, deleted: true }),
+    );
+    await expect(
+      client().deleteRetainedProfileGeneration(request, scopedContext()),
+    ).resolves.toEqual({ ...request, deleted: true });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `http://browser-service:3010/v1/profile-generations/${ID_2}/retention`,
+    );
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        ...request,
+        statePath: `profiles/${ID_2}/committed/${ID_2}`,
+        deleted: true,
+      }),
+    );
+    await expect(
+      client().deleteRetainedProfileGeneration(request, scopedContext()),
+    ).rejects.toMatchObject({
+      category: "browser_service_protocol_error",
+    });
+  });
+
   it.each([
     [
       "getLive",
@@ -648,6 +679,60 @@ describe("BrowserServiceClient", () => {
           ctx,
         ),
     ],
+    [
+      "persistReplayCheckpoint",
+      (c: BrowserServiceClient, ctx: BrowserServiceRequestContext) =>
+        c.persistReplayCheckpoint(
+          {
+            version: 1,
+            ownerId: ID,
+            scrapeId: ID_2,
+            checkpointId: ID,
+            storageState: { cookies: [], origins: [] },
+          },
+          ctx,
+        ),
+    ],
+    [
+      "readReplayCheckpoint",
+      (c: BrowserServiceClient, ctx: BrowserServiceRequestContext) =>
+        c.readReplayCheckpoint(
+          {
+            version: 1,
+            statePath: `replay/${ID}/${ID_2}/${ID}.json`,
+            checksum:
+              "1f6c35926314be663593452b39441c1ba3a462c142197e633b31ab574cf01a46",
+            byteSize: 27,
+          },
+          ctx,
+        ),
+    ],
+    [
+      "deleteReplayCheckpoint",
+      (c: BrowserServiceClient, ctx: BrowserServiceRequestContext) =>
+        c.deleteReplayCheckpoint(
+          {
+            version: 1,
+            statePath: `replay/${ID}/${ID_2}/${ID}.json`,
+            checksum:
+              "1f6c35926314be663593452b39441c1ba3a462c142197e633b31ab574cf01a46",
+          },
+          ctx,
+        ),
+    ],
+    [
+      "deleteRetainedProfileGeneration",
+      (c: BrowserServiceClient, ctx: BrowserServiceRequestContext) =>
+        c.deleteRetainedProfileGeneration(
+          {
+            version: 1,
+            generationId: ID_2,
+            statePath: `profiles/${ID}/committed/${ID_2}`,
+            checksum: HASH,
+          },
+          ctx,
+        ),
+    ],
   ] as const)(
     "closes through mismatch callback on scoped HTTP method %s",
     async (_method, invoke) => {
@@ -666,6 +751,57 @@ describe("BrowserServiceClient", () => {
       expect(onControlGenerationMismatch).toHaveBeenCalledWith({
         processNonce: ctx.processNonce,
         controlGenerationNonce: ctx.controlGenerationNonce,
+      });
+    },
+  );
+
+  it.each([
+    [
+      "finalize",
+      "profile_finalize_failed",
+      (c: BrowserServiceClient) =>
+        c.finalizeProfile(
+          ID_2,
+          {
+            version: 1,
+            profileId: ID,
+            generationId: ID_2,
+            checksum: HASH,
+            prepareToken: TOKEN,
+          },
+          scopedContext(),
+        ),
+    ],
+    [
+      "discard",
+      "profile_discard_failed",
+      (c: BrowserServiceClient) =>
+        c.discardProfile(
+          ID_2,
+          {
+            version: 1,
+            profileId: ID,
+            generationId: ID_2,
+            checksum: HASH,
+            prepareToken: TOKEN,
+          },
+          scopedContext(),
+        ),
+    ],
+  ] as const)(
+    "decodes declared %s profile errors",
+    async (_name, category, invoke) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(409, {
+          version: 1,
+          category,
+          message: "prepared profile request is invalid",
+        }),
+      );
+
+      await expect(invoke(client())).rejects.toMatchObject({
+        category,
+        status: 409,
       });
     },
   );

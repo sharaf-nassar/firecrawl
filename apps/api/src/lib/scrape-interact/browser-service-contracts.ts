@@ -981,7 +981,65 @@ export const replayCheckpointV1Schema = z
   });
 
 /** @public */
-export const profileInputV1Schema = z
+const replayCheckpointAuthorityV1Schema = z.strictObject({
+  statePath: relativeStatePathSchema,
+  checksum: sha256Schema,
+  byteSize: z.number().int().min(1).max(MAX_STORAGE_STATE_BYTES),
+});
+
+export const persistReplayCheckpointV1Schema = z.strictObject({
+  version: z.literal(1),
+  ownerId: canonicalUuidSchema,
+  scrapeId: canonicalUuidSchema,
+  checkpointId: canonicalUuidSchema,
+  storageState: storageStateV1Schema,
+});
+
+export const persistedReplayCheckpointV1Schema =
+  replayCheckpointAuthorityV1Schema.extend({
+    version: z.literal(1),
+  });
+
+export const readReplayCheckpointV1Schema =
+  replayCheckpointAuthorityV1Schema.extend({
+    version: z.literal(1),
+  });
+
+export const replayCheckpointContentV1Schema = replayCheckpointAuthorityV1Schema
+  .extend({
+    version: z.literal(1),
+    storageState: storageStateV1Schema,
+  })
+  .superRefine((checkpoint, context) => {
+    const bytes = Buffer.from(canonicalJson(checkpoint.storageState), "utf8");
+    if (checkpoint.byteSize !== bytes.length) {
+      context.addIssue({
+        code: "custom",
+        message: "checkpoint byte size mismatch",
+      });
+    }
+    if (
+      checkpoint.checksum !== createHash("sha256").update(bytes).digest("hex")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "checkpoint checksum mismatch",
+      });
+    }
+  });
+
+export const deleteReplayCheckpointV1Schema = z.strictObject({
+  version: z.literal(1),
+  statePath: relativeStatePathSchema,
+  checksum: sha256Schema,
+});
+
+export const deletedReplayCheckpointV1Schema =
+  deleteReplayCheckpointV1Schema.extend({
+    deleted: z.boolean(),
+  });
+
+const profileInputV1Schema = z
   .union([
     z.null(),
     z.strictObject({
@@ -1150,6 +1208,21 @@ export const deletedProfileGenerationV1Schema = z.strictObject({
   generationId: canonicalUuidSchema,
   checksum: sha256Schema,
   deleted: z.literal(true),
+});
+/** @public */
+export const deleteRetainedProfileGenerationV1Schema = z.strictObject({
+  version: z.literal(1),
+  generationId: canonicalUuidSchema,
+  statePath: z.string().min(1).max(512),
+  checksum: sha256Schema,
+});
+/** @public */
+export const deletedRetainedProfileGenerationV1Schema = z.strictObject({
+  version: z.literal(1),
+  generationId: canonicalUuidSchema,
+  statePath: z.string().min(1).max(512),
+  checksum: sha256Schema,
+  deleted: z.boolean(),
 });
 
 /** @public */
@@ -1571,19 +1644,27 @@ const PRIVATE_V1_SCHEMAS = {
   CreateControlGenerationV1: createControlGenerationV1Schema,
   CreateRelayGrantV1: createRelayGrantV1Schema,
   CreateSessionV1: createSessionV1Schema,
+  DeleteReplayCheckpointV1: deleteReplayCheckpointV1Schema,
   DeleteProfileGenerationV1: deleteProfileGenerationV1Schema,
+  DeleteRetainedProfileGenerationV1: deleteRetainedProfileGenerationV1Schema,
+  DeletedReplayCheckpointV1: deletedReplayCheckpointV1Schema,
   DeletedProfileGenerationV1: deletedProfileGenerationV1Schema,
+  DeletedRetainedProfileGenerationV1: deletedRetainedProfileGenerationV1Schema,
   FetchArtifactV1: fetchArtifactV1Schema,
   FinalizeProfileGenerationV1: finalizeProfileGenerationV1Schema,
   FinalizedProfileGenerationV1: finalizedProfileGenerationV1Schema,
   LiveDiscoveryV1: liveDiscoveryV1Schema,
+  PersistReplayCheckpointV1: persistReplayCheckpointV1Schema,
+  PersistedReplayCheckpointV1: persistedReplayCheckpointV1Schema,
   PrivateErrorV1: privateErrorV1Schema,
+  ReadReplayCheckpointV1: readReplayCheckpointV1Schema,
   ReadyHealthV1: readyHealthV1Schema,
   ReconciliationRequestV1: reconciliationRequestV1Schema,
   ReconciliationResultV1: reconciliationResultV1Schema,
   RelayGrantV1: relayGrantV1Schema,
   RevokeRelayGrantV1: revokeRelayGrantV1Schema,
   RevokedRelayGrantV1: revokedRelayGrantV1Schema,
+  ReplayCheckpointContentV1: replayCheckpointContentV1Schema,
   ScopedLiveHealthV1: scopedLiveHealthV1Schema,
   SessionV1: sessionV1Schema,
   UnreadyHealthV1: unreadyHealthV1Schema,
@@ -1622,13 +1703,30 @@ const PRIVATE_V1_SCHEMA_RULE_KEYS = {
     "profile_input_v1",
     "create_session_v1",
   ],
+  DeleteReplayCheckpointV1: ["relative_state_path_v1"],
   DeleteProfileGenerationV1: ["canonical_uuid_v1", "canonical_token_v1"],
+  DeleteRetainedProfileGenerationV1: [
+    "canonical_uuid_v1",
+    "relative_state_path_v1",
+  ],
+  DeletedReplayCheckpointV1: ["relative_state_path_v1"],
   DeletedProfileGenerationV1: ["canonical_uuid_v1"],
+  DeletedRetainedProfileGenerationV1: [
+    "canonical_uuid_v1",
+    "relative_state_path_v1",
+  ],
   FetchArtifactV1: ["canonical_uuid_v1"],
   FinalizeProfileGenerationV1: ["canonical_uuid_v1", "canonical_token_v1"],
   FinalizedProfileGenerationV1: ["canonical_uuid_v1"],
   LiveDiscoveryV1: ["canonical_token_v1"],
+  PersistReplayCheckpointV1: [
+    "canonical_uuid_v1",
+    "indexeddb_v1",
+    "storage_state_v1",
+  ],
+  PersistedReplayCheckpointV1: ["relative_state_path_v1"],
   PrivateErrorV1: ["private_error_v1"],
+  ReadReplayCheckpointV1: ["relative_state_path_v1"],
   ReadyHealthV1: ["canonical_token_v1"],
   ReconciliationRequestV1: [
     "canonical_uuid_v1",
@@ -1640,6 +1738,11 @@ const PRIVATE_V1_SCHEMA_RULE_KEYS = {
   RelayGrantV1: ["canonical_uuid_v1", "canonical_token_v1", "timestamp_v1"],
   RevokeRelayGrantV1: ["canonical_uuid_v1"],
   RevokedRelayGrantV1: ["canonical_uuid_v1"],
+  ReplayCheckpointContentV1: [
+    "relative_state_path_v1",
+    "indexeddb_v1",
+    "storage_state_v1",
+  ],
   ScopedLiveHealthV1: ["canonical_token_v1"],
   SessionV1: [
     "canonical_uuid_v1",
@@ -1694,6 +1797,24 @@ export type ReplayBrowserSettingsV1 = z.infer<
 >;
 /** @public */
 export type ReplayCheckpointV1 = z.infer<typeof replayCheckpointV1Schema>;
+export type PersistReplayCheckpointV1 = z.infer<
+  typeof persistReplayCheckpointV1Schema
+>;
+export type PersistedReplayCheckpointV1 = z.infer<
+  typeof persistedReplayCheckpointV1Schema
+>;
+export type ReadReplayCheckpointV1 = z.infer<
+  typeof readReplayCheckpointV1Schema
+>;
+export type ReplayCheckpointContentV1 = z.infer<
+  typeof replayCheckpointContentV1Schema
+>;
+export type DeleteReplayCheckpointV1 = z.infer<
+  typeof deleteReplayCheckpointV1Schema
+>;
+export type DeletedReplayCheckpointV1 = z.infer<
+  typeof deletedReplayCheckpointV1Schema
+>;
 /** @public */
 export type ProfileInputV1 = z.infer<typeof profileInputV1Schema>;
 /** @public */
@@ -1711,6 +1832,14 @@ export type DeleteProfileGenerationV1 = z.infer<
 /** @public */
 export type DeletedProfileGenerationV1 = z.infer<
   typeof deletedProfileGenerationV1Schema
+>;
+/** @public */
+export type DeleteRetainedProfileGenerationV1 = z.infer<
+  typeof deleteRetainedProfileGenerationV1Schema
+>;
+/** @public */
+export type DeletedRetainedProfileGenerationV1 = z.infer<
+  typeof deletedRetainedProfileGenerationV1Schema
 >;
 /** @public */
 export type CreateRelayGrantV1 = z.infer<typeof createRelayGrantV1Schema>;
@@ -1813,6 +1942,9 @@ export const BROWSER_SERVICE_ERROR_STATUS = {
   reconciliation_deadline_exceeded: 408,
   reconciliation_execution_failed: 503,
   reconciliation_cleanup_failed: 503,
+  profile_prepare_failed: 503,
+  profile_finalize_failed: 409,
+  profile_discard_failed: 409,
 } as const;
 const ERROR_CUSTOM_CONSTANTS = {
   internalErrorDetailAllowlist: [
@@ -1999,6 +2131,48 @@ export const API_PRIVATE_ROUTE_CONTRACTS = [
     ],
     requestBytes: 0,
     responseBytes: 4 * 1024,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "POST",
+    path: "/v1/replay-checkpoints",
+    request: "PersistReplayCheckpointV1",
+    responses: [{ status: 201, definition: "PersistedReplayCheckpointV1" }],
+    requestBytes: MAX_REPLAY_REQUEST_BYTES,
+    responseBytes: MAX_PRIVATE_RESPONSE_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "POST",
+    path: "/v1/replay-checkpoints/read",
+    request: "ReadReplayCheckpointV1",
+    responses: [{ status: 200, definition: "ReplayCheckpointContentV1" }],
+    requestBytes: MAX_PRIVATE_REQUEST_BYTES,
+    responseBytes: MAX_REPLAY_REQUEST_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "DELETE",
+    path: "/v1/replay-checkpoints",
+    request: "DeleteReplayCheckpointV1",
+    responses: [{ status: 200, definition: "DeletedReplayCheckpointV1" }],
+    requestBytes: MAX_PRIVATE_REQUEST_BYTES,
+    responseBytes: MAX_PRIVATE_RESPONSE_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "DELETE",
+    path: "/v1/profile-generations/:generationId/retention",
+    request: "DeleteRetainedProfileGenerationV1",
+    responses: [
+      { status: 200, definition: "DeletedRetainedProfileGenerationV1" },
+    ],
+    requestBytes: MAX_PRIVATE_REQUEST_BYTES,
+    responseBytes: MAX_PRIVATE_RESPONSE_BYTES,
     fencing: "generation",
     streaming: null,
   },

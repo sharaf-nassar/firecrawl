@@ -103,6 +103,72 @@ describe("BrowserReconciliationCoordinator", () => {
     await coordinator.stop();
   });
 
+  it("fails startup without retrying a terminal Browser drain failure", async () => {
+    const gate = {
+      close: vi.fn(() => ({ epoch: 1, drained: Promise.resolve() })),
+    };
+    const serviceClient = {
+      discoverLive: vi.fn(async () => ({
+        version: 1 as const,
+        status: "live_unreconciled" as const,
+        processNonce,
+      })),
+      createControlGeneration: vi
+        .fn()
+        .mockRejectedValue(
+          new BrowserServiceClientError(
+            "control_generation_drain_failed",
+            "runtime drain failed",
+            503,
+          ),
+        ),
+      getLive: vi.fn(async () => ({
+        version: 1 as const,
+        status: "live_unreconciled" as const,
+        processNonce,
+        controlGenerationNonce,
+      })),
+      reconcile: vi.fn(),
+      getReady: vi.fn(),
+    };
+    const sleeps: number[] = [];
+    const coordinator = createBrowserReconciliationCoordinator({
+      gate: gate as never,
+      pool: { connect: vi.fn() } as never,
+      filesystem: { delete: vi.fn() } as never,
+      inspectProcessIdentity: vi.fn() as never,
+      serviceClient,
+      loadSnapshot: vi.fn(),
+      interruptUnfinishedBrowserWork: vi.fn(),
+      recoverBrowserCleanupIntentsBeforeSnapshot: vi.fn(),
+      pauseBrowserRetention: vi.fn(async () => undefined),
+      startBrowserRetention: vi.fn(async () => undefined),
+      retry: {
+        maxAttempts: 4,
+        initialBackoffMs: 250,
+        maxBackoffMs: 1_000,
+        startupBudgetMs: 60_000,
+        monitorIntervalMs: 60_000,
+        retryCooldownMs: 30_000,
+      },
+      now: () => Date.now(),
+      sleep: vi.fn(async milliseconds => {
+        sleeps.push(milliseconds);
+      }),
+      logger: { info: vi.fn(), error: vi.fn() } as never,
+    });
+
+    await expect(coordinator.acquireControlGeneration()).rejects.toMatchObject({
+      category: "browser_state_unavailable",
+      cause: {
+        category: "control_generation_drain_failed",
+      },
+    });
+    expect(serviceClient.createControlGeneration).toHaveBeenCalledOnce();
+    expect(sleeps).toEqual([]);
+    await coordinator.stop();
+  });
+
   it("performs zero recovery after a newer durable activation wins", async () => {
     const newerProcessNonce = Buffer.alloc(32, 3).toString("base64url");
     const newerControlNonce = Buffer.alloc(32, 4).toString("base64url");

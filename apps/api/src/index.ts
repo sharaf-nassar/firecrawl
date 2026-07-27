@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { randomUUID } from "node:crypto";
 import { config } from "./config";
 import "./services/sentry";
 import { setSentryServiceTag } from "./services/sentry";
@@ -41,12 +42,12 @@ import { shutdownIndexerQueue } from "./services/indexing/indexer-queue";
 import { Pool } from "pg";
 import { runApplicationMigrations } from "./db/migrate";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
-import { BrowserStateFilesystem } from "./lib/browser-state/filesystem-store";
 import { inspectBrowserStateProcessIdentity } from "./lib/browser-state/process-identity";
 import { interruptUnfinishedBrowserWork } from "./lib/browser-state/store";
 import { BrowserServiceClient } from "./lib/scrape-interact/browser-service-client";
 import {
   createBrowserStartupGate,
+  type BrowserStateMutationLease,
   type BrowserStartupGate,
 } from "./lib/browser-runtime/startup-gate";
 import {
@@ -118,6 +119,7 @@ setSentryServiceTag("api");
 registerReplayPersistenceAuthorityRoute(app, {
   apiKey: config.BROWSER_REPLAY_INGEST_API_KEY,
   getGate: () => localBrowserRuntime?.gate,
+  getBrowserClient: () => localBrowserRuntime?.browserClient,
 });
 registerInternalRoutes(app, {
   adapterTokenFile: config.BROWSER_ADAPTER_TOKEN_FILE,
@@ -215,7 +217,6 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
     });
   });
   const gate = createBrowserStartupGate({ pool });
-  const filesystem = new BrowserStateFilesystem(local.browserStateRoot);
   const serviceClient = new BrowserServiceClient({
     baseUrl: local.browserServiceUrl,
     apiKey: local.browserServiceApiKey,
@@ -228,7 +229,12 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
   const coordinator = createBrowserReconciliationCoordinator({
     gate,
     pool,
-    filesystem,
+    deleteReplayCheckpoint: async (statePath, checksum, lease) => {
+      await serviceClient.deleteReplayCheckpoint(
+        { version: 1, statePath, checksum },
+        browserServiceRequestContext(lease),
+      );
+    },
     inspectProcessIdentity: inspectBrowserStateProcessIdentity,
     serviceClient,
     loadSnapshot: loadBrowserReconciliationSnapshot,
@@ -284,6 +290,16 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
   }
 }
 
+function browserServiceRequestContext(lease: BrowserStateMutationLease) {
+  return {
+    correlationId: randomUUID(),
+    deadline: new Date(Date.now() + 30_000),
+    signal: AbortSignal.timeout(30_000),
+    processNonce: lease.binding.processNonce,
+    controlGenerationNonce: lease.binding.controlGenerationNonce,
+  };
+}
+
 async function startLocalRetentionAfterMigrations(): Promise<void> {
   const local = resolveLocalRuntimeConfig(config);
   if (!local.enabled) return;
@@ -292,9 +308,28 @@ async function startLocalRetentionAfterMigrations(): Promise<void> {
       signal,
       configSource: config,
       browserStartupGate: localBrowserRuntime?.gate,
+      deleteReplayCheckpoint:
+        localBrowserRuntime === undefined
+          ? undefined
+          : async (statePath, checksum, lease) => {
+              await localBrowserRuntime!.browserClient.deleteReplayCheckpoint(
+                { version: 1, statePath, checksum },
+                browserServiceRequestContext(lease),
+              );
+            },
+      deleteProfileGeneration:
+        localBrowserRuntime === undefined
+          ? undefined
+          : async (generationId, statePath, checksum, lease) => {
+              await localBrowserRuntime!.browserClient.deleteRetainedProfileGeneration(
+                { version: 1, generationId, statePath, checksum },
+                browserServiceRequestContext(lease),
+              );
+            },
     }),
   );
-  // Operational retention owns its loop as soon as migrations are complete.
+  // Operational/artifact retention starts after migrations. Its Browser loop
+  // remains gate-blocked until Browser reconciliation is ready.
   void localRetentionService.start();
 }
 
@@ -320,10 +355,31 @@ async function stopLocalRuntime(): Promise<void> {
   return localRuntimeStop;
 }
 
+async function startApplicationListener(port: number) {
+  await initializeBlocklist();
+  initializeEngineForcing();
+  attachWsProxy(app);
+  return new Promise<ReturnType<typeof app.listen>>((resolve, reject) => {
+    const server = app.listen(Number(port), HOST);
+    const failed = (error: Error) => {
+      server.off("listening", listening);
+      reject(error);
+    };
+    const listening = () => {
+      server.off("error", failed);
+      logger.info(`Worker ${process.pid} listening on port ${port}`);
+      resolve(server);
+    };
+    server.once("error", failed);
+    server.once("listening", listening);
+  });
+}
+
 async function startServer(port = DEFAULT_PORT) {
+  let server: Awaited<ReturnType<typeof startApplicationListener>>;
   try {
     const local = resolveLocalRuntimeConfig(config);
-    await runApiStartupLifecycle({
+    server = await runApiStartupLifecycle({
       persistenceEnabled: local.enabled,
       browserEnabled: local.enabled && local.browserServiceEnabled === true,
       acquireBrowserControl: prepareLocalRuntimeBeforeMigrations,
@@ -333,16 +389,16 @@ async function startServer(port = DEFAULT_PORT) {
             ? {}
             : { timeoutMs: Math.max(1, handoff.deadlineMs - Date.now()) }),
         }),
-      startOperationalRetention: startLocalRetentionAfterMigrations,
       initializeBrowser: initializeLocalBrowserAfterMigrations,
-      startApplication: async () => {
-        await initializeBlocklist();
-        initializeEngineForcing();
+      startOperationalRetention: startLocalRetentionAfterMigrations,
+      startApplication: () => startApplicationListener(port),
+      cleanupStartupResources: stopLocalRuntime,
+      observe: event => {
+        logger.info(JSON.stringify(event));
       },
     });
   } catch (error) {
-    await stopLocalRuntime().catch(() => undefined);
-    logger.error("Failed to initialize blocklist and engine forcing", {
+    logger.error("Failed to start API", {
       category:
         error instanceof BrowserReconciliationCoordinatorError
           ? "browser_state_unavailable"
@@ -350,13 +406,6 @@ async function startServer(port = DEFAULT_PORT) {
     });
     throw error;
   }
-
-  // Attach WebSocket proxy to the Express app
-  attachWsProxy(app);
-
-  const server = app.listen(Number(port), HOST, () => {
-    logger.info(`Worker ${process.pid} listening on port ${port}`);
-  });
 
   const exitHandler = async () => {
     logger.info("SIGTERM signal received: closing HTTP server");

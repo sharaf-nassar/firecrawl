@@ -333,7 +333,13 @@ export function createPublicBrowserRuntime(deps: {
         async lease => {
           await deps.browserClient.finalizeProfile(
             prepared.generationId,
-            { version: 1, ...prepared },
+            {
+              version: 1,
+              profileId: prepared.profileId,
+              generationId: prepared.generationId,
+              checksum: prepared.checksum,
+              prepareToken: prepared.prepareToken,
+            },
             serviceContext(lease, randomUUID(), new Date(Date.now() + 30_000)),
           );
         },
@@ -344,7 +350,13 @@ export function createPublicBrowserRuntime(deps: {
         async lease => {
           await deps.browserClient.discardProfile(
             prepared.generationId,
-            { version: 1, ...prepared },
+            {
+              version: 1,
+              profileId: prepared.profileId,
+              generationId: prepared.generationId,
+              checksum: prepared.checksum,
+              prepareToken: prepared.prepareToken,
+            },
             serviceContext(lease, randomUUID(), new Date(Date.now() + 30_000)),
           );
         },
@@ -812,7 +824,11 @@ export function createPublicBrowserRuntime(deps: {
     loadReplayState(ownerId, scrapeId) {
       return deps.gate.withBrowserStateMutationLease(
         "filesystem_and_database",
-        () => loadScrapeReplayState(ownerId, scrapeId),
+        lease =>
+          loadScrapeReplayState(ownerId, scrapeId, {
+            authority: deps.browserClient,
+            lease,
+          }),
       );
     },
 

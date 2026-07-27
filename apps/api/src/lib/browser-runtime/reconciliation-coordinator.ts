@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import type { Pool, PoolClient } from "pg";
 
-import { BrowserStateFilesystem } from "../browser-state/filesystem-store";
 import { inspectBrowserStateProcessIdentity } from "../browser-state/process-identity";
 import { logger as defaultLogger } from "../logger";
 import {
@@ -18,10 +17,12 @@ import {
 } from "../scrape-interact/browser-service-contracts";
 import { interruptUnfinishedBrowserWork } from "../browser-state/store";
 import { recoverBrowserCleanupIntentsBeforeSnapshot } from "../../services/local-retention-worker";
+import type { BrowserStateFileDeleter } from "../../services/local-retention-worker";
 import { loadBrowserReconciliationSnapshot } from "./reconciliation-snapshot";
 import {
   type BrowserMutationDrain,
   type BrowserControlFenceTransaction,
+  type BrowserStateMutationLease,
   type BrowserStartupBinding,
   type BrowserStartupGate,
 } from "./startup-gate";
@@ -40,7 +41,13 @@ export type BrowserReconciliationRetryConfig = {
 export type BrowserReconciliationCoordinatorDependencies = {
   gate: BrowserStartupGate;
   pool: Pick<Pool, "connect">;
-  filesystem: BrowserStateFilesystem;
+  deleteReplayCheckpoint?: (
+    statePath: string,
+    checksum: string,
+    lease: BrowserStateMutationLease,
+  ) => Promise<void>;
+  /** @internal Legacy test injection; production uses Browser Service. */
+  filesystem?: BrowserStateFileDeleter;
   inspectProcessIdentity: typeof inspectBrowserStateProcessIdentity;
   serviceClient: Pick<
     BrowserServiceClient,
@@ -156,6 +163,7 @@ function isNonRetryable(error: unknown): boolean {
       [
         "browser_service_authentication_failed",
         "browser_service_protocol_error",
+        "control_generation_drain_failed",
         "control_generation_mismatch",
         "control_generation_superseded",
         "reconciliation_conflicting_replay",
@@ -556,7 +564,23 @@ export function createBrowserReconciliationCoordinator(
         assertRunning(signal, deadlineFor(startedAt));
         await deps.recoverBrowserCleanupIntentsBeforeSnapshot({
           pool: transactionPool(transaction),
-          filesystem: deps.filesystem,
+          filesystem:
+            deps.filesystem ??
+            ({
+              delete: async () => {
+                throw new BrowserReconciliationCoordinatorError();
+              },
+              deleteWithChecksum: (statePath, checksum) => {
+                if (deps.deleteReplayCheckpoint) {
+                  return deps.deleteReplayCheckpoint(
+                    statePath,
+                    checksum,
+                    lease,
+                  );
+                }
+                throw new BrowserReconciliationCoordinatorError();
+              },
+            } satisfies BrowserStateFileDeleter),
           inspectProcessIdentity: deps.inspectProcessIdentity,
           signal,
         });

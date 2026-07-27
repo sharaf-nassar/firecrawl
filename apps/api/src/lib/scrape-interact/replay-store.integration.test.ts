@@ -263,6 +263,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
   const pool = new Pool({ connectionString: databaseUrl, max: 4 });
   const database = drizzle({ client: pool });
   let root: string;
+  let filesystem: BrowserStateFilesystem;
   let replayStore: typeof import("./replay-store") & {
     persistScrapeReplayState: ReturnType<
       (typeof import("./replay-store"))["createReplayPersistenceForTesting"]
@@ -309,6 +310,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
 
   beforeAll(async () => {
     root = await mkdtemp(path.join(tmpdir(), "firecrawl-replay-store-"));
+    filesystem = new BrowserStateFilesystem(root);
     await pool.query("DROP SCHEMA public CASCADE");
     await pool.query("CREATE SCHEMA public");
     await runApplicationMigrations({
@@ -348,7 +350,14 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     replayStore = {
       ...replayStoreModule,
       persistScrapeReplayState:
-        replayStoreModule.createReplayPersistenceForTesting(),
+        replayStoreModule.createReplayPersistenceForTesting(filesystem),
+      loadScrapeReplayState: (ownerId: string, scrapeId: string) =>
+        replayStoreModule.loadScrapeReplayState(
+          ownerId,
+          scrapeId,
+          undefined,
+          filesystem,
+        ),
     };
     replayIngest = await import("./replay-ingest.js");
   });
@@ -481,6 +490,7 @@ describeWithDatabase("scrape replay checkpoint store", () => {
     replayStore.registerReplayPersistenceAuthorityRoute(app, {
       apiKey: "r".repeat(32),
       getGate: () => gate as never,
+      persistForTesting: replayStore.persistScrapeReplayState,
     });
     const server = app.listen(0, "127.0.0.1");
     await new Promise<void>((resolve, reject) => {

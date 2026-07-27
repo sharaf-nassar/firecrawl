@@ -19,13 +19,20 @@ import {
   createControlGenerationV1Schema,
   createRelayGrantV1Schema,
   createSessionV1Schema,
+  deleteReplayCheckpointV1Schema,
+  deleteRetainedProfileGenerationV1Schema,
+  deletedReplayCheckpointV1Schema,
+  deletedRetainedProfileGenerationV1Schema,
   deleteProfileGenerationV1Schema,
   deletedProfileGenerationV1Schema,
   fetchArtifactV1Schema,
   finalizeProfileGenerationV1Schema,
   finalizedProfileGenerationV1Schema,
   liveDiscoveryV1Schema,
+  persistReplayCheckpointV1Schema,
+  persistedReplayCheckpointV1Schema,
   privateErrorV1Schema,
+  readReplayCheckpointV1Schema,
   PRIVATE_AUTH_HEADERS,
   PRIVATE_FENCING_HEADERS,
   readyHealthV1Schema,
@@ -33,6 +40,7 @@ import {
   relayGrantV1Schema,
   revokeRelayGrantV1Schema,
   revokedRelayGrantV1Schema,
+  replayCheckpointContentV1Schema,
   scopedLiveHealthV1Schema,
   sessionV1Schema,
   tokenSchema,
@@ -45,12 +53,20 @@ import {
   type CreateControlGenerationV1,
   type CreateRelayGrantV1,
   type CreateSessionV1,
+  type DeleteReplayCheckpointV1,
+  type DeleteRetainedProfileGenerationV1,
+  type DeletedReplayCheckpointV1,
+  type DeletedRetainedProfileGenerationV1,
   type DeleteProfileGenerationV1,
   type DeletedProfileGenerationV1,
   type FetchArtifactV1,
   type FinalizeProfileGenerationV1,
   type FinalizedProfileGenerationV1,
   type LiveDiscoveryV1,
+  type PersistReplayCheckpointV1,
+  type PersistedReplayCheckpointV1,
+  type ReadReplayCheckpointV1,
+  type ReplayCheckpointContentV1,
   type ReadyHealthV1,
   type ReconciliationResultV1,
   type RelayGrantV1,
@@ -66,12 +82,17 @@ const RELAY_TOKEN_HEADER = "x-firecrawl-relay-token";
 const JSON_CONTENT_TYPE = "application/json";
 
 function requireHttpRoute(route: (typeof API_PRIVATE_ROUTE_CONTRACTS)[number]) {
-  if (route.method === "WS" || route.responseBytes === null) {
+  if (
+    route.method === "WS" ||
+    route.responseBytes === null ||
+    typeof route.requestBytes !== "number"
+  ) {
     throw new TypeError("API private HTTP route inventory is invalid");
   }
   return {
     ...route,
     method: route.method,
+    requestBytes: route.requestBytes,
     responseBytes: route.responseBytes,
   };
 }
@@ -93,6 +114,12 @@ const PRIVATE_ROUTES = {
   cdpStream: API_PRIVATE_ROUTE_CONTRACTS[13],
   live: requireHttpRoute(API_PRIVATE_ROUTE_CONTRACTS[14]),
   ready: requireHttpRoute(API_PRIVATE_ROUTE_CONTRACTS[15]),
+  persistReplayCheckpoint: requireHttpRoute(API_PRIVATE_ROUTE_CONTRACTS[16]),
+  readReplayCheckpoint: requireHttpRoute(API_PRIVATE_ROUTE_CONTRACTS[17]),
+  deleteReplayCheckpoint: requireHttpRoute(API_PRIVATE_ROUTE_CONTRACTS[18]),
+  deleteRetainedProfileGeneration: requireHttpRoute(
+    API_PRIVATE_ROUTE_CONTRACTS[19],
+  ),
 } as const;
 
 function routePath(
@@ -756,6 +783,119 @@ export class BrowserServiceClient {
     if (
       result.processNonce !== binding.processNonce ||
       result.controlGenerationNonce !== binding.controlGenerationNonce
+    ) {
+      throw protocolError();
+    }
+    return result;
+  }
+
+  async persistReplayCheckpoint(
+    request: PersistReplayCheckpointV1,
+    context: BrowserServiceRequestContext,
+  ): Promise<PersistedReplayCheckpointV1> {
+    const binding = bindingFrom(context);
+    const result = await this.#json(
+      PRIVATE_ROUTES.persistReplayCheckpoint.method,
+      PRIVATE_ROUTES.persistReplayCheckpoint.path,
+      context,
+      PRIVATE_ROUTES.persistReplayCheckpoint.responses[0].status,
+      persistedReplayCheckpointV1Schema,
+      PRIVATE_ROUTES.persistReplayCheckpoint.responseBytes,
+      {
+        schema: persistReplayCheckpointV1Schema,
+        value: request,
+        maximumBytes: PRIVATE_ROUTES.persistReplayCheckpoint.requestBytes,
+      },
+      binding,
+    );
+    const expectedPath =
+      `replay/${request.ownerId}/${request.scrapeId}/` +
+      `${request.checkpointId}.json`;
+    if (result.statePath !== expectedPath) throw protocolError();
+    return result;
+  }
+
+  async readReplayCheckpoint(
+    request: ReadReplayCheckpointV1,
+    context: BrowserServiceRequestContext,
+  ): Promise<ReplayCheckpointContentV1> {
+    const binding = bindingFrom(context);
+    const result = await this.#json(
+      PRIVATE_ROUTES.readReplayCheckpoint.method,
+      PRIVATE_ROUTES.readReplayCheckpoint.path,
+      context,
+      PRIVATE_ROUTES.readReplayCheckpoint.responses[0].status,
+      replayCheckpointContentV1Schema,
+      PRIVATE_ROUTES.readReplayCheckpoint.responseBytes,
+      {
+        schema: readReplayCheckpointV1Schema,
+        value: request,
+        maximumBytes: PRIVATE_ROUTES.readReplayCheckpoint.requestBytes,
+      },
+      binding,
+    );
+    if (
+      result.statePath !== request.statePath ||
+      result.checksum !== request.checksum ||
+      result.byteSize !== request.byteSize
+    ) {
+      throw protocolError();
+    }
+    return result;
+  }
+
+  async deleteReplayCheckpoint(
+    request: DeleteReplayCheckpointV1,
+    context: BrowserServiceRequestContext,
+  ): Promise<DeletedReplayCheckpointV1> {
+    const binding = bindingFrom(context);
+    const result = await this.#json(
+      PRIVATE_ROUTES.deleteReplayCheckpoint.method,
+      PRIVATE_ROUTES.deleteReplayCheckpoint.path,
+      context,
+      PRIVATE_ROUTES.deleteReplayCheckpoint.responses[0].status,
+      deletedReplayCheckpointV1Schema,
+      PRIVATE_ROUTES.deleteReplayCheckpoint.responseBytes,
+      {
+        schema: deleteReplayCheckpointV1Schema,
+        value: request,
+        maximumBytes: PRIVATE_ROUTES.deleteReplayCheckpoint.requestBytes,
+      },
+      binding,
+    );
+    if (
+      result.statePath !== request.statePath ||
+      result.checksum !== request.checksum
+    ) {
+      throw protocolError();
+    }
+    return result;
+  }
+
+  async deleteRetainedProfileGeneration(
+    request: DeleteRetainedProfileGenerationV1,
+    context: BrowserServiceRequestContext,
+  ): Promise<DeletedRetainedProfileGenerationV1> {
+    const binding = bindingFrom(context);
+    const route = PRIVATE_ROUTES.deleteRetainedProfileGeneration;
+    const result = await this.#json(
+      route.method,
+      routePath(route.path, { generationId: request.generationId }),
+      context,
+      route.responses[0].status,
+      deletedRetainedProfileGenerationV1Schema,
+      route.responseBytes,
+      {
+        schema: deleteRetainedProfileGenerationV1Schema,
+        value: request,
+        maximumBytes: route.requestBytes,
+      },
+      binding,
+    );
+    if (
+      result.generationId !== request.generationId ||
+      result.statePath !== request.statePath ||
+      result.checksum !== request.checksum
     ) {
       throw protocolError();
     }

@@ -1647,11 +1647,12 @@ export async function commitPreparedProfileGeneration(
   await lease.transaction.query(
     `INSERT INTO browser_profile_generations
        (id, profile_id, generation, state_path, byte_size, checksum)
-     VALUES ($1, $2, $3, NULL, $4, $5)`,
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
       prepared.generationId,
       prepared.profileId,
       generation,
+      `profiles/${prepared.profileId}/committed/${prepared.generationId}`,
       prepared.byteSize,
       prepared.checksum,
     ],

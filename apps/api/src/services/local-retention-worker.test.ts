@@ -265,6 +265,48 @@ describe("retentionDeadline", () => {
 });
 
 describe("runLocalRetentionIteration", () => {
+  it("dispatches replay and profile candidates with closed authorities", async () => {
+    const database = new FakeDatabase();
+    database.browserStateFiles = [
+      browserStateFiles(1)[0]!,
+      {
+        kind: "profile-generation",
+        id: "33333333-3333-4333-8333-333333333333",
+        statePath:
+          "profiles/11111111-1111-4111-8111-111111111111/committed/" +
+          "33333333-3333-4333-8333-333333333333",
+        checksum: "a".repeat(64),
+        deleteAfter: new Date("2026-07-17T00:00:00.000Z"),
+      },
+    ];
+    const deleteCandidate = vi.fn(async () => undefined);
+
+    await runLocalRetentionIteration({
+      database,
+      artifactStore: null,
+      browserStateFilesystem: {
+        delete: vi.fn(),
+        deleteCandidate,
+      },
+      now: new Date("2026-07-18T00:00:00.000Z"),
+      logger: silentLogger,
+    });
+
+    expect(deleteCandidate).toHaveBeenNthCalledWith(1, {
+      kind: "replay-checkpoint",
+      statePath: "replay/owner/scrape/checkpoint-0.json",
+      checksum: "0".repeat(64),
+    });
+    expect(deleteCandidate).toHaveBeenNthCalledWith(2, {
+      kind: "profile-generation",
+      generationId: "33333333-3333-4333-8333-333333333333",
+      statePath:
+        "profiles/11111111-1111-4111-8111-111111111111/committed/" +
+        "33333333-3333-4333-8333-333333333333",
+      checksum: "a".repeat(64),
+    });
+  });
+
   it("deletes browser state before metadata and operational rows", async () => {
     const database = new FakeDatabase();
     database.browserStateFiles = browserStateFiles(1);

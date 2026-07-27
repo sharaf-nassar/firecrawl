@@ -13,6 +13,7 @@ import {
 } from "vitest";
 
 import { runApplicationMigrations } from "../../db/migrate";
+import { loadBrowserReconciliationSnapshot } from "../browser-runtime/reconciliation-snapshot";
 import type { BrowserStartupGate } from "../browser-runtime/startup-gate";
 import type { BrowserOperation, SubmitBrowserActionV1 } from "./types";
 
@@ -353,6 +354,7 @@ describeWithDatabase("durable browser state store", () => {
         profileId: null,
         browserId: null,
         runtimeEpoch: 1,
+        requiresPreparedProfile: false,
       },
     ]);
     await withMutationLease(lease =>
@@ -475,7 +477,7 @@ describeWithDatabase("durable browser state store", () => {
       [profileId],
     );
     const generation = await pool.query(
-      `SELECT generation, byte_size, checksum
+      `SELECT generation, state_path, byte_size, checksum
          FROM browser_profile_generations
         WHERE id = $1`,
       [preparedGenerationId],
@@ -486,8 +488,21 @@ describeWithDatabase("durable browser state store", () => {
     });
     expect(generation.rows[0]).toEqual({
       generation: 2,
+      state_path: `profiles/${profileId}/committed/${preparedGenerationId}`,
       byte_size: "256",
       checksum: "2".repeat(64),
+    });
+    await expect(
+      loadBrowserReconciliationSnapshot(pool),
+    ).resolves.toMatchObject({
+      references: [
+        {
+          kind: "profile_generation",
+          id: preparedGenerationId,
+          path: `profiles/${profileId}/committed/${preparedGenerationId}`,
+          checksum: "2".repeat(64),
+        },
+      ],
     });
   });
 
