@@ -10,16 +10,6 @@ export const CLEANUP_KILL_GRACE_MS = 1_000;
 export const CLEANUP_POLL_MS = 10;
 export const CLEANUP_TOTAL_GRACE_MS = 5_000;
 export const CLEANUP_DRAIN_GRACE_MS = 1_000;
-const requiredSchemaDefinitions = Object.freeze([
-  "ThreadStartParams",
-  "TurnStartParams",
-  "ThreadStartResponse",
-  "TurnCompletedNotification",
-]);
-export const REQUIRED_SCHEMA_DEFINITIONS = Object.freeze([
-  ...requiredSchemaDefinitions,
-]);
-
 export const CONFIG = `model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
 approval_policy = "never"

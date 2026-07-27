@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import * as contract from "./gate-contract.mjs";
+import * as compatibility from "./app-server-compatibility.mjs";
 import * as codexExecutable from "./codex-executable.mjs";
 import * as decisionWire from "./decision-wire.mjs";
 import * as orchestration from "./gate-orchestration.mjs";
@@ -30,6 +31,7 @@ const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const gatePath = fileURLToPath(new URL("./run.mjs", import.meta.url));
 const productionSourcePaths = [
   "action-store.mjs",
+  "app-server-compatibility.mjs",
   "app-server-protocol.mjs",
   "codex-executable.mjs",
   "decision-wire.mjs",
@@ -1088,12 +1090,17 @@ assert.deepEqual(Object.keys(contract).toSorted(), [
   "MAX_OUTPUT_BYTES",
   "MAX_RUNS",
   "MODEL",
-  "REQUIRED_SCHEMA_DEFINITIONS",
   "REVIEWED_ENABLED_NON_TOOL_FEATURES",
   "TOOL_SURFACE_PATTERN",
   "WATCHDOG_MS",
   "gateError",
   "hashFeatureInventory",
+]);
+assert.deepEqual(Object.keys(compatibility).toSorted(), [
+  "deriveSafeSchemaMismatchDetails",
+  "loadRequiredV2Contract",
+  "validateAppServerCompatibility",
+  "validateSchemaVocabulary",
 ]);
 assert.deepEqual(Object.keys(codexExecutable).toSorted(), [
   "assertSameCodexIdentity",
@@ -1132,8 +1139,9 @@ assert.deepEqual(Object.keys(protocol).toSorted(), [
   "runUnloadedTurnRegression",
   "schemaHash",
   "startTurn",
+  "validateGateSchemaBundle",
 ]);
-assert.equal(Object.keys(protocol).length, 11);
+assert.equal(Object.keys(protocol).length, 12);
 assert.equal(
   protocol.assertGeneratedSchemaValue(1, { schema: { type: "integer" } }),
   1,
@@ -1260,6 +1268,28 @@ assert.match(
 );
 assert.equal("CODEX_VERSION" in contract, false);
 assert.equal("CODEX_VERSION_OUTPUT" in contract, false);
+assert.equal("REQUIRED_SCHEMA_DEFINITIONS" in contract, false);
+assert.doesNotMatch(
+  productionSources["lifecycle.mjs"],
+  /REQUIRED_SCHEMA_DEFINITIONS|required_field|schema_vocabulary/,
+);
+assert.doesNotMatch(
+  productionSources["app-server-protocol.mjs"],
+  /SUPPORTED_SCHEMA_KEYWORDS/,
+);
+assert.match(
+  productionSources["app-server-protocol.mjs"],
+  /validation\.definitions\[name\]/,
+);
+const requiredV2Contract = await compatibility.loadRequiredV2Contract(
+  new URL(
+    "../../host/browser-runtime/protocol/compatibility/required-v2-contract.json",
+    import.meta.url,
+  ),
+);
+for (const name of Object.keys(requiredV2Contract.requiredDefinitions)) {
+  assert.doesNotMatch(productionSources["lifecycle.mjs"], new RegExp(name));
+}
 
 const primaryFailure = new Error("primary");
 const cleanupFailure = new Error("cleanup");
@@ -1642,12 +1672,6 @@ unified_exec = false
 workspace_dependencies = false
 `,
 );
-assert.deepEqual([...contract.REQUIRED_SCHEMA_DEFINITIONS], [
-  "ThreadStartParams",
-  "TurnStartParams",
-  "ThreadStartResponse",
-  "TurnCompletedNotification",
-]);
 assert.deepEqual([...contract.DISABLED_FEATURES], [
   "apps",
   "artifact",
@@ -1729,15 +1753,10 @@ for (const eventName of ["turn/started", "agentMessage", "reasoning"]) {
   assert.equal(contract.FORBIDDEN_EVENT_PATTERN.test(eventName), false);
 }
 
-assert.equal(Object.isFrozen(contract.REQUIRED_SCHEMA_DEFINITIONS), true);
 assert.equal(Object.isFrozen(contract.DISABLED_FEATURES), true);
 assert.equal(Object.isFrozen(contract.REVIEWED_ENABLED_NON_TOOL_FEATURES), true);
 assert.equal(Object.isFrozen(contract.ALLOWED_ITEM_TYPES), true);
-assert.throws(() => contract.REQUIRED_SCHEMA_DEFINITIONS.push("Injected"));
 assert.throws(() => contract.DISABLED_FEATURES.push("injected_tool"));
-assert.throws(() => {
-  contract.REQUIRED_SCHEMA_DEFINITIONS[0] = "Injected";
-});
 assert.throws(() => {
   contract.REVIEWED_ENABLED_NON_TOOL_FEATURES.injected = true;
 });

@@ -14,14 +14,30 @@ import {
   gateError,
   MAX_OUTPUT_BYTES,
   MODEL,
-  REQUIRED_SCHEMA_DEFINITIONS,
   WATCHDOG_MS,
 } from "./gate-contract.mjs";
+import {
+  loadRequiredV2Contract,
+  validateAppServerCompatibility,
+  validateSchemaVocabulary,
+} from "./app-server-compatibility.mjs";
 import { LifecycleRegistry, ProcessDeadline } from "./lifecycle.mjs";
 import {
   hashCanonicalSchemaBundle,
   parseLosslessJson,
 } from "./schema-canonicalizer.mjs";
+
+const REQUIRED_V2_CONTRACT_URL = new URL(
+  "../../host/browser-runtime/protocol/compatibility/required-v2-contract.json",
+  import.meta.url,
+);
+const requiredV2Contract = await loadRequiredV2Contract(
+  REQUIRED_V2_CONTRACT_URL,
+);
+
+export function validateGateSchemaBundle(bundle, contract = requiredV2Contract) {
+  return validateAppServerCompatibility(bundle, contract);
+}
 
 class RawJsonlFramer {
   constructor(onLine) {
@@ -177,7 +193,10 @@ function parseAppServerMessage(raw) {
   }
 }
 
-export async function schemaHash(schemaDir) {
+export async function schemaHash(
+  schemaDir,
+  { contractPath = REQUIRED_V2_CONTRACT_URL } = {},
+) {
   const entries = await readdir(schemaDir, {
     recursive: true,
     withFileTypes: true,
@@ -207,25 +226,11 @@ export async function schemaHash(schemaDir) {
   } catch {
     throw gateError("codex_protocol_schema_mismatch");
   }
-  const bundleRaw = rawFiles.find(
-    ([relativePath]) =>
-      relativePath === "codex_app_server_protocol.v2.schemas.json",
-  )?.[1];
-  let bundleAst;
-  try {
-    bundleAst = parseLosslessJson(bundleRaw);
-  } catch {
-    throw gateError("codex_protocol_schema_mismatch");
-  }
-  const definitions = astObjectMember(bundleAst, "definitions");
-  if (definitions?.kind !== "object") {
-    throw gateError("codex_protocol_schema_mismatch");
-  }
-  for (const name of REQUIRED_SCHEMA_DEFINITIONS) {
-    if (!definitions.members.some(member => member.key === name)) {
-      throw gateError("codex_protocol_schema_mismatch", name);
-    }
-  }
+  const contract =
+    contractPath === REQUIRED_V2_CONTRACT_URL
+      ? requiredV2Contract
+      : await loadRequiredV2Contract(contractPath);
+  validateGateSchemaBundle({ files: rawFiles }, contract);
 
   try {
     const SCHEMA_LOGICAL_PREFIX =
@@ -620,7 +625,7 @@ function generatedSchemaMatchesActive(
 
 export function assertGeneratedSchemaValue(value, schemaSource) {
   try {
-    auditGeneratedSchemaKeywords(schemaSource.schema);
+    validateSchemaVocabulary(schemaSource.schema, requiredV2Contract);
     if (
       !generatedSchemaMatches(
         value,
@@ -638,79 +643,45 @@ export function assertGeneratedSchemaValue(value, schemaSource) {
   }
 }
 
-const SUPPORTED_SCHEMA_KEYWORDS = new Set([
-  "$ref",
-  "$schema",
-  "additionalProperties",
-  "allOf",
-  "anyOf",
-  "const",
-  "default",
-  "definitions",
-  "description",
-  "enum",
-  "format",
-  "items",
-  "maxItems",
-  "maxLength",
-  "maximum",
-  "minItems",
-  "minLength",
-  "minimum",
-  "oneOf",
-  "properties",
-  "required",
-  "title",
-  "type",
-]);
-
-function auditGeneratedSchemaKeywords(schema) {
-  if (schema === true || schema === false) return;
-  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
-    throw gateError("codex_protocol_schema_mismatch");
-  }
-  for (const key of Object.keys(schema)) {
-    if (!SUPPORTED_SCHEMA_KEYWORDS.has(key)) {
-      throw gateError("codex_protocol_schema_mismatch");
-    }
-  }
-  if (Object.hasOwn(schema, "format")) {
-    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-    if (
-      !INTEGER_FORMAT_RANGES.has(schema.format) ||
-      !types.includes("integer")
-    ) {
-      throw gateError("codex_protocol_schema_mismatch");
-    }
-  }
-  for (const group of [schema.properties, schema.definitions]) {
-    for (const child of Object.values(group ?? {})) {
-      auditGeneratedSchemaKeywords(child);
-    }
-  }
-  for (const key of ["items", "additionalProperties"]) {
-    if (schema[key] !== undefined && typeof schema[key] === "object") {
-      auditGeneratedSchemaKeywords(schema[key]);
-    }
-  }
-  for (const key of ["allOf", "anyOf", "oneOf"]) {
-    for (const child of schema[key] ?? []) auditGeneratedSchemaKeywords(child);
-  }
-}
-
 export async function loadEventSchemas(schemaDir) {
   try {
-    const load = async name => {
-      const raw = await readFile(join(schemaDir, "v2", name));
-      const ast = parseLosslessJson(raw);
-      return { ast, schema: schemaAstToValue(ast) };
+    const names = [
+      "ItemCompletedNotification",
+      "ThreadStartParams",
+      "ThreadStartResponse",
+      "TurnCompletedNotification",
+      "TurnStartParams",
+    ];
+    const files = [
+      [
+        "codex_app_server_protocol.v2.schemas.json",
+        await readFile(
+          join(schemaDir, "codex_app_server_protocol.v2.schemas.json"),
+        ),
+      ],
+    ];
+    for (const name of names) {
+      files.push([
+        `v2/${name}.json`,
+        await readFile(join(schemaDir, "v2", `${name}.json`)),
+      ]);
+    }
+    const validation = validateGateSchemaBundle(
+      { files },
+      requiredV2Contract,
+    );
+    const load = name => {
+      const ast = validation.definitions[name];
+      const schema = schemaAstToValue(ast);
+      schema.definitions = schemaAstToValue(validation.allDefinitions);
+      return { ast, schema };
     };
     return {
-      threadStartParams: await load("ThreadStartParams.json"),
-      turnStartParams: await load("TurnStartParams.json"),
-      threadStartResponse: await load("ThreadStartResponse.json"),
-      itemCompleted: await load("ItemCompletedNotification.json"),
-      turnCompleted: await load("TurnCompletedNotification.json"),
+      threadStartParams: load("ThreadStartParams"),
+      turnStartParams: load("TurnStartParams"),
+      threadStartResponse: load("ThreadStartResponse"),
+      itemCompleted: load("ItemCompletedNotification"),
+      turnCompleted: load("TurnCompletedNotification"),
     };
   } catch {
     throw gateError("codex_protocol_schema_mismatch");
@@ -1457,7 +1428,9 @@ export async function runProtocolHardeningSelfTest({
   );
   assert.throws(
     () =>
-      auditGeneratedSchemaKeywords({ type: "integer", format: "int128" }),
+      assertGeneratedSchemaValue(1, {
+        schema: { type: "integer", format: "int128" },
+      }),
     /codex_protocol_schema_mismatch/,
   );
   assert.doesNotThrow(() =>

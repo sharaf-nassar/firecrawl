@@ -17,8 +17,21 @@ import {
   CLEANUP_TOTAL_GRACE_MS,
   gateError,
   MAX_OUTPUT_BYTES,
-  REQUIRED_SCHEMA_DEFINITIONS,
 } from "./gate-contract.mjs";
+import {
+  deriveSafeSchemaMismatchDetails,
+  loadRequiredV2Contract,
+} from "./app-server-compatibility.mjs";
+
+const REQUIRED_V2_CONTRACT_URL = new URL(
+  "../../host/browser-runtime/protocol/compatibility/required-v2-contract.json",
+  import.meta.url,
+);
+const SAFE_SCHEMA_DETAILS = new Set(
+  deriveSafeSchemaMismatchDetails(
+    await loadRequiredV2Contract(REQUIRED_V2_CONTRACT_URL),
+  ),
+);
 
 const wait = milliseconds =>
   new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -316,7 +329,6 @@ const SAFE_AGGREGATE_CATEGORIES = new Set([
   "lifecycle_cleanup_failed",
   "operation_and_cleanup_failed",
 ]);
-const SAFE_SCHEMA_DETAILS = new Set(REQUIRED_SCHEMA_DEFINITIONS);
 const safeProtocolDetail = detail =>
   detail.length <= 128 &&
   /^[A-Za-z][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9_.-]+)*$/.test(detail);
