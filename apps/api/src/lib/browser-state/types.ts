@@ -4,6 +4,8 @@ import type {
   browser_session_activities,
   browser_sessions,
 } from "../../db/schema/public";
+import { z } from "zod";
+import { canonicalUuidSchema } from "../scrape-interact/browser-service-contracts";
 import type { BrowserOperationResultV1 } from "../scrape-interact/browser-service-contracts";
 
 /** @public */
@@ -62,11 +64,15 @@ export interface BoundedPageState {
   snapshotExcerpt: string;
 }
 
-export type AdapterAuthorizationBinding = {
-  adapterJobId: string;
-  adapterSupervisorId: string;
-  adapterProcessId: number;
-};
+export const adapterAuthorizationBindingSchema = z.strictObject({
+  adapterJobId: canonicalUuidSchema,
+  adapterSupervisorId: canonicalUuidSchema,
+  adapterProcessId: z.number().int().positive().safe(),
+});
+
+export type AdapterAuthorizationBinding = z.infer<
+  typeof adapterAuthorizationBindingSchema
+>;
 
 export type AdapterPendingBinding = Omit<
   AdapterAuthorizationBinding,

@@ -1,4 +1,6 @@
 import "dotenv/config";
+import path from "node:path";
+
 import { z } from "zod";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
 
@@ -15,6 +17,20 @@ const emptyStringAsUndefined = <T extends z.ZodTypeAny>(schema: T) =>
 
 const emptyStringAsDefault = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess(value => (value === "" ? undefined : value), schema);
+
+export const canonicalAbsoluteUnixSocketPathSchema = z
+  .string()
+  .min(2)
+  .refine(value => !value.includes("\0"), "socket path contains NUL")
+  .refine(value => path.isAbsolute(value), "socket path must be absolute")
+  .refine(
+    value => path.normalize(value) === value,
+    "socket path must be lexically canonical",
+  )
+  .refine(
+    value => !value.endsWith(path.sep),
+    "socket path must not end with a separator",
+  );
 
 // Ethereum address schema: validates 0x followed by 40 hex characters
 const ethereumAddress = z
@@ -170,6 +186,9 @@ export const configSchema = z.object({
     z.coerce.number().int().min(5_000).max(300_000).default(30_000),
   ),
   BROWSER_ADAPTER_TOKEN_FILE: emptyStringAsUndefined(z.string()),
+  BROWSER_EXECUTION_ADAPTER_SOCKET: emptyStringAsUndefined(
+    canonicalAbsoluteUnixSocketPathSchema,
+  ),
   APPLICATION_DATABASE_URL: emptyStringAsUndefined(z.string().url()),
   LOCAL_OWNER_ID: emptyStringAsUndefined(z.string().uuid()),
   ARTIFACT_STORE_PROVIDER: emptyStringAsDefault(

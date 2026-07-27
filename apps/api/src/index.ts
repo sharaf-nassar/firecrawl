@@ -70,6 +70,7 @@ import {
   createPublicBrowserRuntime,
   registerPublicBrowserRuntime,
 } from "./lib/browser-runtime/public-browser-runtime";
+import { createSocketExecutionAdapter } from "./lib/browser-runtime/execution-adapter";
 import { createBrowserProxyGrantStore } from "./lib/browser-state/proxy-grant-store";
 import { registerBrowserProxyRuntime } from "./controllers/v2/browser-proxy";
 import {
@@ -271,6 +272,11 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
       createPublicBrowserRuntime({
         gate,
         browserClient: serviceClient,
+        adapter: config.BROWSER_EXECUTION_ADAPTER_SOCKET
+          ? createSocketExecutionAdapter({
+              socketPath: config.BROWSER_EXECUTION_ADAPTER_SOCKET,
+            })
+          : undefined,
         getActiveCount: getCombinedTeamActiveCount,
         acquireAdmission: mirrorExternalSlotAcquire,
         releaseAdmissionBackend: releaseExternalSlotBackend,

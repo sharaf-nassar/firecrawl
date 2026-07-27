@@ -20,5 +20,9 @@ describe("unavailable execution adapter", () => {
     expect(new ExecutionAdapterError("codex_unavailable")).toMatchObject({
       category: "codex_unavailable",
     });
+    expect(new ExecutionAdapterError("adapter_protocol_error")).toMatchObject({
+      category: "adapter_protocol_error",
+      message: "Browser execution adapter protocol failed",
+    });
   });
 });

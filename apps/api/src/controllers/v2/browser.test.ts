@@ -213,6 +213,27 @@ describe("local direct Browser compatibility", () => {
     expect(JSON.stringify(execute.body)).not.toContain("private");
   });
 
+  it("maps adapter protocol faults to a sanitized 502", async () => {
+    mocks.runtime.executeSession.mockRejectedValue(
+      Object.assign(new Error("/run/private/adapter.sock: malformed secret"), {
+        category: "adapter_protocol_error",
+      }),
+    );
+    const execute = response();
+
+    await browserExecuteController(
+      request({ code: "1" }, { sessionId: randomUUID() }),
+      execute as never,
+    );
+
+    expect(execute.statusCode).toBe(502);
+    expect(execute.body).toEqual({
+      success: false,
+      error: "Browser execution returned an invalid protocol result.",
+    });
+    expect(JSON.stringify(execute.body)).not.toContain("/run/private");
+  });
+
   it("rotates list URLs and keeps duplicate delete idempotent", async () => {
     const id = randomUUID();
     const base = {

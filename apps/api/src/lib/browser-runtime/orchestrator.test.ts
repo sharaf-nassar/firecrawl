@@ -33,6 +33,7 @@ vi.mock("../browser-state/store", () => ({
 }));
 
 import { PROMPT_LOOP_POLICY_V1 } from "./protocol";
+import { createPreAdmissionExecutionAdapterError } from "./execution-adapter";
 import { createBrowserSessionOrchestrator as createProductionBrowserSessionOrchestrator } from "./orchestrator";
 
 const TEST_CAPABILITY_TOKEN = "t".repeat(43);
@@ -218,6 +219,121 @@ describe("browser session orchestrator", () => {
         capabilityToken: TEST_CAPABILITY_TOKEN,
       }),
       expect.any(AbortSignal),
+    );
+  });
+
+  it("does not cancel host work when the adapter rejects before acceptance", async () => {
+    const unavailable =
+      createPreAdmissionExecutionAdapterError("codex_unavailable");
+    const adapter = {
+      executePromptRun: vi.fn(async () => {
+        throw unavailable;
+      }),
+      executeCodeRun: vi.fn(),
+      cancelExecutionRun: vi.fn(async () => ({ killed: true as const })),
+    };
+    const stores = {
+      beginAdapterRun: vi.fn(async (_lease, input) => input),
+      activateAdapterProcess: vi.fn(),
+      countInteractActions: vi.fn(async () => 0),
+      finishAdapterRun: vi.fn(),
+      failAdapterRun: vi.fn(),
+      revokeCapability: vi.fn(),
+      claimStop: vi.fn(),
+      finishStop: vi.fn(),
+    };
+    const gate = openGate();
+    const orchestrator = createBrowserSessionOrchestratorForTest(
+      { gate: gate as never, adapter, stores, closeSession: vi.fn() },
+      testCapabilities(gate, stores),
+    );
+
+    await expect(
+      orchestrator.executePrompt({
+        runId: randomUUID(),
+        prompt: "inspect",
+        initialObservation: {
+          version: 1,
+          type: "initial",
+          sequence: 0,
+          page: {
+            url: "https://example.com/",
+            title: "Example",
+            snapshotExcerpt: "",
+          },
+        },
+        deadline: new Date(Date.now() + 30_000),
+        correlationId: randomUUID(),
+      }),
+    ).rejects.toBe(unavailable);
+    expect(adapter.cancelExecutionRun).not.toHaveBeenCalled();
+    expect(stores.failAdapterRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves an execution failure when confirmed cancellation also fails", async () => {
+    const executionFailure = Object.assign(new Error("deadline elapsed"), {
+      category: "timed_out",
+    });
+    const cancellationFailure = Object.assign(new Error("adapter refused"), {
+      category: "adapter_protocol_error",
+    });
+    const adapter = {
+      executePromptRun: vi.fn(async input => {
+        await input.onAccepted({
+          adapterJobId: input.adapterJobId,
+          adapterSupervisorId: input.adapterSupervisorId,
+          adapterProcessId: 4242,
+        });
+        throw executionFailure;
+      }),
+      executeCodeRun: vi.fn(),
+      cancelExecutionRun: vi.fn(async () => {
+        throw cancellationFailure;
+      }),
+    };
+    const stores = {
+      beginAdapterRun: vi.fn(async (_lease, input) => input),
+      activateAdapterProcess: vi.fn(),
+      countInteractActions: vi.fn(async () => 0),
+      finishAdapterRun: vi.fn(),
+      failAdapterRun: vi.fn(),
+      revokeCapability: vi.fn(),
+      claimStop: vi.fn(),
+      finishStop: vi.fn(),
+    };
+    const gate = openGate();
+    const orchestrator = createBrowserSessionOrchestratorForTest(
+      { gate: gate as never, adapter, stores, closeSession: vi.fn() },
+      testCapabilities(gate, stores),
+    );
+
+    await expect(
+      orchestrator.executePrompt({
+        runId: randomUUID(),
+        prompt: "inspect",
+        initialObservation: {
+          version: 1,
+          type: "initial",
+          sequence: 0,
+          page: {
+            url: "https://example.com/",
+            title: "Example",
+            snapshotExcerpt: "",
+          },
+        },
+        deadline: new Date(Date.now() + 30_000),
+        correlationId: randomUUID(),
+      }),
+    ).rejects.toBe(executionFailure);
+    expect(adapter.cancelExecutionRun).toHaveBeenCalledTimes(1);
+    expect(
+      (executionFailure as Error & { cancellationError?: unknown })
+        .cancellationError,
+    ).toBe(cancellationFailure);
+    expect(stores.failAdapterRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      executionFailure,
     );
   });
 

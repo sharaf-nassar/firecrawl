@@ -79,6 +79,7 @@ describe("internal browser run callbacks", () => {
     expect(browserActionErrorStatus("action_limit_exceeded")).toBe(429);
     expect(browserActionErrorStatus("duplicate_side_effect")).toBe(409);
     expect(browserActionErrorStatus("action_in_flight")).toBe(409);
+    expect(browserActionErrorStatus("adapter_protocol_error")).toBe(502);
   });
 
   it.each([

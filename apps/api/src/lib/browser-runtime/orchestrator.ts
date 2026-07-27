@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import type { AdapterAuthorizationBinding } from "../browser-state/types";
+import {
+  adapterAuthorizationBindingSchema,
+  type AdapterAuthorizationBinding,
+} from "../browser-state/types";
 import {
   createCapabilityStore,
   type AdapterCapabilityBinding,
@@ -18,7 +21,10 @@ import {
   renewBrowserSessionStop,
 } from "../browser-state/store";
 import type { BrowserSessionBillingClaim } from "../browser-state/store";
-import type { BrowserExecutionAdapter } from "./execution-adapter";
+import {
+  isPreAdmissionExecutionAdapterError,
+  type BrowserExecutionAdapter,
+} from "./execution-adapter";
 import {
   codeRunInputSchema,
   codeRunResultSchema,
@@ -181,12 +187,6 @@ type DirectSessionInput = {
   rollbackProfileWriter?(lease: BrowserStateMutationLease): Promise<void>;
 };
 
-const bindingSchema = z.strictObject({
-  adapterJobId: runtimeUuidSchema,
-  adapterSupervisorId: runtimeUuidSchema,
-  adapterProcessId: z.number().int().positive(),
-});
-
 const abortSignalSchema = z
   .custom<AbortSignal>(
     value => typeof AbortSignal !== "undefined" && value instanceof AbortSignal,
@@ -279,7 +279,7 @@ function createBrowserSessionOrchestratorCore(
     ): ((binding: AdapterAuthorizationBinding) => Promise<void>) =>
     async untrusted => {
       if (signal.aborted) throw signal.reason;
-      const parsed = bindingSchema.safeParse(untrusted);
+      const parsed = adapterAuthorizationBindingSchema.safeParse(untrusted);
       if (!parsed.success) {
         throw executionError(
           "capability_denied",
@@ -405,7 +405,18 @@ function createBrowserSessionOrchestratorCore(
         typeof error.category === "string"
           ? error.category
           : "failed";
-      await cancel(reason);
+      if (!isPreAdmissionExecutionAdapterError(error)) {
+        try {
+          await cancel(reason);
+        } catch (cancellationError) {
+          if (error instanceof Error && Object.isExtensible(error)) {
+            Object.defineProperty(error, "cancellationError", {
+              configurable: true,
+              value: cancellationError,
+            });
+          }
+        }
+      }
       throw error;
     } finally {
       clearTimeout(timer);

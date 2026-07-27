@@ -12,6 +12,10 @@ import {
   createCapabilityStore,
 } from "../../lib/browser-state/capability-store";
 import {
+  adapterAuthorizationBindingSchema,
+  type AdapterAuthorizationBinding,
+} from "../../lib/browser-state/types";
+import {
   getActiveBrowserRunAuthority,
   type ActiveBrowserRunAuthority,
 } from "../../lib/browser-state/store";
@@ -66,11 +70,7 @@ export type InternalBrowserRunsDependencies = {
   createArtifactService?: typeof createBrowserArtifactService;
 };
 
-type AdapterHeaders = {
-  adapterJobId: string;
-  adapterSupervisorId: string;
-  adapterProcessId: number;
-};
+type AdapterHeaders = AdapterAuthorizationBinding;
 
 const authorityByRequest = new WeakMap<Request, ActiveBrowserRunAuthority>();
 const headersByRequest = new WeakMap<Request, AdapterHeaders>();
@@ -113,22 +113,13 @@ function parseAdapterHeaders(request: Request): AdapterHeaders | null {
     "x-firecrawl-adapter-process-id",
   );
   if (job === null || supervisor === null || process === null) return null;
-  const parsedJob = canonicalUuidSchema.safeParse(job);
-  const parsedSupervisor = canonicalUuidSchema.safeParse(supervisor);
-  if (
-    !parsedJob.success ||
-    !parsedSupervisor.success ||
-    !PROCESS_ID.test(process)
-  ) {
-    return null;
-  }
-  const adapterProcessId = Number(process);
-  if (!Number.isSafeInteger(adapterProcessId)) return null;
-  return {
-    adapterJobId: parsedJob.data,
-    adapterSupervisorId: parsedSupervisor.data,
-    adapterProcessId,
-  };
+  if (!PROCESS_ID.test(process)) return null;
+  const parsed = adapterAuthorizationBindingSchema.safeParse({
+    adapterJobId: job,
+    adapterSupervisorId: supervisor,
+    adapterProcessId: Number(process),
+  });
+  return parsed.success ? parsed.data : null;
 }
 
 function relayFrameBytes(data: unknown): number {
@@ -305,6 +296,7 @@ export function browserActionErrorStatus(category: string): number {
   }
   if (category === "deadline_exceeded") return 504;
   if (
+    category === "adapter_protocol_error" ||
     category === "model_protocol_error" ||
     category === "action_outcome_unknown"
   ) {

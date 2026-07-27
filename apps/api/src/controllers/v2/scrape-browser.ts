@@ -192,7 +192,10 @@ function mapLocalInteractError(error: unknown): {
       message:
         "Replay context is unavailable for this scrape job. Please rerun the scrape.",
     };
-  if (category === "model_protocol_error")
+  if (
+    category === "model_protocol_error" ||
+    category === "adapter_protocol_error"
+  )
     return {
       status: 502,
       message: "Browser execution returned an invalid protocol result.",

@@ -3,14 +3,15 @@ import { Buffer } from "node:buffer";
 import { z } from "zod";
 
 import {
+  adapterAuthorizationBindingSchema,
+  type AdapterPendingAuthorizationInput,
+  type BrowserOperation,
+} from "../browser-state/types";
+import {
   browserOperationResultSchema,
   canonicalUuidSchema,
   httpUrlSchema,
 } from "../scrape-interact/browser-service-contracts";
-import type {
-  AdapterPendingAuthorizationInput,
-  BrowserOperation,
-} from "../browser-state/types";
 
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 const MAX_INTERNAL_JSON_DEPTH = 32;
@@ -394,8 +395,9 @@ export const PROMPT_LOOP_POLICY_V1 = {
 } as const;
 
 const adapterPendingSchema = {
-  adapterJobId: runtimeUuidSchema,
-  adapterSupervisorId: runtimeUuidSchema,
+  adapterJobId: adapterAuthorizationBindingSchema.shape.adapterJobId,
+  adapterSupervisorId:
+    adapterAuthorizationBindingSchema.shape.adapterSupervisorId,
   capabilityToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   onAccepted: z.custom<AdapterPendingAuthorizationInput["onAccepted"]>(
     value => typeof value === "function",

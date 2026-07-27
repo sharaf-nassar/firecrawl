@@ -209,7 +209,8 @@ function mapLocalBrowserError(error: unknown): {
                 category === "capability_denied" ||
                 category === "target_blocked"
               ? 403
-              : category === "model_protocol_error"
+              : category === "model_protocol_error" ||
+                  category === "adapter_protocol_error"
                 ? 502
                 : category === "deadline_exceeded" || category === "timed_out"
                   ? 504

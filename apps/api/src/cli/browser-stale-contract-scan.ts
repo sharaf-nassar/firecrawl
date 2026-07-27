@@ -154,6 +154,7 @@ export const browserBridgeImportClassifications: Readonly<
       "apps/api/src/lib/browser-runtime/startup-gate.ts",
       "apps/api/src/lib/browser-state/capability-store.ts",
       "apps/api/src/lib/browser-state/store.ts",
+      "apps/api/src/lib/browser-state/types.ts",
       "apps/api/src/lib/scrape-interact/browser-service-client.ts",
       "apps/api/src/lib/scrape-interact/browser-service-contracts.ts",
     ].map(path => [path, "browser_follow"]),
@@ -306,6 +307,7 @@ export const browserBridgeImportClassifications: Readonly<
   "apps/api/src/index.ts": Object.fromEntries([
     ...[
       "apps/api/src/lib/browser-runtime/api-startup-lifecycle.ts",
+      "apps/api/src/lib/browser-runtime/execution-adapter.ts",
       "apps/api/src/lib/browser-runtime/public-browser-runtime.ts",
       "apps/api/src/lib/browser-runtime/reconciliation-coordinator.ts",
       "apps/api/src/lib/browser-runtime/reconciliation-snapshot.ts",

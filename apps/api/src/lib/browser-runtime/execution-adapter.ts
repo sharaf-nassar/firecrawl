@@ -5,18 +5,50 @@ import type {
   PromptRunResult,
 } from "./protocol";
 
+export type ExecutionAdapterErrorCategory =
+  | "codex_unavailable"
+  | "sandbox_unavailable"
+  | "adapter_protocol_error"
+  | "cancelled"
+  | "timed_out"
+  | "model_protocol_error"
+  | "action_outcome_unknown"
+  | "capability_denied";
+
+const EXECUTION_ADAPTER_ERROR_MESSAGES: Record<
+  ExecutionAdapterErrorCategory,
+  string
+> = {
+  codex_unavailable: "Local Codex execution is unavailable",
+  sandbox_unavailable: "Local sandbox execution is unavailable",
+  adapter_protocol_error: "Browser execution adapter protocol failed",
+  cancelled: "Browser execution was cancelled",
+  timed_out: "Browser execution timed out",
+  model_protocol_error: "Browser execution returned an invalid protocol result",
+  action_outcome_unknown: "Browser action outcome is unknown",
+  capability_denied: "Browser execution capability was denied",
+};
+
+const PRE_ADMISSION_FAILURES = new WeakSet<Error>();
+
 /** @public */
 export class ExecutionAdapterError extends Error {
-  constructor(
-    public readonly category: "codex_unavailable" | "sandbox_unavailable",
-  ) {
-    super(
-      category === "codex_unavailable"
-        ? "Local Codex execution is unavailable"
-        : "Local sandbox execution is unavailable",
-    );
+  constructor(public readonly category: ExecutionAdapterErrorCategory) {
+    super(EXECUTION_ADAPTER_ERROR_MESSAGES[category]);
     this.name = "ExecutionAdapterError";
   }
+}
+
+export function createPreAdmissionExecutionAdapterError(
+  category: "codex_unavailable" | "sandbox_unavailable",
+): ExecutionAdapterError {
+  const error = new ExecutionAdapterError(category);
+  PRE_ADMISSION_FAILURES.add(error);
+  return error;
+}
+
+export function isPreAdmissionExecutionAdapterError(error: unknown): boolean {
+  return error instanceof Error && PRE_ADMISSION_FAILURES.has(error);
 }
 
 /** @public */
@@ -50,3 +82,5 @@ export function createUnavailableExecutionAdapter(): BrowserExecutionAdapter {
 
 /** @public */
 export const unavailableExecutionAdapter = createUnavailableExecutionAdapter();
+
+export { createSocketExecutionAdapter } from "./execution-adapter-client";

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { adapterAuthorizationBindingSchema } from "../browser-state/types";
 import {
   browserOperationSchema,
   codeRunInputSchema,
@@ -21,6 +22,27 @@ const initialObservation = {
 } as const;
 
 describe("browser runtime protocol", () => {
+  it("uses one strict safe authorization binding schema", () => {
+    const binding = {
+      adapterJobId: UUID,
+      adapterSupervisorId: SUPERVISOR,
+      adapterProcessId: 42,
+    };
+    expect(adapterAuthorizationBindingSchema.parse(binding)).toEqual(binding);
+    expect(
+      adapterAuthorizationBindingSchema.safeParse({
+        ...binding,
+        adapterProcessId: Number.MAX_SAFE_INTEGER + 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      adapterAuthorizationBindingSchema.safeParse({
+        ...binding,
+        privateProcessHandle: "secret",
+      }).success,
+    ).toBe(false);
+  });
+
   it("separates strict model wire operations from trusted internal operations", () => {
     const missingRef = {
       decision: { version: 1, type: "action", action: { kind: "get_text" } },

@@ -296,6 +296,36 @@ describe("local scrape Interact compatibility", () => {
     expect(mocks.legacyCode).not.toHaveBeenCalled();
   });
 
+  it("maps adapter protocol faults to a sanitized 502", async () => {
+    const ownerId = randomUUID();
+    const jobId = randomUUID();
+    mocks.getScrape.mockResolvedValue({
+      id: jobId,
+      team_id: ownerId,
+      url: "https://fixture.example/start",
+      options: {},
+    });
+    mocks.runtime.interact.mockRejectedValue(
+      Object.assign(new Error("/run/private/adapter.sock: leaked bytes"), {
+        category: "adapter_protocol_error",
+      }),
+    );
+    const res = response();
+
+    await scrapeInteractController(
+      request(ownerId, { prompt: "read" }, jobId),
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(502);
+    expect(res.body).toEqual({
+      success: false,
+      error: "Browser execution returned an invalid protocol result.",
+    });
+    expect(JSON.stringify(res.body)).not.toContain("/run/private");
+    expect(mocks.legacyPrompt).not.toHaveBeenCalled();
+  });
+
   it("rejects cross-owner, ZDR, and unavailable replay before execution", async () => {
     const ownerId = randomUUID();
     const otherOwner = randomUUID();
