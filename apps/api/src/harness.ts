@@ -2,9 +2,17 @@ import { config } from "./config";
 import { type ChildProcess, spawn } from "child_process";
 import { existsSync } from "fs";
 import * as net from "net";
+import { tmpdir } from "os";
 import { basename, join } from "path";
 import { HTML_TO_MARKDOWN_PATH } from "./natives";
 import { containerRemovalCommand } from "./harness-container";
+import {
+  createHarnessBrowserShutdownCoordinator,
+  createDefaultHarnessBrowserServiceDependencies,
+  HARNESS_BROWSER_EXTERNAL_OVERRIDES,
+  startHarnessBrowserService,
+  type HarnessBrowserServiceHandle,
+} from "./harness-browser-service";
 import { clearLocalPersistenceExternalSettings } from "./harness-local-persistence";
 import { createSharedShutdown } from "./harness-shutdown";
 
@@ -31,6 +39,9 @@ let applicationPostgresContainer: {
   containerRuntime: string;
 } | null = null;
 let localPersistenceHarness = false;
+let localBrowserHarness = false;
+let harnessBrowserService: HarnessBrowserServiceHandle | null = null;
+const harnessBrowserShutdown = createHarnessBrowserShutdownCoordinator();
 let fixtureServerPort: number | null = null;
 // Get the monorepo root for both tsx source execution and compiled dist execution.
 // __dirname is available in CommonJS (which this compiles to)
@@ -301,7 +312,11 @@ async function availablePortRange(count: number): Promise<number> {
 }
 
 function isLocalPersistenceCommand(command: string[]): boolean {
-  return command[0] === "pnpm" && command[1] === "test:snips:local-persistence";
+  return (
+    command[0] === "pnpm" &&
+    (command[1] === "test:snips:local-persistence" ||
+      command[1] === "test:snips:local-browser")
+  );
 }
 
 async function configureLocalPersistenceHarness(
@@ -309,6 +324,16 @@ async function configureLocalPersistenceHarness(
 ): Promise<void> {
   if (!isLocalPersistenceCommand(command)) return;
 
+  localBrowserHarness = command[1] === "test:snips:local-browser";
+  if (localBrowserHarness) {
+    for (const name of HARNESS_BROWSER_EXTERNAL_OVERRIDES) {
+      if (process.env[name] !== undefined) {
+        throw Object.assign(new Error(`Harness rejects inherited ${name}`), {
+          category: "harness_external_browser_override_rejected",
+        });
+      }
+    }
+  }
   localPersistenceHarness = true;
   clearLocalPersistenceExternalSettings(process.env, config);
   PORT = await availablePort();
@@ -606,7 +631,7 @@ async function waitForApplicationPostgres(
 }
 
 async function setupApplicationPostgres(): Promise<void> {
-  if (!localPersistenceHarness) return;
+  if (!localPersistenceHarness || localBrowserHarness) return;
 
   logger.section("Setting up local application persistence");
   let databaseUrl = process.env.TEST_APPLICATION_DATABASE_URL;
@@ -664,6 +689,29 @@ async function setupApplicationPostgres(): Promise<void> {
   await waitForApplicationPostgres(databaseUrl);
   process.env.APPLICATION_DATABASE_URL = databaseUrl;
   config.APPLICATION_DATABASE_URL = databaseUrl;
+}
+
+async function setupHarnessBrowserService(): Promise<void> {
+  if (!localBrowserHarness || harnessBrowserService) return;
+  harnessBrowserService = await startHarnessBrowserService(
+    createDefaultHarnessBrowserServiceDependencies({
+      env: process.env,
+      tempParent: tmpdir(),
+      monorepoRoot: MONOREPO_ROOT,
+      shutdownCoordinator: harnessBrowserShutdown,
+    }),
+  );
+  Object.assign(process.env, harnessBrowserService.environment);
+  process.env.BROWSER_REPLAY_INGEST_URL = `http://127.0.0.1:${PORT}`;
+  Object.assign(config, {
+    LOCAL_BROWSER_SERVICE_ENABLED: true,
+    LOCAL_BROWSER_STATE_ROOT: harnessBrowserService.stateRoot,
+    BROWSER_SERVICE_URL: harnessBrowserService.environment.BROWSER_SERVICE_URL,
+    BROWSER_SERVICE_API_KEY: harnessBrowserService.serviceKey,
+    BROWSER_REPLAY_INGEST_URL: process.env.BROWSER_REPLAY_INGEST_URL,
+    BROWSER_REPLAY_INGEST_API_KEY: harnessBrowserService.replayIngestKey,
+    APPLICATION_DATABASE_URL: harnessBrowserService.databaseUrl,
+  });
 }
 
 async function buildNuqPostgresImage(runtime: string): Promise<void> {
@@ -1052,6 +1100,7 @@ async function installDependencies() {
 }
 
 async function startServices(command?: string[]): Promise<Services> {
+  await setupHarnessBrowserService();
   await setupApplicationPostgres();
 
   // Setup NUQ PostgreSQL container if needed
@@ -1098,6 +1147,10 @@ async function startServices(command?: string[]): Promise<Services> {
   );
   logger.info(`Waiting for API on localhost:${PORT}`);
   await waitForPort(Number(PORT), "localhost");
+  if (harnessBrowserService) {
+    logger.info("Waiting for API-confirmed Browser Service readiness");
+    await harnessBrowserService.waitForReady();
+  }
 
   const worker = execForward(
     "worker",
@@ -1397,6 +1450,13 @@ const gracefulShutdown = createSharedShutdown(async () => {
     terminateProcess(proc, forceTerminate),
   );
   await Promise.allSettled(terminationPromises);
+
+  if (localBrowserHarness) {
+    logger.info("Stopping harness-owned Browser Service runtime");
+    await harnessBrowserShutdown.shutdown();
+    harnessBrowserService = null;
+    logger.success("Harness-owned Browser Service runtime stopped");
+  }
 
   // Stop and remove NUQ PostgreSQL container if it was started by harness
   if (nuqPostgresContainer) {

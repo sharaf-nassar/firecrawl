@@ -3,13 +3,28 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+project_name="${LOCAL_FIRECRAWL_PROJECT_NAME:-firecrawl}"
 compose=(
   docker compose
-  --project-name firecrawl
+  --project-name "$project_name"
   --project-directory "$repo_root"
   -f "$repo_root/compose.yaml"
+  -f "$repo_root/compose.local.yaml"
 )
+if [[ -n "${LOCAL_FIRECRAWL_COMPOSE_OVERRIDE:-}" ]]; then
+  compose+=(-f "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE")
+fi
+if [[ -n "${LOCAL_FIRECRAWL_ENV_FILE:-}" ]]; then
+  compose+=(--env-file "$LOCAL_FIRECRAWL_ENV_FILE")
+fi
 runtime_lock_path="/tmp/firecrawl-local-firecrawl.${UID}.lock"
+if [[ "$project_name" != firecrawl ]]; then
+  if [[ ! "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
+    printf '%s\n' 'LOCAL_FIRECRAWL_PROJECT_NAME is invalid' >&2
+    exit 64
+  fi
+  runtime_lock_path="/tmp/firecrawl-local-firecrawl.${UID}.${project_name}.lock"
+fi
 lock_wait_seconds="${LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS:-30}"
 one_shot_timeout_seconds="${LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS:-300}"
 dependency_services=(
@@ -20,8 +35,8 @@ dependency_services=(
   app-postgres
   minio
 )
-long_running_services=(api "${dependency_services[@]}")
-one_shot_services=(minio-init)
+long_running_services=(api browser-service "${dependency_services[@]}")
+one_shot_services=(browser-state-init minio-init)
 diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
 
 usage() {
@@ -82,9 +97,18 @@ run_one_shot() {
 }
 
 start_runtime() {
+  run_one_shot browser-state-init
+  "${compose[@]}" up -d --no-deps --wait browser-service
   "${compose[@]}" up -d --wait "${dependency_services[@]}"
   run_one_shot minio-init
   "${compose[@]}" up -d --no-deps --wait api
+  "${compose[@]}" exec -T api node -e \
+    "fetch('http://127.0.0.1:' + (process.env.PORT || '3002') + '/', {
+       signal: AbortSignal.timeout(10000),
+     }).then(response => {
+       if (response.status >= 500) process.exit(1);
+     }).catch(() => process.exit(1))"
+  check_port_policy
 }
 
 require_completed_one_shot() {
@@ -103,10 +127,13 @@ require_completed_one_shot() {
 
 check_port_policy() {
   local project_state
+  local expected_published_port="${PORT:-3002}"
 
   project_state="$("${compose[@]}" ps --all --format json)"
-  PROJECT_STATE="$project_state" node - <<'NODE'
+  PROJECT_STATE="$project_state" \
+    EXPECTED_PUBLISHED_PORT="$expected_published_port" node - <<'NODE'
 const input = process.env.PROJECT_STATE ?? "";
+const expectedPublishedPort = Number(process.env.EXPECTED_PUBLISHED_PORT);
 try {
   const containers = input
     .split("\n")
@@ -122,11 +149,11 @@ try {
     published[0].service === "api" &&
     published[0].URL === "127.0.0.1" &&
     Number(published[0].TargetPort) === 3002 &&
-    Number(published[0].PublishedPort) === 3002 &&
+    Number(published[0].PublishedPort) === expectedPublishedPort &&
     published[0].Protocol === "tcp";
   if (!valid) {
     process.stderr.write(
-      "Port policy failed: only api may publish 127.0.0.1:3002\n",
+      `Port policy failed: only api may publish 127.0.0.1:${expectedPublishedPort}\n`,
     );
     process.exit(1);
   }
@@ -135,6 +162,50 @@ try {
   process.exit(1);
 }
 NODE
+}
+
+validate_browser_rollback_request() {
+  if [[ "${LOCAL_FIRECRAWL_BROWSER_DOWNGRADE:-false}" != true ]]; then
+    return
+  fi
+  if [[ -z "${FIRECRAWL_BROWSER_SERVICE_IMAGE:-}" ]] ||
+    [[ ! "$FIRECRAWL_BROWSER_SERVICE_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]; then
+    printf '%s\n' \
+      'Browser downgrade requires an immutable FIRECRAWL_BROWSER_SERVICE_IMAGE' >&2
+    exit 64
+  fi
+}
+
+quiesce_browser_writers() {
+  current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
+  "${compose[@]}" stop api browser-service
+}
+
+check_browser_rollback_offline() {
+  local current_browser_image_id
+
+  if [[ "${LOCAL_FIRECRAWL_BROWSER_DOWNGRADE:-false}" != true ]]; then
+    return
+  fi
+  if [[ -z "$current_browser_container_id" ]]; then
+    printf '%s\n' \
+      'Browser downgrade requires the current Browser Service to be running' >&2
+    exit 1
+  fi
+  current_browser_image_id="$(
+    docker inspect --format '{{.Image}}' "$current_browser_container_id"
+  )"
+  if [[ ! "$current_browser_image_id" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+    printf '%s\n' \
+      'Current Browser Service image identity is unavailable' >&2
+    exit 1
+  fi
+  docker run --rm --read-only --network none --user 1000:1000 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --volumes-from "$current_browser_container_id:ro" \
+    --entrypoint /usr/local/bin/node "$current_browser_image_id" \
+    scripts/check-atomic-publication-rollback.mjs \
+    /var/lib/firecrawl-browser-volume/state
 }
 
 if (( $# != 1 )); then
@@ -150,8 +221,10 @@ case "$1" in
     validate_runtime_options
     acquire_runtime_lock exclusive
     validate_compose
-    # Writers stay stopped until storage initialization and migrations succeed.
-    "${compose[@]}" stop api
+    validate_browser_rollback_request
+    # Writers stay stopped through rollback validation and initialization.
+    quiesce_browser_writers
+    check_browser_rollback_offline
     start_runtime
     ;;
   stop)
@@ -159,13 +232,16 @@ case "$1" in
     acquire_runtime_lock exclusive
     validate_compose
     "${compose[@]}" stop api
+    "${compose[@]}" stop browser-service
     "${compose[@]}" stop "${dependency_services[@]}"
     ;;
   restart)
     validate_runtime_options
     acquire_runtime_lock exclusive
     validate_compose
-    "${compose[@]}" stop api
+    validate_browser_rollback_request
+    quiesce_browser_writers
+    check_browser_rollback_offline
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
     ;;
@@ -265,11 +341,11 @@ case "$1" in
           process.exit(1);
         })"
     curl --fail --silent --show-error --max-time 10 \
-      --output /dev/null http://127.0.0.1:3002/
+      --output /dev/null "http://127.0.0.1:${PORT:-3002}/"
     check_port_policy
 
     printf '%s\n' \
-      "Local Firecrawl is healthy at http://127.0.0.1:3002; migrations: $latest_applied_migration; artifacts: MinIO"
+      "Local Firecrawl is healthy at http://127.0.0.1:${PORT:-3002}; migrations: $latest_applied_migration; artifacts: MinIO"
     ;;
   logs)
     validate_runtime_options

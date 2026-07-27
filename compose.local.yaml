@@ -5,11 +5,6 @@ x-local-api-image: &local-api-image
 services:
   api:
     <<: *local-api-image
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - 'chmod 0700 /var/lib/firecrawl-browser && exec "$$@"'
-      - --
     ports: !override
       - "127.0.0.1:${PORT:-3002}:${INTERNAL_PORT:-3002}"
     restart: unless-stopped
@@ -24,6 +19,10 @@ services:
       retries: 12
       start_period: 30s
     depends_on:
+      app-postgres:
+        condition: service_healthy
+      browser-service:
+        condition: service_healthy
       redis:
         condition: service_healthy
       playwright-service:
@@ -32,13 +31,23 @@ services:
         condition: service_healthy
       nuq-postgres:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     environment:
       USE_DB_AUTHENTICATION: "false"
       LOCAL_PERSISTENCE_ENABLED: ${LOCAL_PERSISTENCE_ENABLED}
       LOCAL_BROWSER_SERVICE_ENABLED: "false"
-      LOCAL_BROWSER_STATE_ROOT: ${LOCAL_BROWSER_STATE_ROOT:-/var/lib/firecrawl-browser}
+      LOCAL_BROWSER_STATE_ROOT: ${LOCAL_BROWSER_STATE_ROOT:-/var/lib/firecrawl-browser-volume/state}
+      BROWSER_SERVICE_URL: http://browser-service:3010
+      BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY}
+      BROWSER_REPLAY_INGEST_URL: http://127.0.0.1:${INTERNAL_PORT:-3002}
+      BROWSER_REPLAY_INGEST_API_KEY: ${BROWSER_REPLAY_INGEST_API_KEY}
+      BROWSER_SERVICE_REQUEST_TIMEOUT_MS: ${BROWSER_SERVICE_REQUEST_TIMEOUT_MS:-30000}
+      BROWSER_RECONCILIATION_TIMEOUT_MS: ${BROWSER_RECONCILIATION_TIMEOUT_MS:-60000}
+      BROWSER_RECONCILIATION_MAX_ATTEMPTS: ${BROWSER_RECONCILIATION_MAX_ATTEMPTS:-4}
+      BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS: ${BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS:-250}
+      BROWSER_RECONCILIATION_MAX_BACKOFF_MS: ${BROWSER_RECONCILIATION_MAX_BACKOFF_MS:-2000}
+      BROWSER_RECONCILIATION_STARTUP_BUDGET_MS: ${BROWSER_RECONCILIATION_STARTUP_BUDGET_MS:-60000}
+      BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS: ${BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS:-5000}
+      BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS: ${BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS:-30000}
       BROWSER_PUBLIC_API_ORIGIN: ${BROWSER_PUBLIC_API_ORIGIN:-http://127.0.0.1:3002}
       APPLICATION_DATABASE_URL: "postgresql://${APP_POSTGRES_USER}:${APP_POSTGRES_PASSWORD}@app-postgres:5432/${APP_POSTGRES_DB}"
       LOCAL_OWNER_ID: ${LOCAL_OWNER_ID}
@@ -50,8 +59,56 @@ services:
       ARTIFACT_MINIO_SECRET_KEY: ${ARTIFACT_MINIO_SECRET_KEY}
       ARTIFACT_MINIO_BUCKET: ${ARTIFACT_MINIO_BUCKET}
       ARTIFACT_MINIO_REGION: ${ARTIFACT_MINIO_REGION}
+  browser-state-init:
+    build:
+      context: .
+      dockerfile: apps/browser-service/Dockerfile
+      target: browser-volume-init
+    image: firecrawl-local-browser-volume-init:local
+    user: "0:0"
+    networks:
+      - backend
     volumes:
-      - browser-state:/var/lib/firecrawl-browser
+      - browser-state:/var/lib/firecrawl-browser-volume
+    restart: "no"
+
+  browser-service:
+    build:
+      context: .
+      dockerfile: apps/browser-service/Dockerfile
+      target: browser-service-runtime
+    image: ${FIRECRAWL_BROWSER_SERVICE_IMAGE:-firecrawl-local-browser-service:local}
+    user: "1000:1000"
+    read_only: true
+    environment:
+      PORT: "3010"
+      LOCAL_BROWSER_SERVICE_ENABLED: "false"
+      LOCAL_BROWSER_STATE_ROOT: /var/lib/firecrawl-browser-volume/state
+      BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY}
+      MAX_BROWSER_SESSIONS: ${MAX_BROWSER_SESSIONS:-8}
+    networks:
+      - backend
+    volumes:
+      - browser-state:/var/lib/firecrawl-browser-volume
+    restart: unless-stopped
+    depends_on:
+      browser-state-init:
+        condition: service_completed_successfully
+    cpus: 2.0
+    mem_limit: 4G
+    memswap_limit: 4G
+    tmpfs:
+      - /tmp:noexec,nosuid,size=1g
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const h={authorization:'Bearer '+process.env.BROWSER_SERVICE_API_KEY,'x-firecrawl-correlation-id':'compose-health','x-firecrawl-deadline':new Date(Date.now()+10000).toISOString()};fetch('http://127.0.0.1:3010/health/live',{headers:h,signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
   app-postgres:
     image: postgres:17.10-bookworm
@@ -70,6 +127,23 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+
+  app-db-migrate:
+    <<: *local-api-image
+    profiles: ["maintenance"]
+    environment:
+      ENV: local
+      USE_DB_AUTHENTICATION: "false"
+      LOCAL_PERSISTENCE_ENABLED: ${LOCAL_PERSISTENCE_ENABLED}
+      APPLICATION_DATABASE_URL: "postgresql://${APP_POSTGRES_USER}:${APP_POSTGRES_PASSWORD}@app-postgres:5432/${APP_POSTGRES_DB}"
+      LOCAL_OWNER_ID: ${LOCAL_OWNER_ID}
+      LOCAL_RECORD_RETENTION_DAYS: ${LOCAL_RECORD_RETENTION_DAYS}
+      LOCAL_ARTIFACT_RETENTION_DAYS: ${LOCAL_ARTIFACT_RETENTION_DAYS}
+    command: node dist/src/db/migrate.js
+    restart: "no"
+    depends_on:
+      app-postgres:
+        condition: service_healthy
 
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z

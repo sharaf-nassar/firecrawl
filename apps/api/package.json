@@ -25,6 +25,8 @@
     "test:prod": "vitest run --exclude='**/__tests__/e2e_noAuth/**' --exclude='**/__tests__/e2e_full_withAuth/**' --exclude='**/scraper/scrapeURL/**'",
     "test:snips": "vitest run src/__tests__/snips/v1 src/__tests__/snips/v2",
     "test:snips:local-persistence": "vitest run src/__tests__/snips/v2/local-persistence.test.ts",
+    "test:snips:local-browser": "vitest run src/__tests__/snips/v2/browser-local.test.ts src/__tests__/snips/v2/scrape-browser.test.ts",
+    "test:local-firecrawl:lifecycle": "node ../../scripts/local-firecrawl.test.mjs --full-lifecycle",
     "harness": "tsx src/harness.ts",
     "workers": "tsc-watch --onSuccess \"node dist/src/services/queue-worker.js\"",
     "worker:production": "node dist/src/services/queue-worker.js",

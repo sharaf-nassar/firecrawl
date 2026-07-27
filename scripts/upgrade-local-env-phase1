@@ -118,6 +118,21 @@ validate_phase_values() {
   if [[ "${managed_values[LOCAL_PERSISTENCE_ENABLED]}" != true ]]; then
     fail_field LOCAL_PERSISTENCE_ENABLED
   fi
+  if [[ "${managed_values[LOCAL_BROWSER_SERVICE_ENABLED]}" != false ]]; then
+    fail_field LOCAL_BROWSER_SERVICE_ENABLED
+  fi
+  if [[ "${managed_values[LOCAL_BROWSER_STATE_ROOT]}" != /var/lib/firecrawl-browser-volume/state ]]; then
+    fail_field LOCAL_BROWSER_STATE_ROOT
+  fi
+  if [[ ! "${managed_values[BROWSER_SERVICE_API_KEY]}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail_field BROWSER_SERVICE_API_KEY
+  fi
+  if [[ ! "${managed_values[BROWSER_REPLAY_INGEST_API_KEY]}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail_field BROWSER_REPLAY_INGEST_API_KEY
+  fi
+  if [[ "${managed_values[BROWSER_REPLAY_INGEST_API_KEY]}" == "${managed_values[BROWSER_SERVICE_API_KEY]}" ]]; then
+    fail_field BROWSER_REPLAY_INGEST_API_KEY
+  fi
 
   expected_database_url="postgresql://${managed_values[APP_POSTGRES_USER]}:${managed_values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${managed_values[APP_POSTGRES_DB]}"
   if [[ "${managed_values[APPLICATION_DATABASE_URL]}" != "${expected_database_url}" ]]; then
@@ -193,6 +208,10 @@ phase_keys=(
   APP_POSTGRES_PASSWORD
   APP_POSTGRES_DB
   LOCAL_PERSISTENCE_ENABLED
+  LOCAL_BROWSER_SERVICE_ENABLED
+  LOCAL_BROWSER_STATE_ROOT
+  BROWSER_SERVICE_API_KEY
+  BROWSER_REPLAY_INGEST_API_KEY
   APPLICATION_DATABASE_URL
   LOCAL_OWNER_ID
   LOCAL_RECORD_RETENTION_DAYS
@@ -269,6 +288,19 @@ if [[ ! -v 'candidate_values[APP_POSTGRES_PASSWORD]' ]]; then
 fi
 set_default APP_POSTGRES_DB firecrawl
 set_default LOCAL_PERSISTENCE_ENABLED true
+set_default LOCAL_BROWSER_SERVICE_ENABLED false
+set_default LOCAL_BROWSER_STATE_ROOT /var/lib/firecrawl-browser-volume/state
+if [[ ! -v 'candidate_values[BROWSER_SERVICE_API_KEY]' ]]; then
+  candidate_values[BROWSER_SERVICE_API_KEY]="$(openssl rand -hex 32)"
+  missing_keys+=(BROWSER_SERVICE_API_KEY)
+fi
+if [[ ! -v 'candidate_values[BROWSER_REPLAY_INGEST_API_KEY]' ]]; then
+  candidate_values[BROWSER_REPLAY_INGEST_API_KEY]="$(openssl rand -hex 32)"
+  while [[ "${candidate_values[BROWSER_REPLAY_INGEST_API_KEY]}" == "${candidate_values[BROWSER_SERVICE_API_KEY]}" ]]; do
+    candidate_values[BROWSER_REPLAY_INGEST_API_KEY]="$(openssl rand -hex 32)"
+  done
+  missing_keys+=(BROWSER_REPLAY_INGEST_API_KEY)
+fi
 set_default APPLICATION_DATABASE_URL \
   "postgresql://${candidate_values[APP_POSTGRES_USER]}:${candidate_values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${candidate_values[APP_POSTGRES_DB]}"
 if [[ ! -v 'candidate_values[LOCAL_OWNER_ID]' ]]; then

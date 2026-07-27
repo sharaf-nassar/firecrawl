@@ -15,6 +15,11 @@ while [[ "${app_postgres_password}" == "${postgres_password}" ]]; do
   app_postgres_password="$(openssl rand -hex 32)"
 done
 bull_auth_key="$(openssl rand -hex 32)"
+browser_service_api_key="$(openssl rand -hex 32)"
+browser_replay_ingest_api_key="$(openssl rand -hex 32)"
+while [[ "${browser_replay_ingest_api_key}" == "${browser_service_api_key}" ]]; do
+  browser_replay_ingest_api_key="$(openssl rand -hex 32)"
+done
 minio_root_password="$(openssl rand -hex 32)"
 minio_app_secret_key="$(openssl rand -hex 32)"
 while [[ "${minio_app_secret_key}" == "${minio_root_password}" ]]; do
@@ -41,6 +46,10 @@ trap cleanup EXIT HUP INT TERM PIPE XFSZ
   printf '%s\n' "APP_POSTGRES_PASSWORD=${app_postgres_password}"
   printf '%s\n' 'APP_POSTGRES_DB=firecrawl'
   printf '%s\n' 'LOCAL_PERSISTENCE_ENABLED=true'
+  printf '%s\n' 'LOCAL_BROWSER_SERVICE_ENABLED=false'
+  printf '%s\n' 'LOCAL_BROWSER_STATE_ROOT=/var/lib/firecrawl-browser-volume/state'
+  printf '%s\n' "BROWSER_SERVICE_API_KEY=${browser_service_api_key}"
+  printf '%s\n' "BROWSER_REPLAY_INGEST_API_KEY=${browser_replay_ingest_api_key}"
   printf '%s\n' "APPLICATION_DATABASE_URL=postgresql://firecrawl:${app_postgres_password}@app-postgres:5432/firecrawl"
   printf '%s\n' "LOCAL_OWNER_ID=${local_owner_id}"
   printf '%s\n' 'LOCAL_RECORD_RETENTION_DAYS=30'
