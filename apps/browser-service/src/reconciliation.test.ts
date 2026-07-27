@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants, readdirSync, writeFileSync } from "node:fs";
+import {
+  constants,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import {
   chmod,
   lstat,
@@ -7278,6 +7284,132 @@ describe("filesystem reconciliation", () => {
 });
 
 describe("atomic publication reconciliation ownership", () => {
+  test("runs and cleans a fresh atomic canary on initial and restart reconciliation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const generations = [
+      GENERATION,
+      Buffer.alloc(32, 6).toString("base64url"),
+    ];
+
+    for (const generation of generations) {
+      let canaryNativeCalls = 0;
+      const value = request([], PROCESS, generation);
+      const outcome = await runWithReconciliationFilesystemTestContext(
+        {
+          atomicNativeBarrier(phase, move) {
+            if (
+              phase === "before" &&
+              (move === "canary_publish" ||
+                move === "canary_source_to_private")
+            ) {
+              canaryNativeCalls += 1;
+            }
+          },
+        },
+        () =>
+          reconcileBrowserStateWithAuthority(canonicalRoot, value, {
+            admission: admission().value,
+            freshAtomicCanary: true,
+            now: () => NOW,
+          }),
+      );
+      expect(canaryNativeCalls).toBe(2);
+      expect(await readdir(path.join(canonicalRoot, "profiles"))).toEqual([]);
+      expect(
+        await readdir(
+          path.join(canonicalRoot, ".profile-publish-staging", "bundles"),
+        ),
+      ).toEqual([]);
+      expect(
+        await readdir(
+          path.join(canonicalRoot, ".profile-publish-staging", "intents"),
+        ),
+      ).toEqual([]);
+      await consumeInternalReconciliationOutcome(
+        outcome,
+        {
+          processNonce: value.processNonce,
+          controlGenerationNonce: value.controlGenerationNonce,
+          snapshotDigest: value.snapshotDigest,
+        },
+        async install => closeAnchoredProfileRoot(install.root),
+      );
+    }
+  });
+
+  test("fresh atomic canary corruption prevents reconciliation readiness", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const initial = request([]);
+    const initialOutcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      initial,
+      {
+        admission: admission().value,
+        freshAtomicCanary: true,
+        now: () => NOW,
+      },
+    );
+    await consumeInternalReconciliationOutcome(
+      initialOutcome,
+      {
+        processNonce: initial.processNonce,
+        controlGenerationNonce: initial.controlGenerationNonce,
+        snapshotDigest: initial.snapshotDigest,
+      },
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+    const restart = request(
+      [],
+      PROCESS,
+      Buffer.alloc(32, 7).toString("base64url"),
+    );
+    let corrupted = false;
+
+    await expect(
+      runWithReconciliationFilesystemTestContext(
+        {
+          atomicNativeBarrier(phase, move) {
+            if (
+              phase !== "before" ||
+              move !== "canary_publish" ||
+              corrupted
+            ) {
+              return;
+            }
+            const bundles = path.join(
+              canonicalRoot,
+              ".profile-publish-staging",
+              "bundles",
+            );
+            for (const wrapper of readdirSync(bundles)) {
+              const wrapperPath = path.join(bundles, wrapper);
+              const proof = readdirSync(wrapperPath).find(leaf =>
+                leaf.startsWith(`proof-${wrapper}-`),
+              );
+              if (proof === undefined) continue;
+              const proofPath = path.join(wrapperPath, proof);
+              rmSync(proofPath, { recursive: true });
+              mkdirSync(proofPath, { mode: 0o700 });
+              corrupted = true;
+              return;
+            }
+          },
+        },
+        () =>
+          reconcileBrowserStateWithAuthority(canonicalRoot, restart, {
+            admission: admission().value,
+            freshAtomicCanary: true,
+            now: () => NOW,
+          }),
+      ),
+    ).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    expect(corrupted).toBe(true);
+  });
+
   test("recovers an allocated intent before Task 3 enumeration", async () => {
     const canonicalRoot = await root();
     await provisionAtomicNamespaces(canonicalRoot);
@@ -7460,6 +7592,195 @@ describe("atomic publication reconciliation ownership", () => {
       );
     },
   );
+
+  test("cleans an empty building canary with its retained intent temp", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const value = request([]);
+    const profilesEvidence = await atomicFileEvidence(
+      path.join(canonicalRoot, "profiles"),
+      null,
+    );
+    const wrapperPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+    );
+    const proofLeaf = `proof-${CHECKPOINT_A}-0`;
+    await mkdir(wrapperPath, { mode: 0o700 });
+    const wrapperEvidence = await atomicFileEvidence(wrapperPath, null);
+    const intent: AtomicPublishIntentV1 = {
+      version: 1,
+      operationId: CHECKPOINT_A,
+      kind: "canary",
+      phase: "building",
+      binding: {
+        processNonce: value.processNonce,
+        controlGenerationNonce: value.controlGenerationNonce,
+        snapshotDigest: value.snapshotDigest,
+      },
+      target: {
+        kind: "canary_parent",
+        parentLocator: { kind: "profiles" },
+        parent: {
+          dev: profilesEvidence.dev,
+          ino: profilesEvidence.ino,
+          mode: 448,
+        },
+      },
+      wrapper: {
+        dev: wrapperEvidence.dev,
+        ino: wrapperEvidence.ino,
+        mode: 448,
+      },
+      privateSource: null,
+      publicSource: null,
+      classification: null,
+      sourceDeletion: null,
+      adoption: null,
+      cleanup: null,
+      canaryProof: {
+        attempt: 0,
+        sourceLeaf: proofLeaf,
+        targetLeaf: `canary-${CHECKPOINT_A}-0`,
+        deletionLeaf: `deletion-${CHECKPOINT_A}-0`,
+        phase: "planned",
+        dev: null,
+        ino: null,
+        mode: null,
+        evidenceDigest: null,
+      },
+      prepublicationAbort: null,
+      identityManifest: null,
+    };
+    const intentsPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "intents",
+    );
+    const encoded = encodeAtomicPublishIntent(intent).bytes;
+    const tempPath = path.join(
+      intentsPath,
+      `${CHECKPOINT_A}.building.${CHECKPOINT_B}.tmp`,
+    );
+    await writeFile(path.join(intentsPath, `${CHECKPOINT_A}.json`), encoded, {
+      mode: 0o600,
+    });
+    await writeFile(tempPath, encoded, { mode: 0o600 });
+
+    const outcome = await reconcileBrowserStateWithAuthority(
+      canonicalRoot,
+      value,
+      {
+        admission: admission().value,
+        now: () => NOW,
+      },
+    );
+
+    await expect(lstat(wrapperPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(lstat(tempPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(intentsPath)).toEqual([]);
+    await consumeInternalReconciliationOutcome(
+      outcome,
+      intent.binding,
+      async install => closeAnchoredProfileRoot(install.root),
+    );
+  });
+
+  test("rejects a corrupt building canary intent temp before mutation", async () => {
+    const canonicalRoot = await root();
+    await provisionAtomicNamespaces(canonicalRoot);
+    const value = request([]);
+    const profilesEvidence = await atomicFileEvidence(
+      path.join(canonicalRoot, "profiles"),
+      null,
+    );
+    const wrapperPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "bundles",
+      CHECKPOINT_A,
+    );
+    await mkdir(wrapperPath, { mode: 0o700 });
+    const proofLeaf = `proof-${CHECKPOINT_A}-0`;
+    const wrapperEvidence = await atomicFileEvidence(wrapperPath, null);
+    const intent: AtomicPublishIntentV1 = {
+      version: 1,
+      operationId: CHECKPOINT_A,
+      kind: "canary",
+      phase: "building",
+      binding: {
+        processNonce: value.processNonce,
+        controlGenerationNonce: value.controlGenerationNonce,
+        snapshotDigest: value.snapshotDigest,
+      },
+      target: {
+        kind: "canary_parent",
+        parentLocator: { kind: "profiles" },
+        parent: {
+          dev: profilesEvidence.dev,
+          ino: profilesEvidence.ino,
+          mode: 448,
+        },
+      },
+      wrapper: {
+        dev: wrapperEvidence.dev,
+        ino: wrapperEvidence.ino,
+        mode: 448,
+      },
+      privateSource: null,
+      publicSource: null,
+      classification: null,
+      sourceDeletion: null,
+      adoption: null,
+      cleanup: null,
+      canaryProof: {
+        attempt: 0,
+        sourceLeaf: proofLeaf,
+        targetLeaf: `canary-${CHECKPOINT_A}-0`,
+        deletionLeaf: `deletion-${CHECKPOINT_A}-0`,
+        phase: "planned",
+        dev: null,
+        ino: null,
+        mode: null,
+        evidenceDigest: null,
+      },
+      prepublicationAbort: null,
+      identityManifest: null,
+    };
+    const intentPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "intents",
+      `${CHECKPOINT_A}.json`,
+    );
+    const encoded = encodeAtomicPublishIntent(intent).bytes;
+    const tempPath = path.join(
+      canonicalRoot,
+      ".profile-publish-staging",
+      "intents",
+      `${CHECKPOINT_A}.building.${CHECKPOINT_B}.tmp`,
+    );
+    const corrupted = Buffer.from(encoded);
+    corrupted[corrupted.byteLength - 2] ^= 1;
+    await writeFile(intentPath, encoded, { mode: 0o600 });
+    await writeFile(tempPath, corrupted, { mode: 0o600 });
+
+    await expect(
+      reconcileBrowserStateWithAuthority(canonicalRoot, value, {
+        admission: admission().value,
+        now: () => NOW,
+      }),
+    ).rejects.toMatchObject({
+      category: "reconciliation_filesystem_unsafe",
+    });
+    await expect(readFile(intentPath)).resolves.toEqual(encoded);
+    await expect(readFile(tempPath)).resolves.toEqual(corrupted);
+    expect((await lstat(wrapperPath)).isDirectory()).toBe(true);
+  });
 
   test("manifests and cleans a classified unpublished payload before Task 3", async () => {
     const canonicalRoot = await root();

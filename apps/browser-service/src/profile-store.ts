@@ -9,10 +9,12 @@ import {
   bindProfileGeneration,
   canonicalizeHeldProfileTree,
   copyHeldProfileTree,
+  deleteHeldReplayCheckpoint,
   deletePreparedProfileGenerationAtomically,
   ensureAtomicPublicationNamespaces,
   isUnverifiedProfileCleanupError,
   listHeldProfileGenerations,
+  persistHeldReplayCheckpoint,
   readHeldRootFile,
   syncAndCanonicalizeHeldProfileTree,
   transitionHeldProfileGenerationAtomically,
@@ -23,7 +25,7 @@ import {
 } from "./reconciliation.js";
 
 const UUID =
-  /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 
 export type ProfileMode = "writer" | "snapshot";
 
@@ -67,6 +69,14 @@ export type DeletedProfileGeneration = Readonly<{
   generationId: string;
   checksum: string;
   deleted: true;
+}>;
+
+export type DeletedRetainedProfileGeneration = Readonly<{
+  version: 1;
+  generationId: string;
+  statePath: string;
+  checksum: string;
+  deleted: boolean;
 }>;
 
 export type PreparedProfileAuthorization = Readonly<{
@@ -147,6 +157,21 @@ type PreparedAuthorizationRecord = {
 
 export type ProfileStore = Readonly<{
   readRootFile(relative: string, maximumBytes: number): Promise<Buffer>;
+  persistReplayCheckpoint(input: {
+    ownerId: string;
+    scrapeId: string;
+    checkpointId: string;
+    storageState: unknown;
+  }): Promise<{ statePath: string; checksum: string; byteSize: number }>;
+  deleteReplayCheckpoint(input: {
+    statePath: string;
+    checksum: string;
+  }): Promise<boolean>;
+  deleteRetainedProfileGeneration(input: {
+    generationId: string;
+    statePath: string;
+    checksum: string;
+  }): Promise<DeletedRetainedProfileGeneration>;
   workingGeneration(work: WorkingProfile): BoundProfileGeneration;
   createWorkingCopy(
     profileId: string,
@@ -449,6 +474,78 @@ export async function createProfileStore(options: {
     async readRootFile(relative, maximumBytes) {
       requireStore(store);
       return readHeldRootFile(record.root, relative, maximumBytes);
+    },
+
+    async persistReplayCheckpoint(input) {
+      requireStore(store);
+      return persistHeldReplayCheckpoint(record.root, input);
+    },
+
+    async deleteReplayCheckpoint(input) {
+      requireStore(store);
+      return deleteHeldReplayCheckpoint(record.root, input);
+    },
+
+    async deleteRetainedProfileGeneration(input) {
+      requireStore(store);
+      assertUuid(input.generationId, "generationId");
+      if (!SHA256.test(input.checksum)) {
+        throw new ProfileStoreError(
+          "profile_discard_failed",
+          "retained profile checksum is invalid",
+        );
+      }
+      const pathMatch =
+        /^profiles\/([a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})\/committed\/([a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/u.exec(
+          input.statePath,
+        );
+      if (pathMatch === null || pathMatch[2] !== input.generationId) {
+        throw new ProfileStoreError(
+          "profile_discard_failed",
+          "retained profile path does not match generation identity",
+        );
+      }
+      const profileId = pathMatch[1]!;
+      const existing = (
+        await listHeldProfileGenerations(record.root, "committed")
+      ).find(generation => generation.generationId === input.generationId);
+      if (existing === undefined) {
+        return Object.freeze({ version: 1, ...input, deleted: false });
+      }
+      if (existing.profileId !== profileId) {
+        throw new ProfileStoreError(
+          "profile_discard_failed",
+          "retained profile path does not match generation identity",
+        );
+      }
+      const capability = await bindProfileGeneration(record.root, {
+        profileId,
+        state: "committed",
+        generationId: input.generationId,
+        openMode: "existing",
+      });
+      let consumed = false;
+      try {
+        await deletePreparedProfileGenerationAtomically(capability, {
+          binding: record.binding,
+          expectedChecksum: input.checksum,
+          authorityDigest: createHash("sha256")
+            .update(
+              `retention\0${profileId}\0${input.generationId}\0${input.statePath}\0${input.checksum}`,
+            )
+            .digest("hex"),
+        });
+        consumed = true;
+        return Object.freeze({ version: 1, ...input, deleted: true });
+      } catch (cause) {
+        throw new ProfileStoreError(
+          "profile_discard_failed",
+          "retained profile deletion failed",
+          { cause },
+        );
+      } finally {
+        if (!consumed) await capability.close().catch(() => undefined);
+      }
     },
 
     workingGeneration(work) {

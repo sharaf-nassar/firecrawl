@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   STATUS_CODES,
   createServer as createHttpServer,
@@ -39,18 +40,26 @@ import {
   createControlGenerationV1Schema,
   createRelayGrantV1Schema,
   createSessionV1Schema,
+  deleteReplayCheckpointV1Schema,
+  deleteRetainedProfileGenerationV1Schema,
   deletedProfileGenerationV1Schema,
+  deletedReplayCheckpointV1Schema,
+  deletedRetainedProfileGenerationV1Schema,
   deleteProfileGenerationV1Schema,
   finalizedProfileGenerationV1Schema,
   finalizeProfileGenerationV1Schema,
   liveDiscoveryV1Schema,
+  persistReplayCheckpointV1Schema,
+  persistedReplayCheckpointV1Schema,
   privateErrorV1Schema,
   readyHealthV1Schema,
+  readReplayCheckpointV1Schema,
   reconciliationRequestV1Schema,
   reconciliationResultV1Schema,
   relayGrantV1Schema,
   revokeRelayGrantV1Schema,
   revokedRelayGrantV1Schema,
+  replayCheckpointContentV1Schema,
   scopedLiveHealthV1Schema,
   sessionV1Schema,
   tokenSchema,
@@ -92,6 +101,10 @@ type ProfileTransport = Pick<
   ProfileStore,
   | "finalizePreparedGenerationByAuthorization"
   | "deletePreparedGenerationByAuthorization"
+  | "persistReplayCheckpoint"
+  | "readRootFile"
+  | "deleteReplayCheckpoint"
+  | "deleteRetainedProfileGeneration"
 >;
 
 export type BrowserGenerationRuntime = Readonly<{
@@ -438,6 +451,35 @@ function ensureRepeatedId(
   }
 }
 
+function requireReplayStatePath(value: string): void {
+  if (
+    !/^replay\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.json$/u.test(
+      value,
+    )
+  ) {
+    throw new BrowserServiceError(
+      "invalid_request",
+      "replay checkpoint state path is invalid",
+    );
+  }
+}
+
+function requireCommittedProfileStatePath(
+  value: string,
+  generationId: string,
+): void {
+  const match =
+    /^profiles\/[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\/committed\/([a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/u.exec(
+      value,
+    );
+  if (match === null || match[1] !== generationId) {
+    throw new BrowserServiceError(
+      "invalid_request",
+      "retained profile state path is invalid",
+    );
+  }
+}
+
 function requestAbort(
   request: IncomingMessage,
   response: ServerResponse,
@@ -605,11 +647,22 @@ export function createBrowserServiceServer(
       failures.push(cause);
     }
     if (failures.length !== 0) {
-      throw new BrowserServiceError(
+      const cause =
+        failures.length === 1
+          ? failures[0]
+          : new AggregateError(failures, "generation runtime drain failed");
+      try {
+        options.internalErrorSink?.(cause);
+      } catch {
+        // Diagnostics cannot alter fail-stop handoff behavior.
+      }
+      const failure = new BrowserServiceError(
         "browser_unavailable",
         "generation runtime drain is unverified",
         { detail: "close_failed" },
       );
+      Object.defineProperty(failure, "cause", { value: cause });
+      throw failure;
     }
     grantIdsBySession.clear();
     options.runtime.release(runtime);
@@ -854,6 +907,81 @@ export function createBrowserServiceServer(
       } finally {
         transport.cleanup();
       }
+    }),
+  );
+
+  app.post(
+    "/v1/replay-checkpoints",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const body = await readJsonBody(request, MAX_REPLAY_REQUEST_BYTES);
+      const input = persistReplayCheckpointV1Schema.parse(body.value);
+      const persisted =
+        await context.runtime.profileStore.persistReplayCheckpoint(input);
+      writeJson(response, 201, persistedReplayCheckpointV1Schema, {
+        version: 1,
+        ...persisted,
+      });
+    }),
+  );
+
+  app.post(
+    "/v1/replay-checkpoints/read",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = readReplayCheckpointV1Schema.parse(body.value);
+      requireReplayStatePath(input.statePath);
+      const bytes = await context.runtime.profileStore.readRootFile(
+        input.statePath,
+        input.byteSize + 1,
+      );
+      if (
+        bytes.byteLength !== input.byteSize ||
+        createHash("sha256").update(bytes).digest("hex") !== input.checksum
+      ) {
+        throw new BrowserServiceError(
+          "browser_unavailable",
+          "replay checkpoint authority does not match",
+        );
+      }
+      let storageState: unknown;
+      try {
+        storageState = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+        );
+      } catch {
+        throw new BrowserServiceError(
+          "browser_unavailable",
+          "replay checkpoint content is invalid",
+        );
+      }
+      writeJson(
+        response,
+        200,
+        replayCheckpointContentV1Schema,
+        { ...input, storageState },
+        MAX_REPLAY_REQUEST_BYTES,
+      );
+    }),
+  );
+
+  app.delete(
+    "/v1/replay-checkpoints",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = deleteReplayCheckpointV1Schema.parse(body.value);
+      requireReplayStatePath(input.statePath);
+      const deleted =
+        await context.runtime.profileStore.deleteReplayCheckpoint(input);
+      writeJson(response, 200, deletedReplayCheckpointV1Schema, {
+        ...input,
+        deleted,
+      });
     }),
   );
 
@@ -1108,7 +1236,12 @@ export function createBrowserServiceServer(
       ensureRepeatedId(generationId, input.generationId, "generation ID");
       const result =
         await context.runtime.profileStore.finalizePreparedGenerationByAuthorization(
-          input,
+          {
+            profileId: input.profileId,
+            generationId: input.generationId,
+            checksum: input.checksum,
+            prepareToken: input.prepareToken,
+          },
         );
       writeJson(response, 200, finalizedProfileGenerationV1Schema, result);
     }),
@@ -1128,9 +1261,40 @@ export function createBrowserServiceServer(
       ensureRepeatedId(generationId, input.generationId, "generation ID");
       const result =
         await context.runtime.profileStore.deletePreparedGenerationByAuthorization(
-          input,
+          {
+            profileId: input.profileId,
+            generationId: input.generationId,
+            checksum: input.checksum,
+            prepareToken: input.prepareToken,
+          },
         );
       writeJson(response, 200, deletedProfileGenerationV1Schema, result);
+    }),
+  );
+
+  app.delete(
+    "/v1/profile-generations/:generationId/retention",
+    route(async (request, response) => {
+      const authorization = authorize(request, options.apiKey);
+      const context = currentRuntime(request, authorization);
+      const generationId = canonicalParameter(
+        request.params.generationId,
+        "profile generation ID",
+      );
+      const body = await readJsonBody(request, MAX_PRIVATE_REQUEST_BYTES);
+      const input = deleteRetainedProfileGenerationV1Schema.parse(body.value);
+      ensureRepeatedId(generationId, input.generationId, "generation ID");
+      requireCommittedProfileStatePath(input.statePath, generationId);
+      const result =
+        await context.runtime.profileStore.deleteRetainedProfileGeneration(
+          input,
+        );
+      writeJson(
+        response,
+        200,
+        deletedRetainedProfileGenerationV1Schema,
+        result,
+      );
     }),
   );
 

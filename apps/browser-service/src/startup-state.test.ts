@@ -992,6 +992,67 @@ describe("startup admission", () => {
     );
   });
 
+  test("retains old authority only for cleanup while rollover is fenced", async () => {
+    const root = await authorityRoot();
+    const fixture = profileStoreFixture();
+    let oldAdmission: ReconciliationExecutionAdmission | undefined;
+    const state = createInternalStartupState({
+      createProfileStore: async () => fixture.store,
+      compareAndSwapInstall: () => true,
+    });
+    const first = await state.createControlGeneration(
+      request(state.processNonce),
+      context().value,
+      async () => undefined,
+    );
+    const firstInput = reconciliationRequest(
+      state.processNonce,
+      first.controlGenerationNonce,
+      EMPTY_SNAPSHOT_DIGEST,
+    );
+    await state.reconcileWithAuthority(
+      firstInput,
+      (requestValue, admission) => {
+        oldAdmission = admission;
+        return reconcileBrowserStateWithAuthority(root, requestValue, {
+          admission,
+        });
+      },
+    );
+
+    const second = await state.createControlGeneration(
+      request(state.processNonce, API_B, KEY_B),
+      context().value,
+      async () => {
+        expect(state.liveHealth().status).toBe("live_unreconciled");
+        expect(state.readyHealth()).toMatchObject({
+          status: "unready",
+          controlGenerationNonce: first.controlGenerationNonce,
+          category: "reconciliation_required",
+        });
+        expect(() => state.requireReady(first)).toThrow(
+          expect.objectContaining({ category: "reconciliation_required" }),
+        );
+        expect(() => oldAdmission!.assertAdmitted()).not.toThrow();
+        await expect(
+          state.reconcileWithAuthority(firstInput, async () => {
+            throw new Error("reconciliation should remain fenced");
+          }),
+        ).rejects.toMatchObject({ category: "reconciliation_required" });
+      },
+    );
+
+    expect(fixture.close).toHaveBeenCalledOnce();
+    expect(() => oldAdmission!.assertAdmitted()).toThrow(
+      expect.objectContaining({ category: "reconciliation_required" }),
+    );
+    expect(state.readyHealth()).toMatchObject({
+      status: "unready",
+      controlGenerationNonce: second.controlGenerationNonce,
+      category: "reconciliation_required",
+    });
+  });
+
   test("control handoff retries unverified generation cleanup", async () => {
     const root = await authorityRoot();
     let installedStore: ProfileStore | undefined;

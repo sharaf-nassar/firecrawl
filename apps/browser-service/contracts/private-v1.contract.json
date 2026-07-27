@@ -589,6 +589,9 @@
         "control_generation_superseded": 409,
         "deadline_expired": 408,
         "invalid_request": 400,
+        "profile_discard_failed": 409,
+        "profile_finalize_failed": 409,
+        "profile_prepare_failed": 503,
         "reconciliation_cleanup_failed": 503,
         "reconciliation_conflicting_replay": 409,
         "reconciliation_deadline_exceeded": 408,
@@ -1060,6 +1063,64 @@
         },
         "semanticRuleKeys": ["canonical_uuid_v1"]
       },
+      "DeletedReplayCheckpointV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "deleted": {
+              "type": "boolean"
+            },
+            "statePath": {
+              "$ref": "__shared#/$defs/schema54"
+            },
+            "version": {
+              "$ref": "__shared#/$defs/schema87"
+            }
+          },
+          "required": ["version", "statePath", "checksum", "deleted"],
+          "type": "object"
+        },
+        "semanticRuleKeys": ["relative_state_path_v1"]
+      },
+      "DeletedRetainedProfileGenerationV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "deleted": {
+              "type": "boolean"
+            },
+            "generationId": {
+              "$ref": "__shared#/$defs/schema1"
+            },
+            "statePath": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "version": {
+              "const": 1,
+              "type": "number"
+            }
+          },
+          "required": [
+            "version",
+            "generationId",
+            "statePath",
+            "checksum",
+            "deleted"
+          ],
+          "type": "object"
+        },
+        "semanticRuleKeys": ["canonical_uuid_v1", "relative_state_path_v1"]
+      },
       "DeleteProfileGenerationV1": {
         "jsonSchema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1078,7 +1139,7 @@
               "$ref": "__shared#/$defs/schema1"
             },
             "version": {
-              "$ref": "__shared#/$defs/schema87"
+              "$ref": "__shared#/$defs/schema88"
             }
           },
           "required": [
@@ -1091,6 +1152,52 @@
           "type": "object"
         },
         "semanticRuleKeys": ["canonical_uuid_v1", "canonical_token_v1"]
+      },
+      "DeleteReplayCheckpointV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "statePath": {
+              "$ref": "__shared#/$defs/schema54"
+            },
+            "version": {
+              "$ref": "__shared#/$defs/schema87"
+            }
+          },
+          "required": ["version", "statePath", "checksum"],
+          "type": "object"
+        },
+        "semanticRuleKeys": ["relative_state_path_v1"]
+      },
+      "DeleteRetainedProfileGenerationV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "generationId": {
+              "$ref": "__shared#/$defs/schema1"
+            },
+            "statePath": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "version": {
+              "const": 1,
+              "type": "number"
+            }
+          },
+          "required": ["version", "generationId", "statePath", "checksum"],
+          "type": "object"
+        },
+        "semanticRuleKeys": ["canonical_uuid_v1", "relative_state_path_v1"]
       },
       "FetchArtifactV1": {
         "jsonSchema": {
@@ -1205,7 +1312,7 @@
               "$ref": "__shared#/$defs/schema1"
             },
             "version": {
-              "$ref": "__shared#/$defs/schema87"
+              "$ref": "__shared#/$defs/schema88"
             }
           },
           "required": [
@@ -1241,25 +1348,110 @@
         },
         "semanticRuleKeys": ["canonical_token_v1"]
       },
+      "PersistedReplayCheckpointV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "byteSize": {
+              "$ref": "__shared#/$defs/schema89"
+            },
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "statePath": {
+              "$ref": "__shared#/$defs/schema54"
+            },
+            "version": {
+              "const": 1,
+              "type": "number"
+            }
+          },
+          "required": ["statePath", "checksum", "byteSize", "version"],
+          "type": "object"
+        },
+        "semanticRuleKeys": ["relative_state_path_v1"]
+      },
+      "PersistReplayCheckpointV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "checkpointId": {
+              "$ref": "__shared#/$defs/schema1"
+            },
+            "ownerId": {
+              "$ref": "__shared#/$defs/schema1"
+            },
+            "scrapeId": {
+              "$ref": "__shared#/$defs/schema1"
+            },
+            "storageState": {
+              "$ref": "__shared#/$defs/schema57"
+            },
+            "version": {
+              "const": 1,
+              "type": "number"
+            }
+          },
+          "required": [
+            "version",
+            "ownerId",
+            "scrapeId",
+            "checkpointId",
+            "storageState"
+          ],
+          "type": "object"
+        },
+        "semanticRuleKeys": [
+          "canonical_uuid_v1",
+          "indexeddb_v1",
+          "storage_state_v1"
+        ]
+      },
       "PrivateErrorV1": {
         "jsonSchema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "additionalProperties": false,
           "properties": {
             "category": {
-              "$ref": "__shared#/$defs/schema89"
+              "$ref": "__shared#/$defs/schema91"
             },
             "message": {
-              "$ref": "__shared#/$defs/schema90"
+              "$ref": "__shared#/$defs/schema92"
             },
             "version": {
-              "$ref": "__shared#/$defs/schema88"
+              "$ref": "__shared#/$defs/schema90"
             }
           },
           "required": ["version", "category", "message"],
           "type": "object"
         },
         "semanticRuleKeys": ["private_error_v1"]
+      },
+      "ReadReplayCheckpointV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "byteSize": {
+              "$ref": "__shared#/$defs/schema89"
+            },
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "statePath": {
+              "$ref": "__shared#/$defs/schema54"
+            },
+            "version": {
+              "const": 1,
+              "type": "number"
+            }
+          },
+          "required": ["statePath", "checksum", "byteSize", "version"],
+          "type": "object"
+        },
+        "semanticRuleKeys": ["relative_state_path_v1"]
       },
       "ReadyHealthV1": {
         "jsonSchema": {
@@ -1307,13 +1499,13 @@
               "$ref": "__shared#/$defs/schema44"
             },
             "references": {
-              "$ref": "__shared#/$defs/schema92"
+              "$ref": "__shared#/$defs/schema94"
             },
             "snapshotDigest": {
               "$ref": "__shared#/$defs/schema5"
             },
             "version": {
-              "$ref": "__shared#/$defs/schema91"
+              "$ref": "__shared#/$defs/schema93"
             }
           },
           "required": [
@@ -1426,6 +1618,42 @@
           "timestamp_v1"
         ]
       },
+      "ReplayCheckpointContentV1": {
+        "jsonSchema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "additionalProperties": false,
+          "properties": {
+            "byteSize": {
+              "$ref": "__shared#/$defs/schema89"
+            },
+            "checksum": {
+              "$ref": "__shared#/$defs/schema5"
+            },
+            "statePath": {
+              "$ref": "__shared#/$defs/schema54"
+            },
+            "storageState": {
+              "$ref": "__shared#/$defs/schema57"
+            },
+            "version": {
+              "$ref": "__shared#/$defs/schema96"
+            }
+          },
+          "required": [
+            "statePath",
+            "checksum",
+            "byteSize",
+            "version",
+            "storageState"
+          ],
+          "type": "object"
+        },
+        "semanticRuleKeys": [
+          "relative_state_path_v1",
+          "indexeddb_v1",
+          "storage_state_v1"
+        ]
+      },
       "RevokedRelayGrantV1": {
         "jsonSchema": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1517,10 +1745,10 @@
               "$ref": "__shared#/$defs/schema12"
             },
             "state": {
-              "$ref": "__shared#/$defs/schema95"
+              "$ref": "__shared#/$defs/schema98"
             },
             "version": {
-              "$ref": "__shared#/$defs/schema94"
+              "$ref": "__shared#/$defs/schema97"
             }
           },
           "required": [
@@ -2946,10 +3174,9 @@
           "type": "number"
         },
         "schema89": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^[\\x20-\\x7e]+$",
-          "type": "string"
+          "maximum": 2097152,
+          "minimum": 1,
+          "type": "integer"
         },
         "schema9": {
           "additionalProperties": false,
@@ -2970,20 +3197,30 @@
           "type": "object"
         },
         "schema90": {
-          "type": "string"
-        },
-        "schema91": {
           "const": 1,
           "type": "number"
         },
+        "schema91": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[\\x20-\\x7e]+$",
+          "type": "string"
+        },
         "schema92": {
+          "type": "string"
+        },
+        "schema93": {
+          "const": 1,
+          "type": "number"
+        },
+        "schema94": {
           "items": {
-            "$ref": "__shared#/$defs/schema93"
+            "$ref": "__shared#/$defs/schema95"
           },
           "maxItems": 25000,
           "type": "array"
         },
-        "schema93": {
+        "schema95": {
           "additionalProperties": false,
           "properties": {
             "checksum": {
@@ -3007,11 +3244,15 @@
           "required": ["kind", "id", "path", "checksum"],
           "type": "object"
         },
-        "schema94": {
+        "schema96": {
           "const": 1,
           "type": "number"
         },
-        "schema95": {
+        "schema97": {
+          "const": 1,
+          "type": "number"
+        },
+        "schema98": {
           "enum": ["ready", "executing", "stopping"],
           "type": "string"
         }
@@ -3286,6 +3527,66 @@
         {
           "definition": "UnreadyHealthV1",
           "status": 503
+        }
+      ],
+      "streaming": null
+    },
+    {
+      "fencing": "generation",
+      "method": "POST",
+      "path": "/v1/replay-checkpoints",
+      "request": "PersistReplayCheckpointV1",
+      "requestBytes": 16777216,
+      "responseBytes": 131072,
+      "responses": [
+        {
+          "definition": "PersistedReplayCheckpointV1",
+          "status": 201
+        }
+      ],
+      "streaming": null
+    },
+    {
+      "fencing": "generation",
+      "method": "POST",
+      "path": "/v1/replay-checkpoints/read",
+      "request": "ReadReplayCheckpointV1",
+      "requestBytes": 262144,
+      "responseBytes": 16777216,
+      "responses": [
+        {
+          "definition": "ReplayCheckpointContentV1",
+          "status": 200
+        }
+      ],
+      "streaming": null
+    },
+    {
+      "fencing": "generation",
+      "method": "DELETE",
+      "path": "/v1/replay-checkpoints",
+      "request": "DeleteReplayCheckpointV1",
+      "requestBytes": 262144,
+      "responseBytes": 131072,
+      "responses": [
+        {
+          "definition": "DeletedReplayCheckpointV1",
+          "status": 200
+        }
+      ],
+      "streaming": null
+    },
+    {
+      "fencing": "generation",
+      "method": "DELETE",
+      "path": "/v1/profile-generations/:generationId/retention",
+      "request": "DeleteRetainedProfileGenerationV1",
+      "requestBytes": 262144,
+      "responseBytes": 131072,
+      "responses": [
+        {
+          "definition": "DeletedRetainedProfileGenerationV1",
+          "status": 200
         }
       ],
       "streaming": null

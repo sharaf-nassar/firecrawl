@@ -177,7 +177,7 @@ type PersistentContextOptions = NonNullable<
 > & { headless: true; acceptDownloads: false };
 
 type NormalCloseDisposition = {
-  reason: "requested" | "expired" | "error" | "shutdown";
+  reason: "requested" | "expired" | "error" | "shutdown" | "handoff";
   preparedProfile: PreparedProfileGeneration | null;
 };
 
@@ -212,6 +212,8 @@ type RegistryEntry = {
     | { url: string; title: string; snapshotExcerpt: string }
     | undefined;
   writerHeld: boolean;
+  writerAbort: AbortController | undefined;
+  writerSettlement: Promise<void> | undefined;
   launchAttempt:
     | {
         state: "owned" | "cleanup_unverified";
@@ -246,7 +248,7 @@ export type SessionRegistry = {
   touch(runtimeSessionId: string): SessionV1;
   withWriter<T>(
     runtimeSessionId: string,
-    operation: () => Promise<T>,
+    operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T>;
   withRuntime<T>(
     runtimeSessionId: string,
@@ -264,7 +266,7 @@ export type SessionRegistry = {
   ): Promise<SessionV1>;
   close(
     runtimeSessionId: string,
-    reason: "requested" | "expired" | "error" | "shutdown",
+    reason: "requested" | "expired" | "error" | "shutdown" | "handoff",
   ): Promise<ClosedSession>;
   sweepExpired(): Promise<void>;
   sweepCleanupFailed(): Promise<void>;
@@ -827,6 +829,7 @@ export function createSessionRegistry(options: {
   async function runWithinDeadline<T>(
     entry: RegistryEntry,
     operation: () => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     assertOperationAdmitted(entry);
     const timeoutMs = Math.min(operationTimeoutMs, entry.deadlineAtMs - now());
@@ -844,6 +847,23 @@ export function createSessionRegistry(options: {
       () => entry.activeEffects.delete(running),
     );
     try {
+      let removeAbort = (): void => undefined;
+      const aborted =
+        signal === undefined
+          ? undefined
+          : new Promise<never>((_resolve, reject) => {
+              const abort = () =>
+                reject(
+                  signal.reason ??
+                    asError(
+                      "browser_unavailable",
+                      "session writer authority ended",
+                    ),
+                );
+              removeAbort = () => signal.removeEventListener("abort", abort);
+              signal.addEventListener("abort", abort, { once: true });
+              if (signal.aborted) abort();
+            });
       const result = await Promise.race([
         running,
         new Promise<never>((_resolve, reject) => {
@@ -852,7 +872,8 @@ export function createSessionRegistry(options: {
             timeoutMs,
           );
         }),
-      ]);
+        ...(aborted === undefined ? [] : [aborted]),
+      ]).finally(removeAbort);
       assertOperationAdmitted(entry);
       return result;
     } finally {
@@ -896,7 +917,10 @@ export function createSessionRegistry(options: {
     return result;
   }
 
-  async function observeWithin(promise: Promise<void>): Promise<boolean> {
+  async function observeWithin(
+    promise: Promise<void>,
+    timeoutMs = cleanupTimeoutMs,
+  ): Promise<boolean> {
     let timer: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([
@@ -904,8 +928,8 @@ export function createSessionRegistry(options: {
           () => true,
           () => false,
         ),
-        new Promise<false>((resolve) => {
-          timer = setTimeout(resolve, cleanupTimeoutMs, false);
+        new Promise<false>(resolve => {
+          timer = setTimeout(resolve, timeoutMs, false);
         }),
       ]);
     } finally {
@@ -1321,6 +1345,8 @@ export function createSessionRegistry(options: {
         actionCache: new SessionActionCache(),
         operationSession: undefined,
         writerHeld: false,
+        writerAbort: undefined,
+        writerSettlement: undefined,
         contextCloseVerified: false,
         runtimeDrainStarted: false,
         beginRuntimeDrain: () => {
@@ -1692,12 +1718,26 @@ export function createSessionRegistry(options: {
       assertEntryAdmitted(entry);
       entry.writerHeld = true;
       entry.state = "executing";
+      const writerAbort = new AbortController();
+      entry.writerAbort = writerAbort;
+      let settleWriter!: () => void;
+      const writerSettlement = new Promise<void>(resolve => {
+        settleWriter = resolve;
+      });
+      entry.writerSettlement = writerSettlement;
       try {
-        const result = await operation();
+        const result = await operation(writerAbort.signal);
         assertEntryAdmitted(entry);
         return result;
       } finally {
         entry.writerHeld = false;
+        if (entry.writerAbort === writerAbort) {
+          entry.writerAbort = undefined;
+        }
+        settleWriter();
+        if (entry.writerSettlement === writerSettlement) {
+          entry.writerSettlement = undefined;
+        }
         if (entry.state === "executing") entry.state = "ready";
       }
     },
@@ -1744,32 +1784,36 @@ export function createSessionRegistry(options: {
       return executeCachedAction({
         cache: entry.actionCache,
         request,
-        withWriter: (operation) =>
-          registry.withWriter(runtimeSessionId, async () => {
+        withWriter: operation =>
+          registry.withWriter(runtimeSessionId, async signal => {
             await applyAuthority(
               entry,
               request.expectedSessionVersion,
               request.allowedDomains,
             );
-            return operation();
+            return operation(signal);
           }),
-        executeOperation: (operation) =>
-          runWithinDeadline(entry, async () => {
-            if (entry.operationSession === undefined) {
-              if (entry.page === undefined) {
-                throw asError(
-                  "session_not_found",
-                  "session has no active page",
-                );
+        executeOperation: (operation, signal) =>
+          runWithinDeadline(
+            entry,
+            async () => {
+              if (entry.operationSession === undefined) {
+                if (entry.page === undefined) {
+                  throw asError(
+                    "session_not_found",
+                    "session has no active page",
+                  );
+                }
+                entry.operationSession = createBrowserOperationSession({
+                  page: entry.page,
+                  allowedDomains: entry.allowedDomains,
+                  initialOrigin: entry.initialOrigin,
+                });
               }
-              entry.operationSession = createBrowserOperationSession({
-                page: entry.page,
-                allowedDomains: entry.allowedDomains,
-                initialOrigin: entry.initialOrigin,
-              });
-            }
-            return entry.operationSession.execute(operation);
-          }),
+              return entry.operationSession.execute(operation);
+            },
+            signal,
+          ),
         currentSessionVersion: () => entry.sessionVersion,
         currentPage: () => {
           if (entry.pageState === undefined) {
@@ -1833,21 +1877,24 @@ export function createSessionRegistry(options: {
         entry.state = "stopping";
         entry.admission = "closed";
         const cleanupCodes = [...(await cleanupEntry(entry, false))];
+        const cleanupFailures: unknown[] = [];
         if (cleanupCodes.length === 0 && entry.work !== undefined) {
-          if (entry.work.mode === "writer") {
+          if (entry.work.mode === "writer" && reason !== "handoff") {
             try {
               normalClose.preparedProfile ??=
                 await options.profileStore.prepareWorkingCopy(entry.work);
               entry.work = undefined;
-            } catch {
+            } catch (cause) {
               cleanupCodes.push("profile_prepare_failed");
+              cleanupFailures.push(cause);
             }
           } else {
             try {
               await options.profileStore.discardWorkingCopy(entry.work);
               entry.work = undefined;
-            } catch {
+            } catch (cause) {
               cleanupCodes.push("profile_discard_failed");
+              cleanupFailures.push(cause);
             }
           }
         }
@@ -1858,7 +1905,15 @@ export function createSessionRegistry(options: {
           throw new SessionRegistryError(
             "browser_unavailable",
             `session close cleanup failed: ${entry.cleanupCodes.join(",")}`,
-            { cleanupCodes: entry.cleanupCodes },
+            {
+              cause:
+                cleanupFailures.length === 1
+                  ? cleanupFailures[0]
+                  : cleanupFailures.length > 1
+                    ? new AggregateError(cleanupFailures)
+                    : undefined,
+              cleanupCodes: entry.cleanupCodes,
+            },
           );
         }
         entry.sessionVersion += 1;
@@ -1930,6 +1985,9 @@ export function createSessionRegistry(options: {
       for (const entry of entriesByRuntime.values()) {
         entry.admission = "closed";
         for (const lease of entry.runtimeLeases) lease.controller.abort();
+        entry.writerAbort?.abort(
+          asError("browser_unavailable", "session writer authority ended"),
+        );
       }
       const failures: unknown[] = [];
       for (const entry of [...entriesByRuntime.values()]) {
@@ -1944,14 +2002,29 @@ export function createSessionRegistry(options: {
             ),
           );
         }
-        if (entry.writerHeld) {
+        const writerSettlement = entry.writerSettlement;
+        if (
+          writerSettlement !== undefined &&
+          !(await observeWithin(
+            writerSettlement,
+            operationTimeoutMs + cleanupTimeoutMs,
+          ))
+        ) {
           failures.push(
             new Error(`writer drain timed out for ${entry.runtimeSessionId}`),
           );
           continue;
         }
+        if (entry.writerHeld) {
+          failures.push(
+            new Error(
+              `writer drain remained held for ${entry.runtimeSessionId}`,
+            ),
+          );
+          continue;
+        }
         try {
-          await registry.close(entry.runtimeSessionId, "shutdown");
+          await registry.close(entry.runtimeSessionId, _reason);
         } catch (error) {
           failures.push(error);
         }

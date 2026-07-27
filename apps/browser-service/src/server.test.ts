@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -20,6 +21,7 @@ import { normalizedProposalHashForOperation } from "./action-cache.js";
 import {
   ARTIFACT_METADATA_HEADERS,
   MAX_RECONCILIATION_REFERENCES,
+  canonicalJson,
   type ControlGenerationV1,
   type ReconciliationResultV1,
   type SessionV1,
@@ -161,11 +163,20 @@ function realRegistryFixture(): {
   rejectPageUrlWith(error: Error): void;
   rejectPageTitleWith(error: Error): void;
   hangPageWait(): void;
+  holdPageTextUntilContextClose(): Promise<void>;
 } {
   let pageUrl = "about:blank";
   let pageUrlFailure: Error | undefined;
   let pageTitleFailure: Error | undefined;
   let waitNeverSettles = false;
+  let heldPageText:
+    | {
+        reached: Promise<void>;
+        markReached(): void;
+        released: Promise<void>;
+        release(): void;
+      }
+    | undefined;
   const cdp = {
     send: vi.fn(async (method: string) =>
       method === "Page.getFrameTree"
@@ -195,7 +206,14 @@ function realRegistryFixture(): {
       if (pageTitleFailure !== undefined) throw pageTitleFailure;
       return "Example";
     }),
-    textContent: vi.fn(async () => "Example"),
+    textContent: vi.fn(async () => {
+      const held = heldPageText;
+      if (held !== undefined) {
+        held.markReached();
+        await held.released;
+      }
+      return "Example";
+    }),
     waitForTimeout: vi.fn(async () => {
       if (waitNeverSettles) {
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -210,7 +228,9 @@ function realRegistryFixture(): {
   context = {
     pages: vi.fn(() => [page]),
     serviceWorkers: vi.fn(() => []),
-    close: vi.fn(async () => undefined),
+    close: vi.fn(async () => {
+      heldPageText?.release();
+    }),
     browser: vi.fn(() => null),
     setStorageState: vi.fn(async () => undefined),
     storageState: vi.fn(async () => ({ cookies: [], origins: [] })),
@@ -333,6 +353,18 @@ function realRegistryFixture(): {
     hangPageWait() {
       waitNeverSettles = true;
     },
+    holdPageTextUntilContextClose() {
+      let markReached!: () => void;
+      const reached = new Promise<void>(resolve => {
+        markReached = resolve;
+      });
+      let release!: () => void;
+      const released = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      heldPageText = { reached, markReached, released, release };
+      return reached;
+    },
   };
 }
 
@@ -429,7 +461,34 @@ function harness(registryOverride?: SessionRegistry) {
     }),
   };
   const profileStore = {
-    finalizePreparedGenerationByAuthorization: vi.fn(async (input) => ({
+    persistReplayCheckpoint: vi.fn(async input => {
+      const value = input as {
+        ownerId: string;
+        scrapeId: string;
+        checkpointId: string;
+        storageState: unknown;
+      };
+      const bytes = Buffer.from(canonicalJson(value.storageState), "utf8");
+      return {
+        statePath:
+          `replay/${value.ownerId}/${value.scrapeId}/` +
+          `${value.checkpointId}.json`,
+        checksum: createHash("sha256").update(bytes).digest("hex"),
+        byteSize: bytes.byteLength,
+      };
+    }),
+    readRootFile: vi.fn(async () => Buffer.from('{"cookies":[],"origins":[]}')),
+    deleteReplayCheckpoint: vi.fn(async () => true),
+    deleteRetainedProfileGeneration: vi.fn(async input => ({
+      version: 1 as const,
+      ...(input as {
+        generationId: string;
+        statePath: string;
+        checksum: string;
+      }),
+      deleted: true,
+    })),
+    finalizePreparedGenerationByAuthorization: vi.fn(async input => ({
       version: 1,
       profileId: (input as { profileId: string }).profileId,
       generationId: (input as { generationId: string }).generationId,
@@ -593,6 +652,7 @@ async function provisionBrowserStateRoot(
 function realApplication(
   stateRoot: string,
   startupAdmissionTimeoutMs?: number,
+  internalErrorSink?: (cause: unknown) => void,
 ) {
   return createBrowserServiceApplication({
     config: {
@@ -605,6 +665,7 @@ function realApplication(
       maxBrowserSessions: 2,
     },
     atomicPublicationSink: vi.fn(),
+    internalErrorSink,
     startupAdmissionTimeoutMs,
   });
 }
@@ -850,7 +911,12 @@ describe("private browser server", () => {
     expect(finalized.status).toBe(200);
     expect(
       h.profileStore.finalizePreparedGenerationByAuthorization,
-    ).toHaveBeenCalledOnce();
+    ).toHaveBeenCalledWith({
+      profileId: IDS[0],
+      generationId: IDS[1],
+      checksum,
+      prepareToken,
+    });
 
     const mismatch = await fetch(`${base}/v1/profile-generations/${IDS[2]}`, {
       method: "DELETE",
@@ -867,6 +933,126 @@ describe("private browser server", () => {
     expect(
       h.profileStore.deletePreparedGenerationByAuthorization,
     ).not.toHaveBeenCalled();
+
+    const deleted = await fetch(`${base}/v1/profile-generations/${IDS[1]}`, {
+      method: "DELETE",
+      headers: requestHeaders(),
+      body: JSON.stringify({
+        version: 1,
+        profileId: IDS[0],
+        generationId: IDS[1],
+        checksum,
+        prepareToken,
+      }),
+    });
+    expect(deleted.status).toBe(200);
+    expect(
+      h.profileStore.deletePreparedGenerationByAuthorization,
+    ).toHaveBeenCalledWith({
+      profileId: IDS[0],
+      generationId: IDS[1],
+      checksum,
+      prepareToken,
+    });
+
+    const retentionPath = `profiles/${IDS[0]}/committed/${IDS[1]}`;
+    const retained = await fetch(
+      `${base}/v1/profile-generations/${IDS[1]}/retention`,
+      {
+        method: "DELETE",
+        headers: requestHeaders(),
+        body: JSON.stringify({
+          version: 1,
+          generationId: IDS[1],
+          statePath: retentionPath,
+          checksum,
+        }),
+      },
+    );
+    expect(retained.status).toBe(200);
+    expect(h.profileStore.deleteRetainedProfileGeneration).toHaveBeenCalledWith(
+      {
+        version: 1,
+        generationId: IDS[1],
+        statePath: retentionPath,
+        checksum,
+      },
+    );
+
+    const retainedMismatch = await fetch(
+      `${base}/v1/profile-generations/${IDS[2]}/retention`,
+      {
+        method: "DELETE",
+        headers: requestHeaders(),
+        body: JSON.stringify({
+          version: 1,
+          generationId: IDS[1],
+          statePath: retentionPath,
+          checksum,
+        }),
+      },
+    );
+    expect(retainedMismatch.status).toBe(400);
+  });
+
+  test("owns replay checkpoint persist, read, and delete bytes", async () => {
+    const h = harness();
+    const base = await start(h);
+    const storageState = { cookies: [], origins: [] };
+    const bytes = Buffer.from(canonicalJson(storageState), "utf8");
+    const checksum = createHash("sha256").update(bytes).digest("hex");
+    const statePath = `replay/${IDS[0]}/${IDS[1]}/${IDS[2]}.json`;
+
+    const persisted = await fetch(`${base}/v1/replay-checkpoints`, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: JSON.stringify({
+        version: 1,
+        ownerId: IDS[0],
+        scrapeId: IDS[1],
+        checkpointId: IDS[2],
+        storageState,
+      }),
+    });
+    expect(persisted.status).toBe(201);
+    expect(await persisted.json()).toEqual({
+      version: 1,
+      statePath,
+      checksum,
+      byteSize: bytes.byteLength,
+    });
+
+    const loaded = await fetch(`${base}/v1/replay-checkpoints/read`, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: JSON.stringify({
+        version: 1,
+        statePath,
+        checksum,
+        byteSize: bytes.byteLength,
+      }),
+    });
+    expect(loaded.status).toBe(200);
+    expect(await loaded.json()).toEqual({
+      version: 1,
+      statePath,
+      checksum,
+      byteSize: bytes.byteLength,
+      storageState,
+    });
+
+    const deleted = await fetch(`${base}/v1/replay-checkpoints`, {
+      method: "DELETE",
+      headers: requestHeaders(),
+      body: JSON.stringify({ version: 1, statePath, checksum }),
+    });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toEqual({
+      version: 1,
+      statePath,
+      checksum,
+      deleted: true,
+    });
   });
 
   test("uses only the dedicated relay header and enforces ws maxPayload", async () => {
@@ -1386,6 +1572,41 @@ describe("private browser server", () => {
     expect(h.order).toEqual(["routes", "streams", "artifacts", "registry"]);
   });
 
+  test("replacement handoff drains a retained API writer session", async () => {
+    const real = realRegistryFixture();
+    const created = await real.registry.create(validSessionCreateRequest());
+    const writerStarted = real.holdPageTextUntilContextClose();
+    const h = harness(real.registry);
+    const base = await start(h);
+    const writer = fetch(
+      `${base}/v1/sessions/${created.runtimeSessionId}/actions`,
+      {
+        method: "POST",
+        headers: requestHeaders(),
+        body: realActionBody({ kind: "get_text" }),
+      },
+    );
+    const writerRejected = expect(writer).rejects.toThrow();
+    await writerStarted;
+    const replacement = fetch(`${base}/v1/control-generations`, {
+      method: "POST",
+      headers: bootstrapHeaders(),
+      body: JSON.stringify({
+        version: 1,
+        processNonce: PROCESS_NONCE,
+        apiInstanceId: IDS[2],
+        idempotencyKey: Buffer.alloc(32, 4).toString("base64url"),
+      }),
+    });
+
+    await writerRejected;
+    const response = await replacement;
+    expect(response.status).toBe(201);
+    expect(real.registry.entries()).toEqual([]);
+    expect(h.internalErrors).toHaveLength(1);
+    expect(h.order).toEqual(["routes", "streams", "artifacts"]);
+  });
+
   test("validates the held state root before binding and stays unreconciled", async () => {
     const stateRoot = await mkdtemp(join(tmpdir(), "browser-server-start-"));
     stateRoots.push(stateRoot);
@@ -1686,6 +1907,137 @@ describe("private browser server", () => {
 
     expect(application.currentRuntime()).toBeNull();
   });
+
+  test(
+    "real handoff drains a retained writer profile and unused grants",
+    { timeout: 15_000 },
+    async () => {
+      const stateRoot = await mkdtemp(
+        join(tmpdir(), "browser-server-retained-"),
+      );
+      stateRoots.push(stateRoot);
+      await provisionBrowserStateRoot(stateRoot);
+      const internalErrors: unknown[] = [];
+      const application = realApplication(stateRoot, undefined, cause =>
+        internalErrors.push(cause),
+      );
+      await application.start();
+      running.push(application.server);
+      const address = application.server.address();
+      expect(address).not.toBeNull();
+      const base = `http://127.0.0.1:${address!.port}`;
+
+      const firstHandoff = await fetch(`${base}/v1/control-generations`, {
+        method: "POST",
+        headers: bootstrapHeaders(),
+        body: JSON.stringify({
+          version: 1,
+          processNonce: application.admission.processNonce,
+          apiInstanceId: IDS[0],
+          idempotencyKey: Buffer.alloc(32, 3).toString("base64url"),
+        }),
+      });
+      expect(firstHandoff.status).toBe(201);
+      const firstGeneration =
+        (await firstHandoff.json()) as ControlGenerationV1;
+      const snapshotDigest = canonicalizeReconciliationSnapshot(
+        [],
+      ).snapshotDigest;
+      const reconciled = await fetch(`${base}/v1/reconciliation`, {
+        method: "POST",
+        headers: {
+          ...bootstrapHeaders(),
+          "x-firecrawl-process-nonce": firstGeneration.processNonce,
+          "x-firecrawl-control-generation-nonce":
+            firstGeneration.controlGenerationNonce,
+        },
+        body: JSON.stringify({
+          version: 1,
+          processNonce: firstGeneration.processNonce,
+          controlGenerationNonce: firstGeneration.controlGenerationNonce,
+          snapshotDigest,
+          references: [],
+        }),
+      });
+      expect(reconciled.status).toBe(200);
+      const generationHeaders = {
+        ...requestHeaders(),
+        "x-firecrawl-process-nonce": firstGeneration.processNonce,
+        "x-firecrawl-control-generation-nonce":
+          firstGeneration.controlGenerationNonce,
+      };
+      const createdResponse = await fetch(`${base}/v1/sessions`, {
+        method: "POST",
+        headers: generationHeaders,
+        body: JSON.stringify({
+          ...validSessionCreateRequest(),
+          initialUrl: "about:blank",
+          allowedDomains: [],
+          profile: {
+            profileId: IDS[2],
+            mode: "writer",
+            generationId: null,
+            statePath: null,
+            checksum: null,
+          },
+        }),
+      });
+      const createdBody = await createdResponse.text();
+      expect(createdResponse.status, createdBody).toBe(201);
+      const created = JSON.parse(createdBody) as SessionV1;
+      for (const [index, permission] of (
+        ["passive", "interactive", "cdp"] as const
+      ).entries()) {
+        const grant = await fetch(
+          `${base}/v1/sessions/${created.runtimeSessionId}/grants`,
+          {
+            method: "POST",
+            headers: generationHeaders,
+            body: JSON.stringify({
+              version: 1,
+              grantId: IDS[index],
+              permission,
+              expiresAt: new Date(Date.now() + 30_000).toISOString(),
+              useLimit: 1,
+              expectedSessionVersion: created.sessionVersion,
+              allowedDomains: [],
+            }),
+          },
+        );
+        expect(grant.status, await grant.text()).toBe(201);
+      }
+
+      const replacement = await fetch(`${base}/v1/control-generations`, {
+        method: "POST",
+        headers: bootstrapHeaders(),
+        body: JSON.stringify({
+          version: 1,
+          processNonce: application.admission.processNonce,
+          apiInstanceId: IDS[1],
+          idempotencyKey: Buffer.alloc(32, 4).toString("base64url"),
+        }),
+      });
+      const replacementBody = await replacement.text();
+      expect(
+        replacement.status,
+        `${replacementBody}\n${String(internalErrors[0])}`,
+      ).toBe(201);
+      expect(internalErrors).toEqual([]);
+      expect(application.currentRuntime()).toBeNull();
+      await expect(
+        readdir(join(stateRoot, "profiles", IDS[2], "working")),
+      ).resolves.toEqual([]);
+      await expect(
+        readdir(join(stateRoot, "profiles", IDS[2], "staging")),
+      ).resolves.toEqual([]);
+      await expect(
+        readdir(join(stateRoot, ".profile-publish-staging", "bundles")),
+      ).resolves.toEqual([]);
+      await expect(
+        readdir(join(stateRoot, ".profile-publish-staging", "intents")),
+      ).resolves.toEqual([]);
+    },
+  );
 
   test("shutdown closes admission synchronously and preserves drain order", async () => {
     const h = harness();

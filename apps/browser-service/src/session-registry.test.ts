@@ -625,6 +625,64 @@ describe("persistent session registry", () => {
     },
   );
 
+  test("handoff discards uncommitted writer work instead of preparing it", async () => {
+    const h = harness();
+    await h.registry.create(
+      request({
+        profile: {
+          profileId: IDS[0]!,
+          mode: "writer",
+          generationId: null,
+          statePath: null,
+          checksum: null,
+        },
+      }),
+    );
+
+    await h.registry.drainAll("handoff");
+
+    expect(h.profileStore.discardWorkingCopy).toHaveBeenCalledOnce();
+    expect(h.profileStore.discardWorkingCopy).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: "writer" }),
+    );
+    expect(h.profileStore.prepareWorkingCopy).not.toHaveBeenCalled();
+    expect(h.profileStore.finalizePreparedGeneration).not.toHaveBeenCalled();
+    expect(h.registry.entries()).toEqual([]);
+  });
+
+  test("full drain waits for an already-admitted API action writer", async () => {
+    const h = harness();
+    const session = await h.registry.create(request());
+    let writerStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      writerStarted = resolve;
+    });
+    let releaseWriter!: () => void;
+    const held = new Promise<void>(resolve => {
+      releaseWriter = resolve;
+    });
+    const writer = h.registry.withWriter(session.runtimeSessionId, async () => {
+      writerStarted();
+      await held;
+    });
+    await started;
+
+    let drainSettled = false;
+    const drain = h.registry.drainAll("handoff").finally(() => {
+      drainSettled = true;
+    });
+    await Promise.resolve();
+    expect(drainSettled).toBe(false);
+
+    releaseWriter();
+    await expect(writer).rejects.toMatchObject({
+      category: "browser_unavailable",
+    });
+    await expect(drain).resolves.toBeUndefined();
+    expect(h.registry.entries()).toEqual([]);
+    expect(h.context.close).toHaveBeenCalledOnce();
+  });
+
   test("close is idempotent and snapshot work never publishes", async () => {
     const h = harness();
     const session = await h.registry.create(request());

@@ -150,6 +150,7 @@ type Logger = {
 
 export type ReconciliationDependencies = {
   admission: ReconciliationExecutionAdmission;
+  freshAtomicCanary?: boolean;
   now?: () => Date;
   gracePeriodMs?: number;
   maxManagedEntries?: number;
@@ -6201,6 +6202,9 @@ export async function reconcileBrowserStateWithAuthority(
       deps,
       observability,
     );
+    if (deps.freshAtomicCanary === true) {
+      await runFreshAtomicDirectoryCanary(root, binding);
+    }
     let evidence: ReconciledRootEvidence | undefined;
     const result = await reconcileBrowserStateCore(
       rootRecord,
@@ -6530,6 +6534,151 @@ export async function readHeldRootFile(
   await record.anchored.revalidate();
   return Buffer.from(result.bytes);
   } finally {
+    release();
+  }
+}
+
+export type PersistedReplayCheckpoint = Readonly<{
+  statePath: string;
+  checksum: string;
+  byteSize: number;
+}>;
+
+function canonicalReplayCheckpointBytes(storageState: unknown): Buffer {
+  const parsed = storageStateV1Schema.safeParse(storageState);
+  if (!parsed.success) {
+    throw err(
+      "reconciliation_filesystem_unsafe",
+      "replay checkpoint storage state is invalid",
+    );
+  }
+  const bytes = Buffer.from(canonicalJson(parsed.data), "utf8");
+  if (bytes.byteLength === 0 || bytes.byteLength > CHECKPOINT_MAX_BYTES) {
+    throw err(
+      "reconciliation_filesystem_unsafe",
+      "replay checkpoint exceeds its byte limit",
+    );
+  }
+  return bytes;
+}
+
+export async function persistHeldReplayCheckpoint(
+  root: AnchoredProfileRoot,
+  input: Readonly<{
+    ownerId: string;
+    scrapeId: string;
+    checkpointId: string;
+    storageState: unknown;
+  }>,
+): Promise<PersistedReplayCheckpoint> {
+  if (
+    !SAFE_OWNER.test(input.ownerId) ||
+    !SAFE_OWNER.test(input.scrapeId) ||
+    !UUID.test(input.checkpointId)
+  ) {
+    throw err(
+      "reconciliation_filesystem_unsafe",
+      "replay checkpoint identity is invalid",
+    );
+  }
+  const directoryPath = `replay/${input.ownerId}/${input.scrapeId}`;
+  const statePath = `${directoryPath}/${input.checkpointId}.json`;
+  const bytes = canonicalReplayCheckpointBytes(input.storageState);
+  const record = requireRoot(root);
+  const release = acquireRootOperation(record);
+  try {
+    await record.anchored.revalidate();
+    const directory = await record.anchored.ensureDirectory(directoryPath);
+    await closeRaw(directory, "replay-checkpoint-directory");
+    await publishTemp(
+      record.anchored,
+      directoryPath,
+      `.checkpoint-${input.checkpointId}.staging`,
+      `${input.checkpointId}.json`,
+      bytes,
+    );
+    await record.anchored.revalidate();
+    return Object.freeze({
+      statePath,
+      checksum: sha256(bytes),
+      byteSize: bytes.byteLength,
+    });
+  } finally {
+    release();
+  }
+}
+
+export async function deleteHeldReplayCheckpoint(
+  root: AnchoredProfileRoot,
+  input: Readonly<{ statePath: string; checksum: string }>,
+): Promise<boolean> {
+  assertCheckpointPath(input.statePath);
+  if (!/^[a-f0-9]{64}$/u.test(input.checksum)) {
+    throw err(
+      "reconciliation_filesystem_unsafe",
+      "replay checkpoint checksum is invalid",
+    );
+  }
+  const record = requireRoot(root);
+  const release = acquireRootOperation(record);
+  let parent: FileHandle | undefined;
+  let pinned: PinnedLeaf | undefined;
+  try {
+    await record.anchored.revalidate();
+    const opened = await record.anchored.openParent(input.statePath);
+    parent = opened.parent;
+    const existing = await record.anchored.lstatOptional(parent, opened.leaf);
+    if (existing === null) {
+      await call(record.anchored.admission, "repair-replay-parent", () =>
+        parent!.sync(),
+      );
+      return false;
+    }
+    const file = await readRegularFileAt(
+      record.anchored,
+      parent,
+      opened.leaf,
+      CHECKPOINT_MAX_BYTES,
+    );
+    if (
+      file.mode !== 0o600 ||
+      sha256(file.bytes) !== input.checksum ||
+      !Buffer.from(
+        canonicalJson(
+          storageStateV1Schema.parse(JSON.parse(file.bytes.toString("utf8"))),
+        ),
+        "utf8",
+      ).equals(file.bytes)
+    ) {
+      throw err(
+        "reconciliation_filesystem_unsafe",
+        "replay checkpoint deletion authority does not match",
+      );
+    }
+    pinned = await pinLeaf(record.anchored, parent, opened.leaf);
+    await assertRawPinnedLeaf(record.anchored, parent, opened.leaf, pinned);
+    await call(record.anchored.admission, "delete-replay-checkpoint", () =>
+      fs.unlink(procPath(parent!, opened.leaf)),
+    );
+    await call(record.anchored.admission, "fsync-replay-parent", () =>
+      parent!.sync(),
+    );
+    await record.anchored.revalidate();
+    return true;
+  } catch (cause) {
+    if (isNodeError(cause) && cause.code === "ENOENT") return false;
+    if (cause instanceof SyntaxError) {
+      throw err(
+        "reconciliation_filesystem_unsafe",
+        "replay checkpoint is corrupt",
+      );
+    }
+    throw cause;
+  } finally {
+    await closeAll([
+      [pinned?.handle, "replay-checkpoint-pin"],
+      [parent, "replay-checkpoint-parent"],
+    ]);
     release();
   }
 }
@@ -16778,7 +16927,7 @@ async function executeAtomicProtectedCleanupEntry(
     entry.release.reservation,
     entry.release.count,
     entry.release.byteSize,
-    "payload_bytes",
+    entry.scope === "intent_temp" ? "other_metadata_bytes" : "payload_bytes",
   );
   step = advanceAtomicProtectedCleanupEntry(
     step.state,
@@ -17667,8 +17816,8 @@ async function closeAtomicRecoveryDirectories(
 async function atomicRecoveryTreeEntries(
   flight: AtomicEffectFlightRecord,
   root: AtomicRecoveryDirectory,
-  scope: "private_profile_payload" | "public_source",
-  prefix: "payload" | "source",
+  scope: "private_profile_payload" | "private_canary_proof" | "public_source",
+  prefix: string,
   expectedChecksum: string | null,
   expectedByteSize: number | null,
 ): Promise<readonly CleanupIdentityEntryV1[]> {
@@ -17718,10 +17867,99 @@ async function atomicRecoveryTreeEntries(
   );
 }
 
+function atomicPrivateRecoverySource(intent: AtomicPublishIntentV1): Readonly<{
+  leaf: string;
+  prefix: string;
+  scope: "private_profile_payload" | "private_canary_proof";
+}> {
+  if (intent.kind === "canary") {
+    if (intent.target.kind !== "canary_parent" || intent.canaryProof === null) {
+      throw atomicFailure("atomic canary recovery source is invalid");
+    }
+    return Object.freeze({
+      leaf: intent.canaryProof.sourceLeaf,
+      prefix: intent.canaryProof.sourceLeaf,
+      scope: "private_canary_proof" as const,
+    });
+  }
+  if (intent.target.kind === "canary_parent" || intent.canaryProof !== null) {
+    throw atomicFailure("atomic profile recovery source is invalid");
+  }
+  return Object.freeze({
+    leaf: "payload",
+    prefix: "payload",
+    scope: "private_profile_payload" as const,
+  });
+}
+
+async function atomicBuildingRecoveryIntentTemps(
+  flight: AtomicEffectFlightRecord,
+  intents: AtomicHeldRecord,
+  intent: AtomicPublishIntentV1,
+): Promise<readonly CleanupIdentityEntryV1[]> {
+  const expectedBuilding = encodeAtomicPublishIntent({
+    ...intent,
+    phase: "building",
+    prepublicationAbort: null,
+    cleanup: null,
+    identityManifest: null,
+  });
+  const entries = await atomicAwait(
+    flight,
+    [intents],
+    "atomic-building-recovery-intent-temp-list",
+    () => fs.readdir(procPath(intents.handle), { withFileTypes: true }),
+  );
+  const recovered: CleanupIdentityEntryV1[] = [];
+  for (const entry of entries) {
+    const leaf = parseAtomicPublicationIntentLeaf(entry.name);
+    if (
+      leaf.operationId !== intent.operationId ||
+      leaf.kind !== "intent_temp"
+    ) {
+      continue;
+    }
+    if (!entry.isFile() || leaf.phase !== "building") {
+      throw atomicFailure("atomic building recovery intent temp is invalid");
+    }
+    const snapshot = await snapshotAtomicManifestPlannedFile(
+      flight,
+      intents,
+      entry.name,
+      ATOMIC_MAX_SCRATCH_OTHER_METADATA_BYTES,
+      "atomic-building-recovery-intent-temp",
+    );
+    if (
+      snapshot === null ||
+      snapshot.evidence.contentSha256 !== expectedBuilding.sha256 ||
+      snapshot.bytes.byteLength !== expectedBuilding.bytes.byteLength
+    ) {
+      throw atomicFailure("atomic building recovery intent temp is invalid");
+    }
+    recovered.push(
+      Object.freeze({
+        index: 0,
+        scope: "intent_temp" as const,
+        path: entry.name,
+        type: "file" as const,
+        dev: snapshot.evidence.dev,
+        ino: snapshot.evidence.ino,
+        mode: snapshot.evidence.mode,
+        size: snapshot.evidence.size,
+        contentSha256: snapshot.evidence.contentSha256,
+      }),
+    );
+  }
+  return Object.freeze(
+    recovered.sort((left, right) => rawCompare(left.path, right.path)),
+  );
+}
+
 async function reconstructAtomicManifestPlannedBytes(
   controller: AtomicEffectControllerV1,
   intent: AtomicPublishIntentV1,
   bundles: AtomicPinnedAuthority,
+  intents: AtomicPinnedAuthority,
   profilesParentId: FlightSemanticId,
 ): Promise<Readonly<{
   manifest: CleanupIdentityManifestV1;
@@ -17733,12 +17971,16 @@ async function reconstructAtomicManifestPlannedBytes(
     intent.wrapper === null ||
     (intent.prepublicationAbort === null &&
       (intent.privateSource === null || intent.classification === null)) ||
-    intent.target.kind === "canary_parent"
+    (intent.target.kind === "canary_parent" &&
+      (intent.kind !== "canary" ||
+        intent.prepublicationAbort?.from !== "building"))
   ) {
     throw atomicFailure("atomic recovery intent is not reconstructible");
   }
+  const privateRecoverySource = atomicPrivateRecoverySource(intent);
   const flight = requireAtomicFlight(controller);
   const bundlesRecord = resolveAtomicRecord(flight, bundles.handleId);
+  const intentsRecord = resolveAtomicRecord(flight, intents.handleId);
   const profilesRecord = resolveAtomicRecord(flight, profilesParentId);
   const opened: AtomicRecoveryDirectory[] = [];
   try {
@@ -17764,7 +18006,7 @@ async function reconstructAtomicManifestPlannedBytes(
           "atomic-recovery-target-profile",
         );
         opened.push(payload);
-      } else {
+      } else if (intent.target.kind === "profile_state") {
         const profile = await openAtomicRecoveryDirectory(
           flight,
           profilesRecord,
@@ -17789,13 +18031,15 @@ async function reconstructAtomicManifestPlannedBytes(
           "atomic-recovery-target-generation",
         );
         opened.push(payload);
+      } else {
+        throw atomicFailure("atomic recovery published target is invalid");
       }
     } else {
       try {
         payload = await openAtomicRecoveryDirectory(
           flight,
           wrapper,
-          "payload",
+          privateRecoverySource.leaf,
           intent.privateSource,
           "atomic-recovery-private-payload",
         );
@@ -17804,7 +18048,6 @@ async function reconstructAtomicManifestPlannedBytes(
         if (
           intent.prepublicationAbort?.from === "building" &&
           intent.privateSource === null &&
-          intent.identityManifest.entryCount === 0 &&
           isNodeError(error) &&
           error.code === "ENOENT"
         ) {
@@ -17814,19 +18057,28 @@ async function reconstructAtomicManifestPlannedBytes(
         }
       }
     }
-    const entries =
+    const entries: CleanupIdentityEntryV1[] =
       payload === null
         ? []
         : [
             ...(await atomicRecoveryTreeEntries(
               flight,
               payload,
-              "private_profile_payload",
-              "payload",
+              privateRecoverySource.scope,
+              privateRecoverySource.prefix,
               intent.privateSource?.checksum ?? null,
               intent.privateSource?.byteSize ?? null,
             )),
           ];
+    if (intent.prepublicationAbort?.from === "building") {
+      entries.push(
+        ...(await atomicBuildingRecoveryIntentTemps(
+          flight,
+          intentsRecord,
+          intent,
+        )),
+      );
+    }
     if (
       intent.classification?.outcome === "published" &&
       intent.publicSource !== null
@@ -17871,6 +18123,12 @@ async function reconstructAtomicManifestPlannedBytes(
       );
     }
     entries.sort((left, right) => {
+      if (left.scope === "intent_temp" && right.scope !== "intent_temp") {
+        return 1;
+      }
+      if (left.scope !== "intent_temp" && right.scope === "intent_temp") {
+        return -1;
+      }
       const leftDepth = left.path.split("/").length;
       const rightDepth = right.path.split("/").length;
       return rightDepth !== leftDepth
@@ -18077,6 +18335,7 @@ export async function recoverAtomicManifestPlannedPublication(
     controller,
     intent,
     bundles,
+    intents,
     lease.initialAuthority.profilesParentId,
   );
   const manifestBinding = intent.identityManifest;
@@ -19296,6 +19555,7 @@ async function planAtomicBuildingAbortManifest(
   const bundlesRecord = resolveAtomicRecord(flight, bundles.handleId);
   const recoveryDirectories: AtomicRecoveryDirectory[] = [];
   try {
+    const privateRecoverySource = atomicPrivateRecoverySource(stable.intent);
     const wrapper = await openAtomicRecoveryDirectory(
       flight,
       bundlesRecord,
@@ -19309,7 +19569,7 @@ async function planAtomicBuildingAbortManifest(
       const payload = await openAtomicRecoveryDirectory(
         flight,
         wrapper,
-        "payload",
+        privateRecoverySource.leaf,
         null,
         "atomic-building-recovery-payload",
       );
@@ -19317,14 +19577,22 @@ async function planAtomicBuildingAbortManifest(
       entries = await atomicRecoveryTreeEntries(
         flight,
         payload,
-        "private_profile_payload",
-        "payload",
+        privateRecoverySource.scope,
+        privateRecoverySource.prefix,
         null,
         null,
       );
     } catch (error) {
       if (!(isNodeError(error) && error.code === "ENOENT")) throw error;
     }
+    entries = Object.freeze([
+      ...entries,
+      ...(await atomicBuildingRecoveryIntentTemps(
+        flight,
+        intentsRecord,
+        stable.intent,
+      )),
+    ]);
     if (stable.intent.phase === "building") {
       const evidenceDigest = sha256(
         JSON.stringify({
@@ -20553,6 +20821,13 @@ async function recoverAtomicBuildingAbortPublication(
         : stable.intent.classification?.outcome === "conflict"
           ? ("conflict" as const)
           : null;
+  const privateRecoverySource = atomicPrivateRecoverySource(stable.intent);
+  const privateEntries =
+    manifest?.entries.filter(
+      entry => entry.scope === privateRecoverySource.scope,
+    ) ?? [];
+  const intentTempEntries =
+    manifest?.entries.filter(entry => entry.scope === "intent_temp") ?? [];
   if (
     stable.intent.phase !== "manifest_published" ||
     cleanupOutcome === null ||
@@ -20563,7 +20838,12 @@ async function recoverAtomicBuildingAbortPublication(
     authority.manifestObjectId === null ||
     authority.manifestEvidence === null ||
     manifest.entries.some(
-      entry => entry.scope !== "private_profile_payload",
+      entry =>
+        entry.scope !== privateRecoverySource.scope &&
+        entry.scope !== "intent_temp",
+    ) ||
+    [...privateEntries, ...intentTempEntries].some(
+      (entry, index) => entry.index !== index,
     )
   ) {
     throw atomicFailure("atomic building abort authority is invalid");
@@ -20580,7 +20860,9 @@ async function recoverAtomicBuildingAbortPublication(
     2,
     0,
   );
-  const children = manifest.entries.filter(entry => entry.path !== "payload");
+  const children = privateEntries.filter(
+    entry => entry.path !== privateRecoverySource.prefix,
+  );
   await reserveAtomicBudget(
     controller,
     `${operationId}:building-abort:payload-entries`,
@@ -20599,6 +20881,22 @@ async function recoverAtomicBuildingAbortPublication(
       (total, entry) => total + (entry.type === "file" ? entry.size : 0),
       0,
     ),
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-abort:intent-temp-files`,
+    operationId,
+    "scratch_files",
+    intentTempEntries.length,
+    0,
+  );
+  await reserveAtomicBudget(
+    controller,
+    `${operationId}:building-abort:intent-temp-bytes`,
+    operationId,
+    "other_metadata_bytes",
+    0,
+    intentTempEntries.reduce((total, entry) => total + entry.size, 0),
   );
   const wrapperLocation = await observeAtomicContinuationDirectory(
     flight,
@@ -20632,12 +20930,11 @@ async function recoverAtomicBuildingAbortPublication(
       role: "private_source" | "payload_entry";
     }>
   >();
-  for (const entry of [...manifest.entries].sort((left, right) => {
-    const depth =
-      left.path.split("/").length - right.path.split("/").length;
+  for (const entry of [...privateEntries].sort((left, right) => {
+    const depth = left.path.split("/").length - right.path.split("/").length;
     return depth !== 0 ? depth : rawCompare(left.path, right.path);
   })) {
-    const isRoot = entry.path === "payload";
+    const isRoot = entry.path === privateRecoverySource.prefix;
     const separator = entry.path.lastIndexOf("/");
     const parentId = isRoot
       ? wrapper.handleId
@@ -20651,7 +20948,7 @@ async function recoverAtomicBuildingAbortPublication(
       operationId,
       isRoot ? "private_source" : "payload_entry",
       parentId,
-      isRoot ? "payload" : entry.path.slice(separator + 1),
+      isRoot ? privateRecoverySource.leaf : entry.path.slice(separator + 1),
       atomicEvidenceFromManifestEntry(entry),
       entry.type === "directory"
         ? "directory_nofollow"
@@ -20692,12 +20989,17 @@ async function recoverAtomicBuildingAbortPublication(
   const entryDigests = manifest.entries.map((entry, index) =>
     sha256(JSON.stringify({ index, entry })),
   );
-  for (const [logicalIndex, entry] of manifest.entries.entries()) {
+  const entryCounts = {
+    privateSourceEntries: privateEntries.length,
+    wrapperTemps: 0,
+    intentTemps: intentTempEntries.length,
+  } as const;
+  for (const [logicalIndex, entry] of privateEntries.entries()) {
     const opened = openedByPath.get(entry.path);
     if (opened === undefined) {
       throw atomicFailure("atomic building abort entry is missing");
     }
-    const isRoot = entry.path === "payload";
+    const isRoot = entry.path === privateRecoverySource.prefix;
     const separator = entry.path.lastIndexOf("/");
     const parentId = isRoot
       ? wrapper.handleId
@@ -20713,11 +21015,7 @@ async function recoverAtomicBuildingAbortPublication(
         operationId,
         manifestSha256: stable.intent.identityManifest!.sha256,
         entryCount: manifest.entries.length,
-        entryCounts: {
-          privateSourceEntries: manifest.entries.length,
-          wrapperTemps: 0,
-          intentTemps: 0,
-        },
+        entryCounts,
         entryDigests,
         cursor: logicalIndex,
         suffix: "private_source_entries",
@@ -20727,7 +21025,7 @@ async function recoverAtomicBuildingAbortPublication(
         manifestSha256: stable.intent.identityManifest!.sha256,
         index: logicalIndex,
         suffix: "private_source_entries",
-        scope: "private_profile_payload",
+        scope: privateRecoverySource.scope,
         entryDigest: entryDigests[logicalIndex]!,
         requestKind: isRoot
           ? "remove_root"
@@ -20736,7 +21034,9 @@ async function recoverAtomicBuildingAbortPublication(
             : "remove_directory",
         role: opened.role,
         parentId,
-        leaf: isRoot ? "payload" : entry.path.slice(separator + 1),
+        leaf: isRoot
+          ? privateRecoverySource.leaf
+          : entry.path.slice(separator + 1),
         objectId: opened.objectId,
         expected: opened.evidence,
         release: {
@@ -20750,21 +21050,43 @@ async function recoverAtomicBuildingAbortPublication(
     );
     stable = result.stable;
   }
-  for (const suffix of ["private_source_root", "wrapper_temps"] as const) {
+  for (
+    let cursor = privateEntries.length;
+    cursor < manifest.entries.length;
+    cursor += 1
+  ) {
     stable = await replaceAtomicCleanupCursor(
       controller,
-      `${operationId}:building-abort:${suffix}`,
+      `${operationId}:building-abort:private-padding:${cursor + 1}`,
       stable,
-      suffix,
-      0,
+      "private_source_entries",
+      cursor + 1,
       authority.intents.handleId,
       authority.intents.evidence,
     );
   }
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:building-abort:private-source-root`,
+    stable,
+    "private_source_root",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
+  stable = await replaceAtomicCleanupCursor(
+    controller,
+    `${operationId}:building-abort:wrapper-temps`,
+    stable,
+    "wrapper_temps",
+    0,
+    authority.intents.handleId,
+    authority.intents.evidence,
+  );
   for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
     stable = await replaceAtomicCleanupCursor(
       controller,
-      `${operationId}:building-abort:wrapper-temp:${cursor + 1}`,
+      `${operationId}:building-abort:wrapper-padding:${cursor + 1}`,
       stable,
       "wrapper_temps",
       cursor + 1,
@@ -20815,13 +21137,76 @@ async function recoverAtomicBuildingAbortPublication(
     authority.intents.handleId,
     authority.intents.evidence,
   );
-  for (let cursor = 0; cursor < manifest.entries.length; cursor += 1) {
+  let intentCursor = 0;
+  for (const entry of intentTempEntries) {
+    while (intentCursor < entry.index) {
+      intentCursor += 1;
+      stable = await replaceAtomicCleanupCursor(
+        controller,
+        `${operationId}:building-abort:intent-padding:${intentCursor}`,
+        stable,
+        "intent_temps",
+        intentCursor,
+        authority.intents.handleId,
+        authority.intents.evidence,
+      );
+    }
+    const opened = await openAtomicExpectedChild(
+      controller,
+      `${operationId}:building-abort:open-intent-temp:${entry.index}`,
+      operationId,
+      "intent_temp",
+      authority.intents.handleId,
+      entry.path,
+      atomicEvidenceFromManifestEntry(entry),
+      "file_read_nofollow",
+    );
+    const result = await executeAtomicProtectedCleanupEntry(
+      controller,
+      stable,
+      authority.intents,
+      createAtomicProtectedCleanupState({
+        operationId,
+        manifestSha256: stable.intent.identityManifest!.sha256,
+        entryCount: manifest.entries.length,
+        entryCounts,
+        entryDigests,
+        cursor: entry.index,
+        suffix: "intent_temps",
+      }),
+      {
+        operationId,
+        manifestSha256: stable.intent.identityManifest!.sha256,
+        index: entry.index,
+        suffix: "intent_temps",
+        scope: "intent_temp",
+        entryDigest: entryDigests[entry.index]!,
+        requestKind: "remove_file",
+        role: "intent_temp",
+        parentId: authority.intents.handleId,
+        leaf: entry.path,
+        objectId: opened.handleId,
+        expected: opened.evidence,
+        release: {
+          reservation: "scratch_files",
+          count: 1,
+          byteSize: entry.size,
+        },
+      },
+      true,
+      "cleanup",
+    );
+    stable = result.stable;
+    intentCursor = entry.index + 1;
+  }
+  while (intentCursor < manifest.entries.length) {
+    intentCursor += 1;
     stable = await replaceAtomicCleanupCursor(
       controller,
-      `${operationId}:building-abort:intent-temp:${cursor + 1}`,
+      `${operationId}:building-abort:intent-padding:${intentCursor}`,
       stable,
       "intent_temps",
-      cursor + 1,
+      intentCursor,
       authority.intents.handleId,
       authority.intents.evidence,
     );
@@ -20841,11 +21226,7 @@ async function recoverAtomicBuildingAbortPublication(
       operationId,
       manifestSha256: stable.intent.identityManifest!.sha256,
       entryCount: manifest.entries.length,
-      entryCounts: {
-        privateSourceEntries: manifest.entries.length,
-        wrapperTemps: 0,
-        intentTemps: 0,
-      },
+      entryCounts,
       entryDigests,
       cursor: manifest.entries.length,
       suffix: "done",
@@ -23570,6 +23951,668 @@ export async function runAtomicCanaryPrivateCleanup(
   });
   await persistProof(cleaned);
   return cleaned;
+}
+
+function atomicIntentCanaryProof(
+  proof: AtomicCanaryProofV1,
+): NonNullable<AtomicPublishIntentV1["canaryProof"]> {
+  return Object.freeze({
+    attempt: 0,
+    sourceLeaf: proof.sourceLeaf as `proof-${string}-0`,
+    targetLeaf: proof.targetLeaf as `canary-${string}-0`,
+    deletionLeaf: proof.deletionLeaf as `deletion-${string}-0`,
+    phase: proof.phase,
+    dev: proof.publishedEvidence?.dev ?? null,
+    ino: proof.publishedEvidence?.ino ?? null,
+    mode: proof.publishedEvidence === null ? null : 448,
+    evidenceDigest: proof.publishedEvidence?.evidenceDigest ?? null,
+  });
+}
+
+function atomicIntentCanaryClassification(
+  classification: AtomicNativeClassificationV1,
+): NonNullable<AtomicPublishIntentV1["classification"]> {
+  return Object.freeze({
+    outcome: classification.outcome,
+    nativeCode: classification.nativeCode,
+    sourceMatches: classification.sourceMatches,
+    targetMatches: classification.targetMatches,
+    targetOther: classification.targetOther,
+    evidenceDigest: sha256(
+      JSON.stringify({
+        precheck: classification.nativePrecheckEvidenceDigest,
+        locations: classification.locationEvidenceDigest,
+      }),
+    ),
+  });
+}
+
+async function runFreshAtomicDirectoryCanary(
+  root: AnchoredProfileRoot,
+  binding: ReadyProfileRootBinding,
+): Promise<void> {
+  const operationId = atomicUuidFromDigest(
+    [
+      "fresh-reconciliation-canary",
+      binding.processNonce,
+      binding.controlGenerationNonce,
+      binding.snapshotDigest,
+    ].join("\n"),
+  );
+  const lease = await acquireAtomicPreReadyRecoveryAuthority(
+    root,
+    operationId,
+  );
+  const { controller, initialAuthority } = lease;
+  const flight = requireAtomicFlight(controller);
+  const profilesEvidence = initialAuthority.evidence.profilesParent;
+  const bundlesEvidence = initialAuthority.evidence.bundlesParent;
+  const intentsEvidence = initialAuthority.evidence.intentsParent;
+  const target: PublicationTargetV1 = Object.freeze({
+    kind: "canary_parent",
+    parentLocator: Object.freeze({ kind: "profiles" }),
+    parent: Object.freeze({
+      dev: profilesEvidence.dev,
+      ino: profilesEvidence.ino,
+      mode: 448,
+    }),
+  });
+  const targetLocatorDigest = publicationTargetLocatorDigest(target);
+  const sourceLeaf = `proof-${operationId}-0` as const;
+  const targetLeaf = `canary-${operationId}-0` as const;
+  const deletionLeaf = `deletion-${operationId}-0` as const;
+  let controllerClosed = false;
+  let stable: AtomicPublishedIntentRecord | null = null;
+  try {
+    const baseIntent: AtomicPublishIntentV1 = {
+      version: 1,
+      operationId,
+      kind: "canary",
+      phase: "allocated",
+      binding,
+      target,
+      wrapper: null,
+      privateSource: null,
+      publicSource: null,
+      classification: null,
+      sourceDeletion: null,
+      adoption: null,
+      cleanup: null,
+      canaryProof: {
+        attempt: 0,
+        sourceLeaf,
+        targetLeaf,
+        deletionLeaf,
+        phase: "planned",
+        dev: null,
+        ino: null,
+        mode: null,
+        evidenceDigest: null,
+      },
+      prepublicationAbort: null,
+      identityManifest: null,
+    };
+    const allocated = encodeAtomicPublishIntent(baseIntent);
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:fresh-canary:stable`,
+      operationId,
+      "stable_files",
+      1,
+      0,
+    );
+    const publishedIntent = await runAtomicCreateAndPersistRecordProtocol(
+      controller,
+      {
+        flightNonce: `${operationId}:fresh-canary:allocated`,
+        operationId,
+        publication: { kind: "persist_intent", expectedPhase: null },
+        canonicalBytes: allocated.bytes,
+        contentDigest: allocated.sha256,
+        tempParentId: initialAuthority.intentsParentId,
+        tempParentEvidence: intentsEvidence,
+        tempLeaf: atomicIntentTempLeaf(operationId, "allocated"),
+        stableParentId: initialAuthority.intentsParentId,
+        stableParentEvidence: intentsEvidence,
+        stableLeaf: `${operationId}.json`,
+      },
+    );
+    stable = {
+      intent: baseIntent,
+      objectId: publishedIntent.stableObjectId,
+      evidence: publishedIntent.stableEvidence,
+    };
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:fresh-canary:scratch`,
+      operationId,
+      "scratch_entries",
+      3,
+      0,
+    );
+    await reserveAtomicBudget(
+      controller,
+      `${operationId}:fresh-canary:target`,
+      operationId,
+      "payload_entries",
+      1,
+      0,
+    );
+    const wrapper = atomicCreatedObservation(
+      await runAtomicRequest(
+        controller,
+        `${operationId}:fresh-canary:wrapper`,
+        {
+          kind: "create_and_pin_wrapper",
+          operationId,
+          role: "wrapper",
+          parentId: initialAuthority.bundlesParentId,
+          leaf: operationId,
+          parentEvidenceDigest: bundlesEvidence.evidenceDigest,
+          mode: 448,
+          expectedAbsence: true,
+        },
+        [initialAuthority.bundlesParentId],
+      ),
+    );
+    await syncAtomicHeld(
+      controller,
+      `${operationId}:fresh-canary:wrapper-sync`,
+      operationId,
+      "fsync_parent",
+      "bundles_parent",
+      initialAuthority.bundlesParentId,
+      bundlesEvidence,
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:fresh-canary:building`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "building",
+        wrapper: {
+          dev: wrapper.evidence.dev,
+          ino: wrapper.evidence.ino,
+          mode: 448,
+        },
+      },
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    const source = atomicCreatedObservation(
+      await runAtomicRequest(
+        controller,
+        `${operationId}:fresh-canary:source`,
+        {
+          kind: "create_and_pin_directory",
+          operationId,
+          role: "private_source",
+          parentId: wrapper.handleId,
+          leaf: sourceLeaf,
+          parentEvidenceDigest: wrapper.evidence.evidenceDigest,
+          mode: 448,
+          expectedAbsence: true,
+        },
+        [wrapper.handleId],
+      ),
+    );
+    await syncAtomicHeld(
+      controller,
+      `${operationId}:fresh-canary:source-sync`,
+      operationId,
+      "fsync_parent",
+      "wrapper",
+      wrapper.handleId,
+      wrapper.evidence,
+    );
+    const sourceTree = await hashProfileTreeAt(
+      flight.root.anchored,
+      resolveAtomicRecord(flight, source.handleId).handle,
+      new Budget(MAX_RECONCILIATION_REFERENCES),
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:fresh-canary:ready`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "ready",
+        privateSource: {
+          dev: source.evidence.dev,
+          ino: source.evidence.ino,
+          mode: 448,
+          checksum: sourceTree.checksum,
+          byteSize: sourceTree.byteSize,
+        },
+      },
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    let proof: AtomicCanaryProofV1 = Object.freeze({
+      version: 1,
+      operationId,
+      targetParentLocatorDigest: targetLocatorDigest,
+      targetParentEvidence: profilesEvidence,
+      wrapperEvidence: wrapper.evidence,
+      attempt: 0,
+      sourceLeaf,
+      targetLeaf,
+      deletionLeaf,
+      phase: "planned",
+      privateSourceEvidence: source.evidence,
+      publishedEvidence: null,
+      privateDeletionEvidence: null,
+      classification: null,
+      manifestSha256: null,
+      cleanupNextIndex: 0,
+      cleanupEntryCount: 0,
+      sourceParentSynced: false,
+      targetParentSynced: false,
+    });
+    const proved = await runAtomicCanaryRecovery(
+      controller,
+      {
+        flightNonce: `${operationId}:fresh-canary:prove`,
+        action: "prove_mount",
+        proof,
+        durableCanaryInventory: [],
+        expectedTargetParentLocatorDigest: targetLocatorDigest,
+        sourceParentId: wrapper.handleId,
+        sourceParentRole: "wrapper",
+        sourceParentEvidence: wrapper.evidence,
+        sourceId: source.handleId,
+        targetParentId: initialAuthority.profilesParentId,
+        targetParentRole: "profiles_parent",
+        targetParentEvidence: profilesEvidence,
+        cleanupManifest: null,
+      },
+      async request => {
+        proof = request.proof;
+        const classification = request.proof.classification;
+        if (classification === null) return;
+        stable = await createAndReplaceAtomicIntent(
+          controller,
+          `${operationId}:fresh-canary:persist-${request.proof.phase}`,
+          stable!,
+          {
+            ...stable!.intent,
+            phase: "classified",
+            classification: atomicIntentCanaryClassification(classification),
+            canaryProof: atomicIntentCanaryProof(request.proof),
+          },
+          initialAuthority.intentsParentId,
+          intentsEvidence,
+        );
+      },
+    );
+    proof = proved.proof;
+    if (
+      proof.phase !== "published" ||
+      proof.publishedEvidence === null ||
+      proof.classification?.outcome !== "published"
+    ) {
+      throw atomicFailure("fresh atomic canary publication was not proved");
+    }
+    const publishedRecord = [...flight.records].find(
+      record =>
+        record.role === "public_target" &&
+        record.parentId === initialAuthority.profilesParentId &&
+        record.leaf === targetLeaf &&
+        sameAtomicEvidence(record.evidence, proof.publishedEvidence!),
+    );
+    const publishedObjectId =
+      publishedRecord === undefined
+        ? undefined
+        : flight.recordTokens.get(publishedRecord);
+    if (publishedObjectId === undefined) {
+      throw atomicFailure("fresh atomic canary target authority is missing");
+    }
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:fresh-canary:renamed`,
+      stable,
+      { ...stable.intent, phase: "renamed" },
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    const manifest: CleanupIdentityManifestV1 = {
+      version: 1,
+      operationId,
+      binding,
+      targetLocatorDigest,
+      entries: [
+        {
+          index: 0,
+          scope: "private_canary_deletion",
+          path: deletionLeaf,
+          type: "directory",
+          dev: proof.publishedEvidence.dev,
+          ino: proof.publishedEvidence.ino,
+          mode: 448,
+          size: 0,
+          contentSha256: null,
+        },
+      ],
+    };
+    const encodedManifest = encodeCleanupIdentityManifest(manifest);
+    const manifestTempLeaf =
+      `${operationId}.identities.${atomicTransitionId(operationId, "manifest")}.tmp` as
+        `${string}.identities.${string}.tmp`;
+    const manifestBinding: NonNullable<
+      AtomicPublishIntentV1["identityManifest"]
+    > = {
+      phase: "planned",
+      filename: `${operationId}.identities.json`,
+      tempFilename: manifestTempLeaf,
+      sha256: encodedManifest.sha256,
+      entryCount: 1,
+      byteSize: encodedManifest.bytes.byteLength,
+      dev: null,
+      ino: null,
+      mode: null,
+    };
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:fresh-canary:manifest-planned`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "manifest_planned",
+        identityManifest: manifestBinding,
+      },
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    const publishedManifest = await runAtomicCreateAndPersistRecordProtocol(
+      controller,
+      {
+        flightNonce: `${operationId}:fresh-canary:manifest`,
+        operationId,
+        publication: {
+          kind: "persist_manifest",
+          expectedPhase: "manifest_planned",
+        },
+        canonicalBytes: encodedManifest.bytes,
+        contentDigest: encodedManifest.sha256,
+        tempParentId: initialAuthority.intentsParentId,
+        tempParentEvidence: intentsEvidence,
+        tempLeaf: manifestTempLeaf,
+        stableParentId: initialAuthority.intentsParentId,
+        stableParentEvidence: intentsEvidence,
+        stableLeaf: `${operationId}.identities.json`,
+      },
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:fresh-canary:manifest-published`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "manifest_published",
+        identityManifest: {
+          ...manifestBinding,
+          phase: "published",
+          dev: publishedManifest.stableEvidence.dev,
+          ino: publishedManifest.stableEvidence.ino,
+          mode: 384,
+        },
+      },
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    stable = await createAndReplaceAtomicIntent(
+      controller,
+      `${operationId}:fresh-canary:discarding`,
+      stable,
+      {
+        ...stable.intent,
+        phase: "discarding",
+        cleanup: {
+          phase: "discarding",
+          outcome: "canary_complete",
+          evidenceDigest: sha256(
+            JSON.stringify({
+              operationId,
+              manifestSha256: encodedManifest.sha256,
+              outcome: "canary_complete",
+            }),
+          ),
+          suffix: "private_source_entries",
+          nextIndex: 0,
+        },
+      },
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    const cleanup = await runAtomicCanaryRecovery(
+      controller,
+      {
+        flightNonce: `${operationId}:fresh-canary:cleanup`,
+        action: "cleanup",
+        proof,
+        durableCanaryInventory: [proof],
+        expectedTargetParentLocatorDigest: targetLocatorDigest,
+        sourceParentId: initialAuthority.profilesParentId,
+        sourceParentRole: "profiles_parent",
+        sourceParentEvidence: profilesEvidence,
+        sourceId: publishedObjectId,
+        targetParentId: wrapper.handleId,
+        targetParentRole: "wrapper",
+        targetParentEvidence: wrapper.evidence,
+        cleanupManifest: {
+          sha256: encodedManifest.sha256,
+          entryCount: 1,
+          nextIndex: 0,
+        },
+      },
+      async request => {
+        proof = request.proof;
+        const nextCanaryProof = atomicIntentCanaryProof(request.proof);
+        if (
+          JSON.stringify(stable!.intent.canaryProof) ===
+          JSON.stringify(nextCanaryProof)
+        ) {
+          return;
+        }
+        stable = await createAndReplaceAtomicIntent(
+          controller,
+          `${operationId}:fresh-canary:persist-deleting`,
+          stable!,
+          {
+            ...stable!.intent,
+            canaryProof: nextCanaryProof,
+          },
+          initialAuthority.intentsParentId,
+          intentsEvidence,
+        );
+      },
+    );
+    proof = cleanup.proof;
+    if (
+      cleanup.kind !== "cleanup_pending" ||
+      cleanup.privateDeletionObjectId === null ||
+      proof.privateDeletionEvidence === null
+    ) {
+      throw atomicFailure("fresh atomic canary cleanup was not proved");
+    }
+    proof = await runAtomicCanaryPrivateCleanup(
+      controller,
+      {
+        proof,
+        privateDeletion: {
+          state: "present",
+          parentId: wrapper.handleId,
+          parentEvidence: wrapper.evidence,
+          objectId: cleanup.privateDeletionObjectId,
+          evidence: proof.privateDeletionEvidence,
+        },
+      },
+      async persisted => {
+        proof = persisted;
+        stable = await createAndReplaceAtomicIntent(
+          controller,
+          `${operationId}:fresh-canary:persist-cleanup-${persisted.cleanupNextIndex}`,
+          stable!,
+          {
+            ...stable!.intent,
+            canaryProof: atomicIntentCanaryProof(persisted),
+            cleanup: {
+              ...stable!.intent.cleanup!,
+              nextIndex: persisted.cleanupNextIndex,
+            },
+          },
+          initialAuthority.intentsParentId,
+          intentsEvidence,
+        );
+      },
+    );
+    if (proof.phase !== "cleaned") {
+      throw atomicFailure("fresh atomic canary cleanup did not complete");
+    }
+    await closeAndReleaseAtomicRecord(
+      controller,
+      `${operationId}:fresh-canary:close-source`,
+      operationId,
+      "private_source",
+      source.handleId,
+      source.evidence,
+      { kind: "scratch_entries", count: 1, byteSize: 0 },
+    );
+    await closeAndReleaseAtomicRecord(
+      controller,
+      `${operationId}:fresh-canary:close-target`,
+      operationId,
+      "public_target",
+      publishedObjectId,
+      proof.publishedEvidence!,
+      { kind: "payload_entries", count: 1, byteSize: 0 },
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:private-root`,
+      stable,
+      "private_source_root",
+      0,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:wrapper-temps`,
+      stable,
+      "wrapper_temps",
+      0,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:wrapper-temps-complete`,
+      stable,
+      "wrapper_temps",
+      1,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:wrapper-root`,
+      stable,
+      "wrapper_root",
+      0,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    await runAtomicRequest(
+      controller,
+      `${operationId}:fresh-canary:remove-wrapper`,
+      {
+        kind: "remove_root",
+        operationId,
+        role: "wrapper",
+        parentId: initialAuthority.bundlesParentId,
+        leaf: operationId,
+        objectId: wrapper.handleId,
+        expected: wrapper.evidence,
+        manifestSha256: encodedManifest.sha256,
+        cursor: 0,
+      },
+      [initialAuthority.bundlesParentId, wrapper.handleId],
+    );
+    await closeAndReleaseAtomicRecord(
+      controller,
+      `${operationId}:fresh-canary:close-wrapper`,
+      operationId,
+      "wrapper",
+      wrapper.handleId,
+      wrapper.evidence,
+      { kind: "scratch_entries", count: 1, byteSize: 0 },
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:intent-temps`,
+      stable,
+      "intent_temps",
+      0,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:intent-temps-complete`,
+      stable,
+      "intent_temps",
+      1,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    stable = await replaceAtomicCleanupCursor(
+      controller,
+      `${operationId}:fresh-canary:done`,
+      stable,
+      "done",
+      0,
+      initialAuthority.intentsParentId,
+      intentsEvidence,
+    );
+    const entryDigest = sha256(
+      JSON.stringify({ index: 0, entry: manifest.entries[0] }),
+    );
+    await executeAtomicProtectedCleanupTerminal(
+      controller,
+      createAtomicProtectedCleanupState({
+        operationId,
+        manifestSha256: encodedManifest.sha256,
+        entryCount: 1,
+        entryCounts: {
+          privateSourceEntries: 1,
+          wrapperTemps: 0,
+          intentTemps: 0,
+        },
+        entryDigests: [entryDigest],
+        cursor: 1,
+        suffix: "done",
+      }),
+      stable,
+      {
+        handleId: initialAuthority.intentsParentId,
+        evidence: intentsEvidence,
+      },
+      {
+        objectId: publishedManifest.stableObjectId,
+        evidence: publishedManifest.stableEvidence,
+      },
+    );
+    await closeAtomicEffectController(controller);
+    controllerClosed = true;
+  } finally {
+    if (!controllerClosed) {
+      await closeAtomicEffectController(controller).catch(() => {
+        flight.root.acceptingOperations = false;
+      });
+    }
+  }
 }
 
 function atomicRecordDepth(

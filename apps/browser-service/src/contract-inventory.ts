@@ -231,6 +231,48 @@ export const PRIVATE_ROUTE_CONTRACTS = [
     fencing: "generation",
     streaming: null,
   },
+  {
+    method: "POST",
+    path: "/v1/replay-checkpoints",
+    request: "PersistReplayCheckpointV1",
+    responses: [{ status: 201, definition: "PersistedReplayCheckpointV1" }],
+    requestBytes: MAX_REPLAY_REQUEST_BYTES,
+    responseBytes: MAX_PRIVATE_RESPONSE_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "POST",
+    path: "/v1/replay-checkpoints/read",
+    request: "ReadReplayCheckpointV1",
+    responses: [{ status: 200, definition: "ReplayCheckpointContentV1" }],
+    requestBytes: MAX_PRIVATE_REQUEST_BYTES,
+    responseBytes: MAX_REPLAY_REQUEST_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "DELETE",
+    path: "/v1/replay-checkpoints",
+    request: "DeleteReplayCheckpointV1",
+    responses: [{ status: 200, definition: "DeletedReplayCheckpointV1" }],
+    requestBytes: MAX_PRIVATE_REQUEST_BYTES,
+    responseBytes: MAX_PRIVATE_RESPONSE_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
+  {
+    method: "DELETE",
+    path: "/v1/profile-generations/:generationId/retention",
+    request: "DeleteRetainedProfileGenerationV1",
+    responses: [
+      { status: 200, definition: "DeletedRetainedProfileGenerationV1" },
+    ],
+    requestBytes: MAX_PRIVATE_REQUEST_BYTES,
+    responseBytes: MAX_PRIVATE_RESPONSE_BYTES,
+    fencing: "generation",
+    streaming: null,
+  },
 ] as const satisfies readonly PrivateRouteContract[];
 
 export type PrivateV1Inventory = {

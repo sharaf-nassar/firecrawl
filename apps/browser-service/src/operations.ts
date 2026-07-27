@@ -926,8 +926,11 @@ return canonical;
 type CachedActionOptions = {
   cache: SessionActionCache;
   request: unknown;
-  withWriter<T>(operation: () => Promise<T>): Promise<T>;
-  executeOperation(operation: BrowserOperation): Promise<OperationExecution>;
+  withWriter<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  executeOperation(
+    operation: BrowserOperation,
+    signal: AbortSignal,
+  ): Promise<OperationExecution>;
   currentSessionVersion(): number;
   currentPage(): BoundedPageState;
   commitSuccess(execution: OperationExecution): number;
@@ -963,7 +966,7 @@ export async function executeCachedAction(
   }
 
   try {
-    candidate = await options.withWriter(async () => {
+    candidate = await options.withWriter(async signal => {
       enteredWriter = true;
       const currentVersion = options.currentSessionVersion();
       if (request.expectedSessionVersion !== currentVersion) {
@@ -984,7 +987,7 @@ export async function executeCachedAction(
 
       let execution: OperationExecution;
       try {
-        execution = await options.executeOperation(request.operation);
+        execution = await options.executeOperation(request.operation, signal);
       } catch (error) {
         if (error instanceof OperationNoEffectError) {
           return actionExecutionResultSchema.parse({

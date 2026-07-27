@@ -591,7 +591,6 @@ function createStartupStateImpl(
     }
 
     const entry = reservation.commit();
-    currentGeneration = null;
     abortReconciliation();
     const drainController = new AbortController();
     const drainOutcome = deferred<void>();
@@ -669,7 +668,7 @@ function createStartupStateImpl(
       );
     }
     validateBinding(request);
-    if (draining) {
+    if (draining || activeWave !== null) {
       throw error("reconciliation_required", "reconciliation is not admitted");
     }
     const generation = currentGeneration;

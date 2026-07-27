@@ -45,6 +45,7 @@ export type BrowserServiceApplication = Readonly<{
 export type BrowserServiceApplicationOptions = Readonly<{
   config?: BrowserServiceConfig;
   atomicPublicationSink?: AtomicPublicationObservabilitySink;
+  internalErrorSink?(cause: unknown): void;
   startupAdmissionTimeoutMs?: number;
 }>;
 
@@ -254,6 +255,7 @@ export function createBrowserServiceApplication(
       admission: executionAdmission,
       correlationId,
       atomicPublicationSink,
+      freshAtomicCanary: true,
     });
 
   const server = createBrowserServiceServer({
@@ -268,6 +270,9 @@ export function createBrowserServiceApplication(
       },
     },
     reconcile,
+    ...(options.internalErrorSink === undefined
+      ? {}
+      : { internalErrorSink: options.internalErrorSink }),
   });
 
   let startPromise: Promise<void> | undefined;

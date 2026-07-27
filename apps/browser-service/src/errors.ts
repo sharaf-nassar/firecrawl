@@ -30,6 +30,9 @@ export const BROWSER_SERVICE_ERROR_STATUS = {
   reconciliation_deadline_exceeded: 408,
   reconciliation_execution_failed: 503,
   reconciliation_cleanup_failed: 503,
+  profile_prepare_failed: 503,
+  profile_finalize_failed: 409,
+  profile_discard_failed: 409,
 } as const;
 
 export type BrowserServiceErrorCategory =

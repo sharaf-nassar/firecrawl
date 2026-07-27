@@ -39,6 +39,7 @@ const PROCESS = Buffer.alloc(32, 14).toString("base64url");
 const CONTROL = Buffer.alloc(32, 15).toString("base64url");
 const PROFILE = "11111111-1111-4111-8111-111111111111";
 const SESSION = "22222222-2222-4222-8222-222222222222";
+const SESSION_V7 = "019fa263-7912-7438-9837-60c547ecb22a";
 const GENERATIONS = [
   "33333333-3333-4333-8333-333333333333",
   "44444444-4444-4444-8444-444444444444",
@@ -126,31 +127,97 @@ async function heldDescriptorCount(stateRoot: string): Promise<number> {
   return targets.filter((target) => target.startsWith(stateRoot)).length;
 }
 
-describe("held profile publication", () => {
-  test.each(
-    (["create", "prepare", "finalize", "remove"] as const).flatMap((operation) =>
-      (["before", "after"] as const).map((edge) => [operation, edge] as const),
-    ),
-  )(
-    "aborts ProfileStore %s at the %s-await admission edge",
-    async (operation, edge) => {
-      const { controller, root, stateRoot, store } = await harness();
-      let work: Awaited<ReturnType<typeof store.createWorkingCopy>> | undefined;
-      let prepared: Awaited<ReturnType<typeof store.prepareWorkingCopy>> | undefined;
-      if (operation !== "create") {
-        work = await store.createWorkingCopy(
-          PROFILE,
-          null,
-          operation === "remove" ? "snapshot" : "writer",
-          SESSION,
-        );
-        if (operation !== "remove") {
-          await writeProfileFixtureFile(work, "Preferences", "trusted");
+describe(
+  "held profile publication",
+  () => {
+    test("persists replay bytes under the reconciled root authority", async () => {
+      const { root, store } = await harness();
+      const storageState = { cookies: [], origins: [] };
+      const persisted = await store.persistReplayCheckpoint({
+        ownerId: PROFILE,
+        scrapeId: SESSION,
+        checkpointId: GENERATIONS[0]!,
+        storageState,
+      });
+      expect(persisted.statePath).toBe(
+        `replay/${PROFILE}/${SESSION}/${GENERATIONS[0]}.json`,
+      );
+      expect(
+        await store.readRootFile(persisted.statePath, persisted.byteSize + 1),
+      ).toEqual(Buffer.from('{"cookies":[],"origins":[]}'));
+      await expect(
+        store.persistReplayCheckpoint({
+          ownerId: PROFILE,
+          scrapeId: SESSION,
+          checkpointId: GENERATIONS[0]!,
+          storageState: { cookies: [], origins: [{ origin: "invalid" }] },
+        }),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+      });
+      await expect(
+        store.deleteReplayCheckpoint({
+          statePath: persisted.statePath,
+          checksum: "0".repeat(64),
+        }),
+      ).rejects.toMatchObject({
+        category: "reconciliation_filesystem_unsafe",
+      });
+      expect(
+        await store.deleteReplayCheckpoint({
+          statePath: persisted.statePath,
+          checksum: persisted.checksum,
+        }),
+      ).toBe(true);
+      await store.close();
+      await closeAnchoredProfileRoot(root);
+    });
+
+    test("accepts canonical UUIDv7 session ownership", async () => {
+      const { root, store } = await harness();
+      const work = await store.createWorkingCopy(
+        PROFILE,
+        null,
+        "snapshot",
+        SESSION_V7,
+      );
+      expect(work.sessionId).toBe(SESSION_V7);
+      await store.discardWorkingCopy(work);
+      await store.close();
+      await closeAnchoredProfileRoot(root);
+    });
+
+    test.each(
+      (["create", "prepare", "finalize", "remove"] as const).flatMap(
+        operation =>
+          (["before", "after"] as const).map(
+            edge => [operation, edge] as const,
+          ),
+      ),
+    )(
+      "aborts ProfileStore %s at the %s-await admission edge",
+      async (operation, edge) => {
+        const { controller, root, stateRoot, store } = await harness();
+        let work:
+          | Awaited<ReturnType<typeof store.createWorkingCopy>>
+          | undefined;
+        let prepared:
+          | Awaited<ReturnType<typeof store.prepareWorkingCopy>>
+          | undefined;
+        if (operation !== "create") {
+          work = await store.createWorkingCopy(
+            PROFILE,
+            null,
+            operation === "remove" ? "snapshot" : "writer",
+            SESSION,
+          );
+          if (operation !== "remove") {
+            await writeProfileFixtureFile(work, "Preferences", "trusted");
+          }
+          if (operation === "finalize") {
+            prepared = await store.prepareWorkingCopy(work);
+          }
         }
-        if (operation === "finalize") {
-          prepared = await store.prepareWorkingCopy(work);
-        }
-      }
       const point =
         operation === "create"
           ? "profile-mkdir-generation"
@@ -329,58 +396,103 @@ describe("held profile publication", () => {
     await closeAnchoredProfileRoot(root);
   });
 
-  test("moves prepare and finalize sources private before returning", async () => {
-    const { root, stateRoot, store } = await harness();
-    const work = await store.createWorkingCopy(PROFILE, null, "writer", SESSION);
-    await writeProfileFixtureFile(work, "Cookies", "state");
-    const observations: Array<{
-      sourceGone: boolean;
-      privateDeletionHeld: boolean;
-    }> = [];
-    const moves: string[] = [];
+    test("deletes retained committed generations by exact path and checksum", async () => {
+      const { root, store } = await harness();
+      const work = await store.createWorkingCopy(
+        PROFILE,
+        null,
+        "writer",
+        SESSION,
+      );
+      await writeProfileFixtureFile(work, "Cookies", "retained");
+      const prepared = await store.prepareWorkingCopy(work);
+      await store.finalizePreparedGeneration(prepared);
+      const statePath = `profiles/${PROFILE}/committed/${prepared.generationId}`;
 
-    await runWithReconciliationFilesystemTestContext(
-      {
-        atomicNativeBarrier(phase, move) {
-          if (phase !== "after") return;
-          moves.push(move);
-          if (move !== "profile_source_to_private") return;
-          const sourceState =
-            observations.length === 0 ? "working" : "staging";
-          const bundles = join(
-            stateRoot,
-            ".profile-publish-staging",
-            "bundles",
-          );
-          const privateDeletionHeld = readdirSync(bundles).some(
-            (operationId) =>
-              existsSync(
+      await expect(
+        store.deleteRetainedProfileGeneration({
+          generationId: prepared.generationId,
+          statePath: `profiles/${SESSION}/committed/${prepared.generationId}`,
+          checksum: prepared.checksum,
+        }),
+      ).rejects.toMatchObject({ category: "profile_discard_failed" });
+      await expect(
+        store.deleteRetainedProfileGeneration({
+          generationId: prepared.generationId,
+          statePath,
+          checksum: "0".repeat(64),
+        }),
+      ).rejects.toMatchObject({ category: "profile_discard_failed" });
+
+      await expect(
+        store.deleteRetainedProfileGeneration({
+          generationId: prepared.generationId,
+          statePath,
+          checksum: prepared.checksum,
+        }),
+      ).resolves.toMatchObject({ deleted: true, statePath });
+      await expect(
+        store.deleteRetainedProfileGeneration({
+          generationId: prepared.generationId,
+          statePath,
+          checksum: prepared.checksum,
+        }),
+      ).resolves.toMatchObject({ deleted: false, statePath });
+
+      await store.close();
+      await closeAnchoredProfileRoot(root);
+    });
+
+    test("moves prepare and finalize sources private before returning", async () => {
+      const { root, stateRoot, store } = await harness();
+      const work = await store.createWorkingCopy(
+        PROFILE,
+        null,
+        "writer",
+        SESSION,
+      );
+      await writeProfileFixtureFile(work, "Cookies", "state");
+      const observations: Array<{
+        sourceGone: boolean;
+        privateDeletionHeld: boolean;
+      }> = [];
+      const moves: string[] = [];
+
+      await runWithReconciliationFilesystemTestContext(
+        {
+          atomicNativeBarrier(phase, move) {
+            if (phase !== "after") return;
+            moves.push(move);
+            if (move !== "profile_source_to_private") return;
+            const sourceState =
+              observations.length === 0 ? "working" : "staging";
+            const bundles = join(
+              stateRoot,
+              ".profile-publish-staging",
+              "bundles",
+            );
+            const privateDeletionHeld = readdirSync(bundles).some(operationId =>
+              existsSync(join(bundles, operationId, `delete-${operationId}`)),
+            );
+            observations.push({
+              sourceGone: !existsSync(
                 join(
-                  bundles,
-                  operationId,
-                  `delete-${operationId}`,
+                  stateRoot,
+                  "profiles",
+                  PROFILE,
+                  sourceState,
+                  work.generationId,
                 ),
               ),
-          );
-          observations.push({
-            sourceGone: !existsSync(
-              join(
-                stateRoot,
-                "profiles",
-                PROFILE,
-                sourceState,
-                work.generationId,
-              ),
-            ),
-            privateDeletionHeld,
-          });
+              privateDeletionHeld,
+            });
+          },
         },
-      },
-      async () => {
-        const prepared = await store.prepareWorkingCopy(work);
-        await store.finalizePreparedGeneration(prepared);
-      },
-    );
+        async () => {
+          const prepared = await store.prepareWorkingCopy(work);
+          await store.finalizePreparedGeneration(prepared);
+        },
+      );
 
     expect(observations).toEqual([
       { sourceGone: true, privateDeletionHeld: true },
