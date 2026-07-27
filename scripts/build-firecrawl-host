@@ -1,0 +1,1248 @@
+#!/usr/bin/env node
+import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { constants } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+import {
+  assertSameCodexIdentity,
+  captureCodexIdentity,
+} from "./codex-browser-gate/codex-executable.mjs";
+import { LifecycleRegistry } from "./codex-browser-gate/lifecycle.mjs";
+import { snapshotProtocol } from "./codex-browser-gate/snapshot-protocol.mjs";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const NODE22 = join(
+  homedir(),
+  ".nvm/versions/node/v22.22.1/bin/node",
+);
+const CONTRACT_PATH = join(
+  ROOT,
+  "host/browser-runtime/protocol/sandbox-broker-v1.contract.json",
+);
+const CONTRACT_SHA256 =
+  "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4";
+const MODEL = "gpt-5.6-terra";
+const EFFORT = "medium";
+const MAX_COMMAND_OUTPUT = 16 * 1024 * 1024;
+
+function fail(code, detail) {
+  const error = new Error(detail ? `${code}: ${detail}` : code);
+  error.code = code;
+  return error;
+}
+
+function sha256(raw) {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function writeJson(path, value, mode = 0o600) {
+  await writeFile(path, `${stableJson(value)}\n`, {
+    flag: "wx",
+    mode,
+  });
+}
+
+async function run(command, args, { cwd = ROOT, env = process.env, timeoutMs = 1_200_000 } = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      detached: true,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise(result);
+    };
+    const collect = destination => chunk => {
+      bytes += chunk.byteLength;
+      if (bytes > MAX_COMMAND_OUTPUT) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {}
+        finish(fail("host_build_command_output_exceeded"));
+        return;
+      }
+      destination.push(chunk);
+    };
+    child.stdout.on("data", collect(stdout));
+    child.stderr.on("data", collect(stderr));
+    child.once("error", () => finish(fail("host_build_command_failed")));
+    child.once("close", (code, signal) => {
+      const result = {
+        code,
+        signal,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      };
+      if (code === 0 && signal === null) finish(null, result);
+      else {
+        const diagnostic = result.stderr.slice(-8_192);
+        if (diagnostic) process.stderr.write(diagnostic);
+        finish(fail("host_build_command_failed", basename(command)));
+      }
+    });
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+      finish(fail("host_build_command_timeout", basename(command)));
+    }, timeoutMs);
+  });
+}
+
+async function exactVersion(command, args, expected) {
+  const result = await run(command, args, { timeoutMs: 20_000 });
+  if (result.stdout.trim() !== expected || result.stderr !== "") {
+    throw fail("host_build_prerequisite_mismatch", command);
+  }
+}
+
+async function checkPrerequisites() {
+  await exactVersion(NODE22, ["--version"], "v22.22.1");
+  await exactVersion("/usr/bin/python3", ["--version"], "Python 3.12.3");
+  const bash = await run("/usr/bin/bash", ["--version"], { timeoutMs: 20_000 });
+  if (!bash.stdout.startsWith("GNU bash, version 5.2.21(1)-release")) {
+    throw fail("host_build_prerequisite_mismatch", "bash");
+  }
+  await exactVersion(
+    "/usr/bin/docker",
+    ["version", "--format", "{{.Client.Version}}\n{{.Server.Version}}"],
+    "29.6.1\n29.6.1",
+  );
+  await exactVersion(
+    "/home/mamba/.cargo/bin/cargo",
+    ["--version"],
+    "cargo 1.94.0 (85eff7c80 2026-01-15)",
+  );
+  const runc = await run("/usr/bin/runc", ["--version"], {
+    timeoutMs: 20_000,
+  });
+  const runcLines = runc.stdout.trimEnd().split("\n");
+  if (
+    runc.stderr !== "" ||
+    runcLines[0] !== "runc version 1.3.6" ||
+    !runcLines.includes("spec: 1.2.1")
+  ) {
+    throw fail("host_build_prerequisite_mismatch", "/usr/bin/runc");
+  }
+  const tar = await run("/usr/bin/tar", ["--version"], {
+    timeoutMs: 20_000,
+  });
+  if (
+    tar.stderr !== "" ||
+    tar.stdout.split("\n")[0] !== "tar (GNU tar) 1.35"
+  ) {
+    throw fail("host_build_prerequisite_mismatch", "/usr/bin/tar");
+  }
+}
+
+async function captureIdentity(failureCode = "codex_version_mismatch") {
+  const lifecycle = new LifecycleRegistry();
+  try {
+    return await captureCodexIdentity({
+      pathValue: process.env.PATH,
+      cwd: ROOT,
+      supervisor: lifecycle,
+      failureCode,
+    });
+  } finally {
+    await lifecycle.cleanup();
+  }
+}
+
+async function revalidateIdentity(expected) {
+  const actual = await captureIdentity("codex_version_changed");
+  assertSameCodexIdentity(expected, actual);
+}
+
+function buildTimestamp(identityStat) {
+  const source = process.env.SOURCE_DATE_EPOCH;
+  let seconds;
+  if (source === undefined) {
+    seconds = Math.floor(identityStat.mtimeMs / 1000);
+  } else {
+    if (!/^(0|[1-9]\d*)$/.test(source)) {
+      throw fail("source_date_epoch_invalid");
+    }
+    seconds = Number(source);
+    if (!Number.isSafeInteger(seconds) || seconds > 253402300799) {
+      throw fail("source_date_epoch_invalid");
+    }
+  }
+  return new Date(seconds * 1000).toISOString();
+}
+
+async function collectTree(root, { includeDirectories = false } = {}) {
+  const output = [];
+  async function visit(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const entry of entries) {
+      if (
+        entry.name === "." ||
+        entry.name === ".." ||
+        [...entry.name].some(character => {
+          const code = character.codePointAt(0);
+          return code < 0x20 || code === 0x7f;
+        })
+      ) {
+        throw fail("host_build_rootfs_path_rejected");
+      }
+      const absolute = join(directory, entry.name);
+      const path = relative(root, absolute).split(sep).join("/");
+      const metadata = await lstat(absolute);
+      if (metadata.isSymbolicLink()) {
+        output.push({ absolute, path, metadata, type: "symlink" });
+      } else if (metadata.isDirectory()) {
+        if (includeDirectories) {
+          output.push({ absolute, path, metadata, type: "directory" });
+        }
+        await visit(absolute);
+      } else if (metadata.isFile()) {
+        output.push({ absolute, path, metadata, type: "file" });
+      } else {
+        throw fail("host_build_special_file_rejected", path);
+      }
+    }
+  }
+  await visit(root);
+  output.sort((left, right) =>
+    Buffer.from(left.path).compare(Buffer.from(right.path)),
+  );
+  return output;
+}
+
+async function copyPackage(source, destination) {
+  await mkdir(destination, { mode: 0o700, recursive: true });
+  const entries = await collectTree(source, { includeDirectories: true });
+  for (const entry of entries) {
+    const target = join(destination, entry.path);
+    if (entry.type === "directory") {
+      await mkdir(target, { mode: 0o700 });
+    } else if (entry.type === "symlink") {
+      throw fail("codex_artifact_symlink_rejected", entry.path);
+    } else {
+      await copyFile(entry.absolute, target, constants.COPYFILE_EXCL);
+      await chmod(target, entry.metadata.mode & 0o111 ? 0o555 : 0o444);
+    }
+  }
+}
+
+function progress(phase) {
+  process.stderr.write(`firecrawl_host_build: ${phase}\n`);
+}
+
+async function makeTreeRemovable(root) {
+  try {
+    const entries = await collectTree(root, { includeDirectories: true });
+    for (const entry of entries) {
+      if (entry.type === "directory") {
+        await chmod(entry.absolute, entry.metadata.mode | 0o700);
+      }
+    }
+    await chmod(root, 0o700);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function checksumManifest(root, filter = () => true) {
+  const entries = await collectTree(root);
+  const lines = [];
+  for (const entry of entries) {
+    if (entry.type !== "file" || !filter(entry.path)) continue;
+    if (
+      !/^[A-Za-z0-9._/@-]+$/.test(entry.path) ||
+      entry.path.split("/").some(part => !part || part === "." || part === "..")
+    ) {
+      throw fail("host_build_checksum_path_rejected");
+    }
+    lines.push(`${sha256(await readFile(entry.absolute))}  ${entry.path}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+async function createCodexArtifact(workspace, identity, timestamp) {
+  if (
+    basename(identity.resolvedPath) !== "codex.js" ||
+    basename(dirname(identity.resolvedPath)) !== "bin"
+  ) {
+    throw fail("codex_artifact_layout_unsupported");
+  }
+  const packageRoot = dirname(dirname(identity.resolvedPath));
+  const packageManifest = JSON.parse(
+    await readFile(join(packageRoot, "package.json"), "utf8"),
+  );
+  if (
+    packageManifest?.name !== "@openai/codex" ||
+    packageManifest?.version !== identity.version ||
+    packageManifest?.bin?.codex !== "bin/codex.js"
+  ) {
+    throw fail("codex_artifact_layout_unsupported");
+  }
+  const source = join(workspace, "codex-artifact-source");
+  const artifactRoot = join(source, "codex-app-server");
+  await mkdir(artifactRoot, { mode: 0o700, recursive: true });
+  await copyPackage(packageRoot, join(artifactRoot, "package"));
+  const sums = await checksumManifest(artifactRoot);
+  await writeFile(join(artifactRoot, "SHA256SUMS"), sums, {
+    flag: "wx",
+    mode: 0o444,
+  });
+  const artifactPath = join(workspace, "codex-app-server.tar");
+  const epoch = Math.floor(Date.parse(timestamp) / 1000);
+  await run(
+    "/usr/bin/tar",
+    [
+      "--sort=name",
+      `--mtime=@${epoch}`,
+      "--owner=0",
+      "--group=0",
+      "--numeric-owner",
+      "--format=posix",
+      "--pax-option=delete=atime,delete=ctime",
+      "-cf",
+      artifactPath,
+      "-C",
+      source,
+      "codex-app-server",
+    ],
+    { timeoutMs: 300_000 },
+  );
+  return {
+    artifactPath,
+    artifactRoot,
+    artifactSha256: sha256(await readFile(artifactPath)),
+  };
+}
+
+async function makeLauncher(path, manifest) {
+  const source = `#!/usr/local/bin/node
+import { createHash } from "node:crypto";
+import { readFile, readdir, lstat } from "node:fs/promises";
+import { join } from "node:path";
+const expected=${JSON.stringify({
+    artifactSha256: manifest.artifactSha256,
+    protocolSha256: manifest.protocolSha256,
+    featureSha256: manifest.featureSha256,
+    gateAttestationSha256: manifest.gateAttestationSha256,
+    model: manifest.model,
+    reasoningEffort: manifest.reasoningEffort,
+  })};
+const manifest=JSON.parse(await readFile("/opt/firecrawl/protocol/codex-app-server.manifest.json","utf8"));
+for(const [key,value] of Object.entries(expected))if(manifest[key]!==value)throw new Error("codex_runtime_identity_mismatch");
+async function verify(root){
+  const lines=(await readFile(join(root,"SHA256SUMS"),"utf8")).trimEnd().split("\\n");
+  if(!lines.length)throw new Error("codex_runtime_checksum_mismatch");
+  for(const line of lines){
+    const match=/^([0-9a-f]{64})  ([A-Za-z0-9._/@-]+)$/.exec(line);
+    if(!match||match[2].split("/").some(part=>!part||part==="."||part===".."))throw new Error("codex_runtime_checksum_mismatch");
+    const raw=await readFile(join(root,match[2]));
+    if(createHash("sha256").update(raw).digest("hex")!==match[1])throw new Error("codex_runtime_checksum_mismatch");
+  }
+}
+await verify("/opt/firecrawl/codex");
+await verify("/opt/firecrawl/protocol/codex-app-server");
+const contract=await readFile("/opt/firecrawl/protocol/sandbox-broker-v1.contract.json");
+if(createHash("sha256").update(contract).digest("hex")!==${JSON.stringify(CONTRACT_SHA256)})throw new Error("codex_runtime_contract_mismatch");
+await import("/opt/firecrawl/codex/package/bin/codex.js");
+`;
+  await writeFile(path, source, { flag: "wx", mode: 0o555 });
+}
+
+async function dockerBuild(context, dockerfile, iidfile) {
+  await run(
+    "/usr/bin/docker",
+    [
+      "build",
+      "--load",
+      "--progress=plain",
+      "--iidfile",
+      iidfile,
+      "-f",
+      dockerfile,
+      context,
+    ],
+    { timeoutMs: 1_800_000 },
+  );
+  const id = (await readFile(iidfile, "utf8")).trim();
+  if (!/^sha256:[0-9a-f]{64}$/.test(id)) {
+    throw fail("docker_image_identity_invalid");
+  }
+  return id;
+}
+
+async function exportImage(imageId, destination, workspace) {
+  const cidfile = join(workspace, `container-${randomUUID()}.cid`);
+  let container;
+  try {
+    const created = await run(
+      "/usr/bin/docker",
+      [
+        "create",
+        "--network",
+        "none",
+        "--cidfile",
+        cidfile,
+        "--entrypoint",
+        "/bin/true",
+        imageId,
+      ],
+    );
+    container = created.stdout.trim();
+    if (!/^[0-9a-f]{64}$/.test(container)) {
+      container = (await readFile(cidfile, "utf8")).trim();
+    }
+    if (!/^[0-9a-f]{64}$/.test(container)) {
+      throw fail("docker_container_identity_invalid");
+    }
+    const archive = join(workspace, `rootfs-${randomUUID()}.tar`);
+    await run("/usr/bin/docker", ["export", "--output", archive, container], {
+      timeoutMs: 600_000,
+    });
+    await mkdir(destination, { mode: 0o700, recursive: true });
+    await run("/usr/bin/tar", ["-xf", archive, "-C", destination], {
+      timeoutMs: 600_000,
+    });
+    await rm(archive, { force: true });
+  } finally {
+    if (!container) {
+      try {
+        const recorded = (await readFile(cidfile, "utf8")).trim();
+        if (/^[0-9a-f]{64}$/.test(recorded)) container = recorded;
+      } catch {}
+    }
+    if (container) {
+      await run("/usr/bin/docker", ["rm", "--force", container], {
+        timeoutMs: 60_000,
+      }).catch(() => {});
+    }
+    await rm(cidfile, { force: true }).catch(() => {});
+  }
+}
+
+function u64(value) {
+  const output = Buffer.alloc(8);
+  output.writeBigUInt64BE(BigInt(value));
+  return output;
+}
+
+async function rootfsDigest(rootfs, expectedUid = process.getuid()) {
+  const rootMetadata = await lstat(rootfs);
+  if (
+    !rootMetadata.isDirectory() ||
+    rootMetadata.uid !== expectedUid ||
+    (rootMetadata.mode & 0o022) !== 0
+  ) {
+    throw fail("rootfs_identity_invalid");
+  }
+  const entries = await collectTree(rootfs, { includeDirectories: true });
+  const hasher = createHash("sha256");
+  for (const entry of entries) {
+    if (entry.metadata.uid !== expectedUid) {
+      throw fail("rootfs_owner_invalid", entry.path);
+    }
+    let record;
+    if (entry.type === "directory") {
+      if (entry.metadata.mode & 0o022) throw fail("rootfs_mode_invalid", entry.path);
+      record = Buffer.from(`d:${(entry.metadata.mode & 0o7777).toString(8)}`);
+    } else if (entry.type === "symlink") {
+      record = Buffer.concat([
+        Buffer.from("l:"),
+        Buffer.from(await readlink(entry.absolute)),
+      ]);
+    } else {
+      if (entry.metadata.mode & 0o022) throw fail("rootfs_mode_invalid", entry.path);
+      const raw = await readFile(entry.absolute);
+      record = Buffer.from(
+        `f:${(entry.metadata.mode & 0o7777).toString(8)}:${raw.byteLength}:${sha256(raw)}`,
+      );
+    }
+    const path = Buffer.from(entry.path);
+    hasher.update(u64(path.byteLength));
+    hasher.update(path);
+    hasher.update(u64(record.byteLength));
+    hasher.update(record);
+  }
+  return hasher.digest("hex");
+}
+
+async function copyBundleInputs(context, names) {
+  await mkdir(context, { mode: 0o700, recursive: true });
+  for (const name of names) {
+    await copyFile(
+      join(ROOT, "host/browser-runtime/bundles/code", name),
+      join(context, name),
+      constants.COPYFILE_EXCL,
+    );
+  }
+}
+
+async function buildRootfs(workspace, staging, artifact, codexManifest) {
+  const codexContext = join(workspace, "codex-context");
+  await mkdir(codexContext, { mode: 0o700 });
+  await copyFile(
+    join(ROOT, "host/browser-runtime/bundles/codex/Dockerfile"),
+    join(codexContext, "Dockerfile"),
+    constants.COPYFILE_EXCL,
+  );
+  const codexArtifact = join(codexContext, "codex-app-server");
+  await mkdir(codexArtifact, { mode: 0o700 });
+  await copyPackage(
+    join(artifact.artifactRoot, "package"),
+    join(codexArtifact, "package"),
+  );
+  await copyFile(
+    join(artifact.artifactRoot, "SHA256SUMS"),
+    join(codexArtifact, "SHA256SUMS"),
+  );
+  await makeLauncher(join(codexArtifact, "codex-launcher.mjs"), codexManifest);
+  const protocol = join(codexContext, "protocol");
+  await mkdir(protocol, { mode: 0o700 });
+  await copyTree(join(staging, "protocol"), protocol);
+
+  const codeContext = join(workspace, "code-context");
+  await copyBundleInputs(codeContext, [
+    "Dockerfile",
+    "job-init.py",
+    "job-relay-supervisor.mjs",
+    "run-node.mjs",
+    "run-python.py",
+    "run-bash.sh",
+    "agent-browser.py",
+    "cdp-relay.mjs",
+  ]);
+  const codexIid = join(workspace, "codex.iid");
+  const codeIid = join(workspace, "code.iid");
+  let codexImage;
+  let codeImage;
+  try {
+    codexImage = await dockerBuild(
+      codexContext,
+      join(codexContext, "Dockerfile"),
+      codexIid,
+    );
+    codeImage = await dockerBuild(
+      codeContext,
+      join(codeContext, "Dockerfile"),
+      codeIid,
+    );
+    for (const [bundle, image] of [
+      ["codex-v1", codexImage],
+      ["code-v1", codeImage],
+    ]) {
+      const directory = join(staging, "bundles", bundle);
+      const rootfs = join(directory, "rootfs");
+      await exportImage(image, rootfs, workspace);
+      const rootfsSha256 = await rootfsDigest(rootfs);
+      await writeJson(join(directory, "rootfs.identity.json"), {
+        version: 1,
+        bundleId: bundle,
+        rootfsSha256,
+      });
+    }
+  } finally {
+    if (codexImage) {
+      await run("/usr/bin/docker", ["image", "rm", "--force", codexImage], {
+        timeoutMs: 120_000,
+      }).catch(() => {});
+    }
+    if (codeImage) {
+      await run("/usr/bin/docker", ["image", "rm", "--force", codeImage], {
+        timeoutMs: 120_000,
+      }).catch(() => {});
+    }
+  }
+}
+
+async function copyTree(source, destination) {
+  await mkdir(destination, { mode: 0o700, recursive: true });
+  const entries = await collectTree(source, { includeDirectories: true });
+  for (const entry of entries) {
+    const target = join(destination, entry.path);
+    if (entry.type === "directory") {
+      await mkdir(target, { mode: entry.metadata.mode & 0o777 });
+    } else if (entry.type === "symlink") {
+      throw fail("staging_symlink_rejected", entry.path);
+    } else {
+      await copyFile(entry.absolute, target, constants.COPYFILE_EXCL);
+      await chmod(target, entry.metadata.mode & 0o777);
+    }
+  }
+}
+
+async function buildRust(staging) {
+  const cargo = "/home/mamba/.cargo/bin/cargo";
+  for (const manifest of [
+    "apps/sandbox-broker/Cargo.toml",
+    "apps/browser-execution-adapter/Cargo.toml",
+  ]) {
+    await run(
+      cargo,
+      ["build", "--release", "--locked", "--manifest-path", manifest],
+      { timeoutMs: 1_200_000 },
+    );
+  }
+  const binaries = {
+    "acceptance-restart-broker":
+      "apps/sandbox-broker/target/release/acceptance-restart-broker",
+    "firecrawl-browser-execution-adapter":
+      "apps/browser-execution-adapter/target/release/firecrawl-browser-execution-adapter",
+    "firecrawl-sandbox-broker":
+      "apps/sandbox-broker/target/release/firecrawl-sandbox-broker",
+  };
+  await mkdir(join(staging, "bin"), { mode: 0o700 });
+  for (const [name, source] of Object.entries(binaries)) {
+    await copyFile(join(ROOT, source), join(staging, "bin", name));
+    await chmod(join(staging, "bin", name), 0o700);
+  }
+}
+
+async function finalizeStaging(staging, identity, timestamp, codexManifest) {
+  const policyHashes = {};
+  for (const name of ["bundles.json", "code-seccomp.json", "codex-seccomp.json"]) {
+    policyHashes[name] = sha256(await readFile(join(staging, "policy", name)));
+  }
+  const bundleDigests = {};
+  for (const name of ["codex-v1", "code-v1"]) {
+    const identityFile = JSON.parse(
+      await readFile(join(staging, "bundles", name, "rootfs.identity.json"), "utf8"),
+    );
+    bundleDigests[name] = identityFile.rootfsSha256;
+  }
+  const binaryHashes = {};
+  for (const entry of await readdir(join(staging, "bin"))) {
+    binaryHashes[entry] = sha256(await readFile(join(staging, "bin", entry)));
+  }
+  const top = {
+    formatVersion: 1,
+    buildTimestamp: timestamp,
+    codexAppServer: codexManifest,
+    codeRuntime: {
+      node: "22.22.1",
+      python: "3.12.3",
+      bash: "5.2.21",
+      javascriptPlaywright: "1.61.1",
+      pythonPlaywright: "1.61.0",
+      relayProtocol: "code-relay-v1",
+    },
+    bundleDigests,
+    policyHashes,
+    brokerContractSha256: CONTRACT_SHA256,
+    binaryHashes,
+  };
+  await writeJson(join(staging, "manifest.json"), top);
+  const sums = await checksumManifest(
+    staging,
+    path =>
+      path !== "SHA256SUMS" &&
+      !path.includes("/rootfs/") &&
+      !path.startsWith("codex-artifact-source/"),
+  );
+  await writeFile(join(staging, "SHA256SUMS"), sums, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  await revalidateIdentity(identity);
+}
+
+async function build(output) {
+  progress("prerequisites");
+  await checkPrerequisites();
+  const workspace = await mkdtemp(join(tmpdir(), "firecrawl-host-build-"));
+  const staging = join(workspace, "staging");
+  let published = false;
+  let primaryFailure;
+  try {
+    await mkdir(staging, { mode: 0o700 });
+    progress("capture-identity");
+    const identity = await captureIdentity();
+    const identityStat = await stat(identity.resolvedPath, { bigint: true });
+    const timestamp = buildTimestamp({
+      mtimeMs: Number(identityStat.mtimeMs),
+    });
+
+    progress("protocol-tests");
+    for (const test of [
+      "schema-canonicalizer.test.mjs",
+      "app-server-compatibility.test.mjs",
+      "gate-characterization.test.mjs",
+      "snapshot-protocol.test.mjs",
+    ]) {
+      await run(NODE22, [join(ROOT, "scripts/codex-browser-gate", test)], {
+        timeoutMs: 180_000,
+      });
+    }
+    await revalidateIdentity(identity);
+
+    progress("gate0");
+    const gateAttestation = join(workspace, "gate-attestation.json");
+    await run(
+      NODE22,
+      [
+        join(ROOT, "scripts/codex-browser-gate/run.mjs"),
+        "--runs",
+        "3",
+        "--attestation-out",
+        gateAttestation,
+      ],
+      { timeoutMs: 1_200_000 },
+    );
+    const gateRaw = await readFile(gateAttestation);
+    const gate = JSON.parse(gateRaw);
+    assertSameCodexIdentity(identity, gate.codexIdentity);
+    if (
+      gate.runCount !== 3 ||
+      gate.model !== MODEL ||
+      gate.reasoningEffort !== EFFORT ||
+      gate.tools !== 0 ||
+      gate.approvals !== 0
+    ) {
+      throw fail("gate_attestation_rejected");
+    }
+    await copyFile(
+      gateAttestation,
+      join(staging, "gate-attestation.json"),
+      constants.COPYFILE_EXCL,
+    );
+    await chmod(join(staging, "gate-attestation.json"), 0o600);
+    await revalidateIdentity(identity);
+
+    progress("protocol-snapshot");
+    const protocol = join(staging, "protocol", "codex-app-server");
+    const snapshotRoot = join(workspace, "snapshot");
+    const snapshotOutput = join(snapshotRoot, "protocol");
+    await mkdir(snapshotRoot, { mode: 0o700 });
+    const snapshot = await snapshotProtocol({
+      out: snapshotOutput,
+      pathValue: process.env.PATH,
+      cwd: ROOT,
+    });
+    assertSameCodexIdentity(identity, snapshot.identity);
+    if (snapshot.schemaDigest !== gate.schemaSha256) {
+      throw fail("gate_protocol_identity_mismatch");
+    }
+    await mkdir(dirname(protocol), { mode: 0o700, recursive: true });
+    await copyTree(snapshotOutput, protocol);
+    await copyFile(
+      CONTRACT_PATH,
+      join(staging, "protocol", "sandbox-broker-v1.contract.json"),
+      constants.COPYFILE_EXCL,
+    );
+    await chmod(
+      join(staging, "protocol", "sandbox-broker-v1.contract.json"),
+      0o600,
+    );
+    if (
+      sha256(await readFile(join(staging, "protocol", "sandbox-broker-v1.contract.json"))) !==
+      CONTRACT_SHA256
+    ) {
+      throw fail("broker_contract_identity_mismatch");
+    }
+
+    progress("codex-artifact");
+    const artifact = await createCodexArtifact(workspace, identity, timestamp);
+    const codexManifest = {
+      formatVersion: 1,
+      sourceIdentity: identity,
+      artifactSha256: artifact.artifactSha256,
+      protocolSha256: snapshot.schemaDigest,
+      featureSha256: gate.featureSha256,
+      gateAttestationSha256: sha256(gateRaw),
+      model: MODEL,
+      reasoningEffort: EFFORT,
+      buildTimestamp: timestamp,
+    };
+    await copyFile(
+      artifact.artifactPath,
+      join(staging, "codex-app-server.tar"),
+      constants.COPYFILE_EXCL,
+    );
+    await chmod(join(staging, "codex-app-server.tar"), 0o600);
+    await writeJson(
+      join(staging, "codex-app-server.manifest.json"),
+      codexManifest,
+    );
+    await copyFile(
+      join(staging, "codex-app-server.manifest.json"),
+      join(staging, "protocol", "codex-app-server.manifest.json"),
+      constants.COPYFILE_EXCL,
+    );
+    await revalidateIdentity(identity);
+
+    progress("policy-and-rust");
+    await mkdir(join(staging, "policy"), { mode: 0o700 });
+    for (const name of ["bundles.json", "code-seccomp.json", "codex-seccomp.json"]) {
+      await copyFile(
+        join(ROOT, "host/browser-runtime/policy", name),
+        join(staging, "policy", name),
+        constants.COPYFILE_EXCL,
+      );
+      await chmod(join(staging, "policy", name), 0o600);
+    }
+    await buildRust(staging);
+    progress("rootfs-images");
+    await buildRootfs(workspace, staging, artifact, codexManifest);
+    progress("finalize");
+    await finalizeStaging(staging, identity, timestamp, codexManifest);
+    await rename(staging, output);
+    published = true;
+    progress("complete");
+    process.stdout.write(`${output}\n`);
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    const cleanupFailures = [];
+    try {
+      await makeTreeRemovable(workspace);
+      if (!published) await rm(staging, { force: true, recursive: true });
+      await rm(workspace, { force: true, recursive: true });
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+    if (!primaryFailure && cleanupFailures.length) throw cleanupFailures[0];
+  }
+}
+
+function parseChecksumRecords(raw) {
+  if (!raw.endsWith("\n")) throw fail("installed_checksum_manifest_invalid");
+  const lines = raw.slice(0, -1).split("\n");
+  if (!lines.length || lines.some(line => line.length === 0)) {
+    throw fail("installed_checksum_manifest_invalid");
+  }
+  const records = lines.map(line => {
+    const match = /^([0-9a-f]{64})  ([A-Za-z0-9._/@-]+)$/.exec(line);
+    if (
+      !match ||
+      match[2].split("/").some(part => !part || part === "." || part === "..")
+    ) {
+      throw fail("installed_checksum_manifest_invalid");
+    }
+    return { digest: match[1], path: match[2] };
+  });
+  const paths = records.map(record => record.path);
+  if (
+    new Set(paths).size !== paths.length ||
+    paths.some((path, index) => index > 0 && Buffer.compare(
+      Buffer.from(paths[index - 1]),
+      Buffer.from(path),
+    ) >= 0)
+  ) {
+    throw fail("installed_checksum_manifest_invalid");
+  }
+  return records;
+}
+
+function hasExactKeys(value, keys) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).sort().join("\n") === [...keys].sort().join("\n")
+  );
+}
+
+async function secureRegular(path, expectedUid) {
+  const metadata = await lstat(path);
+  if (
+    !metadata.isFile() ||
+    metadata.isSymbolicLink() ||
+    metadata.nlink !== 1 ||
+    metadata.uid !== expectedUid ||
+    (metadata.mode & 0o022) !== 0
+  ) {
+    throw fail("installed_file_identity_invalid", path);
+  }
+  return metadata;
+}
+
+async function verifyChecksumInventory(root, manifestName, expectedUid, filter) {
+  const manifestPath = join(root, manifestName);
+  await secureRegular(manifestPath, expectedUid);
+  const records = parseChecksumRecords(await readFile(manifestPath, "utf8"));
+  const recordPaths = records.map(record => record.path);
+  const entries = await collectTree(root);
+  const checkedEntries = entries.filter(entry =>
+    filter ? !entry.path.includes("/rootfs/") : true
+  );
+  if (
+    checkedEntries.some(entry =>
+      entry.type === "symlink" ||
+      entry.metadata.uid !== expectedUid ||
+      (entry.metadata.mode & 0o022) !== 0)
+  ) {
+    throw fail("installed_tree_identity_invalid");
+  }
+  const expectedPaths = entries
+    .filter(entry =>
+      entry.type === "file" &&
+      entry.path !== manifestName &&
+      (filter ? filter(entry.path) : true)
+    )
+    .map(entry => entry.path);
+  if (
+    recordPaths.length !== expectedPaths.length ||
+    recordPaths.some((path, index) => path !== expectedPaths[index])
+  ) {
+    throw fail("installed_checksum_inventory_mismatch");
+  }
+  for (const record of records) {
+    const target = resolve(root, record.path);
+    if (!target.startsWith(`${resolve(root)}${sep}`)) {
+      throw fail("installed_checksum_manifest_invalid");
+    }
+    await secureRegular(target, expectedUid);
+    if (sha256(await readFile(target)) !== record.digest) {
+      throw fail("installed_checksum_mismatch", record.path);
+    }
+  }
+}
+
+async function verifyArtifactArchive(root, manifest, expectedUid) {
+  const artifactPath = join(root, "codex-app-server.tar");
+  await secureRegular(artifactPath, expectedUid);
+  if (sha256(await readFile(artifactPath)) !== manifest.artifactSha256) {
+    throw fail("installed_artifact_identity_mismatch");
+  }
+  const workspace = await mkdtemp(join(tmpdir(), "firecrawl-artifact-verify-"));
+  try {
+    await run(
+      "/usr/bin/tar",
+      [
+        "--extract",
+        "--file",
+        artifactPath,
+        "--directory",
+        workspace,
+        "--no-same-owner",
+        "--no-same-permissions",
+      ],
+      { timeoutMs: 300_000 },
+    );
+    const entries = await readdir(workspace);
+    if (entries.length !== 1 || entries[0] !== "codex-app-server") {
+      throw fail("installed_artifact_inventory_mismatch");
+    }
+    const artifactRoot = join(workspace, "codex-app-server");
+    const artifactUid = (await lstat(artifactRoot)).uid;
+    const tree = await collectTree(artifactRoot, { includeDirectories: true });
+    if (
+      tree.some(entry =>
+        entry.type === "symlink" ||
+        entry.metadata.uid !== artifactUid ||
+        (entry.metadata.mode & 0o022) !== 0)
+    ) {
+      throw fail("installed_artifact_inventory_mismatch");
+    }
+    await verifyChecksumInventory(
+      artifactRoot,
+      "SHA256SUMS",
+      artifactUid,
+    );
+  } finally {
+    await makeTreeRemovable(workspace);
+    await rm(workspace, { force: true, recursive: true });
+  }
+}
+
+async function verifyInstalled(manifestPath) {
+  if (!isAbsolute(manifestPath)) throw fail("installed_manifest_path_invalid");
+  const canonicalManifest = await realpath(manifestPath);
+  const root = dirname(canonicalManifest);
+  const rootMetadata = await lstat(root);
+  if (
+    !rootMetadata.isDirectory() ||
+    rootMetadata.isSymbolicLink() ||
+    (rootMetadata.mode & 0o022) !== 0
+  ) {
+    throw fail("installed_root_identity_invalid");
+  }
+  const expectedUid = rootMetadata.uid;
+  await secureRegular(canonicalManifest, expectedUid);
+  const manifest = JSON.parse(await readFile(canonicalManifest, "utf8"));
+  if (
+    !hasExactKeys(manifest, [
+      "formatVersion",
+      "buildTimestamp",
+      "codexAppServer",
+      "codeRuntime",
+      "bundleDigests",
+      "policyHashes",
+      "brokerContractSha256",
+      "binaryHashes",
+    ]) ||
+    manifest?.formatVersion !== 1 ||
+    manifest?.brokerContractSha256 !== CONTRACT_SHA256 ||
+    stableJson(manifest?.codeRuntime) !== stableJson({
+      node: "22.22.1",
+      python: "3.12.3",
+      bash: "5.2.21",
+      javascriptPlaywright: "1.61.1",
+      pythonPlaywright: "1.61.0",
+      relayProtocol: "code-relay-v1",
+    }) ||
+    !hasExactKeys(manifest?.bundleDigests, ["codex-v1", "code-v1"]) ||
+    !hasExactKeys(manifest?.policyHashes, [
+      "bundles.json",
+      "code-seccomp.json",
+      "codex-seccomp.json",
+    ]) ||
+    !hasExactKeys(manifest?.binaryHashes, [
+      "acceptance-restart-broker",
+      "firecrawl-browser-execution-adapter",
+      "firecrawl-sandbox-broker",
+    ]) ||
+    Object.values({
+      ...manifest?.bundleDigests,
+      ...manifest?.policyHashes,
+      ...manifest?.binaryHashes,
+    }).some(value => !/^[0-9a-f]{64}$/.test(value)) ||
+    !hasExactKeys(manifest?.codexAppServer, [
+      "formatVersion",
+      "sourceIdentity",
+      "artifactSha256",
+      "protocolSha256",
+      "featureSha256",
+      "gateAttestationSha256",
+      "model",
+      "reasoningEffort",
+      "buildTimestamp",
+    ]) ||
+    !hasExactKeys(manifest?.codexAppServer?.sourceIdentity, [
+      "executablePath",
+      "resolvedPath",
+      "device",
+      "inode",
+      "version",
+    ]) ||
+    [
+      manifest?.codexAppServer?.artifactSha256,
+      manifest?.codexAppServer?.protocolSha256,
+      manifest?.codexAppServer?.featureSha256,
+      manifest?.codexAppServer?.gateAttestationSha256,
+    ].some(value => !/^[0-9a-f]{64}$/.test(value)) ||
+    manifest?.buildTimestamp !== manifest?.codexAppServer?.buildTimestamp ||
+    manifest?.codexAppServer?.model !== MODEL ||
+    manifest?.codexAppServer?.reasoningEffort !== EFFORT
+  ) {
+    throw fail("installed_manifest_identity_mismatch");
+  }
+  const identity = await captureIdentity();
+  assertSameCodexIdentity(manifest.codexAppServer.sourceIdentity, identity);
+  await verifyChecksumInventory(
+    root,
+    "SHA256SUMS",
+    expectedUid,
+    path => !path.includes("/rootfs/"),
+  );
+  await verifyArtifactArchive(root, manifest.codexAppServer, expectedUid);
+  await secureRegular(
+    join(root, "codex-app-server.manifest.json"),
+    expectedUid,
+  );
+  await secureRegular(
+    join(root, "protocol/codex-app-server.manifest.json"),
+    expectedUid,
+  );
+  const codexManifestRaw = await readFile(
+    join(root, "codex-app-server.manifest.json"),
+  );
+  if (
+    !codexManifestRaw.equals(
+      await readFile(join(root, "protocol/codex-app-server.manifest.json")),
+    ) ||
+    stableJson(JSON.parse(codexManifestRaw)) !==
+      stableJson(manifest.codexAppServer)
+  ) {
+    throw fail("installed_manifest_identity_mismatch");
+  }
+  const protocolRoot = join(root, "protocol/codex-app-server");
+  await verifyChecksumInventory(
+    protocolRoot,
+    "SHA256SUMS",
+    expectedUid,
+    path => path !== "manifest.json",
+  );
+  const snapshot = JSON.parse(
+    await readFile(join(protocolRoot, "manifest.json"), "utf8"),
+  );
+  assertSameCodexIdentity(manifest.codexAppServer.sourceIdentity, snapshot.codexIdentity);
+  if (
+    snapshot.schemaDigest !== manifest.codexAppServer.protocolSha256 ||
+    snapshot.schemaInventory.some(path =>
+      typeof path !== "string" ||
+      path === "manifest.json" ||
+      path === "SHA256SUMS")
+  ) {
+    throw fail("installed_protocol_identity_mismatch");
+  }
+  const gateRaw = await readFile(join(root, "gate-attestation.json"));
+  const gate = JSON.parse(gateRaw);
+  assertSameCodexIdentity(manifest.codexAppServer.sourceIdentity, gate.codexIdentity);
+  if (
+    sha256(gateRaw) !== manifest.codexAppServer.gateAttestationSha256 ||
+    gate.schemaSha256 !== manifest.codexAppServer.protocolSha256 ||
+    gate.featureSha256 !== manifest.codexAppServer.featureSha256 ||
+    gate.runCount !== 3 ||
+    gate.model !== MODEL ||
+    gate.reasoningEffort !== EFFORT ||
+    gate.tools !== 0 ||
+    gate.approvals !== 0
+  ) {
+    throw fail("installed_gate_identity_mismatch");
+  }
+  if (
+    sha256(await readFile(join(root, "protocol/sandbox-broker-v1.contract.json"))) !==
+    CONTRACT_SHA256
+  ) {
+    throw fail("installed_contract_identity_mismatch");
+  }
+  for (const [name, digest] of Object.entries(manifest.policyHashes)) {
+    if (sha256(await readFile(join(root, "policy", name))) !== digest) {
+      throw fail("installed_policy_identity_mismatch");
+    }
+  }
+  for (const [name, digest] of Object.entries(manifest.binaryHashes)) {
+    const binaryPath = join(root, "bin", name);
+    const metadata = await secureRegular(binaryPath, expectedUid);
+    if ((metadata.mode & 0o111) === 0 || sha256(await readFile(binaryPath)) !== digest) {
+      throw fail("installed_binary_identity_mismatch");
+    }
+  }
+  for (const [bundle, digest] of Object.entries(manifest.bundleDigests)) {
+    const bundleRoot = join(root, "bundles", bundle);
+    const rootfs = join(bundleRoot, "rootfs");
+    const rootfsMetadata = await lstat(rootfs);
+    const actualDigest = await rootfsDigest(rootfs, rootfsMetadata.uid);
+    const identityPath = join(bundleRoot, "rootfs.identity.json");
+    const rootfsIdentity = JSON.parse(await readFile(identityPath, "utf8"));
+    if (
+      rootfsIdentity?.version !== 1 ||
+      rootfsIdentity?.bundleId !== bundle ||
+      rootfsIdentity?.rootfsSha256 !== digest ||
+      actualDigest !== digest
+    ) {
+      throw fail("installed_rootfs_identity_mismatch", bundle);
+    }
+  }
+  process.stdout.write("firecrawl_host_identity: PASS\n");
+}
+
+function parseInvocation(args) {
+  if (args[0] === "--staging-only") {
+    if (args.length === 1) {
+      const parent = join(homedir(), ".cache", "firecrawl-host-builds");
+      return {
+        command: "build",
+        output: join(parent, `staging-${process.pid}`),
+        createPrivateParent: true,
+      };
+    }
+    if (
+      args.length === 3 &&
+      args[1] === "--output" &&
+      isAbsolute(args[2])
+    ) {
+      return { command: "build", output: resolve(args[2]) };
+    }
+  }
+  if (args[0] === "--verify-installed-identity") {
+    if (args.length === 1) {
+      return {
+        command: "verify",
+        manifest: "/opt/firecrawl/current/manifest.json",
+      };
+    }
+    if (
+      args.length === 3 &&
+      args[1] === "--manifest" &&
+      isAbsolute(args[2])
+    ) {
+      return { command: "verify", manifest: resolve(args[2]) };
+    }
+  }
+  throw fail("host_build_arguments_invalid");
+}
+
+async function main() {
+  const invocation = parseInvocation(process.argv.slice(2));
+  if (invocation.command === "build") {
+    try {
+      await lstat(invocation.output);
+      throw fail("host_build_output_exists");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const parent = dirname(invocation.output);
+    if (invocation.createPrivateParent) {
+      await mkdir(parent, { recursive: true, mode: 0o700 });
+    }
+    const parentReal = await realpath(parent);
+    const parentStat = await stat(parentReal);
+    if (
+      parentReal !== parent ||
+      !parentStat.isDirectory() ||
+      parentStat.uid !== process.getuid() ||
+      (parentStat.mode & 0o022) !== 0
+    ) {
+      throw fail("host_build_output_parent_invalid");
+    }
+    await build(invocation.output);
+  } else {
+    await verifyInstalled(invocation.manifest);
+  }
+}
+
+main().catch(error => {
+  process.stderr.write(`${error?.code || "host_build_failed"}\n`);
+  process.exitCode = error?.code === "codex_version_changed" ? 78 : 1;
+});

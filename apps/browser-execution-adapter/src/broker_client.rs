@@ -31,6 +31,10 @@ const BROKER_IO_TIMEOUT_SECONDS: i64 = 30;
 const CODEX_BUNDLE: &str = "codex-v1";
 const BROKER_CONTRACT: &str =
     include_str!("../../../host/browser-runtime/protocol/sandbox-broker-v1.contract.json");
+pub const BROKER_CONTRACT_SHA256: &str =
+    "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4";
+pub const INSTALLED_BROKER_CONTRACT_PATH: &str =
+    "/opt/firecrawl/protocol/sandbox-broker-v1.contract.json";
 
 pub const CODEX_CONFIG: &str = r#"model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
@@ -954,6 +958,9 @@ fn descriptor_roles(bundle_id: &str) -> Result<Vec<String>, AdapterError> {
 }
 
 pub fn validate_shared_contract() -> Result<(), AdapterError> {
+    if hex_sha256(BROKER_CONTRACT.as_bytes()) != BROKER_CONTRACT_SHA256 {
+        return Err(AdapterError::sandbox_unavailable());
+    }
     let contract = validate_shared_contract_bytes(BROKER_CONTRACT.as_bytes())?;
     if descriptor_roles(CODEX_BUNDLE)? != ["stdin", "stdout", "stderr", "auth", "config"] {
         return Err(AdapterError::sandbox_unavailable());
@@ -1062,6 +1069,47 @@ pub fn validate_shared_contract() -> Result<(), AdapterError> {
             .ok_or_else(AdapterError::sandbox_unavailable)?;
         validate_packet_against_contract(&packet, contract_message)?;
     }
+    Ok(())
+}
+
+pub fn validate_installed_contract() -> Result<(), AdapterError> {
+    validate_installed_contract_at(std::path::Path::new(INSTALLED_BROKER_CONTRACT_PATH), 0)
+}
+
+pub fn validate_installed_contract_at(
+    path: &std::path::Path,
+    expected_uid: u32,
+) -> Result<(), AdapterError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| AdapterError::sandbox_unavailable())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdapterError::sandbox_unavailable())?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_BROKER_FRAME_BYTES as u64
+    {
+        return Err(AdapterError::sandbox_unavailable());
+    }
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_BROKER_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut content)
+        .map_err(|_| AdapterError::sandbox_unavailable())?;
+    if content.len() > MAX_BROKER_FRAME_BYTES
+        || content != BROKER_CONTRACT.as_bytes()
+        || hex_sha256(&content) != BROKER_CONTRACT_SHA256
+    {
+        return Err(AdapterError::sandbox_unavailable());
+    }
+    validate_shared_contract_bytes(&content)?;
     Ok(())
 }
 
@@ -1417,6 +1465,7 @@ mod tests {
     use std::fs;
     use std::io::IoSlice;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use nix::sys::memfd::{MFdFlags, memfd_create};
     use nix::sys::socket::{
@@ -1443,6 +1492,25 @@ mod tests {
     #[test]
     fn production_wire_conforms_to_shared_contract() {
         super::validate_shared_contract().unwrap();
+    }
+
+    #[test]
+    fn installed_contract_is_bound_to_exact_regular_bytes() {
+        let root = std::env::temp_dir().join(format!("adapter-contract-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let contract = root.join("contract.json");
+        fs::write(&contract, super::BROKER_CONTRACT).unwrap();
+        fs::set_permissions(&contract, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = fs::metadata(&contract).unwrap().uid();
+        super::validate_installed_contract_at(&contract, uid).unwrap();
+
+        fs::write(&contract, format!("{} ", super::BROKER_CONTRACT)).unwrap();
+        assert!(super::validate_installed_contract_at(&contract, uid).is_err());
+        fs::remove_file(&contract).unwrap();
+        fs::write(root.join("target"), super::BROKER_CONTRACT).unwrap();
+        symlink(root.join("target"), &contract).unwrap();
+        assert!(super::validate_installed_contract_at(&contract, uid).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn count_memfd(name: &str) -> usize {

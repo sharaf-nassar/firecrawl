@@ -408,7 +408,12 @@ async function runOne(runNumber, codexExecutablePath) {
   }
 }
 
-function reportSuccess(runCount, codexIdentity, results) {
+async function reportSuccess(
+  runCount,
+  codexIdentity,
+  results,
+  attestationOut,
+) {
   for (const key of ["root", "markerPath", "pid", "threadId", "actionId"]) {
     if (new Set(results.map(result => result[key])).size !== results.length) {
       throw gateError("codex_run_identity_reused", key);
@@ -425,16 +430,36 @@ function reportSuccess(runCount, codexIdentity, results) {
 
   const sum = key =>
     results.reduce((total, result) => total + result[key], 0);
+  const attestation = {
+    formatVersion: 1,
+    codexIdentity,
+    runCount,
+    model: MODEL,
+    reasoningEffort: EFFORT,
+    turns: sum("turns"),
+    actions: sum("actions"),
+    writes: sum("writes"),
+    tools: sum("tools"),
+    approvals: sum("approvals"),
+    schemaSha256: results[0].schemaHash,
+    featureSha256: results[0].featureHash,
+  };
+  if (attestationOut) {
+    await writeFile(attestationOut, `${JSON.stringify(attestation)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+  }
   process.stdout.write(
     `codex_browser_gate: PASS runs=${runCount} version=${codexIdentity.version} ` +
-      `model=${MODEL} effort=${EFFORT} turns=${sum("turns")} ` +
-      `actions=${sum("actions")} writes=${sum("writes")} ` +
-      `tools=${sum("tools")} approvals=${sum("approvals")} ` +
-      `schema=${results[0].schemaHash} features=${results[0].featureHash}\n`,
+      `model=${MODEL} effort=${EFFORT} turns=${attestation.turns} ` +
+      `actions=${attestation.actions} writes=${attestation.writes} ` +
+      `tools=${attestation.tools} approvals=${attestation.approvals} ` +
+      `schema=${attestation.schemaSha256} features=${attestation.featureSha256}\n`,
   );
 }
 
-async function main(runCount) {
+async function main(runCount, attestationOut) {
   const selection = {
     pathValue: process.env.PATH,
     cwd: process.cwd(),
@@ -448,7 +473,7 @@ async function main(runCount) {
     assertSameCodexIdentity,
     runOne,
     reportSuccess: (codexIdentity, results) =>
-      reportSuccess(runCount, codexIdentity, results),
+      reportSuccess(runCount, codexIdentity, results, attestationOut),
   });
 }
 
@@ -459,7 +484,7 @@ async function invoke(args) {
   const parsedInvocation = parseInvocation(args);
   return parsedInvocation.selfTest
     ? parsedInvocation.selfTest()
-    : main(parsedInvocation.runCount);
+    : main(parsedInvocation.runCount, parsedInvocation.attestationOut);
 }
 
 const invocation = invoke(process.argv.slice(2));

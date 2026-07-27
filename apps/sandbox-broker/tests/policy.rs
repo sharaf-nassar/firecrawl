@@ -42,6 +42,16 @@ fn fixed_bundle_resources_match_closed_policy() {
                     policy.descriptor_roles(),
                     ["input", "stdout", "stderr", "relay"]
                 );
+                let runner = match id {
+                    BundleId::CodeNodeV1 => "/opt/firecrawl/bin/run-node.mjs",
+                    BundleId::CodePythonV1 => "/opt/firecrawl/bin/run-python.py",
+                    BundleId::CodeBashV1 => "/opt/firecrawl/bin/run-bash.sh",
+                    BundleId::CodexV1 => unreachable!(),
+                };
+                assert_eq!(
+                    policy.process_args,
+                    ["/opt/firecrawl/bin/job-init.py", runner]
+                );
             }
         }
     }
@@ -70,11 +80,17 @@ fn seccomp_is_default_deny_and_never_allowlists_privilege_syscalls() {
             .as_array()
             .unwrap()
             .iter()
+            .filter(|rule| rule["action"] == "SCMP_ACT_ALLOW")
             .flat_map(|rule| rule["names"].as_array().unwrap())
             .filter_map(serde_json::Value::as_str)
             .collect::<Vec<_>>();
         assert!(dangerous.iter().all(|name| !allowed.contains(name)));
         assert!(!allowed.contains(&"clone3"));
+        if id == BundleId::CodexV1 {
+            assert!(!allowed.contains(&"kill"));
+        } else {
+            assert!(allowed.contains(&"kill"));
+        }
         let clone_rule = seccomp["syscalls"]
             .as_array()
             .unwrap()
@@ -90,6 +106,14 @@ fn seccomp_is_default_deny_and_never_allowlists_privilege_syscalls() {
                 "op":"SCMP_CMP_MASKED_EQ"
             })
         );
+        let clone3_rule = seccomp["syscalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["names"] == serde_json::json!(["clone3"]))
+            .unwrap();
+        assert_eq!(clone3_rule["action"], "SCMP_ACT_ERRNO");
+        assert_eq!(clone3_rule["errnoRet"], 38);
     }
 }
 

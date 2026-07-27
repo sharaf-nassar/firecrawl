@@ -35,6 +35,9 @@ fn main() -> Result<()> {
     firecrawl_sandbox_broker::protocol::validate_shared_contract()
         .map_err(|error| anyhow::anyhow!(error))
         .context("broker contract rejected")?;
+    firecrawl_sandbox_broker::protocol::validate_installed_contract()
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("installed broker contract rejected")?;
     for bundle in [BundleId::CodexV1, BundleId::CodeNodeV1] {
         BundlePolicy::load(bundle)
             .and_then(|policy| policy.validate_installed_rootfs())
@@ -137,6 +140,15 @@ fn serve_connection<R: Runc>(
     connection: OwnedFd,
     uid: u32,
 ) -> BrokerResult<()> {
+    serve_connection_with_contract_check(runtime, connection, uid, installed_contract_healthy)
+}
+
+fn serve_connection_with_contract_check<R: Runc, F: Fn() -> bool>(
+    runtime: Arc<BrokerRuntime<R>>,
+    connection: OwnedFd,
+    uid: u32,
+    installed_contract_check: F,
+) -> BrokerResult<()> {
     set_timeout(connection.as_fd(), AUTHORIZATION_TIMEOUT)?;
     let packet = receive_packet(connection.as_fd())?;
     let request = parse_request(&packet.bytes)?;
@@ -207,7 +219,10 @@ fn serve_connection<R: Runc>(
         }
         BrokerRequest::Health => {
             reject_descriptors(&packet)?;
-            if !runtime.is_healthy() || validate_shared_contract().is_err() {
+            if !runtime.is_healthy()
+                || validate_shared_contract().is_err()
+                || !installed_contract_check()
+            {
                 return Err(BrokerError::new(ErrorCategory::CleanupFailed));
             }
             send(connection.as_fd(), &BrokerResponse::Healthy)
@@ -216,6 +231,15 @@ fn serve_connection<R: Runc>(
     .inspect_err(|error| {
         let _ = send_error(connection.as_fd(), error);
     })
+}
+
+fn installed_contract_healthy() -> bool {
+    firecrawl_sandbox_broker::protocol::validate_installed_contract().is_ok()
+}
+
+#[cfg(test)]
+fn installed_contract_healthy_at(path: &std::path::Path, expected_uid: u32) -> bool {
+    firecrawl_sandbox_broker::protocol::validate_installed_contract_at(path, expected_uid).is_ok()
 }
 
 fn send_prepared_or_cleanup<R: Runc>(
@@ -552,7 +576,7 @@ fn lease_has_early_input(connection: BorrowedFd<'_>) -> bool {
 mod socket_lifecycle_tests {
     use std::io::{IoSlice, IoSliceMut, Read};
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::process::{Child, Command};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -562,7 +586,9 @@ mod socket_lifecycle_tests {
     use firecrawl_sandbox_broker::bundles::FIXED_CODEX_CONFIG;
     use firecrawl_sandbox_broker::oci::{JobLayout, RuncStateRecord, collect_artifacts};
     use firecrawl_sandbox_broker::peer::{receive_packet, validate_descriptors};
-    use firecrawl_sandbox_broker::protocol::{BrokerResponse, BundleId, Outcome, RuncState};
+    use firecrawl_sandbox_broker::protocol::{
+        BrokerResponse, BundleId, Outcome, RuncState, SHARED_CONTRACT,
+    };
     use firecrawl_sandbox_broker::redaction::{BrokerError, BrokerResult, ErrorCategory};
     use firecrawl_sandbox_broker::registry::{BrokerRuntime, ProcessIdentity, Runc};
     use nix::fcntl::{FcntlArg, OFlag, SealFlag, fcntl};
@@ -578,7 +604,10 @@ mod socket_lifecycle_tests {
 
     use sha2::{Digest, Sha256};
 
-    use super::{send_prepared_or_cleanup, send_terminal, serve_connection};
+    use super::{
+        installed_contract_healthy_at, send_prepared_or_cleanup, send_terminal, serve_connection,
+        serve_connection_with_contract_check,
+    };
 
     struct SocketFakeRunc {
         state: Mutex<Option<RuncStateRecord>>,
@@ -792,7 +821,7 @@ mod socket_lifecycle_tests {
         .unwrap();
         let worker = {
             let runtime = Arc::clone(&runtime);
-            thread::spawn(move || serve_connection(runtime, broker, 0))
+            thread::spawn(move || serve_connection_with_contract_check(runtime, broker, 0, || true))
         };
         let bytes = serde_json::to_vec(&serde_json::json!({"method":"health"})).unwrap();
         sendmsg::<()>(
@@ -810,6 +839,25 @@ mod socket_lifecycle_tests {
             BrokerResponse::Healthy
         );
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn health_contract_check_rejects_tamper_and_symlink() {
+        let root = secure_temp();
+        let contract = root.path().join("sandbox-broker-v1.contract.json");
+        std::fs::write(&contract, SHARED_CONTRACT).unwrap();
+        std::fs::set_permissions(&contract, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        assert!(installed_contract_healthy_at(&contract, uid));
+
+        std::fs::write(&contract, format!("{SHARED_CONTRACT} ")).unwrap();
+        assert!(!installed_contract_healthy_at(&contract, uid));
+
+        std::fs::remove_file(&contract).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, SHARED_CONTRACT).unwrap();
+        symlink(&target, &contract).unwrap();
+        assert!(!installed_contract_healthy_at(&contract, uid));
     }
 
     #[test]

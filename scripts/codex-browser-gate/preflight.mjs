@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import process from "node:process";
 
 import { createGateActionStore } from "./action-store.mjs";
@@ -134,6 +134,18 @@ async function runCrossModuleHardeningSelfTest() {
       runCount,
     );
   }
+  assert.deepEqual(
+    parseInvocation([
+      "--runs",
+      "3",
+      "--attestation-out",
+      "/tmp/codex-gate-attestation.json",
+    ]),
+    {
+      runCount: 3,
+      attestationOut: "/tmp/codex-gate-attestation.json",
+    },
+  );
   for (const [flag, name] of [
     ["--action-store-self-test", "actionStore"],
     ["--hardening-self-test", "hardening"],
@@ -154,6 +166,9 @@ async function runCrossModuleHardeningSelfTest() {
     ["--runs", "9007199254740993"],
     ["--runs", "Infinity"],
     ["--runs", "1", "extra"],
+    ["--runs", "3", "--attestation-out", "relative.json"],
+    ["--runs", "3", "--attestation-out", ""],
+    ["--attestation-out", "/tmp/attestation.json", "--runs", "3"],
     ["--unknown"],
     ["--transport-self-test", "--lifecycle-self-test"],
     ["--hardening-self-test", "extra"],
@@ -376,6 +391,19 @@ export function parseInvocation(args, checks = defaultChecks) {
     return { selfTest: selfTests.get(args[0]) };
   }
   if (args.length === 0) return { runCount: 3 };
+  if (
+    args.length === 4 &&
+    args[0] === "--runs" &&
+    /^[1-9]\d*$/.test(args[1]) &&
+    args[2] === "--attestation-out" &&
+    isAbsolute(args[3])
+  ) {
+    const runCount = Number(args[1]);
+    if (!Number.isSafeInteger(runCount) || runCount > MAX_RUNS) {
+      throw gateError("codex_gate_arguments_invalid");
+    }
+    return { runCount, attestationOut: args[3] };
+  }
   if (
     args.length !== 2 ||
     args[0] !== "--runs" ||

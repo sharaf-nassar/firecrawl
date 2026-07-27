@@ -219,6 +219,12 @@ pub fn generate_oci_config(
             "options":["nosuid","noexec","nodev","ro"]
         }),
         json!({
+            "destination":"/dev/null",
+            "type":"bind",
+            "source":"/dev/null",
+            "options":["bind","rw","nosuid","noexec","nodev"]
+        }),
+        json!({
             "destination":"/run/firecrawl-work",
             "type":"tmpfs",
             "source":"tmpfs",

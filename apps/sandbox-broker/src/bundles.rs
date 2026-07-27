@@ -131,13 +131,14 @@ impl BundlePolicy {
                     "LANG=C.UTF-8",
                     "LC_ALL=C.UTF-8",
                     "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+                    "TMPDIR=/run/firecrawl-work",
                 ][..],
                 "codex-v1",
                 CODEX_SECCOMP_JSON,
             ),
             BundleId::CodeNodeV1 => (
                 &[
-                    "/opt/firecrawl/bin/job-relay-supervisor.mjs",
+                    "/opt/firecrawl/bin/job-init.py",
                     "/opt/firecrawl/bin/run-node.mjs",
                 ][..],
                 "/run/firecrawl-work",
@@ -146,13 +147,14 @@ impl BundlePolicy {
                     "PATH=/opt/firecrawl/bin:/usr/bin:/bin",
                     "LANG=C.UTF-8",
                     "LC_ALL=C.UTF-8",
+                    "TMPDIR=/run/firecrawl-work",
                 ][..],
                 "code-v1",
                 CODE_SECCOMP_JSON,
             ),
             BundleId::CodePythonV1 => (
                 &[
-                    "/opt/firecrawl/bin/job-relay-supervisor.mjs",
+                    "/opt/firecrawl/bin/job-init.py",
                     "/opt/firecrawl/bin/run-python.py",
                 ][..],
                 "/run/firecrawl-work",
@@ -161,13 +163,14 @@ impl BundlePolicy {
                     "PATH=/opt/firecrawl/bin:/usr/bin:/bin",
                     "LANG=C.UTF-8",
                     "LC_ALL=C.UTF-8",
+                    "TMPDIR=/run/firecrawl-work",
                 ][..],
                 "code-v1",
                 CODE_SECCOMP_JSON,
             ),
             BundleId::CodeBashV1 => (
                 &[
-                    "/opt/firecrawl/bin/job-relay-supervisor.mjs",
+                    "/opt/firecrawl/bin/job-init.py",
                     "/opt/firecrawl/bin/run-bash.sh",
                 ][..],
                 "/run/firecrawl-work",
@@ -176,6 +179,7 @@ impl BundlePolicy {
                     "PATH=/opt/firecrawl/bin:/usr/bin:/bin",
                     "LANG=C.UTF-8",
                     "LC_ALL=C.UTF-8",
+                    "TMPDIR=/run/firecrawl-work",
                 ][..],
                 "code-v1",
                 CODE_SECCOMP_JSON,
@@ -471,7 +475,19 @@ fn validate_seccomp(value: &Value, codex: bool) -> BrokerResult<()> {
         "delete_module",
         "reboot",
     ];
+    let mut clone3_enosys = false;
     for rule in syscalls {
+        if rule["action"] == "SCMP_ACT_ERRNO"
+            && rule["names"] == serde_json::json!(["clone3"])
+            && rule["errnoRet"] == 38
+            && rule.as_object().is_some_and(|object| object.len() == 3)
+        {
+            if clone3_enosys {
+                return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
+            }
+            clone3_enosys = true;
+            continue;
+        }
         if rule["action"] != "SCMP_ACT_ALLOW" {
             return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
         }
@@ -484,6 +500,9 @@ fn validate_seccomp(value: &Value, codex: bool) -> BrokerResult<()> {
         {
             return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
         }
+    }
+    if !clone3_enosys {
+        return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
     }
     if codex
         && !syscalls

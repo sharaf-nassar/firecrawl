@@ -1653,9 +1653,17 @@ after durable authorization. Retain relay access only for code runners."
 - Create:
   `host/browser-runtime/bundles/codex/codex-app-server.manifest.schema.json`
 - Create: `host/browser-runtime/bundles/code/Dockerfile`
-- Create: `host/browser-runtime/bundles/code/{job-relay-supervisor.mjs,run-node.mjs,run-python.py,run-bash.sh,agent-browser.py,cdp-relay.mjs}`
+- Create: `host/browser-runtime/bundles/code/{job-init.py,job-relay-supervisor.mjs,run-node.mjs,run-python.py,run-bash.sh,agent-browser.py,cdp-relay.mjs}`
 - Create: `scripts/build-firecrawl-host`
 - Create: `scripts/test-firecrawl-host-install`
+- Create: `scripts/test-code-relay-interoperability`
+- Modify: `apps/sandbox-broker/src/{bundles.rs,main.rs,oci.rs,protocol.rs}`
+- Modify: `apps/sandbox-broker/tests/{oci_config.rs,policy.rs}`
+- Modify:
+  `apps/browser-execution-adapter/src/{broker_client.rs,main.rs}`
+- Modify:
+  `host/browser-runtime/policy/{code-seccomp.json,codex-seccomp.json}`
+- Modify: `scripts/codex-browser-gate/{preflight.mjs,run.mjs}`
 
 - [ ] **Step 1: Write failing bundle tests**
 
@@ -1769,9 +1777,24 @@ false feature keys, reject any MCP table, and assert empty workspace/home.
 
 - [ ] **Step 4: Build code bundle and wrappers**
 
-Pin Node 22, Python 3.12, Bash 5.2, and Playwright client matching Browser
-Service. Supervisor accepts inherited FD 3, exposes only the fixed mode-0600
-relay socket, and terminates child on EOF/deadline.
+Pin Node 22, Python 3.12, Bash 5.2, JavaScript Playwright 1.61.1 matching
+Browser Service, and Python Playwright 1.61.0. PyPI does not publish 1.61.1;
+the exact 1.61.0 Python pin is the same protocol line and must pass the same
+real-client `code-relay-v1` interoperability fixture as JavaScript 1.61.1.
+Record both exact pins without claiming patch parity. Supervisor accepts
+inherited FD 3, exposes only the fixed mode-0600
+relay socket, and terminates child on EOF/deadline. A fixed Python PID 1
+launches the Node supervisor, forwards only TERM/INT, reaps every adopted
+descendant, and preserves the supervisor exit status. The supervisor uses a
+separate process group plus a namespace-wide bounded TERM-to-KILL sweep and
+does not publish artifacts until no live or zombie payload process remains.
+
+`code-relay-v1` accepts one local WebSocket client, fatal-decodes UTF-8, and
+requires newline-framed JSON objects. It permits at most a 24 MiB frame,
+32 MiB of queued traffic in either direction, and 1,024 outstanding CDP
+request IDs. Socket/WebSocket pause-resume backpressure is mandatory. The
+larger frame bound accommodates base64 CDP responses for a 16 MiB artifact;
+the independent artifact total remains capped at 32 MiB.
 
 Node executes:
 
@@ -1787,10 +1810,15 @@ Python uses `connect_over_cdp` and a fixed scope containing `page`, `context`,
 `agent-browser` accepts only snapshot/click/fill/type/press/select/scroll/wait/
 get-text/get-url/navigate/evaluate and artifact verbs without `eval`.
 
-Artifact helpers use safe basenames, `O_EXCL|O_NOFOLLOW`, fixed content types,
-8-file/16-MiB-item/32-MiB-total limits, streaming checksums, and atomic closed
-manifest publication. User code cannot set paths, object keys, IDs, or
-retention.
+Artifact helpers send only a four-byte big-endian length and bytes to a fixed
+mode-0600 supervisor socket. The supervisor reserves and buffers at most
+8 files, 16 MiB per item, and 32 MiB total, then closes artifact IPC and
+fully reaps the payload tree. Only after reaping does it clear the artifact
+mount, classify magic, generate UUIDs/names/content types/checksums, create
+files with `O_EXCL|O_NOFOLLOW`, fsync directories, and atomically publish the
+closed manifest. Direct same-UID writes and racing detached writers are
+therefore discarded. User code can choose artifact bytes only; it cannot set
+paths, object keys, IDs, names, content types, checksums, or retention.
 
 - [ ] **Step 5: Build without runtime Docker access**
 
@@ -1812,7 +1840,7 @@ The top manifest embeds the complete Codex artifact manifest plus rootfs and
 policy hashes plus the checked-in broker contract SHA-256. Staging copies the
 exact `sandbox-broker-v1.contract.json` into
 `/opt/firecrawl/protocol/sandbox-broker-v1.contract.json`. Both Rust binaries
-embed its build-time canonical digest and refuse startup or health if the
+embed its exact raw-byte digest and refuse startup or health if the
 installed file is missing or differs. `COMPATIBILITY_SHA256SUMS`, the staged
 top manifest, fake-root installer tests, installed identity verification, and
 shallow/deep health all cover that same byte digest; it is never part of the
@@ -1824,13 +1852,17 @@ discards all staging. It never copies auth. Rust tools verify and consume
 canonical on-disk bytes; they never implement a second canonicalizer.
 `scripts/build-firecrawl-host --verify-installed-identity` is read-only and
 compares all five active PATH identity fields with the installed neutral
-manifest plus artifact/protocol checksums.
+manifest. It also verifies closed top and nested checksum inventories, the
+extracted Codex artifact inventory, duplicated runtime manifest, Gate/schema/
+feature identity, broker contract, policy and binary hashes, and semantic
+rootfs digests with owner/mode/link checks.
 
 - [ ] **Step 6: Run deterministic bundle tests**
 
 ```bash
 scripts/build-firecrawl-host --staging-only
 scripts/test-firecrawl-host-install
+scripts/test-code-relay-interoperability
 cargo test --manifest-path apps/sandbox-broker/Cargo.toml
 cargo test --manifest-path apps/browser-execution-adapter/Cargo.toml
 ```
@@ -1842,7 +1874,7 @@ files, Docker, or surviving children.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add host/browser-runtime/bundles/codex/Dockerfile host/browser-runtime/bundles/codex/codex-app-server.manifest.schema.json host/browser-runtime/bundles/code/Dockerfile host/browser-runtime/bundles/code/job-relay-supervisor.mjs host/browser-runtime/bundles/code/run-node.mjs host/browser-runtime/bundles/code/run-python.py host/browser-runtime/bundles/code/run-bash.sh host/browser-runtime/bundles/code/agent-browser.py host/browser-runtime/bundles/code/cdp-relay.mjs scripts/build-firecrawl-host scripts/test-firecrawl-host-install
+git add apps/browser-execution-adapter/src apps/sandbox-broker/src apps/sandbox-broker/tests host/browser-runtime/bundles host/browser-runtime/policy scripts/build-firecrawl-host scripts/test-firecrawl-host-install scripts/test-code-relay-interoperability scripts/codex-browser-gate
 sh apps/api/.husky/pre-commit
 git commit -m "feat: add isolated browser execution bundles" -m "Build checksummed Codex app-server and Node, Python, and Bash root
 filesystems for fixed broker policies. Keep Codex tool-free while code

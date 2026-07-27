@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::redaction::{BrokerError, BrokerResult, ErrorCategory};
@@ -11,6 +12,9 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_JOB_WALL_TIME_MS: u64 = 300_000;
 pub const SHARED_CONTRACT: &str =
     include_str!("../../../host/browser-runtime/protocol/sandbox-broker-v1.contract.json");
+pub const SHARED_CONTRACT_SHA256: &str =
+    "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4";
+pub const INSTALLED_CONTRACT_PATH: &str = "/opt/firecrawl/protocol/sandbox-broker-v1.contract.json";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -277,7 +281,55 @@ fn require_ids(ids: &[Uuid]) -> BrokerResult<()> {
 }
 
 pub fn validate_shared_contract() -> BrokerResult<Value> {
+    if contract_sha256(SHARED_CONTRACT.as_bytes()) != SHARED_CONTRACT_SHA256 {
+        return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
+    }
     validate_shared_contract_bytes(SHARED_CONTRACT.as_bytes())
+}
+
+pub fn validate_installed_contract() -> BrokerResult<Value> {
+    validate_installed_contract_at(std::path::Path::new(INSTALLED_CONTRACT_PATH), 0)
+}
+
+pub fn validate_installed_contract_at(
+    path: &std::path::Path,
+    expected_uid: u32,
+) -> BrokerResult<Value> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| BrokerError::with_source(ErrorCategory::SandboxUnavailable, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| BrokerError::with_source(ErrorCategory::SandboxUnavailable, error))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_FRAME_BYTES as u64
+    {
+        return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| BrokerError::with_source(ErrorCategory::SandboxUnavailable, error))?;
+    if bytes.len() > MAX_FRAME_BYTES
+        || contract_sha256(&bytes) != SHARED_CONTRACT_SHA256
+        || bytes != SHARED_CONTRACT.as_bytes()
+    {
+        return Err(BrokerError::new(ErrorCategory::SandboxUnavailable));
+    }
+    validate_shared_contract_bytes(&bytes)
+}
+
+fn contract_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub fn validate_shared_contract_bytes(bytes: &[u8]) -> BrokerResult<Value> {
@@ -666,4 +718,31 @@ fn exact_keys(value: &Value, expected: &[&str]) -> BrokerResult<()> {
         return Err(BrokerError::new(ErrorCategory::InvalidRequest));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    use uuid::Uuid;
+
+    #[test]
+    fn installed_contract_is_bound_to_exact_regular_bytes() {
+        let root = std::env::temp_dir().join(format!("broker-contract-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let contract = root.join("contract.json");
+        fs::write(&contract, super::SHARED_CONTRACT).unwrap();
+        fs::set_permissions(&contract, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = fs::metadata(&contract).unwrap().uid();
+        super::validate_installed_contract_at(&contract, uid).unwrap();
+
+        fs::write(&contract, format!("{} ", super::SHARED_CONTRACT)).unwrap();
+        assert!(super::validate_installed_contract_at(&contract, uid).is_err());
+        fs::remove_file(&contract).unwrap();
+        fs::write(root.join("target"), super::SHARED_CONTRACT).unwrap();
+        symlink(root.join("target"), &contract).unwrap();
+        assert!(super::validate_installed_contract_at(&contract, uid).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

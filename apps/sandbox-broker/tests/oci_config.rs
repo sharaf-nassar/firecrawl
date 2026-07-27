@@ -32,6 +32,20 @@ fn codex_oci_is_fixed_readonly_nonroot_and_has_no_hooks_or_relay() {
             "--stdio"
         ])
     );
+    assert_eq!(
+        config["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == "/dev/null")
+            .unwrap(),
+        &serde_json::json!({
+            "destination":"/dev/null",
+            "type":"bind",
+            "source":"/dev/null",
+            "options":["bind","rw","nosuid","noexec","nodev"]
+        })
+    );
     assert_eq!(config["process"]["cwd"], "/run/firecrawl-work");
     for capability in [
         "ambient",
@@ -102,6 +116,15 @@ fn code_oci_has_fresh_network_namespace_and_bounded_resources() {
         assert_eq!(config["linux"]["resources"]["memory"]["limit"], 536_870_912);
         assert_eq!(config["linux"]["resources"]["pids"]["limit"], 64);
         assert_eq!(config["linux"]["resources"]["memory"]["swap"], 536_870_912);
+        assert_eq!(
+            config["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|mount| mount["destination"] == "/dev/null")
+                .count(),
+            1
+        );
         let job_id = Uuid::new_v4();
         let config = generate_oci_config(job_id, &policy, temp.path()).unwrap();
         assert_eq!(
