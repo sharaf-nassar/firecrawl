@@ -1,7 +1,7 @@
 use firecrawl_browser_execution_adapter::decision::{
-    DecisionDuplicateGuard, Effect, classify, load_model_decision_envelope_schema,
-    normalize_model_decision_envelope, normalized_hash, parse_decision_envelope,
-    validate_model_wire_schema_definition,
+    DecisionDuplicateGuard, Effect, canonical_operation_hash, canonical_operation_json, classify,
+    load_model_decision_envelope_schema, normalize_model_decision_envelope, normalized_hash,
+    parse_decision_envelope, validate_model_wire_schema_definition,
 };
 use firecrawl_browser_execution_adapter::observations::{
     MAX_ACTION_ERROR_MESSAGE_CHARACTERS, ObservationBudget, ObservationV1, sanitize_action_error,
@@ -121,6 +121,40 @@ mod decision_loop {
             guard.check_and_record(&second).unwrap_err().category,
             "model_protocol_error"
         );
+    }
+
+    #[test]
+    fn shared_operation_hash_vectors_match_recursive_canonicalization() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../host/browser-runtime/protocol/browser-operation-hash-v1.vectors.json"
+        ))
+        .unwrap();
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let operation: BrowserOperation =
+                serde_json::from_str(vector["inputJson"].as_str().unwrap()).unwrap();
+            let decision = ModelDecisionV1::Action {
+                version: Default::default(),
+                action: operation.clone(),
+            };
+            assert_eq!(
+                canonical_operation_json(&operation).unwrap(),
+                vector["canonicalJson"].as_str().unwrap(),
+                "{}",
+                vector["name"]
+            );
+            assert_eq!(
+                canonical_operation_hash(&operation).unwrap(),
+                vector["sha256"].as_str().unwrap(),
+                "{}",
+                vector["name"]
+            );
+            assert_eq!(
+                classify(&decision),
+                serde_json::from_value(vector["effect"].clone()).unwrap(),
+                "{}",
+                vector["name"]
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,8 @@ use crate::protocol::{
 
 const MODEL_DECISION_SCHEMA: &str =
     include_str!("../../../host/browser-runtime/protocol/model-decision-envelope-v1.schema.json");
+const MAX_CANONICAL_DEPTH: usize = 32;
+const MAX_CANONICAL_NODES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecisionProtocolError {
@@ -267,17 +269,85 @@ pub fn normalize_model_decision_envelope(envelope: ModelDecisionEnvelopeV1) -> M
     }
 }
 
-pub fn normalized_hash(decision: &ModelDecisionV1) -> String {
+pub fn canonical_operation_json(
+    operation: &BrowserOperation,
+) -> Result<String, DecisionProtocolError> {
+    let value = serde_json::to_value(operation).map_err(|_| DecisionProtocolError::protocol())?;
+    canonical_json(&value)
+}
+
+pub fn canonical_operation_hash(
+    operation: &BrowserOperation,
+) -> Result<String, DecisionProtocolError> {
+    let canonical = canonical_operation_json(operation)?;
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+pub fn normalized_hash(decision: &ModelDecisionV1) -> Result<String, DecisionProtocolError> {
     let value = match decision {
-        ModelDecisionV1::Action { action, .. } => {
-            serde_json::to_value(action).expect("browser operations always serialize")
-        }
+        ModelDecisionV1::Action { action, .. } => return canonical_operation_hash(action),
         ModelDecisionV1::Final { .. } => {
-            serde_json::to_value(decision).expect("model decisions always serialize")
+            serde_json::to_value(decision).map_err(|_| DecisionProtocolError::protocol())?
         }
     };
-    let canonical = serde_json::to_vec(&value).expect("JSON values always serialize");
-    format!("{:x}", Sha256::digest(canonical))
+    let canonical = canonical_json(&value)?;
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+fn canonical_json(value: &Value) -> Result<String, DecisionProtocolError> {
+    fn write(
+        value: &Value,
+        output: &mut String,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> Result<(), DecisionProtocolError> {
+        *nodes = nodes
+            .checked_add(1)
+            .ok_or_else(DecisionProtocolError::protocol)?;
+        if depth > MAX_CANONICAL_DEPTH || *nodes > MAX_CANONICAL_NODES {
+            return Err(DecisionProtocolError::protocol());
+        }
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                output.push_str(
+                    &serde_json::to_string(value).map_err(|_| DecisionProtocolError::protocol())?,
+                );
+            }
+            Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    write(value, output, depth + 1, nodes)?;
+                }
+                output.push(']');
+            }
+            Value::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+                output.push('{');
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    output.push_str(
+                        &serde_json::to_string(key)
+                            .map_err(|_| DecisionProtocolError::protocol())?,
+                    );
+                    output.push(':');
+                    write(&values[key], output, depth + 1, nodes)?;
+                }
+                output.push('}');
+            }
+        }
+        Ok(())
+    }
+
+    let mut output = String::new();
+    let mut nodes = 0;
+    write(value, &mut output, 0, &mut nodes)?;
+    Ok(output)
 }
 
 pub fn classify(decision: &ModelDecisionV1) -> Effect {
@@ -308,7 +378,7 @@ impl DecisionDuplicateGuard {
         if classify(decision) == Effect::ReadOnly {
             return Ok(());
         }
-        if self.side_effect_hashes.insert(normalized_hash(decision)) {
+        if self.side_effect_hashes.insert(normalized_hash(decision)?) {
             Ok(())
         } else {
             Err(DecisionProtocolError::protocol())

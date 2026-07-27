@@ -4,7 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::{BoundedString, VersionOne};
+use crate::protocol::{BoundedString, BrowserOperation, VersionOne};
 
 pub const MAX_PROMPT_CHARACTERS: usize = 10_000;
 pub const MAX_SNAPSHOT_CHARACTERS: usize = 40_000;
@@ -142,6 +142,25 @@ pub enum BrowserOperationKind {
     GetUrl,
     Navigate,
     Evaluate,
+}
+
+impl BrowserOperationKind {
+    pub fn for_operation(operation: &BrowserOperation) -> Self {
+        match operation {
+            BrowserOperation::Snapshot => Self::Snapshot,
+            BrowserOperation::Click { .. } => Self::Click,
+            BrowserOperation::Fill { .. } => Self::Fill,
+            BrowserOperation::Type { .. } => Self::Type,
+            BrowserOperation::Press { .. } => Self::Press,
+            BrowserOperation::Select { .. } => Self::Select,
+            BrowserOperation::Scroll { .. } => Self::Scroll,
+            BrowserOperation::Wait { .. } => Self::Wait,
+            BrowserOperation::GetText { .. } => Self::GetText,
+            BrowserOperation::GetUrl => Self::GetUrl,
+            BrowserOperation::Navigate { .. } => Self::Navigate,
+            BrowserOperation::Evaluate { .. } => Self::Evaluate,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]

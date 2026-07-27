@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +14,28 @@ import type { AdapterAuthorizationBinding } from "../browser-state/types";
 import { EXECUTION_ADAPTER_MAX_LINE_BYTES } from "./execution-adapter-contracts";
 import { createSocketExecutionAdapter } from "./execution-adapter-client";
 import { PROMPT_LOOP_POLICY_V1 } from "./protocol";
+
+const AUTHORIZATION_FIXTURE = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../../host/browser-runtime/protocol/execution-adapter-authorization-v1.fixture.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+) as {
+  fixtureVersion: number;
+  transport: {
+    encoding: string;
+    framing: string;
+    apiAfterAuthorized: string;
+    adapterAfterAuthorizationEof: string;
+  };
+  binding: AdapterAuthorizationBinding;
+  accepted: unknown;
+  authorized: unknown;
+  terminal: unknown;
+};
 
 const REQUEST_ID = "0198f37a-5a9c-7b20-8000-000000000001";
 const JOB_ID = "0198f37a-5a9c-7b20-8000-000000000002";
@@ -203,15 +226,21 @@ describe("socket execution adapter", () => {
           correlationId: CORRELATION_ID,
         },
       });
-      await accept(socket, readFrame);
-      socket.end(
-        `${JSON.stringify({
-          version: 1,
-          requestId: REQUEST_ID,
-          type: "result",
-          body: PROMPT_RESULT,
-        })}\n`,
-      );
+      expect(AUTHORIZATION_FIXTURE).toMatchObject({
+        fixtureVersion: 1,
+        transport: {
+          encoding: "utf-8",
+          framing: "newline-delimited-json",
+          apiAfterAuthorized: "shutdown_write",
+          adapterAfterAuthorizationEof: "continue_write_until_terminal",
+        },
+        binding: BINDING,
+      });
+      const apiWriteEnded = once(socket, "end");
+      socket.write(`${JSON.stringify(AUTHORIZATION_FIXTURE.accepted)}\n`);
+      expect(await readFrame()).toEqual(AUTHORIZATION_FIXTURE.authorized);
+      await apiWriteEnded;
+      socket.end(`${JSON.stringify(AUTHORIZATION_FIXTURE.terminal)}\n`);
     });
 
     await expect(

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -5,11 +7,72 @@ import {
   normalizeBrowserAction,
   parseSubmitBrowserActionV1,
 } from "./action-normalization";
+import { browserOperationSchema } from "./protocol";
+
+const HASH_FIXTURE = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../../host/browser-runtime/protocol/browser-operation-hash-v1.vectors.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+) as {
+  fixtureVersion: number;
+  algorithm: string;
+  hashInput: string;
+  objectKeyOrder: string;
+  arrayOrder: string;
+  vectors: Array<{
+    name: string;
+    inputJson: string;
+    canonicalJson: string;
+    sha256: string;
+    effect: "read_only" | "side_effecting";
+  }>;
+};
 
 const JOB = "10000000-0000-4000-8000-000000000001";
 const ACTION = "10000000-0000-4000-8000-000000000002";
 
 describe("browser action normalization", () => {
+  it("matches every shared production hash and effect vector", () => {
+    expect(HASH_FIXTURE).toMatchObject({
+      fixtureVersion: 1,
+      algorithm: "sha256",
+      hashInput: "canonical-operation-utf8",
+      objectKeyOrder: "recursive-utf16-ascending",
+      arrayOrder: "preserved",
+    });
+    expect(HASH_FIXTURE.vectors.map(vector => vector.name)).toEqual([
+      "snapshot",
+      "click",
+      "fill",
+      "type",
+      "press",
+      "select",
+      "scroll",
+      "wait",
+      "get_text",
+      "get_url",
+      "navigate",
+      "evaluate",
+    ]);
+
+    for (const vector of HASH_FIXTURE.vectors) {
+      const operation = browserOperationSchema.parse(
+        JSON.parse(vector.inputJson),
+      );
+      expect(canonicalBrowserActionJson(operation), vector.name).toBe(
+        vector.canonicalJson,
+      );
+      expect(normalizeBrowserAction(operation), vector.name).toEqual({
+        normalizedProposalHash: vector.sha256,
+        effect: vector.effect,
+      });
+    }
+  });
+
   it("sorts recursive object keys without changing array order", () => {
     expect(
       canonicalBrowserActionJson({ z: [2, 1], a: { y: true, x: null } }),
