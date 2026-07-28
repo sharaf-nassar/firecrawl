@@ -16,7 +16,6 @@ import {
   type CompleteBrowserActionInput,
 } from "../browser-state/store";
 import type {
-  BoundedPageState,
   ObservationV1,
   SubmitBrowserActionV1,
 } from "../browser-state/types";
@@ -67,7 +66,6 @@ type CoordinatorContext = {
   correlationId: string;
   deadline: Date;
   signal?: AbortSignal;
-  page?: BoundedPageState;
 };
 
 type ActionCoordinatorDependencies = {
@@ -143,16 +141,6 @@ function assertAuthority(
       "Browser capability was denied",
     );
   }
-}
-
-function fallbackPage(context: CoordinatorContext): BoundedPageState {
-  return (
-    context.page ?? {
-      url: "http://localhost/",
-      title: "",
-      snapshotExcerpt: "",
-    }
-  );
 }
 
 function validateServiceResult(
@@ -287,26 +275,6 @@ export function createBrowserActionCoordinator(
       }
       assertAuthority(activeRun, proposal, context);
 
-      const prior = await actions.getByIdentity(
-        activeRun.runId,
-        proposal.actionId,
-        proposal.sequence,
-      );
-      if (prior?.proposal_hash !== undefined) {
-        if (
-          prior.proposal_hash !== proposal.proposalHash ||
-          prior.adapter_job_id !== proposal.adapterJobId ||
-          prior.effect !== proposal.effect
-        ) {
-          throw protocol("Browser action identity does not match stored state");
-        }
-        if (prior.state === "executing") {
-          await actions.markOutcomeUnknown(activeRun.runId, proposal.actionId);
-          throw unknown();
-        }
-        if (prior.state === "cancelled_no_effect") throw cancelled();
-      }
-
       let prepared: Awaited<ReturnType<ActionStore["prepare"]>>;
       try {
         prepared = await deps.gate.withBrowserStateMutationLease(
@@ -327,20 +295,12 @@ export function createBrowserActionCoordinator(
               return staged;
             } catch (error) {
               if (!(error instanceof CapabilityDeniedError)) throw error;
-              const observation = await actions.completeWithLease(lease, {
-                runId: activeRun.runId,
-                actionId: proposal.actionId,
-                proposalHash: proposal.proposalHash,
-                expectedSessionVersion: activeRun.expectedSessionVersion,
-                sessionVersion: activeRun.expectedSessionVersion,
-                outcome: "rejected_no_effect",
-                error: {
-                  category: "capability_denied",
-                  message: "Browser capability was denied",
-                },
-                page: fallbackPage(context),
-              });
-              return { kind: "cached" as const, observation };
+              await actions.cancelPreparedWithLease(
+                lease,
+                activeRun.runId,
+                proposal.actionId,
+              );
+              throw error;
             }
           },
         );

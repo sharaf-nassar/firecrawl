@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -19,8 +19,10 @@ use uuid::Uuid;
 use crate::action_client::{ActionClient, AdapterAuthorizationBinding};
 use crate::app_server::{AppServer, PromptJob, ProtocolBundle};
 use crate::broker_client::{
-    BrokerCancelReason, BrokerClient, BrokerTerminalOutcome, PreparedCodex, PreparedLeaseMonitor,
+    BrokerCancelReason, BrokerClient, BrokerTerminalOutcome, CodeBundle, PreparedCodex,
+    PreparedLeaseMonitor,
 };
+use crate::code_relay::CodeRelay;
 use crate::config::{AdapterConfig, effective_uid};
 use crate::observations::ObservationV1;
 use crate::protocol::{VersionOne, parse_json_strict};
@@ -53,7 +55,7 @@ struct JobEntry {
     kind: JobKind,
     state: JobState,
     cancel: watch::Sender<bool>,
-    completion: watch::Sender<bool>,
+    completion: watch::Sender<JobCompletion>,
     cancellation_requested: bool,
 }
 
@@ -82,28 +84,37 @@ pub struct JobRegistry {
 pub struct AdmittedJob {
     pub binding: AdapterAuthorizationBinding,
     pub cancellation: watch::Receiver<bool>,
-    pub completion: watch::Receiver<bool>,
+    pub completion: watch::Receiver<JobCompletion>,
 }
 
 #[derive(Debug)]
 pub struct ReservedJob {
     pub cancellation: watch::Receiver<bool>,
-    pub completion: watch::Receiver<bool>,
+    pub completion: watch::Receiver<JobCompletion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobCompletion {
+    Pending,
+    Proven,
+    CleanupUnproven,
 }
 
 struct RegistryCompletionGuard {
     registry: JobRegistry,
     run_id: Uuid,
     adapter_job_id: Uuid,
+    execution_healthy: Arc<AtomicBool>,
 }
 
 impl Drop for RegistryCompletionGuard {
     fn drop(&mut self) {
-        self.registry.complete_reserved(
-            self.run_id,
-            self.adapter_job_id,
-            Some(AdapterErrorCategory::SandboxUnavailable),
-        );
+        if self
+            .registry
+            .fail_cleanup_reserved(self.run_id, self.adapter_job_id)
+        {
+            self.execution_healthy.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -174,7 +185,7 @@ impl JobRegistry {
             });
         }
         let (cancel, cancellation) = watch::channel(false);
-        let (completion_sender, completion) = watch::channel(false);
+        let (completion_sender, completion) = watch::channel(JobCompletion::Pending);
         registry.run_by_job.insert(adapter_job_id, run_id);
         registry.active_by_run.insert(
             run_id,
@@ -286,7 +297,10 @@ impl JobRegistry {
         Ok(())
     }
 
-    pub fn request_cancel(&self, run_id: Uuid) -> Result<watch::Receiver<bool>, AdapterError> {
+    pub fn request_cancel(
+        &self,
+        run_id: Uuid,
+    ) -> Result<watch::Receiver<JobCompletion>, AdapterError> {
         let mut registry = self
             .inner
             .lock()
@@ -317,6 +331,9 @@ impl JobRegistry {
         if entry.binding != Some(binding) {
             return false;
         }
+        if entry.kind != JobKind::Prompt {
+            return false;
+        }
         drop(registry);
         self.complete_reserved(run_id, binding.adapter_job_id, category)
     }
@@ -333,22 +350,100 @@ impl JobRegistry {
         let Some(entry) = registry.active_by_run.get(&run_id) else {
             return false;
         };
+        if entry.adapter_job_id != adapter_job_id || entry.kind != JobKind::Prompt {
+            return false;
+        }
+        complete_entry(&mut registry, run_id, category)
+    }
+
+    fn complete_code(
+        &self,
+        run_id: Uuid,
+        binding: AdapterAuthorizationBinding,
+        category: Option<AdapterErrorCategory>,
+    ) -> bool {
+        self.prove_code_cleanup(run_id, binding) && self.finish_code(run_id, binding, category)
+    }
+
+    fn prove_code_cleanup(&self, run_id: Uuid, binding: AdapterAuthorizationBinding) -> bool {
+        let Ok(mut registry) = self.inner.lock() else {
+            return false;
+        };
+        let Some(entry) = registry.active_by_run.get_mut(&run_id) else {
+            return false;
+        };
+        if entry.binding != Some(binding) || entry.kind != JobKind::Code {
+            return false;
+        }
+        entry.completion.send_replace(JobCompletion::Proven);
+        true
+    }
+
+    fn finish_code(
+        &self,
+        run_id: Uuid,
+        binding: AdapterAuthorizationBinding,
+        category: Option<AdapterErrorCategory>,
+    ) -> bool {
+        let Ok(mut registry) = self.inner.lock() else {
+            return false;
+        };
+        let Some(entry) = registry.active_by_run.get(&run_id) else {
+            return false;
+        };
+        if entry.binding != Some(binding)
+            || entry.kind != JobKind::Code
+            || *entry.completion.borrow() != JobCompletion::Proven
+        {
+            return false;
+        }
+        finish_entry(&mut registry, run_id, category)
+    }
+
+    fn complete_code_reserved(
+        &self,
+        run_id: Uuid,
+        adapter_job_id: Uuid,
+        category: Option<AdapterErrorCategory>,
+    ) -> bool {
+        let Ok(mut registry) = self.inner.lock() else {
+            return false;
+        };
+        let Some(entry) = registry.active_by_run.get(&run_id) else {
+            return false;
+        };
         if entry.adapter_job_id != adapter_job_id {
+            return false;
+        }
+        entry.completion.send_replace(JobCompletion::Proven);
+        finish_entry(&mut registry, run_id, category)
+    }
+
+    fn fail_cleanup_reserved(&self, run_id: Uuid, adapter_job_id: Uuid) -> bool {
+        let Ok(mut registry) = self.inner.lock() else {
+            return false;
+        };
+        let Some(entry) = registry.active_by_run.get(&run_id) else {
+            return false;
+        };
+        if entry.adapter_job_id != adapter_job_id {
+            return false;
+        }
+        if *entry.completion.borrow() == JobCompletion::Proven {
+            finish_entry(
+                &mut registry,
+                run_id,
+                Some(AdapterErrorCategory::SandboxUnavailable),
+            );
             return false;
         }
         let Some(entry) = registry.active_by_run.remove(&run_id) else {
             return false;
         };
-        let _ = entry.completion.send(true);
+        entry
+            .completion
+            .send_replace(JobCompletion::CleanupUnproven);
         registry.run_by_job.remove(&entry.adapter_job_id);
-        push_terminal(
-            &mut registry,
-            TerminalJob {
-                run_id,
-                adapter_job_id,
-                category,
-            },
-        );
         true
     }
 
@@ -365,6 +460,39 @@ impl JobRegistry {
             .map(|registry| registry.terminal.iter().copied().collect())
             .unwrap_or_default()
     }
+}
+
+fn complete_entry(
+    registry: &mut RegistryState,
+    run_id: Uuid,
+    category: Option<AdapterErrorCategory>,
+) -> bool {
+    let Some(entry) = registry.active_by_run.remove(&run_id) else {
+        return false;
+    };
+    entry.completion.send_replace(JobCompletion::Proven);
+    registry.active_by_run.insert(run_id, entry);
+    finish_entry(registry, run_id, category)
+}
+
+fn finish_entry(
+    registry: &mut RegistryState,
+    run_id: Uuid,
+    category: Option<AdapterErrorCategory>,
+) -> bool {
+    let Some(entry) = registry.active_by_run.remove(&run_id) else {
+        return false;
+    };
+    registry.run_by_job.remove(&entry.adapter_job_id);
+    push_terminal(
+        registry,
+        TerminalJob {
+            run_id,
+            adapter_job_id: entry.adapter_job_id,
+            category,
+        },
+    );
+    true
 }
 
 fn push_terminal(registry: &mut RegistryState, terminal: TerminalJob) {
@@ -480,12 +608,52 @@ pub struct CodeRequestBody {
     pub correlation_id: Uuid,
 }
 
+impl CodeRequestBody {
+    pub fn validate(&self) -> Result<(), AdapterError> {
+        if self.adapter_job_id.is_nil()
+            || self.adapter_supervisor_id.is_nil()
+            || self.run_id.is_nil()
+            || self.correlation_id.is_nil()
+            || self.capability_token.len() != 43
+            || !self
+                .capability_token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || self.source.len() > 100_000
+            || self.deadline.is_empty()
+        {
+            return Err(AdapterError::model_protocol());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeLanguage {
     Node,
     Python,
     Bash,
+}
+
+impl CodeLanguage {
+    const fn bundle(self) -> CodeBundle {
+        match self {
+            Self::Node => CodeBundle::Node,
+            Self::Python => CodeBundle::Python,
+            Self::Bash => CodeBundle::Bash,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CodeResultBody {
+    stdout: String,
+    result: String,
+    stderr: String,
+    exit_code: u8,
+    killed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -598,6 +766,8 @@ pub struct AdapterService {
     registry: JobRegistry,
     protocol: ProtocolBundle,
     boot_id: Option<Uuid>,
+    prompt_execution_healthy: Arc<AtomicBool>,
+    code_execution_healthy: Arc<AtomicBool>,
 }
 
 impl AdapterService {
@@ -611,6 +781,8 @@ impl AdapterService {
             registry,
             protocol,
             boot_id: None,
+            prompt_execution_healthy: Arc::new(AtomicBool::new(true)),
+            code_execution_healthy: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -626,6 +798,8 @@ impl AdapterService {
             registry,
             protocol,
             boot_id: Some(Uuid::new_v4()),
+            prompt_execution_healthy: Arc::new(AtomicBool::new(true)),
+            code_execution_healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -677,7 +851,12 @@ impl AdapterService {
         let request_line = read_bounded_line(&mut reader).await?;
         let request: AdapterRequest =
             parse_json_strict(&request_line).map_err(|_| AdapterError::model_protocol())?;
-        match request {
+        let request_id = match &request {
+            AdapterRequest::ExecutePrompt { request_id, .. }
+            | AdapterRequest::ExecuteCode { request_id, .. }
+            | AdapterRequest::Cancel { request_id, .. } => *request_id,
+        };
+        let result = match request {
             AdapterRequest::ExecutePrompt {
                 request_id, body, ..
             } => {
@@ -687,20 +866,26 @@ impl AdapterService {
             AdapterRequest::ExecuteCode {
                 request_id, body, ..
             } => {
-                let _ = body;
+                self.execute_code(request_id, body, &mut reader, &mut writer)
+                    .await
+            }
+            AdapterRequest::Cancel {
+                request_id, body, ..
+            } => self.cancel(request_id, body, &mut writer).await,
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
                 write_response(
                     &mut writer,
                     &AdapterResponse::<Value>::Error {
                         version: VersionOne,
                         request_id,
-                        error: AdapterError::sandbox_unavailable(),
+                        error,
                     },
                 )
                 .await
             }
-            AdapterRequest::Cancel {
-                request_id, body, ..
-            } => self.cancel(request_id, body, &mut writer).await,
         }
     }
 
@@ -713,6 +898,9 @@ impl AdapterService {
     ) -> Result<(), AdapterError> {
         body.validate()?;
         let (deadline_unix_ms, deadline) = parse_deadline(&body.deadline)?;
+        if !self.prompt_execution_healthy.load(Ordering::Acquire) {
+            return Err(AdapterError::codex_unavailable());
+        }
         let reserved = self.registry.reserve(
             body.run_id,
             JobKind::Prompt,
@@ -724,14 +912,17 @@ impl AdapterService {
             registry: self.registry.clone(),
             run_id: body.run_id,
             adapter_job_id: body.adapter_job_id,
+            execution_healthy: self.prompt_execution_healthy.clone(),
         };
         let broker = self.broker.clone();
         let job_id = body.adapter_job_id;
         let adapter_boot_id = self.boot_id.ok_or_else(AdapterError::sandbox_unavailable)?;
         let auth_file = self.config.codex_auth_file.clone();
         let correlation_id = body.correlation_id;
+        let (prepare_control, prepare_interrupter) = self.broker.prepare_control()?;
         let mut prepare_task = tokio::task::spawn_blocking(move || {
-            broker.prepare_codex(
+            broker.prepare_codex_on(
+                prepare_control,
                 job_id,
                 adapter_boot_id,
                 correlation_id,
@@ -739,38 +930,102 @@ impl AdapterService {
                 &auth_file,
             )
         });
-        let prepared_result = tokio::select! {
-            result = &mut prepare_task => {
-                result.map_err(|_| AdapterError::codex_unavailable())?
+        let mut interrupted = None;
+        let completed_prepare = tokio::select! {
+            result = &mut prepare_task => Some(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                interrupted = Some(AdapterError::timed_out());
+                None
             }
             changed = cancellation.changed() => {
-                let cancellation_error = match changed {
+                interrupted = Some(match changed {
                     Ok(()) if *cancellation.borrow() => AdapterError::cancelled(),
                     _ => AdapterError::model_protocol(),
-                };
-                if let Ok(mut prepared) = prepare_task
-                    .await
-                    .map_err(|_| AdapterError::codex_unavailable())?
-                {
-                    self.abort_prepared(&mut prepared, BrokerCancelReason::Cancelled).await;
-                }
-                self.registry.complete_reserved(
-                    body.run_id,
-                    body.adapter_job_id,
-                    Some(cancellation_error.category),
-                );
-                return Err(cancellation_error);
+                });
+                None
             }
         };
-        let mut prepared = prepared_result?;
-        let binding = AdapterAuthorizationBinding::new(
+        let prepared_result = match completed_prepare {
+            Some(result) => {
+                drop(prepare_interrupter);
+                result
+                    .map_err(|_| AdapterError::codex_unavailable())
+                    .and_then(|result| result)
+            }
+            None => {
+                let error = interrupted.ok_or_else(AdapterError::sandbox_unavailable)?;
+                let _ = prepare_interrupter.interrupt();
+                prepare_task.abort();
+                drop(prepare_task);
+                let reason = if error.category == AdapterErrorCategory::TimedOut {
+                    BrokerCancelReason::TimedOut
+                } else if error.category == AdapterErrorCategory::Cancelled {
+                    BrokerCancelReason::Cancelled
+                } else {
+                    BrokerCancelReason::ProtocolError
+                };
+                self.confirm_ambiguous_prepare_cleanup(
+                    body.adapter_job_id,
+                    adapter_boot_id,
+                    reason,
+                )
+                .await?;
+                if !self.registry.complete_reserved(
+                    body.run_id,
+                    body.adapter_job_id,
+                    Some(error.category),
+                ) {
+                    return Err(AdapterError::codex_unavailable());
+                }
+                return Err(error);
+            }
+        };
+        let mut prepared = match prepared_result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.confirm_ambiguous_prepare_cleanup(
+                    body.adapter_job_id,
+                    adapter_boot_id,
+                    BrokerCancelReason::ProtocolError,
+                )
+                .await?;
+                if !self.registry.complete_reserved(
+                    body.run_id,
+                    body.adapter_job_id,
+                    Some(error.category),
+                ) {
+                    return Err(AdapterError::codex_unavailable());
+                }
+                return Err(error);
+            }
+        };
+        let binding = match AdapterAuthorizationBinding::new(
             body.adapter_job_id,
             body.adapter_supervisor_id,
             prepared.init_pid,
-        )?;
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.abort_prompt_and_complete_reserved(
+                    body.run_id,
+                    body.adapter_job_id,
+                    &mut prepared,
+                    BrokerCancelReason::ProtocolError,
+                    Some(error.category),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.registry.bind_prepared(body.run_id, binding) {
-            self.abort_prepared(&mut prepared, BrokerCancelReason::ProtocolError)
-                .await;
+            self.abort_prompt_and_complete_reserved(
+                body.run_id,
+                body.adapter_job_id,
+                &mut prepared,
+                BrokerCancelReason::ProtocolError,
+                Some(error.category),
+            )
+            .await?;
             return Err(error);
         }
         if *cancellation.borrow() {
@@ -781,7 +1036,7 @@ impl AdapterService {
                 BrokerCancelReason::Cancelled,
                 Some(AdapterErrorCategory::Cancelled),
             )
-            .await;
+            .await?;
             return Err(AdapterError::cancelled());
         }
         let callback_token = match self.config.read_callback_token() {
@@ -794,7 +1049,7 @@ impl AdapterService {
                     BrokerCancelReason::ProtocolError,
                     Some(error.category),
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
@@ -813,7 +1068,7 @@ impl AdapterService {
                     BrokerCancelReason::ProtocolError,
                     Some(error.category),
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
@@ -831,7 +1086,7 @@ impl AdapterService {
                     BrokerCancelReason::ProtocolError,
                     Some(AdapterErrorCategory::SandboxUnavailable),
                 )
-                .await;
+                .await?;
                 return Err(AdapterError::sandbox_unavailable());
             }
         };
@@ -861,7 +1116,7 @@ impl AdapterService {
                     BrokerCancelReason::ProtocolError,
                     Some(error.category),
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
@@ -889,7 +1144,7 @@ impl AdapterService {
                 BrokerCancelReason::AuthorizationFailed,
                 Some(AdapterErrorCategory::Cancelled),
             )
-            .await;
+            .await?;
             return Err(error);
         }
         let authorization_deadline = deadline.min(Instant::now() + MAX_AUTHORIZATION_WAIT);
@@ -920,7 +1175,7 @@ impl AdapterService {
                     BrokerCancelReason::AuthorizationFailed,
                     Some(AdapterErrorCategory::ModelProtocolError),
                 )
-                .await;
+                .await?;
                 return Err(AdapterError::model_protocol());
             }
             Err(error) => {
@@ -931,7 +1186,7 @@ impl AdapterService {
                     BrokerCancelReason::AuthorizationFailed,
                     Some(error.category),
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
@@ -944,7 +1199,7 @@ impl AdapterService {
                 BrokerCancelReason::Cancelled,
                 Some(AdapterErrorCategory::Cancelled),
             )
-            .await;
+            .await?;
             return Err(AdapterError::cancelled());
         }
         if let Err(error) = self.broker.ensure_prepared_lease_quiet(&prepared) {
@@ -955,7 +1210,7 @@ impl AdapterService {
                 BrokerCancelReason::ProtocolError,
                 Some(error.category),
             )
-            .await;
+            .await?;
             return Err(error);
         }
         if let Err(error) = self.registry.authorize(body.run_id, binding) {
@@ -966,7 +1221,7 @@ impl AdapterService {
                 BrokerCancelReason::ProtocolError,
                 Some(error.category),
             )
-            .await;
+            .await?;
             return Err(error);
         }
         emit_lifecycle(
@@ -988,7 +1243,7 @@ impl AdapterService {
                 reason,
                 Some(error.category),
             )
-            .await;
+            .await?;
             return Err(error);
         }
         let start_interrupter = match self.broker.start_interrupter(&prepared) {
@@ -1001,7 +1256,7 @@ impl AdapterService {
                     BrokerCancelReason::ProtocolError,
                     Some(error.category),
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
         };
@@ -1032,11 +1287,42 @@ impl AdapterService {
         match start_wait {
             StartWait::Completed(result) => {
                 drop(start_interrupter);
-                let (returned, result) = result.map_err(|_| AdapterError::sandbox_unavailable())?;
+                let (returned, result) = match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let error = AdapterError::sandbox_unavailable();
+                        self.confirm_ambiguous_start_cleanup(
+                            body.adapter_job_id,
+                            binding.adapter_process_id,
+                            adapter_boot_id,
+                            BrokerCancelReason::ProtocolError,
+                        )
+                        .await?;
+                        if !self
+                            .registry
+                            .complete(body.run_id, binding, Some(error.category))
+                        {
+                            return Err(AdapterError::codex_unavailable());
+                        }
+                        return Err(error);
+                    }
+                };
                 prepared = returned;
                 if let Err(error) = result {
-                    self.registry
-                        .complete(body.run_id, binding, Some(error.category));
+                    prepared.control.take();
+                    self.confirm_ambiguous_start_cleanup(
+                        body.adapter_job_id,
+                        binding.adapter_process_id,
+                        adapter_boot_id,
+                        BrokerCancelReason::ProtocolError,
+                    )
+                    .await?;
+                    if !self
+                        .registry
+                        .complete(body.run_id, binding, Some(error.category))
+                    {
+                        return Err(AdapterError::codex_unavailable());
+                    }
                     return Err(error);
                 }
             }
@@ -1045,8 +1331,26 @@ impl AdapterService {
                 if let Ok((mut returned, _)) = start_task.await {
                     returned.control.take();
                 }
-                self.registry
-                    .complete(body.run_id, binding, Some(error.category));
+                let reason = if error.category == AdapterErrorCategory::TimedOut {
+                    BrokerCancelReason::TimedOut
+                } else if error.category == AdapterErrorCategory::Cancelled {
+                    BrokerCancelReason::Cancelled
+                } else {
+                    BrokerCancelReason::ProtocolError
+                };
+                self.confirm_ambiguous_start_cleanup(
+                    body.adapter_job_id,
+                    binding.adapter_process_id,
+                    adapter_boot_id,
+                    reason,
+                )
+                .await?;
+                if !self
+                    .registry
+                    .complete(body.run_id, binding, Some(error.category))
+                {
+                    return Err(AdapterError::codex_unavailable());
+                }
                 return Err(error);
             }
         }
@@ -1093,19 +1397,11 @@ impl AdapterService {
         .await
         .map_err(|_| AdapterError::sandbox_unavailable())
         .and_then(|result| result);
-        let terminal_outcome = match cleanup {
-            Ok(terminal) => {
-                let outcome = terminal.outcome;
-                let _artifacts = terminal.artifacts;
-                run_result = apply_broker_terminal_outcome(run_result, outcome);
-                Some(outcome)
-            }
-            Err(error) => {
-                run_result = Err(error);
-                None
-            }
-        };
-        if terminal_outcome == Some(BrokerTerminalOutcome::Completed)
+        let terminal = cleanup?;
+        let terminal_outcome = terminal.outcome;
+        let _artifacts = terminal.artifacts;
+        run_result = apply_broker_terminal_outcome(run_result, terminal_outcome);
+        if terminal_outcome == BrokerTerminalOutcome::Completed
             && let Err(error) = app_server
                 .verify_terminated_stdout(Instant::now() + MAX_AUTHORIZATION_WAIT)
                 .await
@@ -1114,11 +1410,604 @@ impl AdapterService {
             run_result = Err(error);
         }
         let category = run_result.as_ref().err().map(|error| error.category);
-        self.registry.complete(body.run_id, binding, category);
+        if !self.registry.complete(body.run_id, binding, category) {
+            return Err(AdapterError::codex_unavailable());
+        }
         match run_result {
             Ok(result) => {
                 let body =
                     serde_json::to_value(result).map_err(|_| AdapterError::model_protocol())?;
+                write_response(
+                    writer,
+                    &AdapterResponse::Result {
+                        version: VersionOne,
+                        request_id,
+                        body,
+                    },
+                )
+                .await
+            }
+            Err(error) => {
+                write_response(
+                    writer,
+                    &AdapterResponse::<Value>::Error {
+                        version: VersionOne,
+                        request_id,
+                        error,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn execute_code(
+        &self,
+        request_id: Uuid,
+        body: CodeRequestBody,
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<(), AdapterError> {
+        body.validate()?;
+        let (deadline_unix_ms, deadline) = parse_deadline(&body.deadline)?;
+        if !self.code_execution_healthy.load(Ordering::Acquire) {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let reserved = self.registry.reserve(
+            body.run_id,
+            JobKind::Code,
+            body.adapter_job_id,
+            body.adapter_supervisor_id,
+        )?;
+        let mut cancellation = reserved.cancellation;
+        let _completion_guard = RegistryCompletionGuard {
+            registry: self.registry.clone(),
+            run_id: body.run_id,
+            adapter_job_id: body.adapter_job_id,
+            execution_healthy: self.code_execution_healthy.clone(),
+        };
+        let broker = self.broker.clone();
+        let adapter_boot_id = self.boot_id.ok_or_else(AdapterError::sandbox_unavailable)?;
+        let job_id = body.adapter_job_id;
+        let correlation_id = body.correlation_id;
+        let bundle = body.language.bundle();
+        let source = body.source.into_bytes();
+        let (prepare_control, prepare_interrupter) = self.broker.prepare_control()?;
+        let mut prepare_task = tokio::task::spawn_blocking(move || {
+            broker.prepare_code_on(
+                prepare_control,
+                job_id,
+                adapter_boot_id,
+                correlation_id,
+                deadline_unix_ms,
+                bundle,
+                &source,
+            )
+        });
+        let mut interrupted = None;
+        let completed_prepare = tokio::select! {
+            result = &mut prepare_task => Some(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                interrupted = Some(AdapterError::timed_out());
+                None
+            }
+            changed = cancellation.changed() => {
+                interrupted = Some(match changed {
+                    Ok(()) if *cancellation.borrow() => AdapterError::cancelled(),
+                    _ => AdapterError::model_protocol(),
+                });
+                None
+            }
+        };
+        let prepared_result = match completed_prepare {
+            Some(result) => {
+                drop(prepare_interrupter);
+                result
+                    .map_err(|_| AdapterError::sandbox_unavailable())
+                    .and_then(|result| result)
+            }
+            None => {
+                let error = interrupted.ok_or_else(AdapterError::sandbox_unavailable)?;
+                let _ = prepare_interrupter.interrupt();
+                prepare_task.abort();
+                drop(prepare_task);
+                let reason = if error.category == AdapterErrorCategory::TimedOut {
+                    BrokerCancelReason::TimedOut
+                } else if error.category == AdapterErrorCategory::Cancelled {
+                    BrokerCancelReason::Cancelled
+                } else {
+                    BrokerCancelReason::ProtocolError
+                };
+                self.confirm_ambiguous_prepare_cleanup(
+                    body.adapter_job_id,
+                    adapter_boot_id,
+                    reason,
+                )
+                .await?;
+                if !self.registry.complete_code_reserved(
+                    body.run_id,
+                    body.adapter_job_id,
+                    Some(error.category),
+                ) {
+                    return Err(AdapterError::sandbox_unavailable());
+                }
+                return Err(error);
+            }
+        };
+        let mut prepared = match prepared_result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.confirm_ambiguous_prepare_cleanup(
+                    body.adapter_job_id,
+                    adapter_boot_id,
+                    BrokerCancelReason::ProtocolError,
+                )
+                .await?;
+                if !self.registry.complete_code_reserved(
+                    body.run_id,
+                    body.adapter_job_id,
+                    Some(error.category),
+                ) {
+                    return Err(AdapterError::sandbox_unavailable());
+                }
+                return Err(error);
+            }
+        };
+        let binding = match AdapterAuthorizationBinding::new(
+            body.adapter_job_id,
+            body.adapter_supervisor_id,
+            prepared.init_pid,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.abort_code_and_complete_reserved(
+                    body.run_id,
+                    body.adapter_job_id,
+                    &mut prepared,
+                    BrokerCancelReason::ProtocolError,
+                    Some(error.category),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.registry.bind_prepared(body.run_id, binding) {
+            self.abort_code_and_complete_reserved(
+                body.run_id,
+                body.adapter_job_id,
+                &mut prepared,
+                BrokerCancelReason::ProtocolError,
+                Some(error.category),
+            )
+            .await?;
+            return Err(error);
+        }
+        let callback_token = match self.config.read_callback_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.abort_code_and_complete(
+                    body.run_id,
+                    binding,
+                    &mut prepared,
+                    BrokerCancelReason::ProtocolError,
+                    Some(error.category),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let action_client = match ActionClient::new(
+            self.config.callback_url.clone(),
+            callback_token.clone(),
+            binding,
+            body.run_id,
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                self.abort_code_and_complete(
+                    body.run_id,
+                    binding,
+                    &mut prepared,
+                    BrokerCancelReason::ProtocolError,
+                    Some(error.category),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let (stdout, stderr, relay_fd) = match (
+            prepared.stdout.take(),
+            prepared.stderr.take(),
+            prepared.relay.take(),
+            prepared.stdin.take(),
+        ) {
+            (Some(stdout), Some(stderr), Some(relay), None) => (stdout, stderr, relay),
+            _ => {
+                self.abort_code_and_complete(
+                    body.run_id,
+                    binding,
+                    &mut prepared,
+                    BrokerCancelReason::ProtocolError,
+                    Some(AdapterErrorCategory::SandboxUnavailable),
+                )
+                .await?;
+                return Err(AdapterError::sandbox_unavailable());
+            }
+        };
+        let lease_monitor = match self.broker.monitor_prepared(&prepared) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                self.abort_code_and_complete(
+                    body.run_id,
+                    binding,
+                    &mut prepared,
+                    BrokerCancelReason::ProtocolError,
+                    Some(error.category),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        emit_lifecycle(
+            "broker_prepared",
+            body.correlation_id,
+            body.adapter_job_id,
+            prepared.init_pid,
+        );
+        if let Err(error) = write_response(
+            writer,
+            &AdapterResponse::<Value>::Accepted {
+                version: VersionOne,
+                request_id,
+                binding: binding.into(),
+            },
+        )
+        .await
+        {
+            drop(lease_monitor);
+            self.abort_code_and_complete(
+                body.run_id,
+                binding,
+                &mut prepared,
+                BrokerCancelReason::AuthorizationFailed,
+                Some(AdapterErrorCategory::Cancelled),
+            )
+            .await?;
+            return Err(error);
+        }
+        let authorization_deadline = deadline.min(Instant::now() + MAX_AUTHORIZATION_WAIT);
+        let acknowledgement = read_authorization_frame(
+            reader,
+            authorization_deadline,
+            &mut cancellation,
+            &lease_monitor,
+        )
+        .await
+        .and_then(|line| {
+            parse_json_strict::<AuthorizationAck>(&line).map_err(|_| AdapterError::model_protocol())
+        });
+        drop(lease_monitor);
+        match acknowledgement {
+            Ok(acknowledgement)
+                if acknowledgement.request_id == request_id
+                    && AdapterAuthorizationBinding::try_from(acknowledgement.binding)
+                        .is_ok_and(|acknowledged| acknowledged == binding) => {}
+            Ok(_) => {
+                self.abort_code_and_complete(
+                    body.run_id,
+                    binding,
+                    &mut prepared,
+                    BrokerCancelReason::AuthorizationFailed,
+                    Some(AdapterErrorCategory::ModelProtocolError),
+                )
+                .await?;
+                return Err(AdapterError::model_protocol());
+            }
+            Err(error) => {
+                self.abort_code_and_complete(
+                    body.run_id,
+                    binding,
+                    &mut prepared,
+                    BrokerCancelReason::AuthorizationFailed,
+                    Some(error.category),
+                )
+                .await?;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.broker.ensure_prepared_lease_quiet(&prepared) {
+            self.abort_code_and_complete(
+                body.run_id,
+                binding,
+                &mut prepared,
+                BrokerCancelReason::ProtocolError,
+                Some(error.category),
+            )
+            .await?;
+            return Err(error);
+        }
+        if let Err(error) = self.registry.authorize(body.run_id, binding) {
+            self.abort_code_and_complete(
+                body.run_id,
+                binding,
+                &mut prepared,
+                BrokerCancelReason::ProtocolError,
+                Some(error.category),
+            )
+            .await?;
+            return Err(error);
+        }
+        let relay_connect = CodeRelay::connect(
+            self.config.callback_url.clone(),
+            callback_token,
+            binding,
+            body.run_id,
+            relay_fd,
+            deadline,
+        );
+        tokio::pin!(relay_connect);
+        let relay_result = tokio::select! {
+            result = &mut relay_connect => result,
+            _ = tokio::time::sleep_until(deadline) => Err(AdapterError::timed_out()),
+            changed = cancellation.changed() => {
+                Err(match changed {
+                    Ok(()) if *cancellation.borrow() => AdapterError::cancelled(),
+                    _ => AdapterError::model_protocol(),
+                })
+            }
+        };
+        let mut relay = match relay_result {
+            Ok(relay) => relay,
+            Err(error) => {
+                let reason = if error.category == AdapterErrorCategory::TimedOut {
+                    BrokerCancelReason::TimedOut
+                } else if error.category == AdapterErrorCategory::Cancelled {
+                    BrokerCancelReason::Cancelled
+                } else {
+                    BrokerCancelReason::AuthorizationFailed
+                };
+                self.cancel_prepared_confirmed(&mut prepared, reason)
+                    .await?;
+                return Err(AdapterError::sandbox_unavailable());
+            }
+        };
+        emit_lifecycle(
+            "api_authorized",
+            body.correlation_id,
+            body.adapter_job_id,
+            prepared.init_pid,
+        );
+        if let Err(error) = self.registry.begin_start(body.run_id, binding) {
+            relay.stop_bundle_traffic();
+            let cleanup = self
+                .cancel_prepared_confirmed(&mut prepared, BrokerCancelReason::Cancelled)
+                .await;
+            let release = relay.close_and_confirm().await;
+            cleanup?;
+            release?;
+            if !self
+                .registry
+                .complete_code(body.run_id, binding, Some(error.category))
+            {
+                return Err(AdapterError::sandbox_unavailable());
+            }
+            return Err(error);
+        }
+        let start_interrupter = match self.broker.start_interrupter(&prepared) {
+            Ok(interrupter) => interrupter,
+            Err(error) => {
+                relay.stop_bundle_traffic();
+                let cleanup = self
+                    .cancel_prepared_confirmed(&mut prepared, BrokerCancelReason::ProtocolError)
+                    .await;
+                let release = relay.close_and_confirm().await;
+                cleanup?;
+                release?;
+                if !self
+                    .registry
+                    .complete_code(body.run_id, binding, Some(error.category))
+                {
+                    return Err(AdapterError::sandbox_unavailable());
+                }
+                return Err(error);
+            }
+        };
+        let broker = self.broker.clone();
+        let mut start_task = tokio::task::spawn_blocking(move || {
+            let mut prepared = prepared;
+            let result = broker.start(&mut prepared);
+            (prepared, result)
+        });
+        let mut interrupted = None;
+        let completed_start = tokio::select! {
+            result = &mut start_task => Some(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                interrupted = Some(AdapterError::timed_out());
+                None
+            },
+            changed = cancellation.changed() => {
+                interrupted = Some(match changed {
+                    Ok(()) if *cancellation.borrow() => AdapterError::cancelled(),
+                    _ => AdapterError::model_protocol(),
+                });
+                None
+            }
+        };
+        let (returned, started) = match completed_start {
+            Some(Ok(result)) => {
+                drop(start_interrupter);
+                result
+            }
+            Some(Err(_)) => {
+                drop(start_interrupter);
+                let error = AdapterError::sandbox_unavailable();
+                relay.stop_bundle_traffic();
+                let cleanup = self
+                    .confirm_ambiguous_start_cleanup(
+                        body.adapter_job_id,
+                        binding.adapter_process_id,
+                        adapter_boot_id,
+                        BrokerCancelReason::ProtocolError,
+                    )
+                    .await;
+                let release = relay.close_and_confirm().await;
+                cleanup?;
+                release?;
+                if !self
+                    .registry
+                    .complete_code(body.run_id, binding, Some(error.category))
+                {
+                    return Err(AdapterError::sandbox_unavailable());
+                }
+                return Err(error);
+            }
+            None => {
+                let error = interrupted.ok_or_else(AdapterError::sandbox_unavailable)?;
+                relay.stop_bundle_traffic();
+                let _ = start_interrupter.interrupt();
+                if let Ok((mut returned, _)) = start_task.await {
+                    returned.control.take();
+                }
+                let reason = if error.category == AdapterErrorCategory::TimedOut {
+                    BrokerCancelReason::TimedOut
+                } else if error.category == AdapterErrorCategory::Cancelled {
+                    BrokerCancelReason::Cancelled
+                } else {
+                    BrokerCancelReason::ProtocolError
+                };
+                let cleanup = self
+                    .confirm_ambiguous_start_cleanup(
+                        body.adapter_job_id,
+                        binding.adapter_process_id,
+                        adapter_boot_id,
+                        reason,
+                    )
+                    .await;
+                let release = relay.close_and_confirm().await;
+                cleanup?;
+                release?;
+                if !self
+                    .registry
+                    .complete_code(body.run_id, binding, Some(error.category))
+                {
+                    return Err(AdapterError::sandbox_unavailable());
+                }
+                return Err(error);
+            }
+        };
+        prepared = returned;
+        if let Err(error) = started {
+            relay.stop_bundle_traffic();
+            prepared.control.take();
+            let cleanup = self
+                .confirm_ambiguous_start_cleanup(
+                    body.adapter_job_id,
+                    binding.adapter_process_id,
+                    adapter_boot_id,
+                    BrokerCancelReason::ProtocolError,
+                )
+                .await;
+            let release = relay.close_and_confirm().await;
+            cleanup?;
+            release?;
+            if !self
+                .registry
+                .complete_code(body.run_id, binding, Some(error.category))
+            {
+                return Err(AdapterError::sandbox_unavailable());
+            }
+            return Err(error);
+        }
+        emit_lifecycle(
+            "broker_started",
+            body.correlation_id,
+            body.adapter_job_id,
+            prepared.init_pid,
+        );
+        let mut stdout_task = tokio::spawn(read_code_output(stdout));
+        let mut stderr_task = tokio::spawn(read_code_output(stderr));
+        let relay_run = if let Err(error) = self.registry.mark_running(body.run_id, binding) {
+            crate::code_relay::CodeRelayRun {
+                relay,
+                result: Err(error),
+            }
+        } else {
+            relay.run(deadline, cancellation.clone()).await
+        };
+        let run_result = match relay_run.result {
+            Ok(()) => {
+                tokio::select! {
+                    joined = async { tokio::try_join!(&mut stdout_task, &mut stderr_task) } => {
+                        match joined {
+                            Ok((Ok(stdout), Ok(stderr))) => Ok((stdout, stderr)),
+                            Ok((Err(error), _)) | Ok((_, Err(error))) => Err(error),
+                            Err(_) => Err(AdapterError::sandbox_unavailable()),
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => Err(AdapterError::timed_out()),
+                    changed = cancellation.changed() => {
+                        Err(match changed {
+                            Ok(()) if *cancellation.borrow() => AdapterError::cancelled(),
+                            _ => AdapterError::model_protocol(),
+                        })
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if run_result.is_err() {
+            stdout_task.abort();
+            stderr_task.abort();
+        }
+        let reason = match &run_result {
+            Ok(_) => BrokerCancelReason::Shutdown,
+            Err(error) if error.category == AdapterErrorCategory::TimedOut => {
+                BrokerCancelReason::TimedOut
+            }
+            Err(error) if error.category == AdapterErrorCategory::Cancelled => {
+                BrokerCancelReason::Cancelled
+            }
+            Err(_) => BrokerCancelReason::ProtocolError,
+        };
+        let broker = self.broker.clone();
+        let terminal = tokio::task::spawn_blocking(move || {
+            broker.finish(&mut prepared, adapter_boot_id, reason)
+        })
+        .await
+        .map_err(|_| AdapterError::sandbox_unavailable())
+        .and_then(|result| result);
+        let release = relay_run.relay.close_and_confirm().await;
+        let terminal = terminal?;
+        release?;
+        if !self.registry.prove_code_cleanup(body.run_id, binding) {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let outcome = terminal.outcome;
+        let result = match (run_result, outcome) {
+            (Ok((stdout, stderr)), BrokerTerminalOutcome::Completed) => {
+                let upload = action_client
+                    .upload_artifacts(
+                        &terminal.artifacts,
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .await;
+                upload.map(|()| CodeResultBody {
+                    stdout,
+                    result: String::new(),
+                    stderr,
+                    exit_code: 0,
+                    killed: false,
+                })
+            }
+            (Err(error), _) => Err(error),
+            _ => Err(AdapterError::sandbox_unavailable()),
+        };
+        let category = result.as_ref().err().map(|error| error.category);
+        if !self.registry.finish_code(body.run_id, binding, category) {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        match result {
+            Ok(body) => {
                 write_response(
                     writer,
                     &AdapterResponse::Result {
@@ -1158,11 +2047,32 @@ impl AdapterService {
             return Err(AdapterError::model_protocol());
         }
         let mut completion = self.registry.request_cancel(body.run_id)?;
-        if !*completion.borrow() {
-            tokio::time::timeout(MAX_AUTHORIZATION_WAIT, completion.changed())
-                .await
-                .map_err(|_| AdapterError::timed_out())?
-                .map_err(|_| AdapterError::sandbox_unavailable())?;
+        if *completion.borrow() == JobCompletion::Pending
+            && !matches!(
+                tokio::time::timeout(MAX_AUTHORIZATION_WAIT, completion.changed()).await,
+                Ok(Ok(()))
+            )
+        {
+            return write_response(
+                writer,
+                &AdapterResponse::<Value>::Error {
+                    version: VersionOne,
+                    request_id,
+                    error: AdapterError::sandbox_unavailable(),
+                },
+            )
+            .await;
+        }
+        if *completion.borrow() != JobCompletion::Proven {
+            return write_response(
+                writer,
+                &AdapterResponse::<Value>::Error {
+                    version: VersionOne,
+                    request_id,
+                    error: AdapterError::sandbox_unavailable(),
+                },
+            )
+            .await;
         }
         write_response(
             writer,
@@ -1175,18 +2085,99 @@ impl AdapterService {
         .await
     }
 
-    async fn abort_prepared(&self, prepared: &mut PreparedCodex, reason: BrokerCancelReason) {
+    async fn confirm_ambiguous_start_cleanup(
+        &self,
+        job_id: Uuid,
+        init_pid: u32,
+        adapter_boot_id: Uuid,
+        reason: BrokerCancelReason,
+    ) -> Result<(), AdapterError> {
         let broker = self.broker.clone();
-        let mut owned = PreparedCodex {
-            job_id: prepared.job_id,
-            init_pid: prepared.init_pid,
-            stdin: prepared.stdin.take(),
-            stdout: prepared.stdout.take(),
-            stderr: prepared.stderr.take(),
-            control: prepared.control.take(),
-            started: false,
-        };
-        let _ = tokio::task::spawn_blocking(move || broker.abort(&mut owned, reason)).await;
+        tokio::task::spawn_blocking(move || {
+            broker.cancel_ambiguous_start(job_id, init_pid, adapter_boot_id, reason)
+        })
+        .await
+        .map_err(|_| AdapterError::sandbox_unavailable())?
+    }
+
+    async fn confirm_ambiguous_prepare_cleanup(
+        &self,
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        reason: BrokerCancelReason,
+    ) -> Result<(), AdapterError> {
+        let broker = self.broker.clone();
+        tokio::task::spawn_blocking(move || {
+            broker.cancel_ambiguous_prepare(job_id, adapter_boot_id, reason)
+        })
+        .await
+        .map_err(|_| AdapterError::sandbox_unavailable())?
+    }
+
+    async fn cancel_prepared_confirmed(
+        &self,
+        prepared: &mut PreparedCodex,
+        reason: BrokerCancelReason,
+    ) -> Result<(), AdapterError> {
+        prepared.control.take();
+        self.confirm_ambiguous_start_cleanup(
+            prepared.job_id,
+            prepared.init_pid,
+            self.boot_id.ok_or_else(AdapterError::sandbox_unavailable)?,
+            reason,
+        )
+        .await
+    }
+
+    async fn abort_code_and_complete_reserved(
+        &self,
+        run_id: Uuid,
+        adapter_job_id: Uuid,
+        prepared: &mut PreparedCodex,
+        reason: BrokerCancelReason,
+        category: Option<AdapterErrorCategory>,
+    ) -> Result<(), AdapterError> {
+        self.cancel_prepared_confirmed(prepared, reason).await?;
+        if !self
+            .registry
+            .complete_code_reserved(run_id, adapter_job_id, category)
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        Ok(())
+    }
+
+    async fn abort_prompt_and_complete_reserved(
+        &self,
+        run_id: Uuid,
+        adapter_job_id: Uuid,
+        prepared: &mut PreparedCodex,
+        reason: BrokerCancelReason,
+        category: Option<AdapterErrorCategory>,
+    ) -> Result<(), AdapterError> {
+        self.cancel_prepared_confirmed(prepared, reason).await?;
+        if !self
+            .registry
+            .complete_reserved(run_id, adapter_job_id, category)
+        {
+            return Err(AdapterError::codex_unavailable());
+        }
+        Ok(())
+    }
+
+    async fn abort_code_and_complete(
+        &self,
+        run_id: Uuid,
+        binding: AdapterAuthorizationBinding,
+        prepared: &mut PreparedCodex,
+        reason: BrokerCancelReason,
+        category: Option<AdapterErrorCategory>,
+    ) -> Result<(), AdapterError> {
+        self.cancel_prepared_confirmed(prepared, reason).await?;
+        if !self.registry.complete_code(run_id, binding, category) {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        Ok(())
     }
 
     async fn abort_and_complete(
@@ -1196,10 +2187,41 @@ impl AdapterService {
         prepared: &mut PreparedCodex,
         reason: BrokerCancelReason,
         category: Option<AdapterErrorCategory>,
-    ) {
-        self.abort_prepared(prepared, reason).await;
-        self.registry.complete(run_id, binding, category);
+    ) -> Result<(), AdapterError> {
+        self.cancel_prepared_confirmed(prepared, reason).await?;
+        if !self.registry.complete(run_id, binding, category) {
+            return Err(AdapterError::codex_unavailable());
+        }
+        Ok(())
     }
+}
+
+async fn read_code_output<R>(reader: R) -> Result<String, AdapterError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = reader;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut exceeded = false;
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|_| AdapterError::sandbox_unavailable())?;
+        if read == 0 {
+            break;
+        }
+        if !exceeded && bytes.len() + read <= 262_144 {
+            bytes.extend_from_slice(&chunk[..read]);
+        } else {
+            exceeded = true;
+        }
+    }
+    if exceeded {
+        return Err(AdapterError::sandbox_unavailable());
+    }
+    String::from_utf8(bytes).map_err(|_| AdapterError::sandbox_unavailable())
 }
 
 async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
@@ -1521,7 +2543,8 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::{
-        JobKind, JobRegistry, apply_broker_terminal_outcome, publish_boot_id, read_prior_boot_id,
+        JobCompletion, JobKind, JobRegistry, apply_broker_terminal_outcome, publish_boot_id,
+        read_prior_boot_id,
     };
     use crate::action_client::AdapterAuthorizationBinding;
     use crate::broker_client::BrokerTerminalOutcome;
@@ -1540,15 +2563,45 @@ mod tests {
         registry.mark_running(run_id, binding).unwrap();
         let completion = registry.request_cancel(run_id).unwrap();
         assert!(*admitted.cancellation.borrow());
-        assert!(!*completion.borrow());
+        assert_eq!(*completion.borrow(), JobCompletion::Pending);
         assert!(registry.request_cancel(run_id).is_ok());
         assert!(registry.complete(
             run_id,
             binding,
             Some(crate::redaction::AdapterErrorCategory::Cancelled),
         ));
-        assert!(*completion.borrow());
+        assert_eq!(*completion.borrow(), JobCompletion::Proven);
         assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn code_completion_distinguishes_proven_from_cleanup_unproven() {
+        let registry = JobRegistry::new(1, 2).unwrap();
+        let unproven_run = Uuid::new_v4();
+        let unproven_job = Uuid::new_v4();
+        registry
+            .reserve(unproven_run, JobKind::Code, unproven_job, Uuid::new_v4())
+            .unwrap();
+        let unproven = registry.request_cancel(unproven_run).unwrap();
+        assert!(!registry.complete_reserved(
+            unproven_run,
+            unproven_job,
+            Some(AdapterErrorCategory::SandboxUnavailable),
+        ));
+        assert!(registry.fail_cleanup_reserved(unproven_run, unproven_job));
+        assert_eq!(*unproven.borrow(), JobCompletion::CleanupUnproven);
+        assert!(registry.terminal_jobs().is_empty());
+
+        let proven_run = Uuid::new_v4();
+        let binding = AdapterAuthorizationBinding::new(Uuid::new_v4(), Uuid::new_v4(), 9).unwrap();
+        registry.admit(proven_run, JobKind::Code, binding).unwrap();
+        let proven = registry.request_cancel(proven_run).unwrap();
+        assert!(!registry.complete(proven_run, binding, Some(AdapterErrorCategory::Cancelled),));
+        assert!(
+            registry.complete_code(proven_run, binding, Some(AdapterErrorCategory::Cancelled),)
+        );
+        assert_eq!(*proven.borrow(), JobCompletion::Proven);
+        assert_eq!(registry.terminal_jobs().len(), 1);
     }
 
     #[test]

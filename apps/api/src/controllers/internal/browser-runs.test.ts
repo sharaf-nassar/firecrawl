@@ -10,12 +10,25 @@ import { describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import {
+  BROWSER_RELAY_LIMITS,
+  BROWSER_RELAY_READY_FRAME,
   browserActionErrorStatus,
   createBrowserRunsInternalRouter,
 } from "./browser-runs";
+import { BROWSER_RELAY_WS_OPTIONS } from "../../lib/browser-runtime/relay-limits";
 
 const ID = (tail: number) =>
   `10000000-0000-4000-8000-${tail.toString().padStart(12, "0")}`;
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 class FakeUpstream extends EventEmitter {
   readonly CONNECTING = WebSocket.CONNECTING;
@@ -75,6 +88,13 @@ function fixture() {
 }
 
 describe("internal browser run callbacks", () => {
+  it("derives global WebSocket maxPayload from the shared relay frame limit", () => {
+    expect(BROWSER_RELAY_WS_OPTIONS.maxPayload).toBe(
+      BROWSER_RELAY_LIMITS.frameBytes,
+    );
+    expect(BROWSER_RELAY_WS_OPTIONS.maxPayload).toBe(24 * 1024 * 1024);
+  });
+
   it("maps action cap and concurrency conflicts without collapsing them", () => {
     expect(browserActionErrorStatus("action_limit_exceeded")).toBe(429);
     expect(browserActionErrorStatus("duplicate_side_effect")).toBe(409);
@@ -470,8 +490,9 @@ describe("internal browser run callbacks", () => {
       await writerRelease;
       events.push("revoke:released");
     });
+    let currentBinding = binding;
     const gate = {
-      assertOpen: vi.fn(() => binding),
+      assertOpen: vi.fn(() => currentBinding),
       withBrowserStateMutationLease: vi.fn(async (_scope, operation) => {
         events.push("lease:start");
         try {
@@ -494,7 +515,9 @@ describe("internal browser run callbacks", () => {
       perOperationTimeoutMs: 30_000,
       zeroDataRetention: false as const,
     };
-    const app = expressWs(express()).app;
+    const app = expressWs(express(), undefined, {
+      wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
+    }).app;
     app.use(
       createBrowserRunsInternalRouter({
         getRuntime: () =>
@@ -542,9 +565,343 @@ describe("internal browser run callbacks", () => {
         "lease:start",
         "revoke:start",
       ]);
+      const release = request(server)
+        .post(`/internal/browser-runs/${authority.runId}/cdp/released`)
+        .set("authorization", `Bearer ${"x".repeat(32)}`)
+        .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+        .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+        .set(
+          "x-firecrawl-adapter-process-id",
+          String(authority.adapterProcessId),
+        )
+        .send();
       acknowledgeWriterRelease();
+      expect((await release).status).toBe(204);
+      const retry = await request(server)
+        .post(`/internal/browser-runs/${authority.runId}/cdp/released`)
+        .set("authorization", `Bearer ${"x".repeat(32)}`)
+        .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+        .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+        .set(
+          "x-firecrawl-adapter-process-id",
+          String(authority.adapterProcessId),
+        )
+        .send();
+      expect(retry.status).toBe(204);
+      const wrongBinding = await request(server)
+        .post(`/internal/browser-runs/${authority.runId}/cdp/released`)
+        .set("authorization", `Bearer ${"x".repeat(32)}`)
+        .set("x-firecrawl-adapter-job-id", ID(99))
+        .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+        .set(
+          "x-firecrawl-adapter-process-id",
+          String(authority.adapterProcessId),
+        )
+        .send();
+      expect(wrongBinding.status).toBe(403);
+      currentBinding = {
+        ...binding,
+        databaseControlEpoch: binding.databaseControlEpoch + 1,
+      };
+      const staleGeneration = await request(server)
+        .post(`/internal/browser-runs/${authority.runId}/cdp/released`)
+        .set("authorization", `Bearer ${"x".repeat(32)}`)
+        .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+        .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+        .set(
+          "x-firecrawl-adapter-process-id",
+          String(authority.adapterProcessId),
+        )
+        .send();
+      expect(staleGeneration.status).toBe(409);
       await vi.waitFor(() => expect(events).toContain("revoke:released"));
+      expect(revokeRelayGrant).toHaveBeenCalledTimes(1);
       expect(events.at(-1)).toBe("lease:end");
+    } finally {
+      socket.terminate();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it("emits relay ready only after lease redemption and upstream opening", async () => {
+    const upstream = new FakeUpstream();
+    const leaseAllowed = deferred<void>();
+    const upstreamOpened = deferred<FakeUpstream>();
+    const binding = {
+      apiInstanceId: ID(20),
+      databaseControlEpoch: 1,
+      processNonce: "a".repeat(43),
+      controlGenerationNonce: "b".repeat(43),
+      snapshotDigest: "c".repeat(64),
+    };
+    const redeemCdpWithLease = vi.fn();
+    const createRelayGrant = vi.fn(async () => ({
+      relayToken: "r".repeat(43),
+    }));
+    const openCdpStream = vi.fn(() => upstreamOpened.promise);
+    const revokeRelayGrant = vi.fn();
+    const gate = {
+      assertOpen: vi.fn(() => binding),
+      withBrowserStateMutationLease: vi.fn(async (_scope, operation) => {
+        await leaseAllowed.promise;
+        return operation({ binding });
+      }),
+    };
+    const authority = {
+      runId: ID(1),
+      ownerId: ID(2),
+      sessionId: ID(3),
+      runtimeSessionId: ID(4),
+      expectedSessionVersion: 1,
+      adapterJobId: ID(5),
+      adapterSupervisorId: ID(6),
+      adapterProcessId: 42,
+      deadline: new Date(Date.now() + 60_000),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
+    };
+    const app = expressWs(express(), undefined, {
+      wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
+    }).app;
+    app.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () =>
+          ({
+            gate,
+            browserClient: {
+              createRelayGrant,
+              openCdpStream,
+              revokeRelayGrant,
+            },
+          }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi.fn().mockResolvedValue(authority),
+        inspectBinding: vi.fn(),
+        redeemCdpWithLease,
+      }),
+    );
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/internal/browser-runs/${authority.runId}/cdp`,
+      {
+        headers: {
+          authorization: `Bearer ${"x".repeat(32)}`,
+          "x-firecrawl-adapter-job-id": authority.adapterJobId,
+          "x-firecrawl-adapter-supervisor-id": authority.adapterSupervisorId,
+          "x-firecrawl-adapter-process-id": String(authority.adapterProcessId),
+        },
+      },
+    );
+    const messages: Array<{ data: string; isBinary: boolean }> = [];
+    socket.on("message", (data, isBinary) => {
+      messages.push({ data: data.toString(), isBinary });
+    });
+    try {
+      await once(socket, "open");
+      expect(messages).toEqual([]);
+      expect(redeemCdpWithLease).not.toHaveBeenCalled();
+      expect(createRelayGrant).not.toHaveBeenCalled();
+      expect(openCdpStream).not.toHaveBeenCalled();
+
+      leaseAllowed.resolve();
+      await vi.waitFor(() => expect(openCdpStream).toHaveBeenCalledOnce());
+      expect(redeemCdpWithLease).toHaveBeenCalledOnce();
+      expect(createRelayGrant).toHaveBeenCalledOnce();
+      expect(messages).toEqual([]);
+
+      const ready = once(socket, "message");
+      upstreamOpened.resolve(upstream);
+      const [data, isBinary] = await ready;
+      expect(isBinary).toBe(false);
+      expect(data.toString()).toBe(BROWSER_RELAY_READY_FRAME);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(messages).toEqual([
+        { data: BROWSER_RELAY_READY_FRAME, isBinary: false },
+      ]);
+    } finally {
+      socket.terminate();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it("fails closed when relay setup lease commit is ambiguous", async () => {
+    const upstream = new FakeUpstream();
+    const binding = {
+      apiInstanceId: ID(20),
+      databaseControlEpoch: 1,
+      processNonce: "a".repeat(43),
+      controlGenerationNonce: "b".repeat(43),
+      snapshotDigest: "c".repeat(64),
+    };
+    const close = vi.fn();
+    const redeemCdpWithLease = vi.fn();
+    const createRelayGrant = vi.fn(async () => ({
+      relayToken: "r".repeat(43),
+    }));
+    const openCdpStream = vi.fn(async () => upstream);
+    const revokeRelayGrant = vi.fn();
+    const gate = {
+      assertOpen: vi.fn(() => binding),
+      close,
+      withBrowserStateMutationLease: vi.fn(async (_scope, operation) => {
+        await operation({ binding });
+        throw new Error("lease commit outcome unknown");
+      }),
+    };
+    const authority = {
+      runId: ID(1),
+      ownerId: ID(2),
+      sessionId: ID(3),
+      runtimeSessionId: ID(4),
+      expectedSessionVersion: 1,
+      adapterJobId: ID(5),
+      adapterSupervisorId: ID(6),
+      adapterProcessId: 42,
+      deadline: new Date(Date.now() + 60_000),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
+    };
+    const app = expressWs(express(), undefined, {
+      wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
+    }).app;
+    app.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () =>
+          ({
+            gate,
+            browserClient: {
+              createRelayGrant,
+              openCdpStream,
+              revokeRelayGrant,
+            },
+          }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi.fn().mockResolvedValue(authority),
+        inspectBinding: vi.fn(),
+        redeemCdpWithLease,
+      }),
+    );
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/internal/browser-runs/${authority.runId}/cdp`,
+      {
+        headers: {
+          authorization: `Bearer ${"x".repeat(32)}`,
+          "x-firecrawl-adapter-job-id": authority.adapterJobId,
+          "x-firecrawl-adapter-supervisor-id": authority.adapterSupervisorId,
+          "x-firecrawl-adapter-process-id": String(authority.adapterProcessId),
+        },
+      },
+    );
+    const messages: string[] = [];
+    socket.on("message", data => messages.push(data.toString()));
+    socket.on("error", () => undefined);
+    try {
+      await once(socket, "close");
+      expect(redeemCdpWithLease).toHaveBeenCalledOnce();
+      expect(createRelayGrant).toHaveBeenCalledOnce();
+      expect(openCdpStream).toHaveBeenCalledOnce();
+      expect(messages).toEqual([]);
+      expect(upstream.readyState).toBe(WebSocket.CLOSED);
+      expect(revokeRelayGrant).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledWith("cdp_relay_cleanup_failed");
+
+      const release = await request(server)
+        .post(`/internal/browser-runs/${authority.runId}/cdp/released`)
+        .set("authorization", `Bearer ${"x".repeat(32)}`)
+        .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+        .set("x-firecrawl-adapter-supervisor-id", authority.adapterSupervisorId)
+        .set(
+          "x-firecrawl-adapter-process-id",
+          String(authority.adapterProcessId),
+        )
+        .send();
+      expect(release.status).toBe(503);
+      expect(release.body.error).toBe("browser_unavailable");
+    } finally {
+      socket.terminate();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it("does not emit relay ready when upstream opening fails", async () => {
+    const binding = {
+      apiInstanceId: ID(20),
+      databaseControlEpoch: 1,
+      processNonce: "a".repeat(43),
+      controlGenerationNonce: "b".repeat(43),
+      snapshotDigest: "c".repeat(64),
+    };
+    const revokeRelayGrant = vi.fn();
+    const gate = {
+      assertOpen: vi.fn(() => binding),
+      withBrowserStateMutationLease: vi.fn(async (_scope, operation) =>
+        operation({ binding }),
+      ),
+    };
+    const authority = {
+      runId: ID(1),
+      ownerId: ID(2),
+      sessionId: ID(3),
+      runtimeSessionId: ID(4),
+      expectedSessionVersion: 1,
+      adapterJobId: ID(5),
+      adapterSupervisorId: ID(6),
+      adapterProcessId: 42,
+      deadline: new Date(Date.now() + 60_000),
+      perOperationTimeoutMs: 30_000,
+      zeroDataRetention: false as const,
+    };
+    const app = expressWs(express(), undefined, {
+      wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
+    }).app;
+    app.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () =>
+          ({
+            gate,
+            browserClient: {
+              createRelayGrant: vi.fn(async () => ({
+                relayToken: "r".repeat(43),
+              })),
+              openCdpStream: vi.fn(async () => {
+                throw new Error("upstream unavailable");
+              }),
+              revokeRelayGrant,
+            },
+          }) as never,
+        readAdapterToken: async () => "x".repeat(32),
+        getAuthority: vi.fn().mockResolvedValue(authority),
+        inspectBinding: vi.fn(),
+        redeemCdpWithLease: vi.fn(),
+      }),
+    );
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/internal/browser-runs/${authority.runId}/cdp`,
+      {
+        headers: {
+          authorization: `Bearer ${"x".repeat(32)}`,
+          "x-firecrawl-adapter-job-id": authority.adapterJobId,
+          "x-firecrawl-adapter-supervisor-id": authority.adapterSupervisorId,
+          "x-firecrawl-adapter-process-id": String(authority.adapterProcessId),
+        },
+      },
+    );
+    const messages: string[] = [];
+    socket.on("message", data => messages.push(data.toString()));
+    socket.on("error", () => undefined);
+    try {
+      await once(socket, "close");
+      expect(messages).toEqual([]);
+      expect(revokeRelayGrant).toHaveBeenCalledOnce();
     } finally {
       socket.terminate();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -555,6 +912,10 @@ describe("internal browser run callbacks", () => {
     ["upstream frame overflow", "upstream", 1009],
     ["downstream frame overflow", "downstream", 1009],
     ["upstream backpressure", "backpressure", 1009],
+    ["near-cap incoming frame", "near-cap", 1009],
+    ["duplicate request ID", "duplicate-id", 1008],
+    ["too many outstanding request IDs", "outstanding-ids", 1008],
+    ["unknown response ID", "unknown-id", 1008],
     ["relay deadline", "deadline", 1008],
   ] as const)("fails closed on %s", async (_name, failure, expectedCode) => {
     const upstream = new FakeUpstream();
@@ -587,7 +948,9 @@ describe("internal browser run callbacks", () => {
       perOperationTimeoutMs: 30_000,
       zeroDataRetention: false as const,
     };
-    const app = expressWs(express()).app;
+    const app = expressWs(express(), undefined, {
+      wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
+    }).app;
     app.use(
       createBrowserRunsInternalRouter({
         getRuntime: () =>
@@ -625,12 +988,35 @@ describe("internal browser run callbacks", () => {
       await once(socket, "open");
       const closed = once(socket, "close");
       if (failure === "upstream") {
-        upstream.emit("message", Buffer.alloc(256 * 1024 + 1));
+        upstream.emit(
+          "message",
+          Buffer.alloc(BROWSER_RELAY_LIMITS.frameBytes + 1),
+        );
       } else if (failure === "downstream") {
-        socket.send(Buffer.alloc(256 * 1024 + 1));
+        socket.send(Buffer.alloc(BROWSER_RELAY_LIMITS.frameBytes + 1));
       } else if (failure === "backpressure") {
-        upstream.bufferedAmount = 256 * 1024 + 1;
-        socket.send(Buffer.from("{}"));
+        upstream.bufferedAmount = BROWSER_RELAY_LIMITS.queueBytes + 1;
+        socket.send(JSON.stringify({ id: 1, method: "Runtime.enable" }));
+      } else if (failure === "near-cap") {
+        upstream.bufferedAmount = BROWSER_RELAY_LIMITS.queueBytes - 8;
+        socket.send(JSON.stringify({ id: 1, method: "Runtime.enable" }));
+      } else if (failure === "duplicate-id") {
+        socket.send(JSON.stringify({ id: 1, method: "Runtime.enable" }));
+        socket.send(JSON.stringify({ id: 1, method: "Runtime.enable" }));
+      } else if (failure === "outstanding-ids") {
+        for (
+          let id = 1;
+          id <= BROWSER_RELAY_LIMITS.outstandingIds + 1;
+          id += 1
+        ) {
+          socket.send(JSON.stringify({ id, method: "Runtime.enable" }));
+        }
+      } else if (failure === "unknown-id") {
+        upstream.emit(
+          "message",
+          Buffer.from(JSON.stringify({ id: 999, result: {} })),
+          false,
+        );
       }
       const [code] = await closed;
       expect(code).toBe(expectedCode);
@@ -716,6 +1102,23 @@ describe("internal browser run callbacks", () => {
       await vi.waitFor(() =>
         expect(close).toHaveBeenCalledWith("cdp_relay_cleanup_failed"),
       );
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const release = await request(server)
+          .post(`/internal/browser-runs/${authority.runId}/cdp/released`)
+          .set("authorization", `Bearer ${"x".repeat(32)}`)
+          .set("x-firecrawl-adapter-job-id", authority.adapterJobId)
+          .set(
+            "x-firecrawl-adapter-supervisor-id",
+            authority.adapterSupervisorId,
+          )
+          .set(
+            "x-firecrawl-adapter-process-id",
+            String(authority.adapterProcessId),
+          )
+          .send();
+        expect(release.status).toBe(503);
+        expect(release.body.error).toBe("browser_unavailable");
+      }
     } finally {
       socket.terminate();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -850,9 +1253,12 @@ describe("internal browser run callbacks", () => {
       events.push("revoke");
     });
     const gate = {
-      assertOpen: vi.fn(() => {
-        throw new Error("gate closed");
-      }),
+      assertOpen: vi
+        .fn()
+        .mockReturnValueOnce(binding)
+        .mockImplementation(() => {
+          throw new Error("gate closed");
+        }),
       withBrowserStateMutationLease: vi.fn(async (_scope, operation) => {
         events.push("lease:start");
         try {

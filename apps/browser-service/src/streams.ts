@@ -33,13 +33,14 @@ import {
 import type { ControlGenerationBinding } from "./startup-state.js";
 
 export const STREAM_LIMITS = Object.freeze({
-  frameBytes: 1024 * 1024,
+  frameBytes: 24 * 1024 * 1024,
   interactiveInputBytes: 4 * 1024,
-  cdpFrameBytes: 256 * 1024,
-  cdpOutstandingIds: 64,
-  queuedMessages: 64,
-  queuedBytes: 4 * 1024 * 1024,
-  backpressureBytes: 1024 * 1024,
+  cdpFrameBytes: 24 * 1024 * 1024,
+  cdpOutstandingIds: 1_024,
+  queuedMessages: 1_024,
+  queuedBytes: 32 * 1024 * 1024,
+  backpressureBytes: 16 * 1024 * 1024,
+  resumeBytes: 8 * 1024 * 1024,
   closeTimeoutMs: 5_000,
   jsonDepth: 16,
   jsonArrayEntries: 1_000,
@@ -741,11 +742,26 @@ function createSocketSender(
   let queuedBytes = 0;
   let sending = false;
   let closed = false;
+  let paused = false;
+
+  const updateFlowControl = (): void => {
+    const bufferedBytes = socket.bufferedAmount + queuedBytes;
+    if (!paused && bufferedBytes >= STREAM_LIMITS.backpressureBytes) {
+      socket.pause();
+      paused = true;
+    } else if (paused && bufferedBytes <= STREAM_LIMITS.resumeBytes) {
+      socket.resume();
+      paused = false;
+    }
+  };
 
   const pump = (): void => {
     if (closed || sending || socket.readyState !== SOCKET_OPEN) return;
     const next = queue.shift();
-    if (next === undefined) return;
+    if (next === undefined) {
+      updateFlowControl();
+      return;
+    }
     queuedBytes -= next.bytes;
     sending = true;
     socket.send(next.data, (error) => {
@@ -754,6 +770,7 @@ function createSocketSender(
         onFailure(STREAM_CLOSE_CODES.internalError, "stream send failed");
         return;
       }
+      updateFlowControl();
       pump();
     });
   };
@@ -774,17 +791,24 @@ function createSocketSender(
         onFailure(STREAM_CLOSE_CODES.messageTooBig, "stream output is too large");
         return false;
       }
+      const bufferedBytes = socket.bufferedAmount + queuedBytes + bytes;
       if (
-        socket.bufferedAmount > STREAM_LIMITS.backpressureBytes ||
         queue.length >= STREAM_LIMITS.queuedMessages ||
-        queuedBytes + bytes > STREAM_LIMITS.queuedBytes
+        bufferedBytes > STREAM_LIMITS.queuedBytes
       ) {
         if (mode === "droppable") return false;
         onFailure(STREAM_CLOSE_CODES.tryAgainLater, "stream backpressure limit");
         return false;
       }
+      if (
+        mode === "droppable" &&
+        bufferedBytes >= STREAM_LIMITS.backpressureBytes
+      ) {
+        return false;
+      }
       queue.push({ bytes, data });
       queuedBytes += bytes;
+      updateFlowControl();
       pump();
       return true;
     },
@@ -792,6 +816,8 @@ function createSocketSender(
       closed = true;
       queue.length = 0;
       queuedBytes = 0;
+      if (paused) socket.resume();
+      paused = false;
     },
   });
 }

@@ -1,5 +1,5 @@
 use firecrawl_browser_execution_adapter::action_client::AdapterAuthorizationBinding;
-use firecrawl_browser_execution_adapter::jobs::{JobKind, JobRegistry};
+use firecrawl_browser_execution_adapter::jobs::{JobCompletion, JobKind, JobRegistry};
 use firecrawl_browser_execution_adapter::redaction::AdapterErrorCategory;
 use uuid::Uuid;
 
@@ -21,10 +21,10 @@ fn authorization_and_completion_compare_exact_binding() {
     registry.mark_running(run_id, expected).unwrap();
     let completion = registry.request_cancel(run_id).unwrap();
     assert!(*admitted.cancellation.borrow());
-    assert!(!*completion.borrow());
+    assert_eq!(*completion.borrow(), JobCompletion::Pending);
     assert!(!registry.complete(run_id, wrong, None));
     assert!(registry.complete(run_id, expected, Some(AdapterErrorCategory::Cancelled),));
-    assert!(*completion.borrow());
+    assert_eq!(*completion.borrow(), JobCompletion::Proven);
     assert_eq!(registry.active_count(), 0);
 }
 
@@ -41,8 +41,8 @@ fn start_and_cancel_linearize_under_one_registry_lock() {
     let first_completion = registry.request_cancel(cancelled_run).unwrap();
     let repeated_completion = registry.request_cancel(cancelled_run).unwrap();
     assert!(registry.begin_start(cancelled_run, cancelled).is_err());
-    assert!(!*first_completion.borrow());
-    assert!(!*repeated_completion.borrow());
+    assert_eq!(*first_completion.borrow(), JobCompletion::Pending);
+    assert_eq!(*repeated_completion.borrow(), JobCompletion::Pending);
     assert!(registry.complete(
         cancelled_run,
         cancelled,
@@ -105,9 +105,9 @@ fn preparing_job_reserves_capacity_and_can_be_cancelled_before_binding() {
 
     let completion = registry.request_cancel(run_id).unwrap();
     assert!(*reserved.cancellation.borrow());
-    assert!(!*completion.borrow());
+    assert_eq!(*completion.borrow(), JobCompletion::Pending);
     assert!(registry.complete_reserved(run_id, job_id, Some(AdapterErrorCategory::Cancelled)));
-    assert!(*completion.borrow());
+    assert_eq!(*completion.borrow(), JobCompletion::Proven);
     assert_eq!(registry.active_count(), 0);
     assert_eq!(
         registry.terminal_jobs(),

@@ -254,9 +254,14 @@ fn serve_connection_with_contract_check<R: Runc, F: Fn() -> bool>(
             let deadline = lease.deadline();
             prepared_control(runtime, &connection, uid, lease, deadline)
         }
-        BrokerRequest::Cancel { .. } => {
+        BrokerRequest::Cancel {
+            job_id,
+            adapter_boot_id,
+            reason,
+        } => {
             reject_descriptors(&packet)?;
-            Err(BrokerError::new(ErrorCategory::Conflict))
+            let response = runtime.cancel_key(uid, adapter_boot_id, job_id, reason)?;
+            send(connection.as_fd(), &response)
         }
         BrokerRequest::CancelOwner { adapter_boot_id } => {
             reject_descriptors(&packet)?;

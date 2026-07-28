@@ -368,6 +368,93 @@ fn abort_and_wrong_pid_never_start_payload_and_remove_all_state() {
 }
 
 #[test]
+fn fresh_cancel_confirms_live_or_recent_terminal_cleanup_by_exact_owner() {
+    for eof_wins in [false, true] {
+        let fixture = Fixture::new();
+        let boot_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let correlation_id = Uuid::new_v4();
+        let lease = fixture.prepare(boot_id, job_id, correlation_id);
+        let init_pid = lease.init_pid();
+        if eof_wins {
+            fixture.runtime.connection_eof(fixture.uid, &lease).unwrap();
+        }
+        let expected = BrokerResponse::Terminal {
+            job_id,
+            init_pid,
+            outcome: if eof_wins {
+                Outcome::Cancelled
+            } else {
+                Outcome::Failed
+            },
+            artifacts: Vec::new(),
+        };
+        assert_eq!(
+            fixture
+                .runtime
+                .cancel_key(fixture.uid, boot_id, job_id, CancelReason::ProtocolError,)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .cancel_key(fixture.uid, boot_id, job_id, CancelReason::ProtocolError,)
+                .unwrap(),
+            expected
+        );
+        let diagnostic = fixture
+            .runtime
+            .diagnose(fixture.uid, correlation_id, job_id)
+            .unwrap();
+        assert_eq!(diagnostic.phase, Phase::Terminal);
+        assert!(!diagnostic.pidfd_live);
+        assert!(!diagnostic.control_lease_connected);
+        assert!(!diagnostic.cgroup_present);
+        assert!(!diagnostic.job_directory_present);
+        assert_eq!(diagnostic.child_count, 0);
+        assert!(!diagnostic.cleanup_failure);
+        assert!(
+            fixture
+                .runtime
+                .cancel_key(
+                    fixture.uid,
+                    Uuid::new_v4(),
+                    job_id,
+                    CancelReason::ProtocolError,
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn fresh_cancel_terminal_cache_evicts_oldest_exact_identity() {
+    let fixture = Fixture::new();
+    let boot_id = Uuid::new_v4();
+    let mut oldest = None;
+    for index in 0..129 {
+        let job_id = Uuid::new_v4();
+        let lease = fixture.prepare(boot_id, job_id, Uuid::new_v4());
+        fixture.runtime.connection_eof(fixture.uid, &lease).unwrap();
+        if index == 0 {
+            oldest = Some(job_id);
+        }
+    }
+    assert!(
+        fixture
+            .runtime
+            .cancel_key(
+                fixture.uid,
+                boot_id,
+                oldest.unwrap(),
+                CancelReason::ProtocolError,
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn exact_uid_boot_and_high_entropy_diagnostic_pair_are_fenced() {
     let fixture = Fixture::new();
     let boot_a = Uuid::new_v4();

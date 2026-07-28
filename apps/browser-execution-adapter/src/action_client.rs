@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::broker_client::BrokerArtifact;
 use crate::decision::{Effect, canonical_operation_hash, classify};
 use crate::observations::{BrowserOperationKind, ObservationV1};
-use crate::protocol::{BrowserOperation, ModelDecisionV1, VersionOne};
+use crate::protocol::{BrowserOperation, ModelDecisionV1, VersionOne, parse_json_strict};
 use crate::redaction::AdapterError;
 
 const MAX_CALLBACK_BYTES: usize = 65_536;
+const MAX_ARTIFACT_ACK_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdapterAuthorizationBinding {
@@ -54,6 +56,18 @@ struct CallbackError {
     success: bool,
     error: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ArtifactAcknowledgement {
+    #[serde(rename = "version")]
+    _version: VersionOne,
+    artifact_id: Uuid,
+    kind: String,
+    content_type: String,
+    byte_size: u64,
+    sha256: String,
 }
 
 pub struct ActionClient {
@@ -182,7 +196,7 @@ impl ActionClient {
                 }
             }
             if status == StatusCode::OK {
-                let observation: ObservationV1 = serde_json::from_slice(&bytes)
+                let observation: ObservationV1 = parse_json_strict(&bytes)
                     .map_err(|_| AdapterError::action_outcome_unknown())?;
                 observation
                     .validate()
@@ -205,10 +219,104 @@ impl ActionClient {
             return Err(map_callback_error(status, &bytes));
         }
     }
+
+    pub async fn upload_artifacts(
+        &self,
+        artifacts: &[BrokerArtifact],
+        timeout: Duration,
+    ) -> Result<(), AdapterError> {
+        if timeout.is_zero() {
+            return Err(AdapterError::timed_out());
+        }
+        let deadline = Instant::now() + timeout;
+        for artifact in artifacts {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(AdapterError::timed_out)?;
+            let endpoint = format!(
+                "{}/internal/browser-runs/{}/artifacts",
+                self.callback_origin, self.run_id
+            );
+            let mut response = self
+                .client
+                .post(endpoint)
+                .timeout(remaining)
+                .bearer_auth(self.callback_token.as_str())
+                .header(
+                    "x-firecrawl-adapter-job-id",
+                    self.binding.adapter_job_id.to_string(),
+                )
+                .header(
+                    "x-firecrawl-adapter-supervisor-id",
+                    self.binding.adapter_supervisor_id.to_string(),
+                )
+                .header(
+                    "x-firecrawl-adapter-process-id",
+                    self.binding.adapter_process_id.to_string(),
+                )
+                .header("x-firecrawl-artifact-id", artifact.artifact_id.to_string())
+                .header("x-firecrawl-artifact-kind", artifact.kind.as_str())
+                .header(
+                    "x-firecrawl-artifact-content-type",
+                    artifact.content_type.as_str(),
+                )
+                .header(
+                    "x-firecrawl-artifact-byte-size",
+                    artifact.byte_size.to_string(),
+                )
+                .header("x-firecrawl-artifact-sha256", artifact.checksum.as_str())
+                .header("content-type", artifact.content_type.as_str())
+                .header("content-length", artifact.byte_size.to_string())
+                .body(artifact.content.clone())
+                .send()
+                .await
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        AdapterError::timed_out()
+                    } else {
+                        AdapterError::sandbox_unavailable()
+                    }
+                })?;
+            if response.status() != StatusCode::CREATED
+                || response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_ARTIFACT_ACK_BYTES as u64)
+            {
+                return Err(AdapterError::sandbox_unavailable());
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| AdapterError::sandbox_unavailable())?
+            {
+                if bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .is_none_or(|length| length > MAX_ARTIFACT_ACK_BYTES)
+                {
+                    return Err(AdapterError::sandbox_unavailable());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let acknowledgement: ArtifactAcknowledgement =
+                parse_json_strict(&bytes).map_err(|_| AdapterError::sandbox_unavailable())?;
+            if acknowledgement.artifact_id != artifact.artifact_id
+                || acknowledgement.kind != artifact.kind
+                || acknowledgement.content_type != artifact.content_type
+                || acknowledgement.byte_size != artifact.byte_size
+                || acknowledgement.sha256 != artifact.checksum
+            {
+                return Err(AdapterError::sandbox_unavailable());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn map_callback_error(status: StatusCode, bytes: &[u8]) -> AdapterError {
-    let Ok(error) = serde_json::from_slice::<CallbackError>(bytes) else {
+    let Ok(error) = parse_json_strict::<CallbackError>(bytes) else {
         return AdapterError::action_outcome_unknown();
     };
     if error.success || error.error.is_empty() || error.message.is_empty() {
@@ -216,6 +324,9 @@ fn map_callback_error(status: StatusCode, bytes: &[u8]) -> AdapterError {
     }
     match error.error.as_str() {
         "capability_denied" if status == StatusCode::FORBIDDEN => AdapterError::capability_denied(),
+        "model_protocol_error" if status == StatusCode::BAD_GATEWAY => {
+            AdapterError::model_protocol()
+        }
         "action_outcome_unknown" => AdapterError::action_outcome_unknown(),
         "cancelled" => AdapterError::cancelled(),
         "deadline_exceeded" => AdapterError::timed_out(),

@@ -13,8 +13,7 @@ use firecrawl_browser_execution_adapter::broker_client::{
     BrokerTerminalOutcome, validate_shared_contract, validate_shared_contract_bytes,
 };
 use firecrawl_browser_execution_adapter::config::AdapterConfig;
-use firecrawl_browser_execution_adapter::jobs::{AdapterService, JobRegistry};
-use firecrawl_browser_execution_adapter::redaction::AdapterErrorCategory;
+use firecrawl_browser_execution_adapter::jobs::{AdapterService, JobCompletion, JobRegistry};
 use nix::cmsg_space;
 use nix::fcntl::{FcntlArg, OFlag, SealFlag, fcntl};
 use nix::sys::memfd::{MFdFlags, memfd_create};
@@ -122,6 +121,29 @@ fn receive_prepare(fd: RawFd) -> (Value, Vec<OwnedFd>) {
         serde_json::from_slice(&buffer[..bytes]).unwrap(),
         descriptors,
     )
+}
+
+fn receive_fresh_cancel(listener: RawFd, prepare: &Value, events: &Arc<Mutex<Vec<String>>>) {
+    let connection = accept(listener).unwrap();
+    let cancel = receive_packet(connection);
+    assert_eq!(cancel["method"], "cancel");
+    assert_eq!(cancel["job_id"], prepare["job_id"]);
+    assert_eq!(cancel["adapter_boot_id"], prepare["adapter_boot_id"]);
+    events.lock().unwrap().push("cancel".to_owned());
+    send_packet(
+        connection,
+        json!({
+            "type": "terminal",
+            "job_id": prepare["job_id"],
+            "init_pid": INIT_PID,
+            "outcome": if cancel["reason"] == "timed_out" {
+                "timed_out"
+            } else {
+                "cancelled"
+            },
+            "artifacts": []
+        }),
+    );
 }
 
 fn run_fake_broker(
@@ -346,14 +368,53 @@ fn run_prestart_failure_broker(
                 }),
             );
         }
-        let abort = receive_packet(connection);
-        assert_eq!(abort["method"], "abort");
-        assert_eq!(abort["job_id"], prepare["job_id"]);
-        events.lock().unwrap().push("abort".to_owned());
+        drop(descriptors);
+        if expects_start {
+            nix::unistd::close(connection).unwrap();
+        }
+        receive_fresh_cancel(listener.as_raw_fd(), &prepare, &events);
+        if !expects_start {
+            nix::unistd::close(connection).unwrap();
+        }
+    })
+}
+
+fn run_unproven_prompt_cleanup_broker(
+    socket_path: PathBuf,
+    events: Arc<Mutex<Vec<String>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(&socket_path).unwrap()).unwrap();
+        listen(&listener, Backlog::new(4).unwrap()).unwrap();
+        let connection = accept(listener.as_raw_fd()).unwrap();
+        let (prepare, descriptors) = receive_prepare(connection);
+        assert_eq!(descriptors.len(), 5);
+        events.lock().unwrap().push("prepare".to_owned());
         send_packet(
             connection,
-            json!({"type": "aborted", "job_id": prepare["job_id"]}),
+            json!({
+                "type": "prepared",
+                "job_id": prepare["job_id"],
+                "init_pid": INIT_PID
+            }),
         );
+        events.lock().unwrap().push("prepared".to_owned());
+
+        let cancellation = accept(listener.as_raw_fd()).unwrap();
+        let cancel = receive_packet(cancellation);
+        assert_eq!(cancel["method"], "cancel");
+        assert_eq!(cancel["job_id"], prepare["job_id"]);
+        assert_eq!(cancel["adapter_boot_id"], prepare["adapter_boot_id"]);
+        events.lock().unwrap().push("cancel_unproven".to_owned());
+        nix::unistd::close(cancellation).unwrap();
+        nix::unistd::close(connection).unwrap();
     })
 }
 
@@ -395,20 +456,17 @@ fn run_lease_failure_broker(
                 }),
             );
             events.lock().unwrap().push("lease_error".to_owned());
-            let abort = receive_packet(connection);
-            assert_eq!(abort["method"], "abort");
-            events.lock().unwrap().push("abort".to_owned());
         } else {
             events.lock().unwrap().push("lease_eof".to_owned());
-            nix::unistd::close(connection).unwrap();
         }
+        nix::unistd::close(connection).unwrap();
+        receive_fresh_cancel(listener.as_raw_fd(), &prepare, &events);
     })
 }
 
 fn run_delayed_prepare_broker(
     socket_path: PathBuf,
     prepared_request_tx: mpsc::Sender<()>,
-    release_rx: mpsc::Receiver<()>,
     events: Arc<Mutex<Vec<String>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -426,23 +484,10 @@ fn run_delayed_prepare_broker(
         assert_eq!(descriptors.len(), 5);
         events.lock().unwrap().push("prepare".to_owned());
         prepared_request_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-        send_packet(
-            connection,
-            json!({
-                "type": "prepared",
-                "job_id": prepare["job_id"],
-                "init_pid": INIT_PID
-            }),
-        );
-        events.lock().unwrap().push("prepared".to_owned());
-        let abort = receive_packet(connection);
-        assert_eq!(abort["method"], "abort");
-        events.lock().unwrap().push("abort".to_owned());
-        send_packet(
-            connection,
-            json!({"type": "aborted", "job_id": prepare["job_id"]}),
-        );
+        let mut packet = [0_u8; 64];
+        assert_eq!(recv(connection, &mut packet, MsgFlags::empty()).unwrap(), 0);
+        nix::unistd::close(connection).unwrap();
+        receive_fresh_cancel(listener.as_raw_fd(), &prepare, &events);
     })
 }
 
@@ -552,6 +597,8 @@ fn run_stalled_start_broker(
         let mut packet = [0_u8; 64];
         assert_eq!(recv(connection, &mut packet, MsgFlags::empty()).unwrap(), 0);
         events.lock().unwrap().push("lease_eof".to_owned());
+        nix::unistd::close(connection).unwrap();
+        receive_fresh_cancel(listener.as_raw_fd(), &prepare, &events);
     })
 }
 
@@ -585,6 +632,8 @@ fn run_prepared_response_fd_broker(
         let mut packet = [0_u8; 64];
         assert_eq!(recv(connection, &mut packet, MsgFlags::empty()).unwrap(), 0);
         events.lock().unwrap().push("lease_eof".to_owned());
+        nix::unistd::close(connection).unwrap();
+        receive_fresh_cancel(listener.as_raw_fd(), &prepare, &events);
     })
 }
 
@@ -996,13 +1045,14 @@ async fn every_prestart_api_or_pid_failure_aborts_and_clears_registry() {
                 api_writer.shutdown().await.unwrap();
             }
         }
-        assert!(handler.await.unwrap().is_err());
+        handler.await.unwrap().unwrap();
+        assert_eq!(read_json_line(&mut api_reader).await["type"], "error");
         broker_thread.join().unwrap();
         assert_eq!(registry.active_count(), 0);
         let expected = if failure.expects_start() {
-            vec!["prepare", "prepared", "start", "abort"]
+            vec!["prepare", "prepared", "start", "cancel"]
         } else {
-            vec!["prepare", "prepared", "abort"]
+            vec!["prepare", "prepared", "cancel"]
         };
         assert_eq!(*events.lock().unwrap(), expected);
         fs::remove_dir_all(root).unwrap();
@@ -1056,15 +1106,18 @@ async fn prepared_lease_eof_or_error_prevents_authorization_and_start() {
             .await
             .unwrap();
         assert_eq!(read_json_line(&mut api_reader).await["type"], "accepted");
-        assert!(handler.await.unwrap().is_err());
+        let error = read_json_line(&mut api_reader).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["category"], "sandbox_unavailable");
+        handler.await.unwrap().unwrap();
         broker_thread.join().unwrap();
         assert_eq!(registry.active_count(), 0);
         assert_eq!(
             *events.lock().unwrap(),
             if send_error {
-                vec!["prepare", "prepared", "lease_error", "abort"]
+                vec!["prepare", "prepared", "lease_error", "cancel"]
             } else {
-                vec!["prepare", "prepared", "lease_eof"]
+                vec!["prepare", "prepared", "lease_eof", "cancel"]
             }
         );
         fs::remove_dir_all(root).unwrap();
@@ -1104,7 +1157,8 @@ async fn callback_credential_failure_aborts_before_accept_or_start() {
     );
     let (api, adapter) = UnixStream::pair().unwrap();
     let handler = tokio::spawn(async move { service.handle_connection(adapter).await });
-    let (_api_reader, mut api_writer) = api.into_split();
+    let (api_reader, mut api_writer) = api.into_split();
+    let mut api_reader = BufReader::new(api_reader);
     api_writer
         .write_all(
             format!(
@@ -1115,13 +1169,15 @@ async fn callback_credential_failure_aborts_before_accept_or_start() {
         )
         .await
         .unwrap();
-    let error = handler.await.unwrap().unwrap_err();
-    assert_eq!(error.category, AdapterErrorCategory::CapabilityDenied);
+    let error = read_json_line(&mut api_reader).await;
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["category"], "capability_denied");
+    handler.await.unwrap().unwrap();
     broker_thread.join().unwrap();
     assert_eq!(registry.active_count(), 0);
     assert_eq!(
         *events.lock().unwrap(),
-        vec!["prepare", "prepared", "abort"]
+        vec!["prepare", "prepared", "cancel"]
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -1194,23 +1250,22 @@ async fn cancellation_before_authorization_aborts_once_and_unblocks_cancel_reque
     let cancelled = read_json_line(&mut cancel_reader).await;
     assert_eq!(cancelled["type"], "result");
     assert_eq!(cancelled["body"]["killed"], true);
-    let prompt_error = prompt_handler.await.unwrap().unwrap_err();
-    assert_eq!(
-        prompt_error.category,
-        firecrawl_browser_execution_adapter::redaction::AdapterErrorCategory::Cancelled
-    );
+    let prompt_error = read_json_line(&mut api_reader).await;
+    assert_eq!(prompt_error["type"], "error");
+    assert_eq!(prompt_error["error"]["category"], "cancelled");
+    prompt_handler.await.unwrap().unwrap();
     cancel_handler.await.unwrap().unwrap();
     broker_thread.join().unwrap();
     assert_eq!(registry.active_count(), 0);
     assert_eq!(
         *events.lock().unwrap(),
-        vec!["prepare", "prepared", "abort"]
+        vec!["prepare", "prepared", "cancel"]
     );
     fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
-async fn cancellation_during_prepare_aborts_once_and_releases_reserved_capacity() {
+async fn unproven_prompt_cleanup_returns_cancel_error_and_fail_stops_prompts() {
     let root = temporary_root();
     let broker_path = root.join("broker.sock");
     let auth_path = root.join("auth.json");
@@ -1218,10 +1273,7 @@ async fn cancellation_during_prepare_aborts_once_and_releases_reserved_capacity(
     write_private(&auth_path, "{}");
     write_private(&token_path, "x".repeat(43));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let (prepare_tx, prepare_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let broker_thread =
-        run_delayed_prepare_broker(broker_path.clone(), prepare_tx, release_rx, events.clone());
+    let broker_thread = run_unproven_prompt_cleanup_broker(broker_path.clone(), events.clone());
     while !broker_path.exists() {
         std::thread::sleep(StdDuration::from_millis(1));
     }
@@ -1243,45 +1295,159 @@ async fn cancellation_during_prepare_aborts_once_and_releases_reserved_capacity(
         synthetic_bundle(),
     );
     let run_id = Uuid::new_v4();
-    let (prompt_api, prompt_adapter) = UnixStream::pair().unwrap();
+    let request_id = Uuid::new_v4();
+    let (api, adapter) = UnixStream::pair().unwrap();
     let prompt_service = service.clone();
     let prompt_handler =
-        tokio::spawn(async move { prompt_service.handle_connection(prompt_adapter).await });
-    let (_prompt_reader, mut prompt_writer) = prompt_api.into_split();
-    prompt_writer
+        tokio::spawn(async move { prompt_service.handle_connection(adapter).await });
+    let (api_reader, mut api_writer) = api.into_split();
+    let mut api_reader = BufReader::new(api_reader);
+    api_writer
+        .write_all(format!("{}\n", prompt_request(request_id, run_id, deadline_iso())).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_json_line(&mut api_reader).await["type"], "accepted");
+
+    let (cancel_api, cancel_adapter) = UnixStream::pair().unwrap();
+    let cancel_service = service.clone();
+    let cancel_handler =
+        tokio::spawn(async move { cancel_service.handle_connection(cancel_adapter).await });
+    let (cancel_reader, mut cancel_writer) = cancel_api.into_split();
+    let mut cancel_reader = BufReader::new(cancel_reader);
+    cancel_writer
         .write_all(
             format!(
                 "{}\n",
-                prompt_request(Uuid::new_v4(), run_id, deadline_iso())
+                json!({
+                    "version": 1,
+                    "requestId": Uuid::new_v4(),
+                    "method": "cancel",
+                    "body": {"runId": run_id, "reason": "api_cancelled"}
+                })
             )
             .as_bytes(),
         )
         .await
         .unwrap();
-    tokio::task::spawn_blocking(move || {
-        prepare_rx.recv_timeout(StdDuration::from_secs(1)).unwrap()
-    })
-    .await
-    .unwrap();
-
-    let mut completion = registry.request_cancel(run_id).unwrap();
-    release_tx.send(()).unwrap();
-
-    assert_eq!(
-        prompt_handler.await.unwrap().unwrap_err().category,
-        AdapterErrorCategory::Cancelled
-    );
-    if !*completion.borrow() {
-        completion.changed().await.unwrap();
-    }
-    assert!(*completion.borrow());
+    let cancel_error = read_json_line(&mut cancel_reader).await;
+    assert_eq!(cancel_error["type"], "error");
+    assert_eq!(cancel_error["error"]["category"], "sandbox_unavailable");
+    cancel_handler.await.unwrap().unwrap();
+    let prompt_error = read_json_line(&mut api_reader).await;
+    assert_eq!(prompt_error["type"], "error");
+    assert_eq!(prompt_error["error"]["category"], "sandbox_unavailable");
+    prompt_handler.await.unwrap().unwrap();
     broker_thread.join().unwrap();
     assert_eq!(registry.active_count(), 0);
     assert_eq!(
         *events.lock().unwrap(),
-        vec!["prepare", "prepared", "abort"]
+        vec!["prepare", "prepared", "cancel_unproven"]
     );
+
+    let (second_api, second_adapter) = UnixStream::pair().unwrap();
+    let second_handler =
+        tokio::spawn(async move { service.handle_connection(second_adapter).await });
+    let (second_reader, mut second_writer) = second_api.into_split();
+    let mut second_reader = BufReader::new(second_reader);
+    second_writer
+        .write_all(
+            format!(
+                "{}\n",
+                prompt_request(Uuid::new_v4(), Uuid::new_v4(), deadline_iso())
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let second_error = read_json_line(&mut second_reader).await;
+    assert_eq!(second_error["type"], "error");
+    assert_eq!(second_error["error"]["category"], "codex_unavailable");
+    second_handler.await.unwrap().unwrap();
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_during_prepare_aborts_once_and_releases_reserved_capacity() {
+    for cancelled in [true, false] {
+        let root = temporary_root();
+        let broker_path = root.join("broker.sock");
+        let auth_path = root.join("auth.json");
+        let token_path = root.join("adapter.token");
+        write_private(&auth_path, "{}");
+        write_private(&token_path, "x".repeat(43));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (prepare_tx, prepare_rx) = mpsc::channel();
+        let broker_thread =
+            run_delayed_prepare_broker(broker_path.clone(), prepare_tx, events.clone());
+        while !broker_path.exists() {
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        let config = AdapterConfig {
+            adapter_socket: root.join("adapter.sock"),
+            broker_socket: broker_path.clone(),
+            callback_url: "http://127.0.0.1:3002".to_owned(),
+            callback_token_file: token_path,
+            codex_auth_file: auth_path,
+            protocol_root: root.join("unused-protocol"),
+            max_prompt_runs: 1,
+            max_code_runs: 2,
+        };
+        let registry = JobRegistry::new(1, 2).unwrap();
+        let service = AdapterService::with_dependencies(
+            config,
+            BrokerClient::new(broker_path).unwrap(),
+            registry.clone(),
+            synthetic_bundle(),
+        );
+        let run_id = Uuid::new_v4();
+        let (prompt_api, prompt_adapter) = UnixStream::pair().unwrap();
+        let prompt_service = service.clone();
+        let prompt_handler =
+            tokio::spawn(async move { prompt_service.handle_connection(prompt_adapter).await });
+        let (prompt_reader, mut prompt_writer) = prompt_api.into_split();
+        let mut prompt_reader = BufReader::new(prompt_reader);
+        prompt_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    prompt_request(
+                        Uuid::new_v4(),
+                        run_id,
+                        deadline_iso_after(if cancelled { 30_000 } else { 100 })
+                    )
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            prepare_rx.recv_timeout(StdDuration::from_secs(1)).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let mut completion = if cancelled {
+            Some(registry.request_cancel(run_id).unwrap())
+        } else {
+            None
+        };
+        let prompt_error = read_json_line(&mut prompt_reader).await;
+        assert_eq!(
+            prompt_error["error"]["category"],
+            if cancelled { "cancelled" } else { "timed_out" }
+        );
+        prompt_handler.await.unwrap().unwrap();
+        if let Some(completion) = completion.as_mut() {
+            if *completion.borrow() == JobCompletion::Pending {
+                completion.changed().await.unwrap();
+            }
+            assert_eq!(*completion.borrow(), JobCompletion::Proven);
+        }
+        broker_thread.join().unwrap();
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(*events.lock().unwrap(), vec!["prepare", "cancel"]);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1449,21 +1615,18 @@ async fn stalled_start_cancel_or_deadline_closes_lease_once() {
         if cancelled {
             registry.request_cancel(run_id).unwrap();
         }
-        let error = handler.await.unwrap().unwrap_err();
+        let error = read_json_line(&mut api_reader).await;
         assert_eq!(
-            error.category,
-            if cancelled {
-                AdapterErrorCategory::Cancelled
-            } else {
-                AdapterErrorCategory::TimedOut
-            }
+            error["error"]["category"],
+            if cancelled { "cancelled" } else { "timed_out" }
         );
+        handler.await.unwrap().unwrap();
         broker_thread.join().unwrap();
         assert_eq!(registry.active_count(), 0);
         assert_eq!(registry.terminal_jobs().len(), 1);
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["prepare", "prepared", "start", "lease_eof"]
+            vec!["prepare", "prepared", "start", "lease_eof", "cancel"]
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1501,7 +1664,8 @@ async fn descriptor_on_prepared_response_is_rejected_before_start() {
     );
     let (api, adapter) = UnixStream::pair().unwrap();
     let handler = tokio::spawn(async move { service.handle_connection(adapter).await });
-    let (_api_reader, mut api_writer) = api.into_split();
+    let (api_reader, mut api_writer) = api.into_split();
+    let mut api_reader = BufReader::new(api_reader);
     api_writer
         .write_all(
             format!(
@@ -1512,15 +1676,15 @@ async fn descriptor_on_prepared_response_is_rejected_before_start() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        handler.await.unwrap().unwrap_err().category,
-        AdapterErrorCategory::SandboxUnavailable
-    );
+    let error = read_json_line(&mut api_reader).await;
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["category"], "sandbox_unavailable");
+    handler.await.unwrap().unwrap();
     broker_thread.join().unwrap();
     assert_eq!(registry.active_count(), 0);
     assert_eq!(
         *events.lock().unwrap(),
-        vec!["prepare", "prepared_with_fd", "lease_eof"]
+        vec!["prepare", "prepared_with_fd", "lease_eof", "cancel"]
     );
     fs::remove_dir_all(root).unwrap();
 }

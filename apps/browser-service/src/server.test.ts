@@ -42,6 +42,7 @@ import {
   createSessionRegistry,
   type SessionRegistry,
 } from "./session-registry.js";
+import { STREAM_LIMITS } from "./streams.js";
 
 const PROCESS_NONCE = Buffer.alloc(32, 1).toString("base64url");
 const GENERATION_NONCE = Buffer.alloc(32, 2).toString("base64url");
@@ -1081,7 +1082,9 @@ describe("private browser server", () => {
     );
     const closed = new Promise<number>((resolve, reject) => {
       client.once("open", () => {
-        client.send(Buffer.alloc(256 * 1024 + 1), { binary: false });
+        client.send(Buffer.alloc(STREAM_LIMITS.cdpFrameBytes + 1), {
+          binary: false,
+        });
       });
       client.once("close", (code) => resolve(code));
       client.once("error", reject);

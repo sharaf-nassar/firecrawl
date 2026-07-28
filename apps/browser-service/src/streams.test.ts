@@ -37,12 +37,26 @@ class FakeSocket extends EventEmitter {
   readonly closes: Array<{ code: number; reason: string }> = [];
   pingCount = 0;
   terminated = false;
+  pauseCount = 0;
+  resumeCount = 0;
+  deferSend = false;
+  private sendCallback?: (error?: Error) => void;
 
   send(data: string | Uint8Array, callback?: (error?: Error) => void): void {
     this.sent.push(
       typeof data === "string" ? data : Buffer.from(data).toString("utf8"),
     );
-    callback?.();
+    if (this.deferSend) {
+      this.sendCallback = callback;
+    } else {
+      callback?.();
+    }
+  }
+
+  flushSend(error?: Error): void {
+    const callback = this.sendCallback;
+    this.sendCallback = undefined;
+    callback?.(error);
   }
 
   close(code = 1000, reason = ""): void {
@@ -57,6 +71,14 @@ class FakeSocket extends EventEmitter {
 
   ping(): void {
     this.pingCount += 1;
+  }
+
+  pause(): void {
+    this.pauseCount += 1;
+  }
+
+  resume(): void {
+    this.resumeCount += 1;
   }
 
   terminate(): void {
@@ -181,8 +203,11 @@ async function settle(): Promise<void> {
 }
 
 test("locks the private stream wire limits", () => {
-  expect(STREAM_LIMITS.cdpFrameBytes).toBe(256 * 1024);
-  expect(STREAM_LIMITS.cdpOutstandingIds).toBe(64);
+  expect(STREAM_LIMITS.cdpFrameBytes).toBe(24 * 1024 * 1024);
+  expect(STREAM_LIMITS.cdpOutstandingIds).toBe(1_024);
+  expect(STREAM_LIMITS.queuedBytes).toBe(32 * 1024 * 1024);
+  expect(STREAM_LIMITS.backpressureBytes).toBe(16 * 1024 * 1024);
+  expect(STREAM_LIMITS.resumeBytes).toBe(8 * 1024 * 1024);
 });
 
 describe("relay grant authority", () => {
@@ -557,6 +582,7 @@ describe("live streams", () => {
     expect(socket.sent.some((value) => value.includes('"kind":"frame"'))).toBe(
       false,
     );
+    expect(socket.pauseCount).toBe(0);
     socket.close();
     await opened;
   });
@@ -887,6 +913,41 @@ describe("live streams", () => {
 });
 
 describe("CDP stream", () => {
+  test("pauses at the high watermark and resumes at the low watermark", async () => {
+    const h = harness();
+    const grant = h.manager.create(IDS[0], grantInput("cdp"));
+    const socket = new FakeSocket();
+    socket.bufferedAmount = STREAM_LIMITS.backpressureBytes - 1;
+    socket.deferSend = true;
+    const opened = h.manager.open(
+      {
+        runtimeSessionId: IDS[0],
+        permission: "cdp",
+        relayToken: grant.relayToken,
+        authority: authority(),
+      },
+      async () => socket as unknown as WebSocket,
+    );
+    await settle();
+    socket.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({ id: 1, method: "Runtime.enable", params: {} }),
+      ),
+      false,
+    );
+    await settle();
+    expect(socket.pauseCount).toBe(1);
+    expect(socket.closes).toEqual([]);
+
+    socket.bufferedAmount = STREAM_LIMITS.resumeBytes;
+    socket.flushSend();
+    await settle();
+    expect(socket.resumeCount).toBe(1);
+    socket.close();
+    await opened;
+  });
+
   test("does not complete upgrade until writer acquisition and enforces policy", async () => {
     let releaseWriter!: () => void;
     const writerGate = new Promise<void>((resolve) => {
@@ -976,7 +1037,7 @@ describe("CDP stream", () => {
     await opened;
   });
 
-  test("caps outstanding IDs at 64 and rejects malformed response values", async () => {
+  test("caps outstanding IDs and rejects malformed response values", async () => {
     let resolveCommands!: (value: unknown) => void;
     const commands = new Promise<unknown>((resolve) => {
       resolveCommands = resolve;
@@ -1351,7 +1412,9 @@ describe("real ws no-server upgrade boundary", () => {
   test("uses maxPayload to reject an oversized inbound frame before dispatch", async () => {
     const real = await realUpgradeHarness();
     try {
-      expect(real.wss.options.maxPayload).toBe(256 * 1024);
+      expect(real.wss.options.maxPayload).toBe(
+        STREAM_LIMITS.cdpFrameBytes,
+      );
       const closed = new Promise<number>((resolve) => {
         real.client.once("close", code => resolve(code));
       });

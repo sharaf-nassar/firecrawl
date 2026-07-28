@@ -7,7 +7,7 @@ use nix::fcntl::{FcntlArg, OFlag, SealFlag, fcntl};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::sys::socket::{
     AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, Shutdown, SockFlag, SockType,
-    UnixAddr, connect, recv, recvmsg, sendmsg, setsockopt, shutdown, socket, sockopt,
+    UnixAddr, connect, recv, recvmsg, sendmsg, setsockopt, shutdown, socket, socketpair, sockopt,
 };
 use nix::sys::time::{TimeVal, TimeValLike};
 use nix::unistd::{Whence, dup, lseek, pipe2, write};
@@ -93,8 +93,26 @@ pub struct PreparedCodex {
     pub stdin: Option<Sender>,
     pub stdout: Option<Receiver>,
     pub stderr: Option<Receiver>,
+    pub relay: Option<OwnedFd>,
     pub(crate) control: Option<OwnedFd>,
     pub(crate) started: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeBundle {
+    Node,
+    Python,
+    Bash,
+}
+
+impl CodeBundle {
+    const fn bundle_id(self) -> BundleId {
+        match self {
+            Self::Node => BundleId::CodeNodeV1,
+            Self::Python => BundleId::CodePythonV1,
+            Self::Bash => BundleId::CodeBashV1,
+        }
+    }
 }
 
 pub struct PreparedLeaseMonitor {
@@ -103,6 +121,10 @@ pub struct PreparedLeaseMonitor {
 }
 
 pub struct PreparedStartInterrupter {
+    fd: OwnedFd,
+}
+
+pub(crate) struct PreparedPrepareInterrupter {
     fd: OwnedFd,
 }
 
@@ -141,6 +163,17 @@ enum BundleId {
     CodeNodeV1,
     CodePythonV1,
     CodeBashV1,
+}
+
+impl BundleId {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexV1 => "codex-v1",
+            Self::CodeNodeV1 => "code-node-v1",
+            Self::CodePythonV1 => "code-python-v1",
+            Self::CodeBashV1 => "code-bash-v1",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -295,6 +328,26 @@ impl BrokerClient {
         {
             return Err(AdapterError::sandbox_unavailable());
         }
+        let (control, _interrupter) = self.prepare_control()?;
+        self.prepare_codex_on(
+            control,
+            job_id,
+            adapter_boot_id,
+            correlation_id,
+            deadline_unix_ms,
+            auth_file,
+        )
+    }
+
+    pub(crate) fn prepare_codex_on(
+        &self,
+        control: OwnedFd,
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        correlation_id: Uuid,
+        deadline_unix_ms: u64,
+        auth_file: &Path,
+    ) -> Result<PreparedCodex, AdapterError> {
         let auth = read_private_file(auth_file, MAX_AUTH_BYTES)
             .map_err(|_| AdapterError::codex_unavailable())?;
         parse_json_strict::<serde_json::Value>(&auth)
@@ -323,7 +376,6 @@ impl BrokerClient {
                 _ => Err(AdapterError::sandbox_unavailable()),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let control = self.connect()?;
         self.send_request(
             &control,
             &BrokerRequest::Prepare {
@@ -359,6 +411,130 @@ impl BrokerClient {
             stdin: Some(stdin),
             stdout: Some(stdout),
             stderr: Some(stderr),
+            relay: None,
+            control: Some(control),
+            started: false,
+        })
+    }
+
+    pub fn prepare_code(
+        &self,
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        correlation_id: Uuid,
+        deadline_unix_ms: u64,
+        bundle: CodeBundle,
+        source: &[u8],
+    ) -> Result<PreparedCodex, AdapterError> {
+        if job_id.is_nil()
+            || adapter_boot_id.is_nil()
+            || correlation_id.is_nil()
+            || deadline_unix_ms == 0
+            || source.len() > 100_000
+            || std::str::from_utf8(source).is_err()
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let (control, _interrupter) = self.prepare_control()?;
+        self.prepare_code_on(
+            control,
+            job_id,
+            adapter_boot_id,
+            correlation_id,
+            deadline_unix_ms,
+            bundle,
+            source,
+        )
+    }
+
+    pub(crate) fn prepare_control(
+        &self,
+    ) -> Result<(OwnedFd, PreparedPrepareInterrupter), AdapterError> {
+        let control = self.connect()?;
+        let duplicate = dup(&control).map_err(|_| AdapterError::sandbox_unavailable())?;
+        Ok((control, PreparedPrepareInterrupter { fd: duplicate }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_code_on(
+        &self,
+        control: OwnedFd,
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        correlation_id: Uuid,
+        deadline_unix_ms: u64,
+        bundle: CodeBundle,
+        source: &[u8],
+    ) -> Result<PreparedCodex, AdapterError> {
+        if job_id.is_nil()
+            || adapter_boot_id.is_nil()
+            || correlation_id.is_nil()
+            || deadline_unix_ms == 0
+            || source.len() > 100_000
+            || std::str::from_utf8(source).is_err()
+        {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let input_fd = sealed_memfd("firecrawl-code-input", source)?;
+        lseek(&input_fd, 0, Whence::SeekSet).map_err(|_| AdapterError::sandbox_unavailable())?;
+        let (adapter_stdout, child_stdout) =
+            pipe2(OFlag::O_CLOEXEC).map_err(|_| AdapterError::sandbox_unavailable())?;
+        let (adapter_stderr, child_stderr) =
+            pipe2(OFlag::O_CLOEXEC).map_err(|_| AdapterError::sandbox_unavailable())?;
+        let (child_relay, adapter_relay) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .map_err(|_| AdapterError::sandbox_unavailable())?;
+        let bundle_id = bundle.bundle_id();
+        let roles = descriptor_roles(bundle_id.as_str())?;
+        if roles != ["input", "stdout", "stderr", "relay"] {
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        let descriptors = [
+            input_fd.as_raw_fd(),
+            child_stdout.as_raw_fd(),
+            child_stderr.as_raw_fd(),
+            child_relay.as_raw_fd(),
+        ];
+        self.send_request(
+            &control,
+            &BrokerRequest::Prepare {
+                job_id,
+                adapter_boot_id,
+                correlation_id,
+                bundle_id,
+                deadline_unix_ms,
+            },
+            &descriptors,
+        )?;
+        let response = self.receive_response(&control)?;
+        let (returned_job_id, init_pid) = match response {
+            BrokerResponse::Prepared { job_id, init_pid } => (job_id, init_pid),
+            _ => {
+                self.abort_invalid_prepare(&control, job_id);
+                return Err(AdapterError::sandbox_unavailable());
+            }
+        };
+        if returned_job_id != job_id || init_pid == 0 {
+            self.abort_invalid_prepare(&control, job_id);
+            return Err(AdapterError::sandbox_unavailable());
+        }
+        Ok(PreparedCodex {
+            job_id,
+            init_pid,
+            stdin: None,
+            stdout: Some(
+                Receiver::from_owned_fd(adapter_stdout)
+                    .map_err(|_| AdapterError::sandbox_unavailable())?,
+            ),
+            stderr: Some(
+                Receiver::from_owned_fd(adapter_stderr)
+                    .map_err(|_| AdapterError::sandbox_unavailable())?,
+            ),
+            relay: Some(adapter_relay),
             control: Some(control),
             started: false,
         })
@@ -522,6 +698,61 @@ impl BrokerClient {
     pub fn cancel_owner(&self, adapter_boot_id: Uuid) -> Result<(), AdapterError> {
         match self.exchange_one_shot(&BrokerRequest::CancelOwner { adapter_boot_id })? {
             BrokerResponse::OwnerCancelled => Ok(()),
+            _ => Err(AdapterError::sandbox_unavailable()),
+        }
+    }
+
+    pub fn cancel_ambiguous_start(
+        &self,
+        job_id: Uuid,
+        init_pid: u32,
+        adapter_boot_id: Uuid,
+        reason: BrokerCancelReason,
+    ) -> Result<(), AdapterError> {
+        self.cancel_job_confirmed(job_id, Some(init_pid), adapter_boot_id, reason)
+    }
+
+    pub fn cancel_ambiguous_prepare(
+        &self,
+        job_id: Uuid,
+        adapter_boot_id: Uuid,
+        reason: BrokerCancelReason,
+    ) -> Result<(), AdapterError> {
+        self.cancel_job_confirmed(job_id, None, adapter_boot_id, reason)
+    }
+
+    fn cancel_job_confirmed(
+        &self,
+        job_id: Uuid,
+        expected_init_pid: Option<u32>,
+        adapter_boot_id: Uuid,
+        reason: BrokerCancelReason,
+    ) -> Result<(), AdapterError> {
+        match self.exchange_one_shot(&BrokerRequest::Cancel {
+            job_id,
+            adapter_boot_id,
+            reason,
+        })? {
+            BrokerResponse::Terminal {
+                job_id: returned_job_id,
+                init_pid: returned_init_pid,
+                outcome,
+                artifacts,
+            } if returned_job_id == job_id
+                && returned_init_pid > 0
+                && expected_init_pid.is_none_or(|expected| returned_init_pid == expected)
+                && artifacts.is_empty()
+                && (terminal_outcome_allowed_for_reason(reason, outcome)
+                    || (!matches!(reason, BrokerCancelReason::Shutdown)
+                        && matches!(
+                            outcome,
+                            BrokerTerminalOutcome::Cancelled
+                                | BrokerTerminalOutcome::TimedOut
+                                | BrokerTerminalOutcome::Failed
+                        ))) =>
+            {
+                Ok(())
+            }
             _ => Err(AdapterError::sandbox_unavailable()),
         }
     }
@@ -878,6 +1109,13 @@ impl PreparedLeaseMonitor {
 }
 
 impl PreparedStartInterrupter {
+    pub fn interrupt(self) -> Result<(), AdapterError> {
+        shutdown(self.fd.as_raw_fd(), Shutdown::Both)
+            .map_err(|_| AdapterError::sandbox_unavailable())
+    }
+}
+
+impl PreparedPrepareInterrupter {
     pub fn interrupt(self) -> Result<(), AdapterError> {
         shutdown(self.fd.as_raw_fd(), Shutdown::Both)
             .map_err(|_| AdapterError::sandbox_unavailable())

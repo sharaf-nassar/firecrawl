@@ -1,6 +1,7 @@
 pub mod action_client;
 pub mod app_server;
 pub mod broker_client;
+pub mod code_relay;
 pub mod config;
 pub mod decision;
 pub mod jobs;

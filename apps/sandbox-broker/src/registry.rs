@@ -506,8 +506,10 @@ struct JobState {
 #[derive(Clone, Debug)]
 struct TerminalRecord {
     uid: u32,
+    adapter_boot_id: Uuid,
     correlation_id: Uuid,
     job_id: Uuid,
+    outcome: Outcome,
     diagnostic: Diagnostic,
 }
 
@@ -854,6 +856,66 @@ impl<R: Runc> BrokerRuntime<R> {
             job_id: job.owner.job_id,
             init_pid,
             outcome,
+            artifacts: Vec::new(),
+        })
+    }
+
+    pub fn cancel_key(
+        &self,
+        uid: u32,
+        adapter_boot_id: Uuid,
+        job_id: Uuid,
+        reason: CancelReason,
+    ) -> BrokerResult<BrokerResponse> {
+        let key = OwnerKey {
+            uid,
+            adapter_boot_id,
+            job_id,
+        };
+        let job = lock(&self.jobs)?.get(&key).cloned();
+        if let Some(job) = job {
+            {
+                let mut state = lock(&job.state)?;
+                if state.phase != Phase::Terminal {
+                    state.cancellation_reason = Some(reason);
+                    state.control_lease_connected = false;
+                    job.cancelled.store(true, Ordering::Release);
+                }
+            }
+            let operation = lock(&job.operation)?;
+            let outcome = cancellation_outcome(&job);
+            let init_pid = lock(&job.identity)?.as_ref().map(ProcessIdentity::pid);
+            if let Some(init_pid) = init_pid {
+                self.cleanup(&job, outcome)?;
+                return Ok(BrokerResponse::Terminal {
+                    job_id,
+                    init_pid,
+                    outcome,
+                    artifacts: Vec::new(),
+                });
+            }
+            drop(operation);
+        }
+        let terminal = lock(&self.terminal)?;
+        let record = terminal
+            .iter()
+            .rev()
+            .find(|record| {
+                record.uid == uid
+                    && record.adapter_boot_id == adapter_boot_id
+                    && record.job_id == job_id
+            })
+            .ok_or_else(|| BrokerError::new(ErrorCategory::Conflict))?;
+        if record.diagnostic.cleanup_failure {
+            return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+        }
+        Ok(BrokerResponse::Terminal {
+            job_id,
+            init_pid: record
+                .diagnostic
+                .init_pid
+                .ok_or_else(|| BrokerError::new(ErrorCategory::CleanupFailed))?,
+            outcome: record.outcome,
             artifacts: Vec::new(),
         })
     }
@@ -1217,8 +1279,10 @@ impl<R: Runc> BrokerRuntime<R> {
         let mut terminal = lock(&self.terminal)?;
         terminal.push_back(TerminalRecord {
             uid: job.owner.uid,
+            adapter_boot_id: job.owner.adapter_boot_id,
             correlation_id: job.correlation_id,
             job_id: job.owner.job_id,
+            outcome,
             diagnostic,
         });
         while terminal.len() > TERMINAL_RECORD_LIMIT {
@@ -1228,7 +1292,6 @@ impl<R: Runc> BrokerRuntime<R> {
             self.healthy.store(false, Ordering::Release);
             return Err(BrokerError::new(ErrorCategory::CleanupFailed));
         }
-        let _ = outcome;
         Ok(())
     }
 

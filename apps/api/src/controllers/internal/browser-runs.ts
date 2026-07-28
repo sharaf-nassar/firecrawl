@@ -30,15 +30,23 @@ import {
   readBrowserArtifactBody,
 } from "../../lib/browser-runtime/artifacts";
 import type { BrowserStartupGate } from "../../lib/browser-runtime/startup-gate";
-import type { BrowserStateMutationLease } from "../../lib/browser-runtime/startup-gate";
+import type {
+  BrowserStartupBinding,
+  BrowserStateMutationLease,
+} from "../../lib/browser-runtime/startup-gate";
+import {
+  BROWSER_RELAY_LIMITS,
+  BROWSER_RELAY_READY_FRAME,
+} from "../../lib/browser-runtime/relay-limits";
 import { canonicalUuidSchema } from "../../lib/scrape-interact/browser-service-contracts";
 import type { BrowserServiceClient } from "../../lib/scrape-interact/browser-service-client";
 
 const MAX_OBSERVATION_BYTES = 64 * 1024;
-const MAX_RELAY_FRAME_BYTES = 256 * 1024;
-const MAX_RELAY_BUFFERED_BYTES = 256 * 1024;
+export { BROWSER_RELAY_LIMITS } from "../../lib/browser-runtime/relay-limits";
+export { BROWSER_RELAY_READY_FRAME } from "../../lib/browser-runtime/relay-limits";
 const RELAY_CLEANUP_TIMEOUT_MS = 5_000;
 const RELAY_RELEASE_TIMEOUT_MS = 16_000;
+const RELAY_RELEASE_PROOF_TTL_MS = 60_000;
 const PROCESS_ID = /^[1-9][0-9]*$/;
 
 type InternalBrowserRuntime = {
@@ -130,7 +138,87 @@ function relayFrameBytes(data: unknown): number {
   if (Array.isArray(data)) {
     return data.reduce((total, item) => total + relayFrameBytes(item), 0);
   }
-  return MAX_RELAY_FRAME_BYTES + 1;
+  return BROWSER_RELAY_LIMITS.frameBytes + 1;
+}
+
+function relayFrameText(data: unknown): string | null {
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data).toString("utf8");
+  }
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString(
+      "utf8",
+    );
+  }
+  if (Array.isArray(data) && data.every(Buffer.isBuffer)) {
+    return Buffer.concat(data).toString("utf8");
+  }
+  return null;
+}
+
+function parseRelayObject(data: unknown): Record<string, unknown> | null {
+  const text = relayFrameText(data);
+  if (text === null) return null;
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function createRelayIdTracker() {
+  const outstanding = new Set<number>();
+  return Object.freeze({
+    acceptRequest(data: unknown, isBinary: boolean): boolean {
+      if (isBinary) return false;
+      const request = parseRelayObject(data);
+      const id = request?.id;
+      if (
+        !Number.isSafeInteger(id) ||
+        Number(id) <= 0 ||
+        typeof request?.method !== "string" ||
+        request.method.length === 0 ||
+        Object.hasOwn(request, "result") ||
+        Object.hasOwn(request, "error") ||
+        outstanding.has(Number(id)) ||
+        outstanding.size >= BROWSER_RELAY_LIMITS.outstandingIds
+      ) {
+        return false;
+      }
+      outstanding.add(Number(id));
+      return true;
+    },
+    acceptResponse(data: unknown, isBinary: boolean): boolean {
+      if (isBinary) return false;
+      const response = parseRelayObject(data);
+      if (response === null) return false;
+      if (!Object.hasOwn(response, "id")) {
+        return (
+          typeof response.method === "string" &&
+          response.method.length > 0 &&
+          !Object.hasOwn(response, "result") &&
+          !Object.hasOwn(response, "error")
+        );
+      }
+      const id = response.id;
+      if (
+        !Number.isSafeInteger(id) ||
+        Number(id) <= 0 ||
+        Object.hasOwn(response, "method") ||
+        Object.hasOwn(response, "result") ===
+          Object.hasOwn(response, "error") ||
+        !outstanding.delete(Number(id))
+      ) {
+        return false;
+      }
+      return true;
+    },
+  });
 }
 
 function closeSocket(socket: WebSocket, code: number, reason: string): void {
@@ -140,6 +228,32 @@ function closeSocket(socket: WebSocket, code: number, reason: string): void {
   ) {
     socket.close(code, reason);
   }
+}
+
+async function sendRelayReady(socket: WebSocket): Promise<void> {
+  if (
+    socket.readyState !== socket.OPEN ||
+    Buffer.byteLength(BROWSER_RELAY_READY_FRAME, "utf8") >
+      BROWSER_RELAY_LIMITS.frameBytes ||
+    socket.bufferedAmount >
+      BROWSER_RELAY_LIMITS.queueBytes -
+        Buffer.byteLength(BROWSER_RELAY_READY_FRAME, "utf8")
+  ) {
+    throw new Error("Browser relay downstream is unavailable");
+  }
+  await new Promise<void>((resolve, reject) => {
+    try {
+      socket.send(BROWSER_RELAY_READY_FRAME, error => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
 }
 
 async function closeRelaySocket(socket: WebSocket): Promise<void> {
@@ -160,34 +274,55 @@ async function closeRelaySocket(socket: WebSocket): Promise<void> {
 }
 
 function sendBounded(
+  source: WebSocket,
   destination: WebSocket,
   data: unknown,
   onOverflow: () => void,
-): void {
+): boolean {
+  const frameBytes = relayFrameBytes(data);
   if (
-    relayFrameBytes(data) > MAX_RELAY_FRAME_BYTES ||
-    destination.bufferedAmount > MAX_RELAY_BUFFERED_BYTES
+    frameBytes > BROWSER_RELAY_LIMITS.frameBytes ||
+    destination.bufferedAmount > BROWSER_RELAY_LIMITS.queueBytes - frameBytes
   ) {
     onOverflow();
-    return;
+    return false;
   }
-  if (destination.readyState !== destination.OPEN) return;
+  if (destination.readyState !== destination.OPEN) return false;
+  const sourceTransport = (
+    source as WebSocket & {
+      _socket?: { pause(): void; resume(): void };
+    }
+  )._socket;
+  if (
+    destination.bufferedAmount + frameBytes >=
+    BROWSER_RELAY_LIMITS.pauseBytes
+  ) {
+    sourceTransport?.pause();
+  }
   try {
     destination.send(data as never, error => {
       if (
+        error === undefined &&
+        destination.bufferedAmount <= BROWSER_RELAY_LIMITS.resumeBytes
+      ) {
+        sourceTransport?.resume();
+      }
+      if (
         error !== undefined ||
-        destination.bufferedAmount > MAX_RELAY_BUFFERED_BYTES
+        destination.bufferedAmount > BROWSER_RELAY_LIMITS.queueBytes
       ) {
         onOverflow();
       }
     });
   } catch {
     onOverflow();
-    return;
+    return false;
   }
-  if (destination.bufferedAmount > MAX_RELAY_BUFFERED_BYTES) {
+  if (destination.bufferedAmount > BROWSER_RELAY_LIMITS.queueBytes) {
     onOverflow();
+    return false;
   }
+  return true;
 }
 
 function sanitizedError(
@@ -320,6 +455,87 @@ export function createBrowserRunsInternalRouter(
   deps: InternalBrowserRunsDependencies,
 ) {
   const router = express.Router();
+  type RelayGeneration = Pick<
+    BrowserStartupBinding,
+    | "apiInstanceId"
+    | "databaseControlEpoch"
+    | "processNonce"
+    | "controlGenerationNonce"
+  >;
+  type RelayReleaseRecord = {
+    readonly runId: string;
+    readonly runtimeSessionId: string;
+    readonly grantId: string;
+    readonly adapter: AdapterHeaders;
+    readonly generation: RelayGeneration;
+    readonly completion: Promise<boolean>;
+    complete(released: boolean): void;
+    settled: boolean;
+  };
+  const relayReleases = new Map<string, RelayReleaseRecord>();
+  const relayIdentityKey = (runId: string, adapter: AdapterHeaders) =>
+    [
+      runId,
+      adapter.adapterJobId,
+      adapter.adapterSupervisorId,
+      adapter.adapterProcessId,
+    ].join(":");
+  const sameGeneration = (
+    left: RelayGeneration,
+    right: BrowserStartupBinding,
+  ) =>
+    left.apiInstanceId === right.apiInstanceId &&
+    left.databaseControlEpoch === right.databaseControlEpoch &&
+    left.processNonce === right.processNonce &&
+    left.controlGenerationNonce === right.controlGenerationNonce;
+  const beginRelayRelease = (
+    authority: ActiveBrowserRunAuthority,
+    adapter: AdapterHeaders,
+    grantId: string,
+    generation: BrowserStartupBinding,
+  ) => {
+    const key = relayIdentityKey(authority.runId, adapter);
+    if (relayReleases.has(key)) return null;
+    let resolve!: (released: boolean) => void;
+    let pendingTimer: NodeJS.Timeout | undefined;
+    const record: RelayReleaseRecord = {
+      runId: authority.runId,
+      runtimeSessionId: authority.runtimeSessionId,
+      grantId,
+      adapter: Object.freeze({ ...adapter }),
+      generation: Object.freeze({
+        apiInstanceId: generation.apiInstanceId,
+        databaseControlEpoch: generation.databaseControlEpoch,
+        processNonce: generation.processNonce,
+        controlGenerationNonce: generation.controlGenerationNonce,
+      }),
+      completion: new Promise<boolean>(settle => {
+        resolve = settle;
+      }),
+      complete(released: boolean) {
+        if (record.settled) return;
+        record.settled = true;
+        if (pendingTimer !== undefined) clearTimeout(pendingTimer);
+        resolve(released);
+        const settledTimer = setTimeout(() => {
+          if (relayReleases.get(key) === record) relayReleases.delete(key);
+        }, RELAY_RELEASE_PROOF_TTL_MS);
+        settledTimer.unref?.();
+      },
+      settled: false,
+    };
+    relayReleases.set(key, record);
+    const pendingExpiryMs = Math.max(
+      1,
+      authority.deadline.getTime() -
+        now().getTime() +
+        RELAY_CLEANUP_TIMEOUT_MS +
+        RELAY_RELEASE_TIMEOUT_MS,
+    );
+    pendingTimer = setTimeout(() => record.complete(false), pendingExpiryMs);
+    pendingTimer.unref?.();
+    return record;
+  };
   const readToken =
     deps.readAdapterToken ?? (() => defaultReadToken(deps.adapterTokenFile));
   const getAuthority = deps.getAuthority ?? getActiveBrowserRunAuthority;
@@ -553,6 +769,67 @@ export function createBrowserRunsInternalRouter(
     },
   );
 
+  router.post(
+    "/internal/browser-runs/:runId/cdp/released",
+    async (request, response) => {
+      const runtime = deps.getRuntime();
+      const authority = authorityByRequest.get(request);
+      const headers = headersByRequest.get(request);
+      if (!runtime || !authority || !headers) {
+        sanitizedError(
+          response,
+          503,
+          "browser_state_unavailable",
+          "Browser state is unavailable",
+        );
+        return;
+      }
+      const release = relayReleases.get(
+        relayIdentityKey(authority.runId, headers),
+      );
+      let currentGeneration: BrowserStartupBinding;
+      try {
+        currentGeneration = runtime.gate.assertOpen();
+      } catch {
+        sanitizedError(
+          response,
+          503,
+          "browser_state_unavailable",
+          "Browser state is unavailable",
+        );
+        return;
+      }
+      if (
+        !release ||
+        release.runId !== authority.runId ||
+        release.runtimeSessionId !== authority.runtimeSessionId ||
+        release.adapter.adapterJobId !== headers.adapterJobId ||
+        release.adapter.adapterSupervisorId !== headers.adapterSupervisorId ||
+        release.adapter.adapterProcessId !== headers.adapterProcessId ||
+        !sameGeneration(release.generation, currentGeneration)
+      ) {
+        sanitizedError(
+          response,
+          409,
+          "adapter_protocol_error",
+          "Browser relay release is unavailable",
+        );
+        return;
+      }
+      const released = await release.completion;
+      if (!released) {
+        sanitizedError(
+          response,
+          503,
+          "browser_unavailable",
+          "Browser relay writer release failed",
+        );
+        return;
+      }
+      response.status(204).end();
+    },
+  );
+
   router.ws(
     "/internal/browser-runs/:runId/cdp",
     async (downstream: WebSocket, request: Request) => {
@@ -570,15 +847,38 @@ export function createBrowserRunsInternalRouter(
         return;
       }
       const { runtime, authority, headers } = authenticated;
+      let openingGeneration: BrowserStartupBinding;
+      try {
+        openingGeneration = runtime.gate.assertOpen();
+      } catch {
+        downstream.close(1011, "browser_unavailable");
+        return;
+      }
+      const grantId = randomUUID();
+      const relayRelease = beginRelayRelease(
+        authority,
+        headers,
+        grantId,
+        openingGeneration,
+      );
+      if (!relayRelease) {
+        downstream.close(1008, "relay_already_open");
+        return;
+      }
       const controller = new AbortController();
       downstream.once("close", () => controller.abort());
-      const grantId = randomUUID();
       let upstream: WebSocket | undefined;
       let grantCleanupOwed = false;
       try {
         upstream = await runtime.gate.withBrowserStateMutationLease(
           "filesystem_and_database",
           async lease => {
+            if (!sameGeneration(relayRelease.generation, lease.binding)) {
+              throw Object.assign(
+                new Error("Browser relay generation changed before setup"),
+                { category: "browser_state_unavailable" },
+              );
+            }
             if (deps.redeemCdpWithLease) {
               await deps.redeemCdpWithLease(runtime, lease, authority, headers);
             } else {
@@ -631,11 +931,12 @@ export function createBrowserRunsInternalRouter(
                   { category: "browser_state_unavailable" },
                 );
               }
-              return await runtime.browserClient.openCdpStream(
+              upstream = await runtime.browserClient.openCdpStream(
                 authority.runtimeSessionId,
                 grant.relayToken,
                 context,
               );
+              return upstream;
             } catch (error) {
               const revokeDeadline = new Date(
                 Math.min(
@@ -679,6 +980,14 @@ export function createBrowserRunsInternalRouter(
               await runtime.gate.withBrowserStateMutationLease(
                 "filesystem_and_database",
                 async lease => {
+                  if (!sameGeneration(relayRelease.generation, lease.binding)) {
+                    throw Object.assign(
+                      new Error(
+                        "Browser relay generation changed before cleanup",
+                      ),
+                      { category: "browser_state_unavailable" },
+                    );
+                  }
                   const deadline = new Date(
                     Math.min(
                       authority.deadline.getTime(),
@@ -713,18 +1022,43 @@ export function createBrowserRunsInternalRouter(
             } catch {
               // An already-closed gate is already fail closed.
             }
+            relayRelease.complete(false);
+            return;
           }
+          relayRelease.complete(true);
         };
+        const ids = createRelayIdTracker();
         const overflow = () => {
           closeSocket(downstream, 1009, "relay_overflow");
           closeSocket(connected, 1009, "relay_overflow");
           void finalize();
         };
-        connected.on("message", data => {
-          sendBounded(downstream, data, overflow);
+        const protocolError = () => {
+          closeSocket(downstream, 1008, "relay_protocol_error");
+          closeSocket(connected, 1008, "relay_protocol_error");
+          void finalize();
+        };
+        connected.on("message", (data, isBinary) => {
+          if (relayFrameBytes(data) > BROWSER_RELAY_LIMITS.frameBytes) {
+            overflow();
+            return;
+          }
+          if (!ids.acceptResponse(data, isBinary)) {
+            protocolError();
+            return;
+          }
+          sendBounded(connected, downstream, data, overflow);
         });
-        downstream.on("message", data => {
-          sendBounded(connected, data, overflow);
+        downstream.on("message", (data, isBinary) => {
+          if (relayFrameBytes(data) > BROWSER_RELAY_LIMITS.frameBytes) {
+            overflow();
+            return;
+          }
+          if (!ids.acceptRequest(data, isBinary)) {
+            protocolError();
+            return;
+          }
+          sendBounded(downstream, connected, data, overflow);
         });
         connected.once("error", () => {
           closeSocket(downstream, 1011, "browser_unavailable");
@@ -751,16 +1085,28 @@ export function createBrowserRunsInternalRouter(
           clearTimeout(lifetimeTimer);
           void finalize();
         });
+        try {
+          await sendRelayReady(downstream);
+        } catch {
+          closeSocket(downstream, 1011, "browser_unavailable");
+          await finalize();
+        }
       } catch {
+        let released = !grantCleanupOwed;
         if (upstream) {
           await closeRelaySocket(upstream).catch(() => {
-            try {
-              runtime.gate.close("cdp_relay_cleanup_failed");
-            } catch {
-              // Already closed.
-            }
+            released = false;
           });
         }
+        if (grantCleanupOwed || !released) {
+          released = false;
+          try {
+            runtime.gate.close("cdp_relay_cleanup_failed");
+          } catch {
+            // An already-closed gate is already fail closed.
+          }
+        }
+        relayRelease.complete(released);
         downstream.close(1011, "browser_unavailable");
       }
     },

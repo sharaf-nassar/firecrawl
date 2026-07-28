@@ -80,6 +80,7 @@ import {
 } from "./services/worker/nuq-router";
 import { startBrowserBillingOutboxWorker } from "./services/browser-billing-outbox";
 import { startBrowserAdmissionCleanupWorker } from "./services/browser-admission-cleanup";
+import { BROWSER_RELAY_WS_OPTIONS } from "./lib/browser-runtime/relay-limits";
 
 type LocalBrowserRuntime = {
   pool: Pool;
@@ -113,7 +114,7 @@ cacheableLookup.install(https.globalAgent);
 // Initialize Express with WebSocket support
 const expressApp = express();
 const ws = expressWs(expressApp, undefined, {
-  wsOptions: { maxPayload: 256 * 1024 },
+  wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
 });
 const app = ws.app;
 
