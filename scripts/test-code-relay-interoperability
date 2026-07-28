@@ -4,9 +4,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -245,6 +247,158 @@ racer.unref();
 return saved;
 `;
 
+const NONZERO_USER_SOURCE = String.raw`
+const png = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]),
+  Buffer.from("supervisor-owned"),
+]);
+await saveArtifact(png);
+throw new Error("fixture_nonzero");
+`;
+
+const SYNTAX_ERROR_USER_SOURCE = "return (\n";
+
+const TIMEOUT_USER_SOURCE = String.raw`
+const png = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]),
+  Buffer.from("supervisor-owned"),
+]);
+await saveArtifact(png);
+await new Promise(() => {});
+`;
+
+const STDOUT_BOMB_USER_SOURCE = String.raw`
+const png = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]),
+  Buffer.from("supervisor-owned"),
+]);
+await saveArtifact(png);
+process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 0x78));
+`;
+
+const STDERR_BOMB_USER_SOURCE = String.raw`
+const png = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]),
+  Buffer.from("supervisor-owned"),
+]);
+await saveArtifact(png);
+process.stderr.write(Buffer.alloc(2 * 1024 * 1024, 0x79));
+`;
+
+const FAST_SUCCESS_USER_SOURCE = "process.exit(0);\n";
+
+const FAST_EXIT_USER_SOURCE = String.raw`
+const childProcess = await import("node:child_process");
+const child = childProcess.spawn(
+  "/usr/local/bin/node",
+  [
+    "-e",
+    "process.on('SIGTERM',()=>{" +
+      "process.stdout.write(Buffer.alloc(2*1024*1024,0x7a));" +
+      "setTimeout(()=>process.exit(0),50)" +
+    "});process.send('ready');setInterval(()=>{},1000)",
+  ],
+  { stdio: ["ignore", "inherit", "inherit", "ipc"] },
+);
+await new Promise((resolve, reject) => {
+  const timer = setTimeout(
+    () => reject(new Error("late_stream_child_start_timeout")),
+    2_000,
+  );
+  child.once("message", () => {
+    clearTimeout(timer);
+    resolve();
+  });
+});
+child.unref();
+process.exit(0);
+`;
+
+const HOST_BOUNDARY_USER_SOURCE = String.raw`
+const assert = await import("node:assert/strict");
+const dns = await import("node:dns/promises");
+const fs = await import("node:fs/promises");
+const net = await import("node:net");
+
+await assert.rejects(
+  fs.access("/home", fs.constants.R_OK | fs.constants.X_OK),
+  error => error?.code === "EACCES",
+  "host_home_accessible",
+);
+await assert.rejects(
+  fs.access("/root", fs.constants.R_OK | fs.constants.X_OK),
+  error => error?.code === "EACCES",
+  "host_root_accessible",
+);
+await assert.rejects(
+  fs.access("/var/run/docker.sock", fs.constants.R_OK | fs.constants.W_OK),
+  error => error?.code === "EACCES",
+  "docker_socket_accessible",
+);
+const initCommand = await fs.readFile("/proc/1/cmdline", "utf8");
+assert.match(initCommand, /job-init\.py/, "host_process_namespace_visible");
+await assert.rejects(
+  fs.stat("/proc/__HOST_SCRIPT_PID__"),
+  error => error?.code === "ENOENT",
+  "host_process_visible",
+);
+await assert.rejects(
+  dns.lookup("example.com"),
+  error => ["EAI_AGAIN", "ENOTFOUND"].includes(error?.code),
+  "external_dns_available",
+);
+await new Promise((resolve, reject) => {
+  const socket = net.createConnection({ host: "1.1.1.1", port: 443 });
+  const timer = setTimeout(() => {
+    socket.destroy();
+    reject(new Error("external_network_timeout"));
+  }, 2_000);
+  socket.once("connect", () => {
+    clearTimeout(timer);
+    socket.destroy();
+    reject(new Error("external_network_available"));
+  });
+  socket.once("error", error => {
+    clearTimeout(timer);
+    if (!["ENETUNREACH", "EHOSTUNREACH"].includes(error?.code)) {
+      reject(error);
+      return;
+    }
+    resolve();
+  });
+});
+return "host-boundaries:isolated";
+`;
+
+const SURVIVING_CHILD_USER_SOURCE = String.raw`
+const childProcess = await import("node:child_process");
+const fs = await import("node:fs/promises");
+const childSource = [
+  "const fs=require('node:fs');",
+  "fs.writeFileSync('/run/firecrawl-job/survivor-started','started\\n');",
+  "process.on('SIGTERM',()=>{});",
+  "setTimeout(()=>fs.writeFileSync(",
+  "'/run/firecrawl-job/survivor-late','survived\\n'),4000);",
+  "setInterval(()=>{},1000);",
+].join("");
+const child = childProcess.spawn(
+  "/usr/local/bin/node",
+  ["-e", childSource],
+  { detached: true, stdio: "ignore" },
+);
+child.unref();
+for (let attempt = 0; attempt < 200; attempt += 1) {
+  try {
+    await fs.stat("/run/firecrawl-job/survivor-started");
+    return "detached-child-reaped";
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  await new Promise(resolve => setTimeout(resolve, 10));
+}
+throw new Error("detached_child_start_timeout");
+`;
+
 const SUPERVISOR_HARNESS_SOURCE = String.raw`
 import os
 import socket
@@ -311,6 +465,21 @@ process.stdout.write(
     ? "artifact-manifest:server-owned\n"
     : "artifact-manifest:empty\n",
 );
+`;
+
+const ARTIFACT_ABSENCE_VALIDATOR_SOURCE = String.raw`
+import assert from "node:assert/strict";
+import { readdir } from "node:fs/promises";
+
+const entries = await readdir("/job/artifacts");
+assert.deepEqual(entries, [], "failed job published artifact state");
+const jobEntries = (await readdir("/job")).sort();
+assert.deepEqual(
+  jobEntries,
+  ["artifacts"],
+  "failed job left runtime residue",
+);
+process.stdout.write("artifact-publication:none\n");
 `;
 
 const RELAY_CONTRACT_SOURCE = String.raw`
@@ -465,6 +634,21 @@ function docker(...args) {
   return run([DOCKER, ...args]);
 }
 
+function dockerResult(args, timeout = 120_000) {
+  const result = spawnSync(DOCKER, args, {
+    cwd: ROOT,
+    encoding: "utf8",
+    timeout,
+    maxBuffer: MAX_OUTPUT,
+  });
+  if (result.error || result.signal !== null) {
+    process.stderr.write(result.stdout || "");
+    process.stderr.write(result.stderr || "");
+    throw result.error ?? new Error(`docker_signal:${result.signal}`);
+  }
+  return result;
+}
+
 function makeFixtureRemovable(fixtureRoot) {
   spawnSync(
     DOCKER,
@@ -568,6 +752,11 @@ function runSupervisorFixture(
   runnerSource,
   expected,
   expectArtifact = false,
+  {
+    deadline = "300000",
+    extraDockerArgs = [],
+    after,
+  } = {},
 ) {
   const jobRoot = join(fixtureRoot, `job-supervisor-${name}`);
   run(["/usr/bin/mkdir", "-m", "0777", jobRoot]);
@@ -613,10 +802,13 @@ function runSupervisorFixture(
       `RUNNER_PATH=${runnerPath}`,
       "--env",
       `RUNNER_SOURCE=${runnerSource}`,
+      "--env",
+      `FIRECRAWL_RUNNER_DEADLINE_MS=${deadline}`,
       "--tmpfs",
       "/run/firecrawl-work:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700",
       "--tmpfs",
       "/run/firecrawl-home:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700",
+      ...extraDockerArgs,
       "--mount",
       `type=bind,src=${fixtureRoot},dst=/fixture,readonly`,
       "--mount",
@@ -649,7 +841,121 @@ function runSupervisorFixture(
         ? "artifact-manifest:server-owned"
         : "artifact-manifest:empty",
     );
+    after?.({ jobRoot });
   } finally {
+    spawnSync(DOCKER, ["rm", "--force", gatewayName], {
+      encoding: "utf8",
+      maxBuffer: MAX_OUTPUT,
+    });
+  }
+}
+
+function runFailedSupervisorFixture(
+  image,
+  fixtureRoot,
+  {
+    name,
+    source,
+    deadline = "300000",
+    expectedError,
+    extraDockerArgs = [],
+    after,
+  },
+) {
+  const jobRoot = join(fixtureRoot, `job-supervisor-${name}`);
+  run(["/usr/bin/mkdir", "-m", "0777", jobRoot]);
+  const gatewayName = `firecrawl-code-relay-${process.pid}-supervisor-${name}`;
+  const containerName = `firecrawl-code-runner-${process.pid}-${name}`;
+  try {
+    docker(
+      "run",
+      "--detach",
+      "--rm",
+      "--name",
+      gatewayName,
+      "--network",
+      "none",
+      "--env",
+      "RELAY_PATH=/run/firecrawl-job/gateway.sock",
+      "--env",
+      "CREATE_ARTIFACT_ROOT=1",
+      "--mount",
+      `type=bind,src=${fixtureRoot},dst=/fixture,readonly`,
+      "--mount",
+      `type=bind,src=${jobRoot},dst=/run/firecrawl-job`,
+      "--entrypoint",
+      "/usr/bin/node",
+      BROWSER_IMAGE,
+      "/fixture/gateway.mjs",
+    );
+    waitForRelay(jobRoot, gatewayName, "gateway.sock");
+    const result = dockerResult(
+      [
+        "run",
+        "--rm",
+        "--name",
+        containerName,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--security-opt",
+        `seccomp=${join(CODE_ROOT, "../../policy/code-seccomp.json")}`,
+        "--pids-limit",
+        "64",
+        "--network",
+        "none",
+        "--env",
+        "RUNNER_PATH=/opt/firecrawl/bin/run-node.mjs",
+        "--env",
+        `RUNNER_SOURCE=${source}`,
+        "--env",
+        `FIRECRAWL_RUNNER_DEADLINE_MS=${deadline}`,
+        "--tmpfs",
+        "/run/firecrawl-work:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700",
+        "--tmpfs",
+        "/run/firecrawl-home:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700",
+        ...extraDockerArgs,
+        "--mount",
+        `type=bind,src=${fixtureRoot},dst=/fixture,readonly`,
+        "--mount",
+        `type=bind,src=${jobRoot},dst=/run/firecrawl-job`,
+        "--entrypoint",
+        "/usr/bin/python3",
+        image,
+        "/fixture/supervisor-harness.py",
+      ],
+      180_000,
+    );
+    assert.equal(result.status, 1, `${name}: expected container failure`);
+    assert.match(result.stderr, expectedError, `${name}: wrong terminal error`);
+    assert.equal(
+      dockerResult(["inspect", containerName]).status,
+      1,
+      `${name}: runner container residue`,
+    );
+    const validated = docker(
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--mount",
+      `type=bind,src=${fixtureRoot},dst=/fixture,readonly`,
+      "--mount",
+      `type=bind,src=${jobRoot},dst=/job`,
+      "--entrypoint",
+      "/usr/bin/node",
+      BROWSER_IMAGE,
+      "/fixture/artifact-absence-validator.mjs",
+    );
+    assert.equal(validated, "artifact-publication:none");
+    after?.({ jobRoot, result });
+  } finally {
+    spawnSync(DOCKER, ["rm", "--force", containerName], {
+      encoding: "utf8",
+      maxBuffer: MAX_OUTPUT,
+    });
     spawnSync(DOCKER, ["rm", "--force", gatewayName], {
       encoding: "utf8",
       maxBuffer: MAX_OUTPUT,
@@ -671,12 +977,33 @@ function main() {
       ["relay-contract.mjs", RELAY_CONTRACT_SOURCE],
       ["supervisor-harness.py", SUPERVISOR_HARNESS_SOURCE],
       ["runner-artifact.js", ARTIFACT_USER_SOURCE],
+      ["runner-syntax.js", SYNTAX_ERROR_USER_SOURCE],
+      ["runner-nonzero.js", NONZERO_USER_SOURCE],
+      ["runner-timeout.js", TIMEOUT_USER_SOURCE],
+      ["runner-stdout-bomb.js", STDOUT_BOMB_USER_SOURCE],
+      ["runner-stderr-bomb.js", STDERR_BOMB_USER_SOURCE],
+      ["runner-fast-success.js", FAST_SUCCESS_USER_SOURCE],
+      ["runner-fast-exit.js", FAST_EXIT_USER_SOURCE],
+      [
+        "runner-host-boundary.js",
+        HOST_BOUNDARY_USER_SOURCE.replace(
+          "__HOST_SCRIPT_PID__",
+          String(process.pid),
+        ),
+      ],
+      ["runner-surviving-child.js", SURVIVING_CHILD_USER_SOURCE],
       ["runner-python.py", 'print(page.title())\n'],
       ["runner-bash.sh", 'agent-browser get-url\n'],
       ["artifact-validator.mjs", ARTIFACT_VALIDATOR_SOURCE],
+      [
+        "artifact-absence-validator.mjs",
+        ARTIFACT_ABSENCE_VALIDATOR_SOURCE,
+      ],
+      ["denied-docker.sock", "not-a-docker-socket\n"],
     ]) {
       writeFileSync(join(fixtureRoot, name), source, { mode: 0o444 });
     }
+    chmodSync(join(fixtureRoot, "denied-docker.sock"), 0o000);
 
     const supplied = process.env.FIRECRAWL_CODE_IMAGE;
     const image =
@@ -736,6 +1063,103 @@ function main() {
       "runner-bash.sh",
       `data:text/html,<title>${EXPECTED_TITLE}</title>`,
     );
+    runSupervisorFixture(
+      image,
+      fixtureRoot,
+      "fast-success",
+      "/opt/firecrawl/bin/run-node.mjs",
+      "runner-fast-success.js",
+      "",
+    );
+    runSupervisorFixture(
+      image,
+      fixtureRoot,
+      "host-boundary",
+      "/opt/firecrawl/bin/run-node.mjs",
+      "runner-host-boundary.js",
+      '"host-boundaries:isolated"',
+      false,
+      {
+        extraDockerArgs: [
+          "--tmpfs",
+          "/home:rw,noexec,nosuid,nodev,uid=0,gid=0,mode=000",
+          "--tmpfs",
+          "/root:rw,noexec,nosuid,nodev,uid=0,gid=0,mode=000",
+          "--mount",
+          `type=bind,src=${join(
+            fixtureRoot,
+            "denied-docker.sock",
+          )},dst=/run/docker.sock,readonly`,
+        ],
+      },
+    );
+    runSupervisorFixture(
+      image,
+      fixtureRoot,
+      "surviving-child",
+      "/opt/firecrawl/bin/run-node.mjs",
+      "runner-surviving-child.js",
+      '"detached-child-reaped"',
+      false,
+      {
+        after: ({ jobRoot }) => {
+          assert.equal(
+            readFileSync(join(jobRoot, "survivor-started"), "utf8"),
+            "started\n",
+          );
+          Atomics.wait(
+            new Int32Array(new SharedArrayBuffer(4)),
+            0,
+            0,
+            4_500,
+          );
+          assert.equal(
+            existsSync(join(jobRoot, "survivor-late")),
+            false,
+            "detached child survived supervisor completion",
+          );
+          assert.deepEqual(
+            readdirSync(join(jobRoot, "artifacts")).sort(),
+            ["files", "manifest.json"],
+          );
+        },
+      },
+    );
+    for (const failure of [
+      {
+        name: "syntax",
+        source: "runner-syntax.js",
+        expectedError: /runner_failed/,
+      },
+      {
+        name: "nonzero",
+        source: "runner-nonzero.js",
+        expectedError: /runner_failed/,
+      },
+      {
+        name: "timeout",
+        source: "runner-timeout.js",
+        deadline: "3000",
+        expectedError: /runner_timeout/,
+      },
+      {
+        name: "stdout-bomb",
+        source: "runner-stdout-bomb.js",
+        expectedError: /runner_output_exceeded/,
+      },
+      {
+        name: "stderr-bomb",
+        source: "runner-stderr-bomb.js",
+        expectedError: /runner_output_exceeded/,
+      },
+      {
+        name: "fast-exit-late-stream",
+        source: "runner-fast-exit.js",
+        expectedError: /runner_output_exceeded/,
+      },
+    ]) {
+      runFailedSupervisorFixture(image, fixtureRoot, failure);
+    }
 
     const protocolJob = join(fixtureRoot, "job-protocol");
     run(["/usr/bin/mkdir", "-m", "0777", protocolJob]);

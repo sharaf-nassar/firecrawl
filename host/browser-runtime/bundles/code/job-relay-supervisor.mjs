@@ -22,8 +22,11 @@ const RUNNERS = new Set([
   "/opt/firecrawl/bin/run-python.py",
   "/opt/firecrawl/bin/run-bash.sh",
 ]);
-const DEADLINE_MS = 300_000;
+const DEADLINE_MS = parseDeadline(
+  process.env.FIRECRAWL_RUNNER_DEADLINE_MS ?? "300000",
+);
 const KILL_GRACE_MS = 2_000;
+const STREAM_CLOSE_GRACE_MS = 2_000;
 const RELAY_EXIT_GRACE_MS = 250;
 const MAX_STDOUT_BYTES = 262_144;
 const MAX_STDERR_BYTES = 262_144;
@@ -31,6 +34,17 @@ const MAX_ARTIFACT_CONNECTIONS = 16;
 const MAX_ARTIFACTS = 8;
 const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 const MAX_ARTIFACT_TOTAL = 32 * 1024 * 1024;
+
+function parseDeadline(raw) {
+  if (!/^[1-9][0-9]{0,5}$/.test(raw ?? "")) {
+    throw new Error("runner_deadline_invalid");
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value > 300_000) {
+    throw new Error("runner_deadline_invalid");
+  }
+  return value;
+}
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -321,6 +335,36 @@ async function terminateAllPayloads() {
   }
 }
 
+function streamCompletion(stream) {
+  return new Promise(resolve => {
+    let completed = false;
+    const finish = () => {
+      if (completed) return;
+      completed = true;
+      stream.off("end", finish);
+      stream.off("close", finish);
+      resolve();
+    };
+    stream.once("end", finish);
+    stream.once("close", finish);
+    if (stream.readableEnded || stream.closed) finish();
+  });
+}
+
+async function waitBounded(promise, timeoutMs, code) {
+  let timer;
+  try {
+    await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(code)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function main() {
   const runner = process.argv[2];
   if (process.argv.length !== 3 || !RUNNERS.has(runner)) {
@@ -369,6 +413,11 @@ async function main() {
       TMPDIR: "/run/firecrawl-work",
     },
   });
+  const childClosed = new Promise(resolve => child.once("close", resolve));
+  const outputCompleted = Promise.all([
+    streamCompletion(child.stdout),
+    streamCompletion(child.stderr),
+  ]);
   let terminalError;
   let escalation;
   let relayExitGrace;
@@ -426,6 +475,16 @@ async function main() {
   } catch (error) {
     cleanupError = error;
   }
+  let streamError;
+  try {
+    await waitBounded(
+      Promise.all([childClosed, outputCompleted]),
+      STREAM_CLOSE_GRACE_MS,
+      "runner_output_close_timeout",
+    );
+  } catch (error) {
+    streamError = error;
+  }
   peer?.destroy();
   inherited.destroy();
   server.close();
@@ -437,6 +496,7 @@ async function main() {
     terminalError ??
     result.error ??
     cleanupError ??
+    streamError ??
     (result.signal ? new Error("runner_terminated") : undefined) ??
     (result.code === 0 ? undefined : new Error("runner_failed"));
   if (failure) throw failure;

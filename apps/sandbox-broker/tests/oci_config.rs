@@ -116,6 +116,12 @@ fn code_oci_has_fresh_network_namespace_and_bounded_resources() {
         assert_eq!(config["linux"]["resources"]["memory"]["limit"], 536_870_912);
         assert_eq!(config["linux"]["resources"]["pids"]["limit"], 64);
         assert_eq!(config["linux"]["resources"]["memory"]["swap"], 536_870_912);
+        assert!(
+            config["process"]["env"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("FIRECRAWL_RUNNER_DEADLINE_MS=300000"))
+        );
         assert_eq!(
             config["mounts"]
                 .as_array()
