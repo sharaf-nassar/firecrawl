@@ -218,260 +218,85 @@ volume to silence them.
 
 ## Coordinated persistence backup and restore
 
-Application PostgreSQL and MinIO form one persistence generation. PostgreSQL
-uses a logical custom-format dump; MinIO uses a complete offline volume
-archive. Never edit individual MinIO data files. Stop the API, its retention
-worker, and MinIO once, capture both files while writers remain stopped, and
-restart only after the pair and its checksums validate.
+Use the coordinated scripts; do not dump or replace individual volumes by
+hand. Both scripts acquire the same exclusive lifecycle lock as
+`scripts/local-firecrawl`, drain active browser work, stop Browser Service and
+host execution writers, and keep PostgreSQL, MinIO, and browser profiles in one
+generation.
 
-Every lifecycle command and maintenance procedure uses the exact lock reported
-by `scripts/local-firecrawl lock-path`. The wrapper waits at most
-`LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS` (default `30`) and one-shots run at most
-`LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS` (default `300`). A concurrent agent
-cannot start, stop, restart, or inspect a half-restored runtime.
+Profiles are sensitive. Committed profile generations can contain cookies,
+local storage, IndexedDB, authentication state, and browsing history. Write
+backups only to encrypted storage restricted to the Firecrawl operator. Do not
+sync an unencrypted generation to shared or public storage.
 
 ### Create a coordinated generation
 
-Run from anywhere inside this checkout. This snippet holds the exclusive lock
-through service restart and never recursively calls the lifecycle wrapper:
+Run from any directory:
 
 ```bash
-set -euo pipefail
-repo_root="$(git rev-parse --show-toplevel)"
-compose=(docker compose --project-name firecrawl \
-  --project-directory "$repo_root" -f "$repo_root/compose.yaml")
-lock_wait="${LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS:-30}"
-one_shot_timeout="${LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS:-300}"
-[[ "$lock_wait" =~ ^[1-9][0-9]*$ ]]
-[[ "$one_shot_timeout" =~ ^[1-9][0-9]*$ ]]
-lock_path="$("$repo_root/scripts/local-firecrawl" lock-path)"
-exec {lock_fd}> "$lock_path"
-flock --exclusive --timeout "$lock_wait" --conflict-exit-code 75 "$lock_fd"
-
-run_one_shot() {
-  local service="$1" status
-  set +e
-  timeout --signal=TERM --kill-after=10s "${one_shot_timeout}s" \
-    "${compose[@]}" up --no-deps --force-recreate \
-    --abort-on-container-exit --exit-code-from "$service" "$service"
-  status=$?
-  set -e
-  if (( status != 0 )); then
-    "${compose[@]}" stop --timeout 10 "$service" >/dev/null 2>&1 || true
-    "${compose[@]}" kill "$service" >/dev/null 2>&1 || true
-    return "$status"
-  fi
-  test "$("${compose[@]}" ps --all \
-    --format '{{.State}} {{.ExitCode}}' "$service")" = 'exited 0'
-}
-
-start_locked_runtime() {
-  "${compose[@]}" up -d --wait playwright-service nuq-postgres redis \
-    rabbitmq app-postgres minio
-  run_one_shot app-db-migrate
-  run_one_shot minio-init
-  "${compose[@]}" up -d --no-deps --wait api
-}
-
-backup_root="$repo_root/backups/local-firecrawl"
-mkdir -p "$backup_root"
-generation="$(date --utc +%Y%m%dT%H%M%SZ)-$$"
-generation_tmp="$(mktemp -d "$backup_root/.${generation}.XXXXXX")"
-db_name="${generation}.app-postgres.dump"
-minio_name="${generation}.minio-data.tar.gz"
-checksum_name="${generation}.sha256"
-manifest_name="${generation}.manifest"
-complete=false
-fail_closed() {
-  if [[ "$complete" != true ]]; then
-    "${compose[@]}" stop api minio >/dev/null || true
-  fi
-}
-trap fail_closed EXIT
-"${compose[@]}" stop api minio
-minio_volume="$(docker volume ls \
-  --filter label=com.docker.compose.project=firecrawl \
-  --filter label=com.docker.compose.volume=minio-data \
-  --format '{{.Name}}')"
-test -n "$minio_volume"
-[[ "$minio_volume" != *$'\n'* ]]
-"${compose[@]}" exec -T app-postgres sh -ec \
-  'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner' \
-  > "$generation_tmp/$db_name"
-docker run --rm --network none --read-only \
-  --volume "$minio_volume:/source:ro" \
-  --volume "$generation_tmp:/backup" \
-  --entrypoint tar postgres:17.10-bookworm \
-  -C /source -czf "/backup/$minio_name" .
-"${compose[@]}" exec -T app-postgres pg_restore --list \
-  < "$generation_tmp/$db_name" >/dev/null
-docker run --rm --network none --read-only \
-  --volume "$generation_tmp:/backup:ro" \
-  --entrypoint tar postgres:17.10-bookworm \
-  -tzf "/backup/$minio_name" >/dev/null
-(
-  cd "$generation_tmp"
-  sha256sum -- "$db_name" "$minio_name" > "$checksum_name"
-)
-printf 'generation=%s\ndatabase=%s\nartifacts=%s\n' \
-  "$generation" "$db_name" "$minio_name" \
-  > "$generation_tmp/$manifest_name"
-mv -- "$generation_tmp" "$backup_root/$generation"
-start_locked_runtime
-complete=true
-trap - EXIT
-printf 'Created persistence generation: %s\n' \
-  "$backup_root/$generation"
+/home/mamba/work/firecrawl/scripts/local-firecrawl-backup
 ```
 
-Any failure keeps API and MinIO stopped. A completed directory contains the
-generation identifier in both data filenames, a manifest, and checksums. Copy
-the complete directory to independent storage; never mix files from different
-generations.
+The default destination is `backups/local-firecrawl` in this checkout. Prefer
+an absolute encrypted destination:
+
+```bash
+/home/mamba/work/firecrawl/scripts/local-firecrawl-backup \
+  --output /absolute/encrypted/firecrawl-backups
+```
+
+A successfully published directory is mode `0700`. Its five mode-`0600`
+members are:
+
+```text
+<generation>.app-postgres.dump
+<generation>.minio-data.tar.gz
+<generation>.browser-profiles.tar.gz
+<generation>.manifest
+<generation>.sha256
+```
+
+The checksum inventory covers the manifest and all three payloads exactly.
+Publication is an atomic, no-clobber directory rename. Working and staging
+profile generations are excluded. Codex auth, adapter tokens, runtime sockets,
+broker state, app-server thread state, replay work, host build staging, and
+other ephemeral state are never included.
+
+A runtime that was running before backup is restarted and receives the full
+local health check. A runtime that was already stopped remains stopped. Any
+capture, publication, restart, or health failure leaves API, Browser Service,
+the execution adapter, MinIO, and application PostgreSQL stopped.
 
 ### Restore a coordinated generation
 
-Set `generation` to one complete directory name. Preflight validates both files
-and checksums before writes. The procedure then captures a second coordinated
-rollback generation, restores both stores, verifies MinIO content/ownership,
-runs migrations and MinIO initialization, checks application credentials, and
-only then starts API workers.
+Pass the canonical absolute generation directory. Optionally place the
+rollback generation in another encrypted directory:
 
 ```bash
-set -euo pipefail
-repo_root="$(git rev-parse --show-toplevel)"
-compose=(docker compose --project-name firecrawl \
-  --project-directory "$repo_root" -f "$repo_root/compose.yaml")
-lock_wait="${LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS:-30}"
-one_shot_timeout="${LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS:-300}"
-[[ "$lock_wait" =~ ^[1-9][0-9]*$ ]]
-[[ "$one_shot_timeout" =~ ^[1-9][0-9]*$ ]]
-lock_path="$("$repo_root/scripts/local-firecrawl" lock-path)"
-exec {lock_fd}> "$lock_path"
-flock --exclusive --timeout "$lock_wait" --conflict-exit-code 75 "$lock_fd"
-
-run_one_shot() {
-  local service="$1" status
-  set +e
-  timeout --signal=TERM --kill-after=10s "${one_shot_timeout}s" \
-    "${compose[@]}" up --no-deps --force-recreate \
-    --abort-on-container-exit --exit-code-from "$service" "$service"
-  status=$?
-  set -e
-  if (( status != 0 )); then
-    "${compose[@]}" stop --timeout 10 "$service" >/dev/null 2>&1 || true
-    "${compose[@]}" kill "$service" >/dev/null 2>&1 || true
-    return "$status"
-  fi
-  test "$("${compose[@]}" ps --all \
-    --format '{{.State}} {{.ExitCode}}' "$service")" = 'exited 0'
-}
-
-start_locked_runtime() {
-  "${compose[@]}" up -d --wait playwright-service nuq-postgres redis \
-    rabbitmq app-postgres minio
-  run_one_shot app-db-migrate
-  run_one_shot minio-init
-  "${compose[@]}" run --rm --no-deps -T api sh -ec \
-    'test -z "${MINIO_ROOT_USER+x}" && \
-     test -z "${MINIO_ROOT_PASSWORD+x}" && \
-     node dist/src/cli/artifact-health.js'
-  "${compose[@]}" up -d --no-deps --wait api
-}
-
-backup_root="$repo_root/backups/local-firecrawl"
-generation="REPLACE_WITH_GENERATION"
-generation_dir="$backup_root/$generation"
-db_name="${generation}.app-postgres.dump"
-minio_name="${generation}.minio-data.tar.gz"
-checksum_name="${generation}.sha256"
-manifest_name="${generation}.manifest"
-complete=false
-fail_closed() {
-  if [[ "$complete" != true ]]; then
-    "${compose[@]}" stop api minio >/dev/null || true
-  fi
-}
-trap fail_closed EXIT
-test "$(sed -n '1p' "$generation_dir/$manifest_name")" = \
-  "generation=$generation"
-test "$(sed -n '2p' "$generation_dir/$manifest_name")" = \
-  "database=$db_name"
-test "$(sed -n '3p' "$generation_dir/$manifest_name")" = \
-  "artifacts=$minio_name"
-(
-  cd "$generation_dir"
-  sha256sum --check --strict "$checksum_name"
-)
-"${compose[@]}" exec -T app-postgres pg_restore --list \
-  < "$generation_dir/$db_name" >/dev/null
-docker run --rm --network none --read-only \
-  --volume "$generation_dir:/backup:ro" \
-  --entrypoint tar postgres:17.10-bookworm \
-  -tzf "/backup/$minio_name" >/dev/null
-
-"${compose[@]}" stop api minio
-minio_volume="$(docker volume ls \
-  --filter label=com.docker.compose.project=firecrawl \
-  --filter label=com.docker.compose.volume=minio-data \
-  --format '{{.Name}}')"
-test -n "$minio_volume"
-[[ "$minio_volume" != *$'\n'* ]]
-rollback="rollback-$(date --utc +%Y%m%dT%H%M%SZ)-$$"
-rollback_dir="$(mktemp -d "$backup_root/.${rollback}.XXXXXX")"
-rollback_db="${rollback}.app-postgres.dump"
-rollback_minio="${rollback}.minio-data.tar.gz"
-"${compose[@]}" exec -T app-postgres sh -ec \
-  'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner' \
-  > "$rollback_dir/$rollback_db"
-docker run --rm --network none --read-only \
-  --volume "$minio_volume:/source:ro" \
-  --volume "$rollback_dir:/backup" \
-  --entrypoint tar postgres:17.10-bookworm \
-  -C /source -czf "/backup/$rollback_minio" .
-(
-  cd "$rollback_dir"
-  sha256sum -- "$rollback_db" "$rollback_minio" \
-    > "${rollback}.sha256"
-)
-printf 'generation=%s\ndatabase=%s\nartifacts=%s\n' \
-  "$rollback" "$rollback_db" "$rollback_minio" \
-  > "$rollback_dir/${rollback}.manifest"
-"${compose[@]}" exec -T app-postgres pg_restore --list \
-  < "$rollback_dir/$rollback_db" >/dev/null
-docker run --rm --network none --read-only \
-  --volume "$rollback_dir:/backup:ro" \
-  --entrypoint tar postgres:17.10-bookworm \
-  -tzf "/backup/$rollback_minio" >/dev/null
-mv -- "$rollback_dir" "$backup_root/$rollback"
-printf 'Rollback generation: %s\n' "$backup_root/$rollback"
-
-"${compose[@]}" exec -T app-postgres sh -ec \
-  'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --exit-on-error --single-transaction' \
-  < "$generation_dir/$db_name"
-docker run --rm --network none --read-only \
-  --volume "$minio_volume:/target" \
-  --volume "$generation_dir:/backup:ro" \
-  --entrypoint sh postgres:17.10-bookworm -ec \
-  'find /target -mindepth 1 -delete
-   tar --extract --gzip --numeric-owner --same-owner \
-     --file "/backup/$1" --directory /target' sh "$minio_name"
-docker run --rm --network none --read-only \
-  --volume "$minio_volume:/target:ro" \
-  --volume "$generation_dir:/backup:ro" \
-  --entrypoint tar postgres:17.10-bookworm \
-  --compare --gzip --numeric-owner --file "/backup/$minio_name" \
-  --directory /target
-start_locked_runtime
-complete=true
-trap - EXIT
+/home/mamba/work/firecrawl/scripts/local-firecrawl-restore \
+  /absolute/encrypted/firecrawl-backups/<generation> \
+  --rollback-output /absolute/encrypted/firecrawl-rollbacks
 ```
 
-This is service-level atomicity, not filesystem atomicity: no consumer observes
-a partial pair because the same exclusive lock and stopped-writer window cover
-both restores and validation. Any failure stops API and MinIO and preserves the
-validated rollback generation. To recover, repeat with that rollback generation
-while keeping consumers stopped.
+Restore stops writers before copying or validating backup payloads. It rejects
+missing or extra files, generation drift, checksum mismatch, unsafe ownership
+or modes, hard-linked or symlink payloads, absolute or parent archive paths,
+links and special archive members, uncommitted profile paths, and
+database-to-profile pointer disagreement.
+
+Before any destructive write, restore captures and validates a complete
+PostgreSQL, MinIO, and committed-profile rollback generation. It restores all
+three stores, verifies every live database profile pointer against the exact
+committed directory inventory, and only then restarts services that were
+running before restore. The full health check catches installed Codex protocol,
+application schema, migration checksum, adapter, broker, and Browser Service
+drift after recovery. On any failure, all writers stay stopped and the
+rollback generation remains available for an explicit second restore.
+
+Backup and restore never resume active model threads, browser sessions, code
+jobs, prompt jobs, or app-server conversations. Those operations terminate at
+drain or restart; only durable database records, MinIO artifacts, and committed
+profile generations return.
 
 MinIO server and client images are pinned to exact releases because upstream
 is archived and maintenance-sensitive. They never upgrade automatically.

@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/local-firecrawl
+source "$script_dir/local-firecrawl"
+
+backup_postgres_image="postgres:17.10-bookworm"
+backup_runtime_was_running=0
+backup_operation_complete=0
+
+lf_backup_usage() {
+  printf 'Usage: %s [--output <absolute-directory>]\n' "${0##*/}" >&2
+}
+
+lf_backup_validate_root() {
+  local path="$1"
+
+  [[ "$path" == /* ]] ||
+    { printf '%s\n' 'Backup root must be absolute' >&2; return 64; }
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    install -d -m 0700 -- "$path"
+  fi
+  [[ -d "$path" && ! -L "$path" ]] ||
+    { printf '%s\n' 'Backup root must be a real directory' >&2; return 64; }
+  [[ "$(readlink -f -- "$path")" == "$path" ]] ||
+    { printf '%s\n' 'Backup root must be canonical' >&2; return 64; }
+  [[ "$(stat -c '%u:%a' -- "$path")" == "$UID:700" ]] ||
+    { printf '%s\n' 'Backup root ownership or mode is unsafe' >&2; return 64; }
+}
+
+lf_backup_generation_name() {
+  local random_id
+
+  random_id="$(< /proc/sys/kernel/random/uuid)"
+  printf '%s-%s\n' "$(date --utc +%Y%m%dT%H%M%SZ)" "$random_id"
+}
+
+lf_backup_generation_names() {
+  local generation="$1"
+
+  [[ "$generation" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+    { printf '%s\n' 'Backup generation name is invalid' >&2; return 64; }
+  db_name="${generation}.app-postgres.dump"
+  minio_name="${generation}.minio-data.tar.gz"
+  profiles_name="${generation}.browser-profiles.tar.gz"
+  manifest_name="${generation}.manifest"
+  checksum_name="${generation}.sha256"
+}
+
+lf_backup_validate_regular_file() {
+  local path="$1"
+
+  [[ -f "$path" && ! -L "$path" ]] ||
+    { printf 'Backup member is not a regular file: %s\n' "$path" >&2; return 1; }
+  [[ "$(stat -c '%u:%a:%h' -- "$path")" == "$UID:600:1" ]] ||
+    { printf 'Backup member ownership or mode is unsafe: %s\n' "$path" >&2; return 1; }
+}
+
+lf_backup_validate_archive() {
+  local kind="$1"
+  local archive="$2"
+
+  python3 - "$kind" "$archive" <<'PY'
+import pathlib
+import re
+import sys
+import tarfile
+
+kind, archive = sys.argv[1:]
+uuid = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+seen: set[str] = set()
+total = 0
+count = 0
+with tarfile.open(archive, "r:gz") as bundle:
+    for member in bundle:
+        count += 1
+        if count > 1_000_000:
+            raise SystemExit("backup_archive_too_many_members")
+        raw = member.name
+        if "\x00" in raw or raw.startswith("/"):
+            raise SystemExit("backup_archive_absolute_member")
+        parts = [part for part in pathlib.PurePosixPath(raw).parts if part != "."]
+        if any(part in ("", "..") for part in parts):
+            raise SystemExit("backup_archive_parent_member")
+        normalized = "/".join(parts)
+        if normalized in seen:
+            raise SystemExit("backup_archive_duplicate_member")
+        seen.add(normalized)
+        if member.issym() or member.islnk():
+            raise SystemExit("backup_archive_link_member")
+        if not (member.isdir() or member.isfile()):
+            raise SystemExit("backup_archive_special_member")
+        if member.mode & 0o7000:
+            raise SystemExit("backup_archive_special_mode")
+        if member.uid < 0 or member.gid < 0 or member.size < 0:
+            raise SystemExit("backup_archive_invalid_metadata")
+        total += member.size
+        if total > 1 << 40:
+            raise SystemExit("backup_archive_unpacked_size_limit")
+        if kind == "minio":
+            if member.uid != 0 or member.gid != 0:
+                raise SystemExit("backup_minio_invalid_owner")
+            if member.isdir() and member.mode != 0o755:
+                raise SystemExit("backup_minio_invalid_directory_mode")
+            if member.isfile() and member.mode != 0o644:
+                raise SystemExit("backup_minio_invalid_file_mode")
+            continue
+        if member.uid != 1000 or member.gid != 1000:
+            raise SystemExit("backup_profiles_invalid_owner")
+        if member.isdir() and member.mode != 0o700:
+            raise SystemExit("backup_profiles_invalid_directory_mode")
+        if member.isfile() and member.mode != 0o600:
+            raise SystemExit("backup_profiles_invalid_file_mode")
+        if not parts or parts[0] != "profiles":
+            raise SystemExit("backup_profiles_wrong_root")
+        if len(parts) == 1:
+            if not member.isdir():
+                raise SystemExit("backup_profiles_root_not_directory")
+            continue
+        if not uuid.fullmatch(parts[1]):
+            raise SystemExit("backup_profiles_invalid_profile")
+        if len(parts) == 2:
+            if not member.isdir():
+                raise SystemExit("backup_profiles_profile_not_directory")
+            continue
+        if parts[2] != "committed":
+            raise SystemExit("backup_profiles_uncommitted_member")
+        if len(parts) == 3:
+            if not member.isdir():
+                raise SystemExit("backup_profiles_committed_not_directory")
+            continue
+        if not uuid.fullmatch(parts[3]):
+            raise SystemExit("backup_profiles_invalid_generation")
+        if len(parts) == 4 and not member.isdir():
+            raise SystemExit("backup_profiles_generation_not_directory")
+if kind == "profiles" and "profiles" not in seen:
+    raise SystemExit("backup_profiles_root_missing")
+PY
+}
+
+lf_backup_profile_paths() {
+  local archive="$1"
+
+  python3 - "$archive" <<'PY'
+import pathlib
+import re
+import sys
+import tarfile
+
+uuid = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+paths = set()
+with tarfile.open(sys.argv[1], "r:gz") as bundle:
+    for member in bundle:
+        parts = [
+            part
+            for part in pathlib.PurePosixPath(member.name).parts
+            if part != "."
+        ]
+        if (
+            member.isdir()
+            and len(parts) == 4
+            and parts[0] == "profiles"
+            and uuid.fullmatch(parts[1])
+            and parts[2] == "committed"
+            and uuid.fullmatch(parts[3])
+        ):
+            paths.add("/".join(parts))
+for path in sorted(paths):
+    print(path)
+PY
+}
+
+lf_backup_validate_checksum_inventory() {
+  local directory="$1"
+  local expected
+  local inventory="$directory/$checksum_name"
+
+  expected="$(
+    printf '%s\n' "$db_name" "$manifest_name" "$minio_name" "$profiles_name" |
+      LC_ALL=C sort
+  )"
+  [[ "$(
+    sed -nE 's/^[0-9a-f]{64}  ([^/]+)$/\1/p' "$inventory" |
+      LC_ALL=C sort
+  )" == "$expected" ]] ||
+    { printf '%s\n' 'Backup checksum inventory is not closed' >&2; return 1; }
+  [[ "$(wc -l < "$inventory")" == 4 ]] ||
+    { printf '%s\n' 'Backup checksum inventory length is invalid' >&2; return 1; }
+  (
+    cd -- "$directory"
+    sha256sum --check --strict -- "$checksum_name"
+  ) >/dev/null
+}
+
+lf_backup_validate_generation() {
+  local directory="$1"
+  local generation="${2:-${directory##*/}}"
+  local expected_entries
+  local expected_manifest
+
+  [[ -d "$directory" && ! -L "$directory" ]] ||
+    { printf '%s\n' 'Backup generation must be a real directory' >&2; return 1; }
+  [[ "$(readlink -f -- "$directory")" == "$directory" ]] ||
+    { printf '%s\n' 'Backup generation must be canonical' >&2; return 1; }
+  [[ "$(stat -c '%u:%a' -- "$directory")" == "$UID:700" ]] ||
+    { printf '%s\n' 'Backup generation ownership or mode is unsafe' >&2; return 1; }
+  lf_backup_generation_names "$generation" || return $?
+  expected_entries="$(
+    printf '%s\n' \
+      "$checksum_name" "$db_name" "$manifest_name" "$minio_name" \
+      "$profiles_name" | LC_ALL=C sort
+  )"
+  [[ "$(find "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)" == "$expected_entries" ]] ||
+    { printf '%s\n' 'Backup generation member set is invalid' >&2; return 1; }
+  for member in \
+    "$checksum_name" "$db_name" "$manifest_name" "$minio_name" "$profiles_name"; do
+    lf_backup_validate_regular_file "$directory/$member" || return $?
+  done
+  expected_manifest="$(
+    printf 'generation=%s\ndatabase=%s\nartifacts=%s\nprofiles=%s\n' \
+      "$generation" "$db_name" "$minio_name" "$profiles_name"
+  )"
+  [[ "$(cat -- "$directory/$manifest_name")" == "$expected_manifest" ]] ||
+    { printf '%s\n' 'Backup manifest is invalid' >&2; return 1; }
+  lf_backup_validate_checksum_inventory "$directory" || return $?
+  [[ -s "$directory/$db_name" ]] ||
+    { printf '%s\n' 'Database dump is empty' >&2; return 1; }
+  lf_backup_validate_archive minio "$directory/$minio_name" || return $?
+  lf_backup_validate_archive profiles "$directory/$profiles_name"
+}
+
+lf_backup_volume_name() {
+  local service="$1"
+  local target="$2"
+  local logical="$3"
+  local rendered
+  local volume
+  local labels
+
+  rendered="$("${compose[@]}" config --format json)" || return $?
+  volume="$(
+    jq -er --arg service "$service" --arg target "$target" '
+      [.services[$service].volumes[] |
+        select(.type == "volume" and .target == $target) | .source] |
+      if length == 1 then .[0] else error("volume mapping is ambiguous") end
+    ' <<< "$rendered"
+  )" || return $?
+  [[ "$volume" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] ||
+    { printf '%s\n' 'Resolved Compose volume name is invalid' >&2; return 1; }
+  labels="$(docker volume inspect --format '{{json .Labels}}' "$volume")" ||
+    return $?
+  jq -e --arg project "$project_name" --arg logical "$logical" '
+    ."com.docker.compose.project" == $project and
+    ."com.docker.compose.volume" == $logical
+  ' <<< "$labels" >/dev/null ||
+    { printf '%s\n' 'Compose volume provenance is invalid' >&2; return 1; }
+  printf '%s\n' "$volume"
+}
+
+lf_backup_capture_database() {
+  local output="$1"
+
+  "${compose[@]}" exec -T app-postgres sh -ec \
+    'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner' \
+    > "$output"
+  "${compose[@]}" exec -T app-postgres pg_restore --list \
+    < "$output" >/dev/null
+}
+
+lf_backup_capture_minio() {
+  local output="$1"
+  local output_directory="${output%/*}"
+  local output_name="${output##*/}"
+  local volume
+
+  volume="$(lf_backup_volume_name minio /data minio-data)" || return $?
+  docker run --rm --network none --read-only \
+    --volume "$volume:/source:ro" \
+    --volume "$output_directory:/backup" \
+    --entrypoint tar "$backup_postgres_image" \
+    --create --gzip --numeric-owner --one-file-system \
+    --owner=0 --group=0 --mode='u=rwX,go=rX' \
+    --file "/backup/$output_name" --directory /source .
+}
+
+lf_backup_capture_profiles() {
+  local output="$1"
+  local output_directory="${output%/*}"
+  local output_name="${output##*/}"
+  local volume
+
+  volume="$(
+    lf_backup_volume_name browser-service \
+      /var/lib/firecrawl-browser-volume browser-state
+  )" || return $?
+  docker run --rm --network none --read-only \
+    --volume "$volume:/source:ro" \
+    --volume "$output_directory:/backup" \
+    --entrypoint sh "$backup_postgres_image" -ec '
+      test -d /source/state/profiles
+      test -z "$(find /source/state/profiles -xdev -type l -print -quit)"
+      test -z "$(find /source/state/profiles -xdev -type f -links +1 -print -quit)"
+      cd /source/state
+      tar --create --gzip --numeric-owner --one-file-system \
+        --exclude="profiles/*/working" \
+        --exclude="profiles/*/working/**" \
+        --exclude="profiles/*/staging" \
+        --exclude="profiles/*/staging/**" \
+        --file "/backup/$1" profiles
+    ' sh "$output_name"
+}
+
+lf_backup_capture_generation_locked() {
+  local backup_root="$1"
+  local generation="$2"
+  local temporary
+  local published
+
+  [[ "$runtime_lock_held" == exclusive ]] ||
+    { printf '%s\n' 'Backup capture requires the lifecycle lock' >&2; return 70; }
+  lf_backup_generation_names "$generation" || return $?
+  temporary="$(mktemp -d "$backup_root/.${generation}.XXXXXXXX")" || return $?
+  chmod 0700 -- "$temporary" || return $?
+  published="$backup_root/$generation"
+  cleanup_partial_generation() {
+    rm -rf -- "$temporary"
+  }
+  trap cleanup_partial_generation RETURN
+  lf_backup_capture_database "$temporary/$db_name" || return $?
+  lf_backup_capture_minio "$temporary/$minio_name" || return $?
+  lf_backup_capture_profiles "$temporary/$profiles_name" || return $?
+  chmod 0600 -- \
+    "$temporary/$db_name" "$temporary/$minio_name" "$temporary/$profiles_name" ||
+    return $?
+  printf 'generation=%s\ndatabase=%s\nartifacts=%s\nprofiles=%s\n' \
+    "$generation" "$db_name" "$minio_name" "$profiles_name" \
+    > "$temporary/$manifest_name" || return $?
+  chmod 0600 -- "$temporary/$manifest_name" || return $?
+  (
+    cd -- "$temporary"
+    printf '%s\n' "$db_name" "$manifest_name" "$minio_name" "$profiles_name" |
+      LC_ALL=C sort |
+      xargs sha256sum -- > "$checksum_name"
+  ) || return $?
+  chmod 0600 -- "$temporary/$checksum_name" || return $?
+  lf_backup_validate_generation "$temporary" "$generation" || return $?
+  python3 - "$temporary" <<'PY' || return $?
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for path in root.iterdir():
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+  [[ ! -e "$published" && ! -L "$published" ]] ||
+    { printf '%s\n' 'Backup generation already exists' >&2; return 1; }
+  mv --no-clobber --no-copy -- "$temporary" "$published" || return $?
+  temporary="$published"
+  python3 - "$backup_root" <<'PY' || return $?
+import os
+import sys
+
+directory = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+  lf_backup_validate_generation "$published" || return $?
+  trap - RETURN
+  printf '%s\n' "$published"
+}
+
+lf_backup_runtime_running() {
+  [[ -n "$("${compose[@]}" ps -q api)" ]]
+}
+
+lf_backup_stop_writers_locked() {
+  validate_compose
+  drain_and_stop_runtime
+  "${compose[@]}" stop browser-state-init minio-init
+  [[ -z "$("${compose[@]}" ps -q browser-state-init minio-init)" ]] ||
+    { printf '%s\n' 'Volume initialization writers did not stop' >&2; return 1; }
+  "${compose[@]}" up -d --no-deps --wait app-postgres
+}
+
+lf_backup_fail_closed() {
+  if [[ "$backup_operation_complete" == 1 ]]; then
+    return
+  fi
+  "${compose[@]}" stop api browser-service browser-state-init minio \
+    minio-init app-postgres \
+    >/dev/null 2>&1 || true
+  stop_host_services_locked >/dev/null 2>&1 || true
+}
+
+lf_backup_restart_locked() {
+  if (( backup_runtime_was_running == 0 )); then
+    "${compose[@]}" stop app-postgres
+    return
+  fi
+  start_host_services_locked
+  start_runtime
+  verify_deep_health_locked 0 >/dev/null
+}
+
+lf_backup_main() {
+  local backup_root="$repo_root/backups/local-firecrawl"
+  local generation
+  local published
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --output)
+        (( $# >= 2 )) || { lf_backup_usage; return 64; }
+        backup_root="$2"
+        shift 2
+        ;;
+      *)
+        lf_backup_usage
+        return 64
+        ;;
+    esac
+  done
+  validate_runtime_options || return $?
+  lf_backup_validate_root "$backup_root" || return $?
+  acquire_runtime_lock exclusive || return $?
+  if lf_backup_runtime_running; then
+    backup_runtime_was_running=1
+  fi
+  backup_operation_complete=0
+  trap lf_backup_fail_closed EXIT
+  lf_backup_stop_writers_locked || return $?
+  generation="$(lf_backup_generation_name)"
+  published="$(lf_backup_capture_generation_locked "$backup_root" "$generation")" ||
+    return $?
+  lf_backup_restart_locked || return $?
+  backup_operation_complete=1
+  trap cleanup_sealed_identity EXIT
+  printf 'Created persistence generation: %s\n' "$published"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  lf_backup_main "$@"
+fi

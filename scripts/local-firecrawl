@@ -846,6 +846,134 @@ check_browser_rollback_offline() {
     /var/lib/firecrawl-browser-volume/state
 }
 
+verify_deep_health_locked() {
+  local live_codex="${1:-0}"
+  local api_compose_source
+  local api_container_id
+  local health_json
+  local latest_applied_checksum
+  local latest_applied_migration
+  local latest_checked_in_checksum
+  local latest_checked_in_migration
+  local migration_ledger_entry
+  local redis_response
+
+  [[ "$runtime_lock_held" == shared || "$runtime_lock_held" == exclusive ]] ||
+    { printf '%s\n' 'Deep health requires the lifecycle lock' >&2; return 70; }
+  [[ "$live_codex" == 0 || "$live_codex" == 1 ]] ||
+    { printf '%s\n' 'Deep health live Codex option is invalid' >&2; return 64; }
+  validate_compose
+  shallow_host_health
+  health_json="$(api_running_cli browser-runtime-status)"
+  verify_runtime_status_json "$health_json"
+  jq -e '.orphanProcesses == 0' <<< "$health_json" >/dev/null || {
+    printf '%s\n' 'Broker orphan processes are present' >&2
+    return 1
+  }
+  verify_adapter_health_json "$(
+    jq '{
+      version, status, codexCliVersion, codexArtifactSha256,
+      codexProtocolSchemaSha256, brokerProtocolSha256, model,
+      reasoningEffort
+    }' <<< "$health_json"
+  )"
+
+  redis_response="$("${compose[@]}" exec -T redis redis-cli ping)"
+  if [[ "$redis_response" != "PONG" ]]; then
+    printf 'Redis health check returned %q, expected PONG\n' \
+      "$redis_response" >&2
+    return 1
+  fi
+
+  "${compose[@]}" exec -T rabbitmq \
+    rabbitmq-diagnostics -q check_running
+  "${compose[@]}" exec -T nuq-postgres sh -c \
+    'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+  "${compose[@]}" exec -T app-postgres sh -c \
+    'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+  latest_checked_in_migration="$(
+    find "$repo_root/apps/api/src/db/migrations" -maxdepth 1 -type f \
+      -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' |
+      LC_ALL=C sort | tail -n 1
+  )"
+  if [[ -z "$latest_checked_in_migration" ]]; then
+    printf '%s\n' 'No application migrations were found' >&2
+    return 1
+  fi
+  migration_ledger_entry="$(
+    "${compose[@]}" exec -T app-postgres sh -ec \
+      'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT concat_ws('"'"'|'"'"', filename, checksum) FROM application_schema_migrations ORDER BY filename DESC LIMIT 1"'
+  )"
+  IFS='|' read -r latest_applied_migration latest_applied_checksum \
+    <<< "$migration_ledger_entry"
+  if [[ "$latest_applied_migration" != "$latest_checked_in_migration" ]]; then
+    printf 'Application migration mismatch: expected %s, found %s\n' \
+      "$latest_checked_in_migration" \
+      "${latest_applied_migration:-none}" >&2
+    return 1
+  fi
+  latest_checked_in_checksum="$(
+    sha256sum -- \
+      "$repo_root/apps/api/src/db/migrations/$latest_checked_in_migration"
+  )"
+  latest_checked_in_checksum="${latest_checked_in_checksum%% *}"
+  if [[ -z "$latest_applied_checksum" ]] ||
+    [[ "$latest_applied_checksum" != "$latest_checked_in_checksum" ]]; then
+    printf 'Application migration checksum mismatch: %s\n' \
+      "$latest_checked_in_migration" >&2
+    return 1
+  fi
+
+  api_container_id="$("${compose[@]}" ps -q api)"
+  if [[ -z "$api_container_id" ]]; then
+    printf '%s\n' 'API container provenance is unavailable' >&2
+    return 1
+  fi
+  api_compose_source="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
+      "$api_container_id"
+  )"
+  if [[ "$api_compose_source" != "$compose_config_sources" ]]; then
+    printf '%s\n' 'API compose provenance does not match' >&2
+    return 1
+  fi
+
+  require_completed_one_shot minio-init
+  "${compose[@]}" exec -T minio curl --fail --silent --show-error \
+    --max-time 10 --output /dev/null \
+    http://127.0.0.1:9000/minio/health/live
+  "${compose[@]}" exec -T api sh -ec \
+    'test -z "${MINIO_ROOT_USER+x}" && test -z "${MINIO_ROOT_PASSWORD+x}" && node dist/src/cli/artifact-health.js'
+  "${compose[@]}" exec -T playwright-service node -e \
+    "fetch('http://127.0.0.1:3000/health', {
+        signal: AbortSignal.timeout(10000),
+      })
+      .then(response => {
+        if (!response.ok) {
+          throw new Error('Playwright health check returned ' + response.status);
+        }
+      })
+      .catch(error => {
+        console.error(error);
+        process.exit(1);
+      })"
+  curl --fail --silent --show-error --max-time 10 \
+    --output /dev/null "http://127.0.0.1:${PORT:-3002}/"
+  check_port_policy
+  disposable_browser_health
+  if (( live_codex == 1 )); then
+    run_live_codex_gate
+  fi
+  deep_health_json="$(jq -c 'del(.unsettledHostJobs)' <<< "$health_json")"
+  deep_health_migration="$latest_applied_migration"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 if (( $# < 1 )); then
   usage
   exit 64
@@ -1056,114 +1184,11 @@ case "$command" in
     done
     validate_runtime_options
     acquire_runtime_lock shared
-    validate_compose
-    shallow_host_health
-    health_json="$(api_running_cli browser-runtime-status)"
-    verify_runtime_status_json "$health_json"
-    jq -e '.orphanProcesses == 0' <<< "$health_json" >/dev/null || {
-      printf '%s\n' 'Broker orphan processes are present' >&2
-      exit 1
-    }
-    verify_adapter_health_json "$(
-      jq '{
-        version, status, codexCliVersion, codexArtifactSha256,
-        codexProtocolSchemaSha256, brokerProtocolSha256, model,
-        reasoningEffort
-      }' <<< "$health_json"
-    )"
-
-    redis_response="$("${compose[@]}" exec -T redis redis-cli ping)"
-    if [[ "$redis_response" != "PONG" ]]; then
-      printf 'Redis health check returned %q, expected PONG\n' \
-        "$redis_response" >&2
-      exit 1
-    fi
-
-    "${compose[@]}" exec -T rabbitmq \
-      rabbitmq-diagnostics -q check_running
-    "${compose[@]}" exec -T nuq-postgres sh -c \
-      'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-    "${compose[@]}" exec -T app-postgres sh -c \
-      'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-
-    latest_checked_in_migration="$(
-      find "$repo_root/apps/api/src/db/migrations" -maxdepth 1 -type f \
-        -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' |
-        LC_ALL=C sort | tail -n 1
-    )"
-    if [[ -z "$latest_checked_in_migration" ]]; then
-      printf '%s\n' 'No application migrations were found' >&2
-      exit 1
-    fi
-    migration_ledger_entry="$(
-      "${compose[@]}" exec -T app-postgres sh -ec \
-        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT concat_ws('"'"'|'"'"', filename, checksum) FROM application_schema_migrations ORDER BY filename DESC LIMIT 1"'
-    )"
-    IFS='|' read -r latest_applied_migration latest_applied_checksum \
-      <<< "$migration_ledger_entry"
-    if [[ "$latest_applied_migration" != "$latest_checked_in_migration" ]]; then
-      printf 'Application migration mismatch: expected %s, found %s\n' \
-        "$latest_checked_in_migration" \
-        "${latest_applied_migration:-none}" >&2
-      exit 1
-    fi
-    latest_checked_in_checksum="$(
-      sha256sum -- \
-        "$repo_root/apps/api/src/db/migrations/$latest_checked_in_migration"
-    )"
-    latest_checked_in_checksum="${latest_checked_in_checksum%% *}"
-    if [[ -z "$latest_applied_checksum" ]] ||
-      [[ "$latest_applied_checksum" != "$latest_checked_in_checksum" ]]; then
-      printf 'Application migration checksum mismatch: %s\n' \
-        "$latest_checked_in_migration" >&2
-      exit 1
-    fi
-
-    api_container_id="$("${compose[@]}" ps -q api)"
-    if [[ -z "$api_container_id" ]]; then
-      printf '%s\n' 'API container provenance is unavailable' >&2
-      exit 1
-    fi
-    api_compose_source="$(
-      docker inspect --format \
-        '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
-        "$api_container_id"
-    )"
-    if [[ "$api_compose_source" != "$compose_config_sources" ]]; then
-      printf '%s\n' 'API compose provenance does not match' >&2
-      exit 1
-    fi
-
-    require_completed_one_shot minio-init
-    "${compose[@]}" exec -T minio curl --fail --silent --show-error \
-      --max-time 10 --output /dev/null \
-      http://127.0.0.1:9000/minio/health/live
-    "${compose[@]}" exec -T api sh -ec \
-      'test -z "${MINIO_ROOT_USER+x}" && test -z "${MINIO_ROOT_PASSWORD+x}" && node dist/src/cli/artifact-health.js'
-    "${compose[@]}" exec -T playwright-service node -e \
-      "fetch('http://127.0.0.1:3000/health', {
-          signal: AbortSignal.timeout(10000),
-        })
-        .then(response => {
-          if (!response.ok) {
-            throw new Error('Playwright health check returned ' + response.status);
-          }
-        })
-        .catch(error => {
-          console.error(error);
-          process.exit(1);
-        })"
-    curl --fail --silent --show-error --max-time 10 \
-      --output /dev/null "http://127.0.0.1:${PORT:-3002}/"
-    check_port_policy
-    disposable_browser_health
-
-    if (( live_codex == 1 )); then
-      run_live_codex_gate
-    fi
-
+    verify_deep_health_locked "$live_codex"
+    health_json="$deep_health_json"
+    latest_applied_migration="$deep_health_migration"
     if (( health_json_output == 1 )); then
-      jq -c 'del(.unsettledHostJobs)' <<< "$health_json"
+      printf '%s\n' "$health_json"
     else
       printf '%s\n' \
         "Local Firecrawl is healthy at http://127.0.0.1:${PORT:-3002}; migrations: $latest_applied_migration; artifacts: MinIO; browser probe: PASS"
