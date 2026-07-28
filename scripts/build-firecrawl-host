@@ -469,6 +469,33 @@ async function exportImage(imageId, destination, workspace) {
   }
 }
 
+async function normalizeRootfsHardlinks(rootfs) {
+  const entries = await collectTree(rootfs, { includeDirectories: true });
+  for (const entry of entries) {
+    if (entry.type === "symlink" && entry.metadata.nlink !== 1) {
+      throw fail("rootfs_hardlink_rejected", entry.path);
+    }
+    if (entry.type !== "file" || entry.metadata.nlink === 1) continue;
+
+    const replacement = `${entry.absolute}.firecrawl-unlinked-${randomUUID()}`;
+    try {
+      await copyFile(
+        entry.absolute,
+        replacement,
+        constants.COPYFILE_EXCL,
+      );
+      await chmod(replacement, entry.metadata.mode & 0o7777);
+      await rename(replacement, entry.absolute);
+    } finally {
+      await rm(replacement, { force: true });
+    }
+    const normalized = await lstat(entry.absolute);
+    if (!normalized.isFile() || normalized.nlink !== 1) {
+      throw fail("rootfs_hardlink_normalization_failed", entry.path);
+    }
+  }
+}
+
 function u64(value) {
   const output = Buffer.alloc(8);
   output.writeBigUInt64BE(BigInt(value));
@@ -487,7 +514,10 @@ async function rootfsDigest(rootfs, expectedUid = process.getuid()) {
   const entries = await collectTree(rootfs, { includeDirectories: true });
   const hasher = createHash("sha256");
   for (const entry of entries) {
-    if (entry.metadata.uid !== expectedUid) {
+    if (
+      entry.metadata.uid !== expectedUid ||
+      entry.metadata.dev !== rootMetadata.dev
+    ) {
       throw fail("rootfs_owner_invalid", entry.path);
     }
     let record;
@@ -495,12 +525,18 @@ async function rootfsDigest(rootfs, expectedUid = process.getuid()) {
       if (entry.metadata.mode & 0o022) throw fail("rootfs_mode_invalid", entry.path);
       record = Buffer.from(`d:${(entry.metadata.mode & 0o7777).toString(8)}`);
     } else if (entry.type === "symlink") {
+      if (entry.metadata.nlink !== 1) {
+        throw fail("rootfs_hardlink_rejected", entry.path);
+      }
       record = Buffer.concat([
         Buffer.from("l:"),
         Buffer.from(await readlink(entry.absolute)),
       ]);
     } else {
       if (entry.metadata.mode & 0o022) throw fail("rootfs_mode_invalid", entry.path);
+      if (entry.metadata.nlink !== 1) {
+        throw fail("rootfs_hardlink_rejected", entry.path);
+      }
       const raw = await readFile(entry.absolute);
       record = Buffer.from(
         `f:${(entry.metadata.mode & 0o7777).toString(8)}:${raw.byteLength}:${sha256(raw)}`,
@@ -582,6 +618,7 @@ async function buildRootfs(workspace, staging, artifact, codexManifest) {
       const directory = join(staging, "bundles", bundle);
       const rootfs = join(directory, "rootfs");
       await exportImage(image, rootfs, workspace);
+      await normalizeRootfsHardlinks(rootfs);
       const rootfsSha256 = await rootfsDigest(rootfs);
       await writeJson(join(directory, "rootfs.identity.json"), {
         version: 1,

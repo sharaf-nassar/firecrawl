@@ -1,0 +1,15 @@
+[Unit]
+Description=Firecrawl sandbox broker socket
+
+[Socket]
+ExecStartPre=/usr/bin/install -d -o root -g firecrawl-sandbox -m 0750 /run/firecrawl-sandbox
+ListenSequentialPacket=/run/firecrawl-sandbox/broker.sock
+Service=firecrawl-sandbox-broker.service
+SocketUser=root
+SocketGroup=firecrawl-sandbox
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

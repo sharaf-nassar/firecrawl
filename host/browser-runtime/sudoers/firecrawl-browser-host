@@ -1,0 +1,4 @@
+# Permit only the fixed, closed acceptance helper surface. Installation and
+# arbitrary paths, units, commands, signals, and arguments are not allowed.
+Cmnd_Alias FIRECRAWL_ACCEPTANCE = /usr/local/libexec/firecrawl-acceptance-restart-broker --check, /usr/local/libexec/firecrawl-acceptance-restart-broker ^--restart-prepared [0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12} [0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$
+%firecrawl-sandbox ALL=(root) NOPASSWD: FIRECRAWL_ACCEPTANCE

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/firecrawl/current/bin/acceptance-restart-broker "$@"

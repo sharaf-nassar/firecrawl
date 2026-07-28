@@ -18,6 +18,7 @@ if [[ -n "${LOCAL_FIRECRAWL_ENV_FILE:-}" ]]; then
   compose+=(--env-file "$LOCAL_FIRECRAWL_ENV_FILE")
 fi
 runtime_lock_path="/tmp/firecrawl-local-firecrawl.${UID}.lock"
+runtime_lock_held=
 if [[ "$project_name" != firecrawl ]]; then
   if [[ ! "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
     printf '%s\n' 'LOCAL_FIRECRAWL_PROJECT_NAME is invalid' >&2
@@ -40,7 +41,7 @@ one_shot_services=(browser-state-init minio-init)
 diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
 
 usage() {
-  printf 'Usage: %s {start|stop|restart|status|health|logs|lock-path}\n' \
+  printf 'Usage: %s {install-host|start|stop|restart|status|health|logs|lock-path}\n' \
     "${0##*/}" >&2
 }
 
@@ -71,6 +72,52 @@ acquire_runtime_lock() {
       "$runtime_lock_path" >&2
     exit 75
   fi
+  runtime_lock_held="$mode"
+}
+
+build_host_staging_locked() {
+  local cache_root
+  local staging
+
+  [[ "$runtime_lock_held" == exclusive ]] ||
+    { printf '%s\n' 'Host publication requires the lifecycle lock' >&2; return 70; }
+  cache_root="$(getent passwd "$UID" | cut -d: -f6)/.cache/firecrawl-host-builds"
+  staging="$cache_root/staging-$BASHPID"
+  "$repo_root/scripts/build-firecrawl-host" \
+    --staging-only --output "$staging" >&2
+  printf '%s\n' "$staging"
+}
+
+publish_host_from_staging_locked() {
+  local staging="$1"
+  local mode="$2"
+  local -a sudo_command=(sudo)
+
+  [[ "$runtime_lock_held" == exclusive ]] ||
+    { printf '%s\n' 'Host publication requires the lifecycle lock' >&2; return 70; }
+  [[ "$mode" == initial || "$mode" == refresh ]] ||
+    { printf '%s\n' 'Host publication mode is invalid' >&2; return 64; }
+  [[ "$staging" == /* && "$(readlink -f -- "$staging")" == "$staging" ]] ||
+    { printf '%s\n' 'Host staging path is invalid' >&2; return 64; }
+  if [[ "$mode" == refresh ]]; then
+    sudo_command+=( -n )
+  fi
+  "${sudo_command[@]}" \
+    "$repo_root/host/browser-runtime/install-root.sh" \
+    --staging "$staging" \
+    --adapter-user "$(id -un)" \
+    --adapter-uid "$UID"
+  systemctl --user daemon-reload
+  systemctl --user enable firecrawl-execution-adapter.service
+}
+
+refresh_host_locked() {
+  local staging
+  if [[ ! -f /opt/firecrawl/current/manifest.json ]]; then
+    return
+  fi
+  staging="$(build_host_staging_locked)"
+  publish_host_from_staging_locked "$staging" refresh
 }
 
 validate_compose() {
@@ -217,9 +264,29 @@ case "$1" in
   lock-path)
     printf '%s\n' "$runtime_lock_path"
     ;;
+  install-host)
+    validate_runtime_options
+    [[ -t 0 && -t 1 ]] || {
+      printf '%s\n' 'install-host requires an interactive terminal' >&2
+      exit 64
+    }
+    acquire_runtime_lock exclusive
+    staging="$(build_host_staging_locked)"
+    printf 'Staging: %s\n' "$staging"
+    jq -r \
+      '"Codex: " + .codexAppServer.sourceIdentity.version +
+       "\\nModel: " + .codexAppServer.model +
+       "\\nEffort: " + .codexAppServer.reasoningEffort' \
+      "$staging/manifest.json"
+    printf '%s\n' \
+      'System units: firecrawl-sandbox-broker.socket, firecrawl-sandbox-broker.service' \
+      'User unit: firecrawl-execution-adapter.service'
+    publish_host_from_staging_locked "$staging" initial
+    ;;
   start)
     validate_runtime_options
     acquire_runtime_lock exclusive
+    refresh_host_locked
     validate_compose
     validate_browser_rollback_request
     # Writers stay stopped through rollback validation and initialization.
@@ -238,6 +305,7 @@ case "$1" in
   restart)
     validate_runtime_options
     acquire_runtime_lock exclusive
+    refresh_host_locked
     validate_compose
     validate_browser_rollback_request
     quiesce_browser_writers

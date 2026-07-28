@@ -1,0 +1,38 @@
+[Unit]
+Description=Firecrawl fixed-bundle sandbox broker
+Requires=firecrawl-sandbox-broker.socket
+After=firecrawl-sandbox-broker.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/firecrawl-sandbox-broker
+EnvironmentFile=/etc/firecrawl/browser-host.env
+User=root
+Group=root
+UMask=0077
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=default
+ProcSubset=all
+Delegate=cpu memory pids io
+DelegateSubgroup=broker
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadOnlyPaths=/opt/firecrawl
+ReadWritePaths=/run/firecrawl-sandbox /sys/fs/cgroup/system.slice/firecrawl-sandbox-broker.service
+
+[Install]
+WantedBy=multi-user.target

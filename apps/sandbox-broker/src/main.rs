@@ -1,5 +1,6 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -21,6 +22,7 @@ use firecrawl_sandbox_broker::registry::{BrokerRuntime, PreparedLease, RealRunc,
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{MsgFlags, recv};
 const RUNTIME_ROOT: &str = "/run/firecrawl-sandbox";
+const BROKER_SOCKET_PATH: &str = "/run/firecrawl-sandbox/broker.sock";
 const SYSTEMD_LISTENER_FD: i32 = 3;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 64;
@@ -45,9 +47,9 @@ fn main() -> Result<()> {
             .context("installed rootfs rejected")?;
     }
     let expected_uid = expected_adapter_uid().context("adapter UID rejected")?;
-    validate_socket_activation().context("socket activation rejected")?;
+    let sandbox_gid = validate_socket_activation().context("socket activation rejected")?;
     let runtime_root = PathBuf::from(RUNTIME_ROOT);
-    ensure_runtime_root(&runtime_root).context("runtime root rejected")?;
+    ensure_runtime_root(&runtime_root, sandbox_gid).context("runtime root rejected")?;
     let runtime = Arc::new(BrokerRuntime::new(
         runtime_root.clone(),
         Arc::new(RealRunc::new(runtime_root)),
@@ -107,32 +109,87 @@ fn expected_adapter_uid() -> Result<u32> {
     Ok(uid)
 }
 
-fn validate_socket_activation() -> Result<()> {
+fn validate_socket_activation() -> Result<u32> {
     let listen_pid = std::env::var("LISTEN_PID").context("LISTEN_PID is required")?;
     let listen_fds = std::env::var("LISTEN_FDS").context("LISTEN_FDS is required")?;
     if listen_pid != std::process::id().to_string() || listen_fds != "1" {
         bail!("exactly one listener must belong to this process");
     }
     let listener = unsafe { BorrowedFd::borrow_raw(SYSTEMD_LISTENER_FD) };
-    validate_listener(listener).map_err(|error| anyhow::anyhow!(error))
+    validate_listener(listener).map_err(|error| anyhow::anyhow!(error))?;
+    validate_listener_identity(listener, Path::new(BROKER_SOCKET_PATH))
 }
 
-fn ensure_runtime_root(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    match std::fs::create_dir(path) {
-        Ok(()) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+fn validate_listener_identity(listener: BorrowedFd<'_>, expected_path: &Path) -> Result<u32> {
+    let address = nix::sys::socket::getsockname::<nix::sys::socket::UnixAddr>(listener.as_raw_fd())
+        .context("listener address unavailable")?;
+    if address.path() != Some(expected_path) {
+        bail!("listener path rejected");
     }
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o777 != 0o700
+    let descriptor = nix::sys::stat::fstat(listener).context("listener identity unavailable")?;
+    let path = std::fs::symlink_metadata(expected_path).context("listener path unavailable")?;
+    if !path.file_type().is_socket()
+        || path.file_type().is_symlink()
+        || path.uid() != 0
+        || path.gid() == 0
+        || path.permissions().mode() & 0o777 != 0o660
+        || path.dev() != descriptor.st_dev
+        || path.ino() != descriptor.st_ino
+        || path.uid() != descriptor.st_uid
+        || path.gid() != descriptor.st_gid
+        || descriptor.st_mode & 0o777 != 0o660
+    {
+        bail!("listener ownership or mode rejected");
+    }
+    Ok(path.gid())
+}
+
+fn validate_runtime_root_metadata(metadata: &std::fs::Metadata, expected_gid: u32) -> Result<()> {
+    validate_runtime_root_fields(
+        metadata.file_type().is_dir(),
+        metadata.file_type().is_symlink(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.permissions().mode() & 0o777,
+        expected_gid,
+    )
+}
+
+fn validate_runtime_root_fields(
+    is_directory: bool,
+    is_symlink: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    expected_gid: u32,
+) -> Result<()> {
+    if expected_gid == 0
+        || !is_directory
+        || is_symlink
+        || uid != 0
+        || gid != expected_gid
+        || mode != 0o750
     {
         bail!("runtime root ownership or mode rejected");
     }
     Ok(())
+}
+
+fn ensure_runtime_root(path: &std::path::Path, expected_gid: u32) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750))?;
+            nix::unistd::chown(
+                path,
+                Some(nix::unistd::Uid::from_raw(0)),
+                Some(nix::unistd::Gid::from_raw(expected_gid)),
+            )?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    validate_runtime_root_metadata(&metadata, expected_gid)
 }
 
 fn serve_connection<R: Runc>(
@@ -606,8 +663,29 @@ mod socket_lifecycle_tests {
 
     use super::{
         installed_contract_healthy_at, send_prepared_or_cleanup, send_terminal, serve_connection,
-        serve_connection_with_contract_check,
+        serve_connection_with_contract_check, validate_runtime_root_fields,
     };
+
+    #[test]
+    fn runtime_root_requires_exact_socket_group_and_mode() {
+        assert!(validate_runtime_root_fields(true, false, 0, 123, 0o750, 123).is_ok());
+        for invalid in [
+            (false, false, 0, 123, 0o750, 123),
+            (true, true, 0, 123, 0o750, 123),
+            (true, false, 1, 123, 0o750, 123),
+            (true, false, 0, 0, 0o750, 0),
+            (true, false, 0, 124, 0o750, 123),
+            (true, false, 0, 123, 0o700, 123),
+            (true, false, 0, 123, 0o751, 123),
+        ] {
+            assert!(
+                validate_runtime_root_fields(
+                    invalid.0, invalid.1, invalid.2, invalid.3, invalid.4, invalid.5
+                )
+                .is_err()
+            );
+        }
+    }
 
     struct SocketFakeRunc {
         state: Mutex<Option<RuncStateRecord>>,
