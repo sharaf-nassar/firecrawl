@@ -13,7 +13,8 @@ export type ExecutionAdapterErrorCategory =
   | "timed_out"
   | "model_protocol_error"
   | "action_outcome_unknown"
-  | "capability_denied";
+  | "capability_denied"
+  | "not_found";
 
 const EXECUTION_ADAPTER_ERROR_MESSAGES: Record<
   ExecutionAdapterErrorCategory,
@@ -27,6 +28,7 @@ const EXECUTION_ADAPTER_ERROR_MESSAGES: Record<
   model_protocol_error: "Browser execution returned an invalid protocol result",
   action_outcome_unknown: "Browser action outcome is unknown",
   capability_denied: "Browser execution capability was denied",
+  not_found: "Browser execution job was not found",
 };
 
 const PRE_ADMISSION_FAILURES = new WeakSet<Error>();

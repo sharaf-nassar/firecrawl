@@ -76,6 +76,7 @@ export type InternalBrowserRunsDependencies = {
   now?: () => Date;
   getArtifactStore?: () => ArtifactStore | null;
   createArtifactService?: typeof createBrowserArtifactService;
+  drainRuntime?: () => Promise<void>;
 };
 
 type AdapterHeaders = AdapterAuthorizationBinding;
@@ -444,7 +445,7 @@ async function defaultReadToken(path: string | undefined): Promise<string> {
   if (!path) throw new Error("Adapter token file is not configured");
   const raw = await readFile(path, { encoding: "utf8" });
   const token = raw.trim();
-  if (token.length < 32 || token.length > 4_096) {
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(token)) {
     throw new Error("Adapter token file is invalid");
   }
   return token;
@@ -543,6 +544,54 @@ export function createBrowserRunsInternalRouter(
   const buildArtifactService =
     deps.createArtifactService ?? createBrowserArtifactService;
   const now = deps.now ?? (() => new Date());
+  router.post("/internal/browser-runtime/drain", async (request, response) => {
+    try {
+      const authorization = exactSingleRawHeader(request, "authorization");
+      const expected = await readToken();
+      if (
+        authorization === null ||
+        !/^Bearer [^\s]+$/u.test(authorization) ||
+        !equalSecret(authorization.slice(7), expected)
+      ) {
+        throw new CapabilityDeniedError();
+      }
+      if (
+        request.headers["transfer-encoding"] !== undefined ||
+        (request.headers["content-length"] !== undefined &&
+          request.headers["content-length"] !== "0")
+      ) {
+        sanitizedError(
+          response,
+          400,
+          "model_protocol_error",
+          "Browser drain request must have an empty body",
+        );
+        return;
+      }
+      if (!deps.drainRuntime) {
+        sanitizedError(
+          response,
+          503,
+          "browser_state_unavailable",
+          "Browser state is unavailable",
+        );
+        return;
+      }
+      await deps.drainRuntime();
+      response.status(200).json({ version: 1, status: "drained" });
+    } catch (error) {
+      const denied = error instanceof CapabilityDeniedError;
+      sanitizedError(
+        response,
+        denied ? 403 : 503,
+        denied ? "capability_denied" : "browser_state_unavailable",
+        denied
+          ? "Browser capability was denied"
+          : "Browser state is unavailable",
+      );
+    }
+  });
+
   const authenticate = async (request: Request) => {
     const authorization = exactSingleRawHeader(request, "authorization");
     const expected = await readToken();

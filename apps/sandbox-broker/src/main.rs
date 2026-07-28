@@ -279,6 +279,11 @@ fn serve_connection_with_contract_check<R: Runc, F: Fn() -> bool>(
                 &BrokerResponse::Diagnostic { diagnostic },
             )
         }
+        BrokerRequest::Status => {
+            reject_descriptors(&packet)?;
+            let status = runtime.status()?;
+            send(connection.as_fd(), &BrokerResponse::StatusResult { status })
+        }
         BrokerRequest::Health => {
             reject_descriptors(&packet)?;
             if !runtime.is_healthy()

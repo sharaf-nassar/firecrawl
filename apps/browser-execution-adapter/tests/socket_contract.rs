@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader as StdBufReader, IoSlice, IoSliceMut, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
@@ -13,7 +13,9 @@ use firecrawl_browser_execution_adapter::broker_client::{
     BrokerTerminalOutcome, validate_shared_contract, validate_shared_contract_bytes,
 };
 use firecrawl_browser_execution_adapter::config::AdapterConfig;
+use firecrawl_browser_execution_adapter::jobs::AdapterRequest;
 use firecrawl_browser_execution_adapter::jobs::{AdapterService, JobCompletion, JobRegistry};
+use firecrawl_browser_execution_adapter::protocol::parse_json_strict;
 use nix::cmsg_space;
 use nix::fcntl::{FcntlArg, OFlag, SealFlag, fcntl};
 use nix::sys::memfd::{MFdFlags, memfd_create};
@@ -34,12 +36,276 @@ const INIT_PID: u32 = 4242;
 fn temporary_root() -> PathBuf {
     let path = std::env::temp_dir().join(format!("firecrawl-adapter-test-{}", Uuid::new_v4()));
     fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     path
+}
+
+#[test]
+fn health_and_diagnostic_requests_are_closed_and_canonical() {
+    let request_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    for accepted in [
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "health",
+            "body": {}
+        }),
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "status",
+            "body": {}
+        }),
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "diagnose_host_job",
+            "body": {"correlationId": correlation_id, "jobId": job_id}
+        }),
+    ] {
+        assert!(parse_json_strict::<AdapterRequest>(accepted.to_string().as_bytes()).is_ok());
+    }
+    for rejected in [
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "health",
+            "body": {"extra": true}
+        }),
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "status",
+            "body": {"extra": true}
+        }),
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "diagnose_host_job",
+            "body": {
+                "correlationId": correlation_id,
+                "jobId": job_id,
+                "extra": true
+            }
+        }),
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "method": "diagnose_host_job",
+            "body": {
+                "correlationId": correlation_id.to_string().to_uppercase(),
+                "jobId": job_id
+            }
+        }),
+        json!({
+            "version": 1,
+            "requestId": Uuid::nil(),
+            "method": "health",
+            "body": {}
+        }),
+    ] {
+        assert!(parse_json_strict::<AdapterRequest>(rejected.to_string().as_bytes()).is_err());
+    }
 }
 
 fn write_private(path: &Path, contents: impl AsRef<[u8]>) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn sha256(raw: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(raw))
+}
+
+fn write_regular(path: &Path, contents: impl AsRef<[u8]>) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+fn write_checksum_manifest(root: &Path, relative_paths: &[String]) {
+    let mut paths = relative_paths.to_vec();
+    paths.sort();
+    let contents = paths
+        .iter()
+        .map(|path| format!("{}  {path}\n", sha256(&fs::read(root.join(path)).unwrap())))
+        .collect::<String>();
+    write_regular(&root.join("SHA256SUMS"), contents);
+}
+
+fn installed_health_fixture(root: &Path) -> (PathBuf, String) {
+    let generation_name = format!("host-{}", "a".repeat(64));
+    let generation = root.join("generations").join(&generation_name);
+    let protocol = generation.join("protocol/codex-app-server");
+    let mut inventory = [
+        "v1/InitializeResponse.json",
+        "v2/ThreadStartResponse.json",
+        "v2/TurnStartResponse.json",
+        "v2/ThreadStartedNotification.json",
+        "v2/TurnStartedNotification.json",
+        "v2/ItemStartedNotification.json",
+        "v2/ItemCompletedNotification.json",
+        "v2/TurnCompletedNotification.json",
+        "v2/ThreadTokenUsageUpdatedNotification.json",
+        "v2/AgentMessageDeltaNotification.json",
+        "v2/ReasoningSummaryPartAddedNotification.json",
+        "v2/ReasoningSummaryTextDeltaNotification.json",
+        "v2/ReasoningTextDeltaNotification.json",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    inventory.sort();
+    let mut schema_digest = Sha256::new();
+    for path in &inventory {
+        let raw = b"true";
+        write_regular(&protocol.join(path), raw);
+        schema_digest.update(b"host/browser-runtime/protocol/codex-app-server/");
+        schema_digest.update(path.as_bytes());
+        schema_digest.update([0]);
+        schema_digest.update(raw);
+        schema_digest.update([0]);
+    }
+    let schema_digest = format!("{:x}", schema_digest.finalize());
+    let identity = json!({
+        "executablePath": "/usr/local/bin/codex",
+        "resolvedPath": "/opt/codex/bin/codex.js",
+        "device": "1",
+        "inode": "2",
+        "version": "0.145.0"
+    });
+    write_regular(
+        &protocol.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "codexIdentity": identity,
+            "schemaInventory": inventory,
+            "schemaDigest": schema_digest
+        }))
+        .unwrap(),
+    );
+    write_regular(
+        &protocol.join("model-decision-envelope-v1.schema.json"),
+        include_bytes!(
+            "../../../host/browser-runtime/protocol/model-decision-envelope-v1.schema.json"
+        ),
+    );
+    let mut protocol_sums = inventory.clone();
+    protocol_sums.push("model-decision-envelope-v1.schema.json".to_owned());
+    write_checksum_manifest(&protocol, &protocol_sums);
+    write_regular(
+        &generation.join("protocol/sandbox-broker-v1.contract.json"),
+        include_bytes!("../../../host/browser-runtime/protocol/sandbox-broker-v1.contract.json"),
+    );
+
+    let artifact = b"codex-artifact";
+    write_regular(&generation.join("codex-app-server.tar"), artifact);
+    let mut binary_hashes = serde_json::Map::new();
+    for name in [
+        "acceptance-restart-broker",
+        "firecrawl-browser-execution-adapter",
+        "firecrawl-sandbox-broker",
+    ] {
+        let raw = format!("binary-{name}");
+        write_regular(&generation.join("bin").join(name), raw.as_bytes());
+        binary_hashes.insert(name.to_owned(), Value::String(sha256(raw.as_bytes())));
+    }
+    let mut policy_hashes = serde_json::Map::new();
+    for name in ["bundles.json", "code-seccomp.json", "codex-seccomp.json"] {
+        let raw = format!("policy-{name}");
+        write_regular(&generation.join("policy").join(name), raw.as_bytes());
+        policy_hashes.insert(name.to_owned(), Value::String(sha256(raw.as_bytes())));
+    }
+    let code_digest = "b".repeat(64);
+    let codex_digest = "c".repeat(64);
+    for (bundle, digest) in [
+        ("code-v1", code_digest.as_str()),
+        ("codex-v1", codex_digest.as_str()),
+    ] {
+        write_regular(
+            &generation
+                .join("bundles")
+                .join(bundle)
+                .join("rootfs.identity.json"),
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "bundleId": bundle,
+                "rootfsSha256": digest
+            }))
+            .unwrap(),
+        );
+    }
+    let timestamp = "2026-07-27T00:00:00.000Z";
+    write_regular(
+        &generation.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "buildTimestamp": timestamp,
+            "codexAppServer": {
+                "formatVersion": 1,
+                "sourceIdentity": identity,
+                "artifactSha256": sha256(artifact),
+                "protocolSha256": schema_digest,
+                "featureSha256": "d".repeat(64),
+                "gateAttestationSha256": "e".repeat(64),
+                "model": "gpt-5.6-terra",
+                "reasoningEffort": "medium",
+                "buildTimestamp": timestamp
+            },
+            "codeRuntime": {
+                "node": "22.22.1",
+                "python": "3.12.3",
+                "bash": "5.2.21",
+                "javascriptPlaywright": "1.61.1",
+                "pythonPlaywright": "1.61.0",
+                "relayProtocol": "code-relay-v1"
+            },
+            "bundleDigests": {
+                "code-v1": code_digest,
+                "codex-v1": codex_digest
+            },
+            "policyHashes": policy_hashes,
+            "brokerContractSha256":
+                firecrawl_browser_execution_adapter::broker_client::BROKER_CONTRACT_SHA256,
+            "binaryHashes": binary_hashes
+        }))
+        .unwrap(),
+    );
+    fn collect(root: &Path, current: &Path, files: &mut Vec<String>) {
+        for entry in fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                collect(root, &entry.path(), files);
+            } else {
+                files.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    let mut generation_files = Vec::new();
+    collect(&generation, &generation, &mut generation_files);
+    write_checksum_manifest(&generation, &generation_files);
+    fs::set_permissions(
+        generation.parent().unwrap(),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::set_permissions(&generation, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(
+        format!("generations/{generation_name}"),
+        root.join("current"),
+    )
+    .unwrap();
+    symlink("current/protocol", root.join("protocol")).unwrap();
+    (root.join("protocol/codex-app-server"), schema_digest)
 }
 
 fn synthetic_bundle() -> ProtocolBundle {
@@ -703,6 +969,69 @@ fn run_diagnose_broker(
                 "cleanup_failure": false
             }),
         );
+    })
+}
+
+fn run_not_found_diagnose_broker(socket_path: PathBuf) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(&socket_path).unwrap()).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let connection = accept(listener.as_raw_fd()).unwrap();
+        assert_eq!(receive_packet(connection)["method"], "diagnose");
+        send_packet(
+            connection,
+            json!({
+                "type": "error",
+                "category": "unauthorized",
+                "message": "peer rejected"
+            }),
+        );
+    })
+}
+
+fn run_health_broker(socket_path: PathBuf) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(&socket_path).unwrap()).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let connection = accept(listener.as_raw_fd()).unwrap();
+        assert_eq!(receive_packet(connection), json!({"method": "health"}));
+        send_packet(connection, json!({"type": "healthy"}));
+    })
+}
+
+fn run_status_broker(socket_path: PathBuf, response: Option<Value>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(&socket_path).unwrap()).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let connection = unsafe { OwnedFd::from_raw_fd(accept(listener.as_raw_fd()).unwrap()) };
+        assert_eq!(
+            receive_packet(connection.as_raw_fd()),
+            json!({"method": "status"})
+        );
+        if let Some(response) = response {
+            send_packet(connection.as_raw_fd(), response);
+        }
     })
 }
 
@@ -1789,6 +2118,371 @@ fn diagnose_round_trips_exact_correlation_and_state() {
         broker_thread.join().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn unknown_diagnostic_pair_maps_to_closed_not_found() {
+    let root = temporary_root();
+    let broker_path = root.join("broker.sock");
+    let broker_thread = run_not_found_diagnose_broker(broker_path.clone());
+    while !broker_path.exists() {
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    let error = BrokerClient::new(broker_path)
+        .unwrap()
+        .diagnose(Uuid::new_v4(), Uuid::new_v4())
+        .unwrap_err();
+    assert_eq!(
+        error.category,
+        firecrawl_browser_execution_adapter::redaction::AdapterErrorCategory::NotFound
+    );
+    assert_eq!(error.message, "Host job was not found");
+    broker_thread.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn adapter_health_verifies_installed_identity_and_returns_closed_result() {
+    let root = temporary_root();
+    let (protocol_root, protocol_sha256) = installed_health_fixture(&root);
+    let broker_path = root.join("broker.sock");
+    let adapter_path = root.join("adapter.sock");
+    let auth_path = root.join("auth.json");
+    let token_path = root.join("adapter.token");
+    write_private(&auth_path, "{}");
+    write_private(&token_path, "x".repeat(43));
+    let socket_guard = std::os::unix::net::UnixListener::bind(&adapter_path).unwrap();
+    fs::set_permissions(&adapter_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let broker_thread = run_health_broker(broker_path.clone());
+    while !broker_path.exists() {
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    let service = AdapterService::with_dependencies(
+        AdapterConfig {
+            adapter_socket: adapter_path,
+            broker_socket: broker_path.clone(),
+            callback_url: "http://127.0.0.1:3002".to_owned(),
+            callback_token_file: token_path,
+            codex_auth_file: auth_path,
+            protocol_root,
+            max_prompt_runs: 1,
+            max_code_runs: 2,
+        },
+        BrokerClient::new(broker_path).unwrap(),
+        JobRegistry::new(1, 2).unwrap(),
+        synthetic_bundle(),
+    );
+    let request_id = Uuid::new_v4();
+    let (mut api, adapter) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(async move { service.handle_connection(adapter).await });
+    api.write_all(
+        format!(
+            "{}\n",
+            json!({
+                "version": 1,
+                "requestId": request_id,
+                "method": "health",
+                "body": {}
+            })
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut reader = BufReader::new(api);
+    let response = read_json_line(&mut reader).await;
+    assert_eq!(
+        response,
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "type": "result",
+            "body": {
+                "version": 1,
+                "status": "ok",
+                "codexCliVersion": "0.145.0",
+                "codexArtifactSha256": sha256(b"codex-artifact"),
+                "codexProtocolSchemaSha256": protocol_sha256,
+                "brokerProtocolSha256":
+                    firecrawl_browser_execution_adapter::broker_client::BROKER_CONTRACT_SHA256,
+                "model": "gpt-5.6-terra",
+                "reasoningEffort": "medium"
+            }
+        })
+    );
+    handler.await.unwrap().unwrap();
+    broker_thread.join().unwrap();
+    drop(socket_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn adapter_health_fails_closed_on_installed_checksum_drift() {
+    let root = temporary_root();
+    let (protocol_root, _) = installed_health_fixture(&root);
+    let broker_path = root.join("missing-broker.sock");
+    let adapter_path = root.join("adapter.sock");
+    let auth_path = root.join("auth.json");
+    let token_path = root.join("adapter.token");
+    write_private(&auth_path, "{}");
+    write_private(&token_path, "x".repeat(43));
+    let socket_guard = std::os::unix::net::UnixListener::bind(&adapter_path).unwrap();
+    fs::set_permissions(&adapter_path, fs::Permissions::from_mode(0o600)).unwrap();
+    write_regular(
+        &root.join("current/bin/firecrawl-browser-execution-adapter"),
+        b"tampered",
+    );
+    let service = AdapterService::with_dependencies(
+        AdapterConfig {
+            adapter_socket: adapter_path,
+            broker_socket: broker_path.clone(),
+            callback_url: "http://127.0.0.1:3002".to_owned(),
+            callback_token_file: token_path,
+            codex_auth_file: auth_path,
+            protocol_root,
+            max_prompt_runs: 1,
+            max_code_runs: 2,
+        },
+        BrokerClient::new(broker_path).unwrap(),
+        JobRegistry::new(1, 2).unwrap(),
+        synthetic_bundle(),
+    );
+    let request_id = Uuid::new_v4();
+    let (mut api, adapter) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(async move { service.handle_connection(adapter).await });
+    api.write_all(
+        format!(
+            "{}\n",
+            json!({
+                "version": 1,
+                "requestId": request_id,
+                "method": "health",
+                "body": {}
+            })
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut reader = BufReader::new(api);
+    assert_eq!(
+        read_json_line(&mut reader).await,
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "type": "error",
+            "error": {
+                "category": "codex_unavailable",
+                "message": "Codex execution is unavailable"
+            }
+        })
+    );
+    handler.await.unwrap().unwrap();
+    drop(socket_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn adapter_status_returns_one_closed_broker_authoritative_record() {
+    let root = temporary_root();
+    let broker_path = root.join("broker.sock");
+    let broker_thread = run_status_broker(
+        broker_path.clone(),
+        Some(json!({
+            "type": "status_result",
+            "prepared_jobs": 2,
+            "starting_jobs": 3,
+            "running_jobs": 4,
+            "unsettled_jobs": 6,
+            "orphan_processes": 5
+        })),
+    );
+    while !broker_path.exists() {
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    let service = AdapterService::with_dependencies(
+        AdapterConfig {
+            adapter_socket: root.join("adapter.sock"),
+            broker_socket: broker_path.clone(),
+            callback_url: "http://127.0.0.1:3002".to_owned(),
+            callback_token_file: root.join("unused-token"),
+            codex_auth_file: root.join("unused-auth"),
+            protocol_root: root.join("unused-protocol"),
+            max_prompt_runs: 1,
+            max_code_runs: 2,
+        },
+        BrokerClient::new(broker_path).unwrap(),
+        JobRegistry::new(1, 2).unwrap(),
+        synthetic_bundle(),
+    );
+    let request_id = Uuid::new_v4();
+    let (mut api, adapter) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(async move { service.handle_connection(adapter).await });
+    api.write_all(
+        format!(
+            "{}\n",
+            json!({
+                "version": 1,
+                "requestId": request_id,
+                "method": "status",
+                "body": {}
+            })
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut reader = BufReader::new(api);
+    assert_eq!(
+        read_json_line(&mut reader).await,
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "type": "result",
+            "body": {
+                "version": 1,
+                "preparedHostJobs": 2,
+                "startingHostJobs": 3,
+                "runningHostJobs": 4,
+                "unsettledHostJobs": 6,
+                "orphanProcesses": 5
+            }
+        })
+    );
+    handler.await.unwrap().unwrap();
+    let mut trailing = String::new();
+    assert_eq!(reader.read_line(&mut trailing).await.unwrap(), 0);
+    broker_thread.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn broker_status_rejects_eof_and_extra_response_fields() {
+    for (index, response) in [
+        None,
+        Some(json!({
+            "type": "status_result",
+            "prepared_jobs": 0,
+            "starting_jobs": 0,
+            "running_jobs": 0,
+            "unsettled_jobs": 0,
+            "orphan_processes": 0,
+            "extra": true
+        })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = temporary_root();
+        let broker_path = root.join(format!("broker-{index}.sock"));
+        let broker_thread = run_status_broker(broker_path.clone(), response);
+        while !broker_path.exists() {
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        assert!(BrokerClient::new(broker_path).unwrap().status().is_err());
+        broker_thread.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn adapter_diagnose_host_job_returns_one_closed_exact_record() {
+    let root = temporary_root();
+    let broker_path = root.join("broker.sock");
+    let auth_path = root.join("auth.json");
+    let token_path = root.join("adapter.token");
+    write_private(&auth_path, "{}");
+    write_private(&token_path, "x".repeat(43));
+    let correlation_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let broker_thread = run_diagnose_broker(broker_path.clone(), correlation_id);
+    while !broker_path.exists() {
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    let registry = JobRegistry::new(1, 2).unwrap();
+    let reserved = registry
+        .reserve_correlated(
+            run_id,
+            firecrawl_browser_execution_adapter::jobs::JobKind::Code,
+            job_id,
+            Uuid::new_v4(),
+            correlation_id,
+        )
+        .unwrap();
+    reserved.lifecycle.record_payload_started();
+    reserved.lifecycle.record_callback();
+    reserved.lifecycle.record_browser_effect();
+    let service = AdapterService::with_dependencies(
+        AdapterConfig {
+            adapter_socket: root.join("adapter.sock"),
+            broker_socket: broker_path.clone(),
+            callback_url: "http://127.0.0.1:3002".to_owned(),
+            callback_token_file: token_path,
+            codex_auth_file: auth_path,
+            protocol_root: root.join("unused-protocol"),
+            max_prompt_runs: 1,
+            max_code_runs: 2,
+        },
+        BrokerClient::new(broker_path).unwrap(),
+        registry,
+        synthetic_bundle(),
+    );
+    let request_id = Uuid::new_v4();
+    let (mut api, adapter) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(async move { service.handle_connection(adapter).await });
+    api.write_all(
+        format!(
+            "{}\n",
+            json!({
+                "version": 1,
+                "requestId": request_id,
+                "method": "diagnose_host_job",
+                "body": {
+                    "correlationId": correlation_id,
+                    "jobId": job_id
+                }
+            })
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut reader = BufReader::new(api);
+    let response = read_json_line(&mut reader).await;
+    assert_eq!(
+        response,
+        json!({
+            "version": 1,
+            "requestId": request_id,
+            "type": "result",
+            "body": {
+                "version": 1,
+                "correlationId": correlation_id,
+                "jobId": job_id,
+                "phase": "prepared",
+                "hostInitPid": INIT_PID,
+                "pidfdLive": true,
+                "pidfdPidMatches": true,
+                "controlLeaseConnected": true,
+                "inertRelayFdPresent": false,
+                "relayListenerPresent": false,
+                "cdpRelayOpened": false,
+                "payloadStartedCount": 1,
+                "payloadMarkerPresent": false,
+                "callbackCount": 1,
+                "browserEffectCount": 1,
+                "runcState": "created",
+                "cgroupPresent": true,
+                "jobDirectoryPresent": true,
+                "childCount": 1,
+                "cleanupFailure": false
+            }
+        })
+    );
+    handler.await.unwrap().unwrap();
+    broker_thread.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[derive(Clone)]

@@ -102,6 +102,73 @@ describe("internal browser run callbacks", () => {
     expect(browserActionErrorStatus("adapter_protocol_error")).toBe(502);
   });
 
+  it("closes admission before acknowledging an authenticated drain", async () => {
+    const drained = deferred<void>();
+    let admitting = true;
+    const app = expressWs(express()).app;
+    app.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () =>
+          admitting
+            ? ({
+                gate: {
+                  withBrowserStateMutationLease: vi.fn(),
+                },
+                browserClient: {},
+              } as never)
+            : undefined,
+        readAdapterToken: async () => "x".repeat(32),
+        drainRuntime: async () => {
+          admitting = false;
+          await drained.promise;
+        },
+      }),
+    );
+
+    const drainRequest = request(app)
+      .post("/internal/browser-runtime/drain")
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .then(response => response);
+    await vi.waitFor(() => expect(admitting).toBe(false));
+    const rejected = await request(app)
+      .post(`/internal/browser-runs/${ID(1)}/actions`)
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .set("x-firecrawl-adapter-job-id", ID(2))
+      .set("x-firecrawl-adapter-supervisor-id", ID(3))
+      .set("x-firecrawl-adapter-process-id", "42")
+      .send({});
+    expect(rejected.status).toBe(503);
+    expect(rejected.body.error).toBe("browser_state_unavailable");
+
+    drained.resolve();
+    await expect(drainRequest).resolves.toMatchObject({
+      status: 200,
+      body: { version: 1, status: "drained" },
+    });
+  });
+
+  it("rejects unauthenticated or nonempty drain controls", async () => {
+    const drained = vi.fn(async () => undefined);
+    const app = expressWs(express()).app;
+    app.use(
+      createBrowserRunsInternalRouter({
+        getRuntime: () => undefined,
+        readAdapterToken: async () => "x".repeat(32),
+        drainRuntime: drained,
+      }),
+    );
+    const unauthorized = await request(app).post(
+      "/internal/browser-runtime/drain",
+    );
+    expect(unauthorized.status).toBe(403);
+    const nonempty = await request(app)
+      .post("/internal/browser-runtime/drain")
+      .set("authorization", `Bearer ${"x".repeat(32)}`)
+      .send({ unexpected: true });
+    expect(nonempty.status).toBe(400);
+    expect(drained).not.toHaveBeenCalled();
+  });
+
   it.each([
     { authorization: "Bearer wrong" },
     { authorization: `Bearer ${"x".repeat(32)}`, job: ID(9) },

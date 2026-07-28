@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -11,9 +12,9 @@ import { browserOperationSchema } from "./protocol";
 
 const HASH_FIXTURE = JSON.parse(
   readFileSync(
-    new URL(
+    path.resolve(
+      __dirname,
       "../../../../../host/browser-runtime/protocol/browser-operation-hash-v1.vectors.json",
-      import.meta.url,
     ),
     "utf8",
   ),

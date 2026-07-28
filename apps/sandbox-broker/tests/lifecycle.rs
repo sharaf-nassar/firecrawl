@@ -38,6 +38,7 @@ struct FakeRunc {
     mismatch_state_pid: AtomicBool,
     fail_state: AtomicBool,
     fail_delete: AtomicBool,
+    hang_delete: AtomicBool,
     network_delay_ms: AtomicU64,
 }
 
@@ -56,6 +57,7 @@ impl FakeRunc {
             mismatch_state_pid: AtomicBool::new(false),
             fail_state: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
+            hang_delete: AtomicBool::new(false),
             network_delay_ms: AtomicU64::new(0),
         }
     }
@@ -233,6 +235,9 @@ impl Runc for FakeRunc {
 
     fn delete_force(&self, layout: &JobLayout) -> BrokerResult<()> {
         self.record("delete");
+        while self.hang_delete.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(2));
+        }
         if self.fail_delete.load(Ordering::Acquire) {
             return Err(BrokerError::new(ErrorCategory::CleanupFailed));
         }
@@ -429,7 +434,7 @@ fn fresh_cancel_confirms_live_or_recent_terminal_cleanup_by_exact_owner() {
 }
 
 #[test]
-fn fresh_cancel_terminal_cache_evicts_oldest_exact_identity() {
+fn terminal_diagnostics_survive_more_than_legacy_high_churn_limit() {
     let fixture = Fixture::new();
     let boot_id = Uuid::new_v4();
     let mut oldest = None;
@@ -450,8 +455,162 @@ fn fresh_cancel_terminal_cache_evicts_oldest_exact_identity() {
                 oldest.unwrap(),
                 CancelReason::ProtocolError,
             )
-            .is_err()
+            .is_ok()
     );
+}
+
+#[test]
+fn aggregate_status_counts_exact_phases_and_non_enumerable_orphans() {
+    let fixture = Fixture::new();
+    let boot_id = Uuid::new_v4();
+    let running_job = Uuid::new_v4();
+    let running = fixture.prepare(boot_id, running_job, Uuid::new_v4());
+    fixture
+        .runtime
+        .start(fixture.uid, &running, running.init_pid())
+        .unwrap();
+
+    let starting_job = Uuid::new_v4();
+    let starting = fixture.prepare(boot_id, starting_job, Uuid::new_v4());
+    fixture.runc.hang_start.store(true, Ordering::Release);
+    let runtime = Arc::clone(&fixture.runtime);
+    let uid = fixture.uid;
+    let starting_thread = thread::spawn(move || runtime.start(uid, &starting, starting.init_pid()));
+    while fixture
+        .runc
+        .events()
+        .iter()
+        .filter(|event| event.as_str() == "start")
+        .count()
+        < 2
+    {
+        thread::yield_now();
+    }
+
+    let prepared_job = Uuid::new_v4();
+    let prepared = fixture.prepare(boot_id, prepared_job, Uuid::new_v4());
+    let orphan_job = Uuid::new_v4();
+    let orphan_directory = fixture
+        .root
+        .path()
+        .join("jobs")
+        .join(orphan_job.to_string());
+    fs::create_dir(&orphan_directory).unwrap();
+    fs::set_permissions(&orphan_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut orphan_process = Command::new("/usr/bin/sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fs::write(
+        orphan_directory.join("pid"),
+        format!("{}\n", orphan_process.id()),
+    )
+    .unwrap();
+    fs::set_permissions(
+        orphan_directory.join("pid"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fixture.runc.states.lock().unwrap().insert(
+        orphan_job,
+        RuncStateRecord {
+            oci_version: "1.2.0".to_owned(),
+            id: orphan_job.to_string(),
+            pid: i64::from(orphan_process.id()),
+            status: RuncState::Running,
+            bundle: orphan_directory.to_string_lossy().into_owned(),
+            rootfs: "/opt/firecrawl/sandbox-bundles/codex-v1/rootfs".to_owned(),
+            created: "2026-07-27T00:00:00Z".to_owned(),
+            annotations: std::collections::BTreeMap::new(),
+            owner: String::new(),
+        },
+    );
+    let status = fixture.runtime.status().unwrap();
+    assert_eq!(status.prepared_jobs, 1);
+    assert_eq!(status.starting_jobs, 1);
+    assert_eq!(status.running_jobs, 1);
+    assert_eq!(status.unsettled_jobs, 0);
+    assert_eq!(status.orphan_processes, 1);
+
+    fixture
+        .runtime
+        .request_cancel_lease(fixture.uid, &prepared, CancelReason::Shutdown)
+        .unwrap();
+    fixture
+        .runtime
+        .request_cancel_key(fixture.uid, boot_id, starting_job, CancelReason::Shutdown)
+        .unwrap();
+    fixture.runc.hang_start.store(false, Ordering::Release);
+    assert!(starting_thread.join().unwrap().is_err());
+    fixture
+        .runtime
+        .connection_eof(fixture.uid, &running)
+        .unwrap();
+    fixture
+        .runtime
+        .connection_eof(fixture.uid, &prepared)
+        .unwrap();
+    fixture.runc.states.lock().unwrap().remove(&orphan_job);
+    orphan_process.kill().unwrap();
+    orphan_process.wait().unwrap();
+    fs::remove_dir_all(orphan_directory).unwrap();
+}
+
+#[test]
+fn aggregate_status_counts_creating_and_stopping_as_unsettled() {
+    let creating = Fixture::new();
+    creating.runc.hang_create.store(true, Ordering::Release);
+    let uid = creating.uid;
+    let boot_id = Uuid::new_v4();
+    let creating_job = Uuid::new_v4();
+    let runtime = Arc::clone(&creating.runtime);
+    let prepare = thread::spawn(move || {
+        runtime.prepare(
+            uid,
+            boot_id,
+            creating_job,
+            Uuid::new_v4(),
+            BundleId::CodexV1,
+            deadline(),
+            codex_descriptors(uid),
+        )
+    });
+    while !creating.runc.events().contains(&"create".to_owned()) {
+        thread::sleep(Duration::from_millis(2));
+    }
+    let status = creating.runtime.status().unwrap();
+    assert_eq!(status.prepared_jobs, 0);
+    assert_eq!(status.starting_jobs, 0);
+    assert_eq!(status.running_jobs, 0);
+    assert_eq!(status.unsettled_jobs, 1);
+    assert_eq!(status.orphan_processes, 0);
+    creating
+        .runtime
+        .request_cancel_key(uid, boot_id, creating_job, CancelReason::Shutdown)
+        .unwrap();
+    assert!(prepare.join().unwrap().is_err());
+
+    let stopping = Fixture::new();
+    let lease = stopping.prepare(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    stopping.runc.hang_delete.store(true, Ordering::Release);
+    let runtime = Arc::clone(&stopping.runtime);
+    let uid = stopping.uid;
+    let cancel_lease = lease.clone();
+    let cancel = thread::spawn(move || runtime.abort(uid, &cancel_lease, CancelReason::Shutdown));
+    while !stopping.runc.events().contains(&"delete".to_owned()) {
+        thread::sleep(Duration::from_millis(2));
+    }
+    let status = stopping.runtime.status().unwrap();
+    assert_eq!(status.prepared_jobs, 0);
+    assert_eq!(status.starting_jobs, 0);
+    assert_eq!(status.running_jobs, 0);
+    assert_eq!(status.unsettled_jobs, 1);
+    assert_eq!(status.orphan_processes, 0);
+    stopping.runc.hang_delete.store(false, Ordering::Release);
+    assert!(cancel.join().unwrap().is_ok());
 }
 
 #[test]
@@ -494,6 +653,68 @@ fn exact_uid_boot_and_high_entropy_diagnostic_pair_are_fenced() {
         .runtime
         .abort(fixture.uid, &lease_b, CancelReason::Shutdown)
         .unwrap();
+}
+
+#[test]
+fn terminal_diagnostic_expires_without_extending_retention() {
+    let fixture = Fixture::with_terminal_retention(Duration::from_millis(1));
+    let boot_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let lease = fixture.prepare(boot_id, job_id, correlation_id);
+    fixture
+        .runtime
+        .abort(fixture.uid, &lease, CancelReason::Shutdown)
+        .unwrap();
+    thread::sleep(Duration::from_millis(5));
+    assert!(
+        fixture
+            .runtime
+            .diagnose(fixture.uid, correlation_id, job_id)
+            .is_err()
+    );
+    assert!(
+        fixture
+            .runtime
+            .diagnose(fixture.uid, correlation_id, job_id)
+            .is_err()
+    );
+    assert_eq!(fixture.runtime.status().unwrap().orphan_processes, 0);
+}
+
+#[test]
+fn live_cleanup_unproven_job_counts_as_orphan() {
+    let fixture = Fixture::new();
+    let job_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let lease = fixture.prepare(Uuid::new_v4(), job_id, correlation_id);
+    fixture.runc.hang_start.store(true, Ordering::Release);
+    fixture.runc.fail_start_reap.store(true, Ordering::Release);
+    let runtime = Arc::clone(&fixture.runtime);
+    let uid = fixture.uid;
+    let thread_lease = lease.clone();
+    let start = thread::spawn(move || runtime.start(uid, &thread_lease, thread_lease.init_pid()));
+    while !fixture.runc.events().iter().any(|event| event == "start") {
+        thread::sleep(Duration::from_millis(2));
+    }
+    fixture
+        .runtime
+        .request_cancel_lease(fixture.uid, &lease, CancelReason::ProtocolError)
+        .unwrap();
+    assert_eq!(
+        start.join().unwrap().unwrap_err().category(),
+        ErrorCategory::CleanupFailed
+    );
+    let status = fixture.runtime.status().unwrap();
+    assert_eq!(status.starting_jobs, 0);
+    assert_eq!(status.orphan_processes, 1);
+    assert!(
+        fixture
+            .runtime
+            .diagnose(fixture.uid, correlation_id, job_id)
+            .unwrap()
+            .cleanup_failure
+    );
 }
 
 #[test]
@@ -1239,13 +1460,26 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_runtime(|root, runc| BrokerRuntime::new(root.to_path_buf(), Arc::clone(runc)))
+    }
+
+    fn with_terminal_retention(retention: Duration) -> Self {
+        Self::with_runtime(|root, runc| {
+            BrokerRuntime::new_with_terminal_retention(
+                root.to_path_buf(),
+                Arc::clone(runc),
+                retention,
+            )
+        })
+    }
+
+    fn with_runtime(
+        make_runtime: impl FnOnce(&std::path::Path, &Arc<FakeRunc>) -> BrokerRuntime<FakeRunc>,
+    ) -> Self {
         let root = secure_temp();
         let marker = root.path().join("payload-marker");
         let runc = Arc::new(FakeRunc::new(marker.clone()));
-        let runtime = Arc::new(BrokerRuntime::new(
-            root.path().to_path_buf(),
-            Arc::clone(&runc),
-        ));
+        let runtime = Arc::new(make_runtime(root.path(), &runc));
         Self {
             root,
             marker,

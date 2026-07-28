@@ -25,6 +25,8 @@ fn production_wire_conforms_to_shared_contract() {
     validate_shared_contract().unwrap();
     let request = parse_request(br#"{"method":"health"}"#).unwrap();
     assert_eq!(request, BrokerRequest::Health);
+    let request = parse_request(br#"{"method":"status"}"#).unwrap();
+    assert_eq!(request, BrokerRequest::Status);
 }
 
 #[test]
@@ -81,6 +83,7 @@ fn request_and_control_are_closed_and_phase_specific() {
     for invalid in [
         br#"{"method":"Health"}"#.as_slice(),
         br#"{"method":"health","extra":true}"#,
+        br#"{"method":"status","extra":true}"#,
         br#"{"method":"prepare"}"#,
         br#"{"method":"start","job_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","expected_init_pid":1}"#,
     ] {

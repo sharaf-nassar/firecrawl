@@ -13,7 +13,7 @@ pub const MAX_JOB_WALL_TIME_MS: u64 = 300_000;
 pub const SHARED_CONTRACT: &str =
     include_str!("../../../host/browser-runtime/protocol/sandbox-broker-v1.contract.json");
 pub const SHARED_CONTRACT_SHA256: &str =
-    "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4";
+    "709ed34abc51ca9a9b44d96e1496667ac535ea8ff53d372d10817f4b613c48a1";
 pub const INSTALLED_CONTRACT_PATH: &str = "/opt/firecrawl/protocol/sandbox-broker-v1.contract.json";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -84,6 +84,7 @@ pub enum BrokerRequest {
         correlation_id: Uuid,
         job_id: Uuid,
     },
+    Status,
     Health,
 }
 
@@ -160,6 +161,15 @@ pub struct Diagnostic {
     pub cleanup_failure: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AggregateStatus {
+    pub prepared_jobs: u32,
+    pub starting_jobs: u32,
+    pub running_jobs: u32,
+    pub unsettled_jobs: u32,
+    pub orphan_processes: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerResponse {
@@ -183,6 +193,10 @@ pub enum BrokerResponse {
     Diagnostic {
         #[serde(flatten)]
         diagnostic: Diagnostic,
+    },
+    StatusResult {
+        #[serde(flatten)]
+        status: AggregateStatus,
     },
     OwnerCancelled,
     Healthy,
@@ -267,6 +281,7 @@ pub fn validate_request(request: &BrokerRequest) -> BrokerResult<()> {
             correlation_id,
             job_id,
         } => require_ids(&[*correlation_id, *job_id])?,
+        BrokerRequest::Status => {}
         BrokerRequest::Health => {}
     }
     Ok(())
@@ -386,6 +401,8 @@ pub fn validate_shared_contract_bytes(bytes: &[u8]) -> BrokerResult<Value> {
         "prepared",
         "start",
         "started",
+        "status",
+        "status_result",
         "terminal",
     ];
     if messages.len() != expected_messages.len()
@@ -419,7 +436,14 @@ pub fn validate_shared_contract_bytes(bytes: &[u8]) -> BrokerResult<Value> {
         exact_keys(&message["discriminator"], &["field", "value"])?;
         let request = matches!(
             name,
-            "prepare" | "start" | "abort" | "cancel" | "cancel_owner" | "diagnose" | "health"
+            "prepare"
+                | "start"
+                | "abort"
+                | "cancel"
+                | "cancel_owner"
+                | "diagnose"
+                | "status"
+                | "health"
         );
         let discriminator = if request { "method" } else { "type" };
         if message["direction"]
@@ -467,6 +491,15 @@ pub fn validate_shared_contract_bytes(bytes: &[u8]) -> BrokerResult<Value> {
                 "relay_listener_present",
                 "runc_state",
                 "type",
+            ],
+            "status" => &["method"],
+            "status_result" => &[
+                "orphan_processes",
+                "prepared_jobs",
+                "running_jobs",
+                "starting_jobs",
+                "type",
+                "unsettled_jobs",
             ],
             "owner_cancelled" | "health" | "healthy" => &[discriminator],
             "terminal" => &["artifacts", "init_pid", "job_id", "outcome", "type"],
@@ -630,6 +663,7 @@ fn validate_production_packets(contract: &Value) -> BrokerResult<()> {
             correlation_id,
             job_id,
         }),
+        serde_json::to_value(BrokerRequest::Status),
         serde_json::to_value(BrokerRequest::Health),
     ];
     let controls = [
@@ -659,6 +693,15 @@ fn validate_production_packets(contract: &Value) -> BrokerResult<()> {
             artifacts: Vec::new(),
         }),
         serde_json::to_value(BrokerResponse::OwnerCancelled),
+        serde_json::to_value(BrokerResponse::StatusResult {
+            status: AggregateStatus {
+                prepared_jobs: 1,
+                starting_jobs: 2,
+                running_jobs: 3,
+                unsettled_jobs: 4,
+                orphan_processes: 5,
+            },
+        }),
         serde_json::to_value(BrokerResponse::Healthy),
         serde_json::to_value(BrokerResponse::Error {
             category: "invalid_request".to_owned(),

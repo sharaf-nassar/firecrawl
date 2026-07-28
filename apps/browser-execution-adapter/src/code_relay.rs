@@ -18,6 +18,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::action_client::AdapterAuthorizationBinding;
+use crate::jobs::JobLifecycle;
 use crate::protocol::{VersionOne, parse_json_strict};
 use crate::redaction::AdapterError;
 
@@ -188,6 +189,7 @@ pub struct CodeRelay {
     binding: AdapterAuthorizationBinding,
     run_id: Uuid,
     client: Client,
+    lifecycle: Option<JobLifecycle>,
 }
 
 pub struct CodeRelayRun {
@@ -207,6 +209,48 @@ impl CodeRelay {
         run_id: Uuid,
         relay_fd: OwnedFd,
         deadline: Instant,
+    ) -> Result<Self, AdapterError> {
+        Self::connect_internal(
+            callback_origin,
+            callback_token,
+            binding,
+            run_id,
+            relay_fd,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    pub async fn connect_with_lifecycle(
+        callback_origin: String,
+        callback_token: Zeroizing<String>,
+        binding: AdapterAuthorizationBinding,
+        run_id: Uuid,
+        relay_fd: OwnedFd,
+        deadline: Instant,
+        lifecycle: JobLifecycle,
+    ) -> Result<Self, AdapterError> {
+        Self::connect_internal(
+            callback_origin,
+            callback_token,
+            binding,
+            run_id,
+            relay_fd,
+            deadline,
+            Some(lifecycle),
+        )
+        .await
+    }
+
+    async fn connect_internal(
+        callback_origin: String,
+        callback_token: Zeroizing<String>,
+        binding: AdapterAuthorizationBinding,
+        run_id: Uuid,
+        relay_fd: OwnedFd,
+        deadline: Instant,
+        lifecycle: Option<JobLifecycle>,
     ) -> Result<Self, AdapterError> {
         if run_id.is_nil()
             || callback_origin
@@ -294,6 +338,7 @@ impl CodeRelay {
             binding,
             run_id,
             client,
+            lifecycle,
         })
     }
 
@@ -343,6 +388,10 @@ impl CodeRelay {
                     }
                     if self.websocket.send(Message::Text(text.into())).await.is_err() {
                         break Err(AdapterError::sandbox_unavailable());
+                    }
+                    if let Some(lifecycle) = &self.lifecycle {
+                        lifecycle.record_callback();
+                        lifecycle.record_browser_effect();
                     }
                     if let Err(error) = bundle_flow.complete(bytes) {
                         break Err(error);

@@ -27,8 +27,8 @@ use crate::oci::{
 };
 use crate::peer::ValidatedDescriptors;
 use crate::protocol::{
-    BrokerResponse, BundleId, CancelReason, Diagnostic, MAX_JOB_WALL_TIME_MS, Outcome, Phase,
-    RuncState,
+    AggregateStatus, BrokerResponse, BundleId, CancelReason, Diagnostic, MAX_JOB_WALL_TIME_MS,
+    Outcome, Phase, RuncState,
 };
 use crate::redaction::{BrokerError, BrokerResult, ErrorCategory};
 
@@ -38,8 +38,12 @@ const PRODUCTION_RUNTIME_ROOT: &str = "/run/firecrawl-sandbox";
 const CGROUP_FILESYSTEM_ROOT: &str = "/sys/fs/cgroup";
 const COMMAND_KILL_BOUND: Duration = Duration::from_secs(2);
 const PIDFD_EXIT_BOUND: Duration = Duration::from_secs(2);
-const TERMINAL_RECORD_LIMIT: usize = 128;
+const TERMINAL_RECORD_LIMIT: usize = 4_096;
+const TERMINAL_RECORD_RETENTION: Duration = Duration::from_secs(10 * 60);
 const COMMAND_OUTPUT_BOUND: usize = 64 * 1024;
+const ORPHAN_SCAN_ENTRY_LIMIT: usize = 4_096;
+const ORPHAN_SCAN_PROCESS_LIMIT: usize = 65_536;
+const CGROUP_PROCS_BOUND: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OwnerKey {
@@ -476,6 +480,7 @@ pub struct BrokerRuntime<R: Runc> {
     jobs: Mutex<HashMap<OwnerKey, Arc<Job>>>,
     revoked_owners: Mutex<HashSet<(u32, Uuid)>>,
     terminal: Mutex<VecDeque<TerminalRecord>>,
+    terminal_retention: Duration,
     next_lease: AtomicU64,
     healthy: AtomicBool,
 }
@@ -511,16 +516,27 @@ struct TerminalRecord {
     job_id: Uuid,
     outcome: Outcome,
     diagnostic: Diagnostic,
+    retained_at: Instant,
 }
 
 impl<R: Runc> BrokerRuntime<R> {
     pub fn new(runtime_root: PathBuf, runc: Arc<R>) -> Self {
+        Self::new_with_terminal_retention(runtime_root, runc, TERMINAL_RECORD_RETENTION)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_terminal_retention(
+        runtime_root: PathBuf,
+        runc: Arc<R>,
+        terminal_retention: Duration,
+    ) -> Self {
         Self {
             runtime_root,
             runc,
             jobs: Mutex::new(HashMap::new()),
             revoked_owners: Mutex::new(HashSet::new()),
             terminal: Mutex::new(VecDeque::new()),
+            terminal_retention,
             next_lease: AtomicU64::new(1),
             healthy: AtomicBool::new(true),
         }
@@ -584,9 +600,11 @@ impl<R: Runc> BrokerRuntime<R> {
             if lock(&self.revoked_owners)?.contains(&(uid, adapter_boot_id)) {
                 return Err(BrokerError::new(ErrorCategory::Unauthorized));
             }
-            let terminal_reuse = lock(&self.terminal)?
-                .iter()
-                .any(|record| record.job_id == job_id);
+            let terminal_reuse = {
+                let mut terminal = lock(&self.terminal)?;
+                self.prune_terminal(&mut terminal);
+                terminal.iter().any(|record| record.job_id == job_id)
+            };
             if terminal_reuse || jobs.keys().any(|key| key.job_id == job_id) {
                 return Err(BrokerError::new(ErrorCategory::Conflict));
             }
@@ -896,7 +914,8 @@ impl<R: Runc> BrokerRuntime<R> {
             }
             drop(operation);
         }
-        let terminal = lock(&self.terminal)?;
+        let mut terminal = lock(&self.terminal)?;
+        self.prune_terminal(&mut terminal);
         let record = terminal
             .iter()
             .rev()
@@ -1134,7 +1153,8 @@ impl<R: Runc> BrokerRuntime<R> {
                 return self.live_diagnostic(job);
             }
         }
-        let terminal = lock(&self.terminal)?;
+        let mut terminal = lock(&self.terminal)?;
+        self.prune_terminal(&mut terminal);
         terminal
             .iter()
             .rev()
@@ -1145,6 +1165,68 @@ impl<R: Runc> BrokerRuntime<R> {
             })
             .map(|record| record.diagnostic.clone())
             .ok_or_else(|| BrokerError::new(ErrorCategory::Unauthorized))
+    }
+
+    pub fn status(&self) -> BrokerResult<AggregateStatus> {
+        let jobs = lock(&self.jobs)?;
+        let mut prepared_jobs = 0_u32;
+        let mut starting_jobs = 0_u32;
+        let mut running_jobs = 0_u32;
+        let mut unsettled_jobs = 0_u32;
+        let mut registered = HashSet::with_capacity(jobs.len());
+        for job in jobs.values() {
+            let state = lock(&job.state)?;
+            if state.cleanup_failure {
+                continue;
+            }
+            registered.insert(job.owner.job_id);
+            match state.phase {
+                Phase::Prepared => prepared_jobs = prepared_jobs.saturating_add(1),
+                Phase::Starting => starting_jobs = starting_jobs.saturating_add(1),
+                Phase::Running => running_jobs = running_jobs.saturating_add(1),
+                Phase::Creating | Phase::Stopping => {
+                    unsettled_jobs = unsettled_jobs.saturating_add(1)
+                }
+                Phase::Terminal | Phase::Absent => {}
+            }
+        }
+        let mut orphan_pids = HashSet::new();
+        scan_runtime_orphan_pids(
+            &self.runtime_root.join("jobs"),
+            &registered,
+            &mut orphan_pids,
+        )?;
+        if self.runtime_root == Path::new(PRODUCTION_RUNTIME_ROOT) {
+            scan_cgroup_orphan_pids(&production_cgroup_root(), &registered, &mut orphan_pids)?;
+        }
+        let jobs_root = self.runtime_root.join("jobs");
+        for job_id in self.runc.list(&self.runtime_root)? {
+            if registered.contains(&job_id) {
+                continue;
+            }
+            let layout = layout_for_existing(&jobs_root, job_id);
+            if let Some(state) = self.runc.state(&layout)? {
+                let pid = u32::try_from(state.pid)
+                    .ok()
+                    .filter(|pid| *pid != 0)
+                    .ok_or_else(|| BrokerError::new(ErrorCategory::CleanupFailed))?;
+                if process_is_live(pid) {
+                    insert_orphan_pid(&mut orphan_pids, pid)?;
+                }
+            }
+        }
+        drop(jobs);
+        let mut terminal = lock(&self.terminal)?;
+        self.prune_terminal(&mut terminal);
+        let orphan_processes = u32::try_from(orphan_pids.len())
+            .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        Ok(AggregateStatus {
+            prepared_jobs,
+            starting_jobs,
+            running_jobs,
+            unsettled_jobs,
+            orphan_processes,
+        })
     }
 
     pub fn reconcile_orphans(&self) -> BrokerResult<()> {
@@ -1284,6 +1366,7 @@ impl<R: Runc> BrokerRuntime<R> {
             job_id: job.owner.job_id,
             outcome,
             diagnostic,
+            retained_at: Instant::now(),
         });
         while terminal.len() > TERMINAL_RECORD_LIMIT {
             terminal.pop_front();
@@ -1293,6 +1376,15 @@ impl<R: Runc> BrokerRuntime<R> {
             return Err(BrokerError::new(ErrorCategory::CleanupFailed));
         }
         Ok(())
+    }
+
+    fn prune_terminal(&self, terminal: &mut VecDeque<TerminalRecord>) {
+        let now = Instant::now();
+        while terminal.front().is_some_and(|record| {
+            now.saturating_duration_since(record.retained_at) >= self.terminal_retention
+        }) {
+            terminal.pop_front();
+        }
     }
 
     fn live_diagnostic(&self, job: &Arc<Job>) -> BrokerResult<Diagnostic> {
@@ -1784,6 +1876,155 @@ fn observed_child_count(pid: u32) -> u32 {
         .unwrap_or(0)
 }
 
+fn scan_runtime_orphan_pids(
+    jobs_root: &Path,
+    registered: &HashSet<Uuid>,
+    orphan_pids: &mut HashSet<u32>,
+) -> BrokerResult<()> {
+    if !jobs_root.exists() {
+        return Ok(());
+    }
+    let mut entry_count = 0_usize;
+    for entry in fs::read_dir(jobs_root)
+        .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?
+    {
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > ORPHAN_SCAN_ENTRY_LIMIT {
+            return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+        }
+        let entry =
+            entry.map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+        }
+        let job_id = parse_canonical_job_name(&entry.file_name(), "")?;
+        if registered.contains(&job_id) {
+            continue;
+        }
+        let layout = layout_for_existing(jobs_root, job_id);
+        if !layout.pid_file.exists() {
+            continue;
+        }
+        let directory =
+            open_secure_directory(&layout.directory, 0o700, nix::unistd::geteuid().as_raw())?;
+        let pid_bytes = read_secure_child(
+            &directory,
+            "pid",
+            32,
+            0o600,
+            nix::unistd::geteuid().as_raw(),
+        )?;
+        let pid = parse_pid_file(&pid_bytes)?;
+        if process_is_live(pid) {
+            insert_orphan_pid(orphan_pids, pid)?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_cgroup_orphan_pids(
+    cgroup_root: &Path,
+    registered: &HashSet<Uuid>,
+    orphan_pids: &mut HashSet<u32>,
+) -> BrokerResult<()> {
+    if !cgroup_root.is_dir() {
+        return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+    }
+    let mut entry_count = 0_usize;
+    for entry in fs::read_dir(cgroup_root)
+        .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?
+    {
+        let entry =
+            entry.map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > ORPHAN_SCAN_ENTRY_LIMIT {
+            return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+        }
+        let job_id = parse_canonical_job_name(&entry.file_name(), "firecrawl-")?;
+        if registered.contains(&job_id) {
+            continue;
+        }
+        let procs_path = entry.path().join("cgroup.procs");
+        let metadata = fs::symlink_metadata(&procs_path)
+            .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > CGROUP_PROCS_BOUND
+        {
+            return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+        }
+        let mut contents = String::new();
+        fs::File::open(&procs_path)
+            .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?
+            .take(CGROUP_PROCS_BOUND.saturating_add(1))
+            .read_to_string(&mut contents)
+            .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+        if contents.len() as u64 > CGROUP_PROCS_BOUND {
+            return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+        }
+        for line in contents.lines() {
+            if line.is_empty()
+                || line.len() > 10
+                || line.bytes().any(|byte| !byte.is_ascii_digit())
+                || (line.len() > 1 && line.starts_with('0'))
+            {
+                return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+            }
+            let pid = line
+                .parse::<u32>()
+                .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+            if pid == 0 || pid > i32::MAX as u32 {
+                return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+            }
+            if process_is_live(pid) {
+                insert_orphan_pid(orphan_pids, pid)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_canonical_job_name(name: &std::ffi::OsStr, prefix: &str) -> BrokerResult<Uuid> {
+    let name = name
+        .to_str()
+        .ok_or_else(|| BrokerError::new(ErrorCategory::CleanupFailed))?;
+    let value = name
+        .strip_prefix(prefix)
+        .ok_or_else(|| BrokerError::new(ErrorCategory::CleanupFailed))?;
+    let job_id = Uuid::parse_str(value)
+        .map_err(|error| BrokerError::with_source(ErrorCategory::CleanupFailed, error))?;
+    if name != format!("{prefix}{job_id}") {
+        return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+    }
+    Ok(job_id)
+}
+
+fn process_is_live(pid: u32) -> bool {
+    let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return false;
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    pidfd_live(pidfd.as_fd())
+}
+
+fn insert_orphan_pid(orphan_pids: &mut HashSet<u32>, pid: u32) -> BrokerResult<()> {
+    orphan_pids.insert(pid);
+    if orphan_pids.len() > ORPHAN_SCAN_PROCESS_LIMIT {
+        return Err(BrokerError::new(ErrorCategory::CleanupFailed));
+    }
+    Ok(())
+}
+
 fn layout_for_existing(jobs_root: &Path, job_id: Uuid) -> JobLayout {
     let directory = jobs_root.join(job_id.to_string());
     let artifact_directory = directory.join("artifacts");
@@ -2025,8 +2266,9 @@ fn unsafe_validated(bundle: BundleId, descriptors: Vec<OwnedFd>) -> ValidatedDes
 
 #[cfg(test)]
 mod fd_table_tests {
+    use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Duration;
 
@@ -2037,7 +2279,7 @@ mod fd_table_tests {
 
     use super::{
         configure_create_fds, prepare_cgroup_tree_at, reconcile_cgroups_at, run_output_bounded,
-        run_status_bounded, validate_broker_cgroup_membership,
+        run_status_bounded, scan_cgroup_orphan_pids, validate_broker_cgroup_membership,
     };
     use crate::oci::PRODUCTION_BROKER_CGROUP_PATH;
     use crate::protocol::BundleId;
@@ -2113,6 +2355,56 @@ mod fd_table_tests {
                 .unwrap()
                 .all(|entry| !entry.unwrap().path().is_dir())
         );
+    }
+
+    #[test]
+    fn cgroup_scan_counts_only_live_processes_without_registry_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let registered_job = uuid::Uuid::new_v4();
+        let orphan_job = uuid::Uuid::new_v4();
+        let mut registered_process = Command::new("/usr/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut orphan_process = Command::new("/usr/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        for (job_id, pid) in [
+            (registered_job, registered_process.id()),
+            (orphan_job, orphan_process.id()),
+        ] {
+            let path = root.path().join(format!("firecrawl-{job_id}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        }
+        let mut orphan_pids = HashSet::new();
+        scan_cgroup_orphan_pids(
+            root.path(),
+            &HashSet::from([registered_job]),
+            &mut orphan_pids,
+        )
+        .unwrap();
+        assert_eq!(orphan_pids, HashSet::from([orphan_process.id()]));
+
+        orphan_process.kill().unwrap();
+        orphan_process.wait().unwrap();
+        orphan_pids.clear();
+        scan_cgroup_orphan_pids(
+            root.path(),
+            &HashSet::from([registered_job]),
+            &mut orphan_pids,
+        )
+        .unwrap();
+        assert!(orphan_pids.is_empty());
+        registered_process.kill().unwrap();
+        registered_process.wait().unwrap();
     }
 
     #[test]

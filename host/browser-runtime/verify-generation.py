@@ -29,7 +29,7 @@ CODE_RUNTIME = {
 }
 SCHEMA_LOGICAL_PREFIX = "host/browser-runtime/protocol/codex-app-server/"
 BROKER_CONTRACT_SHA256 = (
-    "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4"
+    "709ed34abc51ca9a9b44d96e1496667ac535ea8ff53d372d10817f4b613c48a1"
 )
 
 

@@ -15,6 +15,7 @@ pub enum AdapterErrorCategory {
     ModelProtocolError,
     ActionOutcomeUnknown,
     CapabilityDenied,
+    NotFound,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -74,6 +75,10 @@ impl AdapterError {
             AdapterErrorCategory::CapabilityDenied,
             "Browser capability was denied",
         )
+    }
+
+    pub fn not_found() -> Self {
+        Self::new(AdapterErrorCategory::NotFound, "Host job was not found")
     }
 }
 

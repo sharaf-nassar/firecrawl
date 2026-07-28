@@ -4,12 +4,13 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -19,16 +20,17 @@ use uuid::Uuid;
 use crate::action_client::{ActionClient, AdapterAuthorizationBinding};
 use crate::app_server::{AppServer, PromptJob, ProtocolBundle};
 use crate::broker_client::{
-    BrokerCancelReason, BrokerClient, BrokerTerminalOutcome, CodeBundle, PreparedCodex,
-    PreparedLeaseMonitor,
+    BROKER_CONTRACT_SHA256, BrokerCancelReason, BrokerClient, BrokerDiagnostic, BrokerPhase,
+    BrokerRuncState, BrokerTerminalOutcome, CodeBundle, PreparedCodex, PreparedLeaseMonitor,
 };
 use crate::code_relay::CodeRelay;
 use crate::config::{AdapterConfig, effective_uid};
 use crate::observations::ObservationV1;
-use crate::protocol::{VersionOne, parse_json_strict};
+use crate::protocol::{BrowserOperation, VersionOne, parse_json_strict};
 use crate::redaction::{AdapterError, AdapterErrorCategory};
 
-const MAX_TERMINAL_METADATA: usize = 128;
+const MAX_TERMINAL_METADATA: usize = 4_096;
+const TERMINAL_METADATA_RETENTION: Duration = Duration::from_secs(10 * 60);
 const MAX_ADAPTER_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AUTHORIZATION_WAIT: Duration = Duration::from_secs(30);
 
@@ -53,6 +55,8 @@ struct JobEntry {
     adapter_supervisor_id: Uuid,
     binding: Option<AdapterAuthorizationBinding>,
     kind: JobKind,
+    correlation_id: Option<Uuid>,
+    lifecycle: JobLifecycle,
     state: JobState,
     cancel: watch::Sender<bool>,
     completion: watch::Sender<JobCompletion>,
@@ -63,14 +67,66 @@ struct JobEntry {
 pub struct TerminalJob {
     pub run_id: Uuid,
     pub adapter_job_id: Uuid,
+    pub correlation_id: Option<Uuid>,
     pub category: Option<AdapterErrorCategory>,
+    pub lifecycle: LifecycleCounts,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RetainedTerminalJob {
+    job: TerminalJob,
+    retained_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleCounts {
+    pub payload_started_count: u32,
+    pub callback_count: u32,
+    pub browser_effect_count: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct JobLifecycle {
+    payload_started_count: Arc<AtomicU32>,
+    callback_count: Arc<AtomicU32>,
+    browser_effect_count: Arc<AtomicU32>,
+}
+
+impl JobLifecycle {
+    fn increment(counter: &AtomicU32) {
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.saturating_add(1))
+        });
+    }
+
+    pub fn record_payload_started(&self) {
+        Self::increment(&self.payload_started_count);
+    }
+
+    pub fn record_callback(&self) {
+        Self::increment(&self.callback_count);
+    }
+
+    pub fn record_browser_effect(&self) {
+        Self::increment(&self.browser_effect_count);
+    }
+
+    pub fn snapshot(&self) -> LifecycleCounts {
+        LifecycleCounts {
+            payload_started_count: self.payload_started_count.load(Ordering::Acquire),
+            callback_count: self.callback_count.load(Ordering::Acquire),
+            browser_effect_count: self.browser_effect_count.load(Ordering::Acquire),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct RegistryState {
     active_by_run: BTreeMap<Uuid, JobEntry>,
     run_by_job: BTreeMap<Uuid, Uuid>,
-    terminal: VecDeque<TerminalJob>,
+    terminal: VecDeque<RetainedTerminalJob>,
+    unproven_terminal: VecDeque<RetainedTerminalJob>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +134,7 @@ pub struct JobRegistry {
     inner: Arc<Mutex<RegistryState>>,
     max_prompt_runs: usize,
     max_code_runs: usize,
+    terminal_retention: Duration,
 }
 
 #[derive(Debug)]
@@ -91,6 +148,7 @@ pub struct AdmittedJob {
 pub struct ReservedJob {
     pub cancellation: watch::Receiver<bool>,
     pub completion: watch::Receiver<JobCompletion>,
+    pub lifecycle: JobLifecycle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +178,19 @@ impl Drop for RegistryCompletionGuard {
 
 impl JobRegistry {
     pub fn new(max_prompt_runs: usize, max_code_runs: usize) -> Result<Self, AdapterError> {
+        Self::new_with_terminal_retention(
+            max_prompt_runs,
+            max_code_runs,
+            TERMINAL_METADATA_RETENTION,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_terminal_retention(
+        max_prompt_runs: usize,
+        max_code_runs: usize,
+        terminal_retention: Duration,
+    ) -> Result<Self, AdapterError> {
         if max_prompt_runs != 1 || max_code_runs != 2 {
             return Err(AdapterError::model_protocol());
         }
@@ -127,6 +198,7 @@ impl JobRegistry {
             inner: Arc::new(Mutex::new(RegistryState::default())),
             max_prompt_runs,
             max_code_runs,
+            terminal_retention,
         })
     }
 
@@ -157,6 +229,37 @@ impl JobRegistry {
         adapter_job_id: Uuid,
         adapter_supervisor_id: Uuid,
     ) -> Result<ReservedJob, AdapterError> {
+        self.reserve_internal(run_id, kind, adapter_job_id, adapter_supervisor_id, None)
+    }
+
+    pub fn reserve_correlated(
+        &self,
+        run_id: Uuid,
+        kind: JobKind,
+        adapter_job_id: Uuid,
+        adapter_supervisor_id: Uuid,
+        correlation_id: Uuid,
+    ) -> Result<ReservedJob, AdapterError> {
+        if correlation_id.is_nil() {
+            return Err(AdapterError::model_protocol());
+        }
+        self.reserve_internal(
+            run_id,
+            kind,
+            adapter_job_id,
+            adapter_supervisor_id,
+            Some(correlation_id),
+        )
+    }
+
+    fn reserve_internal(
+        &self,
+        run_id: Uuid,
+        kind: JobKind,
+        adapter_job_id: Uuid,
+        adapter_supervisor_id: Uuid,
+        correlation_id: Option<Uuid>,
+    ) -> Result<ReservedJob, AdapterError> {
         if run_id.is_nil() || adapter_job_id.is_nil() || adapter_supervisor_id.is_nil() {
             return Err(AdapterError::model_protocol());
         }
@@ -186,6 +289,7 @@ impl JobRegistry {
         }
         let (cancel, cancellation) = watch::channel(false);
         let (completion_sender, completion) = watch::channel(JobCompletion::Pending);
+        let lifecycle = JobLifecycle::default();
         registry.run_by_job.insert(adapter_job_id, run_id);
         registry.active_by_run.insert(
             run_id,
@@ -194,6 +298,8 @@ impl JobRegistry {
                 adapter_supervisor_id,
                 binding: None,
                 kind,
+                correlation_id,
+                lifecycle: lifecycle.clone(),
                 state: JobState::Preparing,
                 cancel,
                 completion: completion_sender,
@@ -203,6 +309,7 @@ impl JobRegistry {
         Ok(ReservedJob {
             cancellation,
             completion,
+            lifecycle,
         })
     }
 
@@ -444,6 +551,20 @@ impl JobRegistry {
             .completion
             .send_replace(JobCompletion::CleanupUnproven);
         registry.run_by_job.remove(&entry.adapter_job_id);
+        prune_terminal_metadata(&mut registry, self.terminal_retention);
+        registry.unproven_terminal.push_back(RetainedTerminalJob {
+            job: TerminalJob {
+                run_id,
+                adapter_job_id: entry.adapter_job_id,
+                correlation_id: entry.correlation_id,
+                category: Some(AdapterErrorCategory::SandboxUnavailable),
+                lifecycle: entry.lifecycle.snapshot(),
+            },
+            retained_at: Instant::now(),
+        });
+        while registry.unproven_terminal.len() > MAX_TERMINAL_METADATA {
+            registry.unproven_terminal.pop_front();
+        }
         true
     }
 
@@ -457,8 +578,38 @@ impl JobRegistry {
     pub fn terminal_jobs(&self) -> Vec<TerminalJob> {
         self.inner
             .lock()
-            .map(|registry| registry.terminal.iter().copied().collect())
+            .map(|mut registry| {
+                prune_terminal_metadata(&mut registry, self.terminal_retention);
+                registry.terminal.iter().map(|entry| entry.job).collect()
+            })
             .unwrap_or_default()
+    }
+
+    pub fn lifecycle_counts(
+        &self,
+        correlation_id: Uuid,
+        adapter_job_id: Uuid,
+    ) -> Option<LifecycleCounts> {
+        if correlation_id.is_nil() || adapter_job_id.is_nil() {
+            return None;
+        }
+        let mut registry = self.inner.lock().ok()?;
+        prune_terminal_metadata(&mut registry, self.terminal_retention);
+        if let Some(entry) = registry.active_by_run.values().find(|entry| {
+            entry.adapter_job_id == adapter_job_id && entry.correlation_id == Some(correlation_id)
+        }) {
+            return Some(entry.lifecycle.snapshot());
+        }
+        registry
+            .terminal
+            .iter()
+            .rev()
+            .chain(registry.unproven_terminal.iter().rev())
+            .find(|entry| {
+                entry.job.adapter_job_id == adapter_job_id
+                    && entry.job.correlation_id == Some(correlation_id)
+            })
+            .map(|entry| entry.job.lifecycle)
     }
 }
 
@@ -489,16 +640,33 @@ fn finish_entry(
         TerminalJob {
             run_id,
             adapter_job_id: entry.adapter_job_id,
+            correlation_id: entry.correlation_id,
             category,
+            lifecycle: entry.lifecycle.snapshot(),
         },
     );
     true
 }
 
 fn push_terminal(registry: &mut RegistryState, terminal: TerminalJob) {
-    registry.terminal.push_back(terminal);
+    registry.terminal.push_back(RetainedTerminalJob {
+        job: terminal,
+        retained_at: Instant::now(),
+    });
     while registry.terminal.len() > MAX_TERMINAL_METADATA {
         registry.terminal.pop_front();
+    }
+}
+
+fn prune_terminal_metadata(registry: &mut RegistryState, retention: Duration) {
+    let now = Instant::now();
+    for terminal in [&mut registry.terminal, &mut registry.unproven_terminal] {
+        while terminal
+            .front()
+            .is_some_and(|entry| now.saturating_duration_since(entry.retained_at) >= retention)
+        {
+            terminal.pop_front();
+        }
     }
 }
 
@@ -663,27 +831,125 @@ pub struct CancelRequestBody {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthRequestBody {}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusRequestBody {}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DiagnoseHostJobRequestBody {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    pub correlation_id: Uuid,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    pub job_id: Uuid,
+}
+
+fn deserialize_canonical_uuid<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let uuid = Uuid::parse_str(&raw).map_err(serde::de::Error::custom)?;
+    if uuid.is_nil() || uuid.to_string() != raw {
+        return Err(serde::de::Error::custom(
+            "UUID must be canonical and non-nil",
+        ));
+    }
+    Ok(uuid)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdapterRequest {
     ExecutePrompt {
         version: VersionOne,
-        #[serde(rename = "requestId")]
+        #[serde(rename = "requestId", deserialize_with = "deserialize_canonical_uuid")]
         request_id: Uuid,
         body: Box<PromptRequestBody>,
     },
     ExecuteCode {
         version: VersionOne,
-        #[serde(rename = "requestId")]
+        #[serde(rename = "requestId", deserialize_with = "deserialize_canonical_uuid")]
         request_id: Uuid,
         body: CodeRequestBody,
     },
     Cancel {
         version: VersionOne,
-        #[serde(rename = "requestId")]
+        #[serde(rename = "requestId", deserialize_with = "deserialize_canonical_uuid")]
         request_id: Uuid,
         body: CancelRequestBody,
     },
+    Health {
+        version: VersionOne,
+        #[serde(rename = "requestId", deserialize_with = "deserialize_canonical_uuid")]
+        request_id: Uuid,
+        body: HealthRequestBody,
+    },
+    Status {
+        version: VersionOne,
+        #[serde(rename = "requestId", deserialize_with = "deserialize_canonical_uuid")]
+        request_id: Uuid,
+        body: StatusRequestBody,
+    },
+    DiagnoseHostJob {
+        version: VersionOne,
+        #[serde(rename = "requestId", deserialize_with = "deserialize_canonical_uuid")]
+        request_id: Uuid,
+        body: DiagnoseHostJobRequestBody,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct HealthResultBody {
+    version: VersionOne,
+    status: &'static str,
+    codex_cli_version: String,
+    codex_artifact_sha256: String,
+    codex_protocol_schema_sha256: String,
+    broker_protocol_sha256: &'static str,
+    model: &'static str,
+    reasoning_effort: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StatusResultBody {
+    version: VersionOne,
+    prepared_host_jobs: u32,
+    starting_host_jobs: u32,
+    running_host_jobs: u32,
+    unsettled_host_jobs: u32,
+    orphan_processes: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DiagnoseHostJobResultBody {
+    version: VersionOne,
+    correlation_id: Uuid,
+    job_id: Uuid,
+    phase: BrokerPhase,
+    host_init_pid: Option<u32>,
+    pidfd_live: bool,
+    pidfd_pid_matches: bool,
+    control_lease_connected: bool,
+    inert_relay_fd_present: bool,
+    relay_listener_present: bool,
+    cdp_relay_opened: bool,
+    payload_started_count: u32,
+    payload_marker_present: bool,
+    callback_count: u32,
+    browser_effect_count: u32,
+    runc_state: Option<BrokerRuncState>,
+    cgroup_present: bool,
+    job_directory_present: bool,
+    child_count: u32,
+    cleanup_failure: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -854,7 +1120,10 @@ impl AdapterService {
         let request_id = match &request {
             AdapterRequest::ExecutePrompt { request_id, .. }
             | AdapterRequest::ExecuteCode { request_id, .. }
-            | AdapterRequest::Cancel { request_id, .. } => *request_id,
+            | AdapterRequest::Cancel { request_id, .. }
+            | AdapterRequest::Health { request_id, .. }
+            | AdapterRequest::Status { request_id, .. }
+            | AdapterRequest::DiagnoseHostJob { request_id, .. } => *request_id,
         };
         let result = match request {
             AdapterRequest::ExecutePrompt {
@@ -872,6 +1141,11 @@ impl AdapterService {
             AdapterRequest::Cancel {
                 request_id, body, ..
             } => self.cancel(request_id, body, &mut writer).await,
+            AdapterRequest::Health { request_id, .. } => self.health(request_id, &mut writer).await,
+            AdapterRequest::Status { request_id, .. } => self.status(request_id, &mut writer).await,
+            AdapterRequest::DiagnoseHostJob {
+                request_id, body, ..
+            } => self.diagnose_host_job(request_id, body, &mut writer).await,
         };
         match result {
             Ok(()) => Ok(()),
@@ -901,12 +1175,14 @@ impl AdapterService {
         if !self.prompt_execution_healthy.load(Ordering::Acquire) {
             return Err(AdapterError::codex_unavailable());
         }
-        let reserved = self.registry.reserve(
+        let reserved = self.registry.reserve_correlated(
             body.run_id,
             JobKind::Prompt,
             body.adapter_job_id,
             body.adapter_supervisor_id,
+            body.correlation_id,
         )?;
+        let lifecycle = reserved.lifecycle.clone();
         let mut cancellation = reserved.cancellation;
         let _completion_guard = RegistryCompletionGuard {
             registry: self.registry.clone(),
@@ -1097,6 +1373,7 @@ impl AdapterService {
             body.adapter_job_id,
             prepared.init_pid,
             payload_started.clone(),
+            lifecycle.clone(),
         );
         let stderr = AuditedReader::new(
             stderr,
@@ -1104,6 +1381,7 @@ impl AdapterService {
             body.adapter_job_id,
             prepared.init_pid,
             payload_started,
+            lifecycle.clone(),
         );
         let mut app_server = AppServer::new(stdout, stdin, stderr);
         let lease_monitor = match self.broker.monitor_prepared(&prepared) {
@@ -1371,8 +1649,18 @@ impl AdapterService {
                             deadline,
                         },
                         |sequence, operation| {
+                            lifecycle.record_callback();
+                            let browser_effect = operation_has_browser_effect(&operation);
                             let remaining = deadline.saturating_duration_since(Instant::now());
-                            action_client.execute(sequence, operation, remaining)
+                            let lifecycle = lifecycle.clone();
+                            let pending = action_client.execute(sequence, operation, remaining);
+                            async move {
+                                let result = pending.await;
+                                if result.is_ok() && browser_effect {
+                                    lifecycle.record_browser_effect();
+                                }
+                                result
+                            }
                         },
                         cancellation,
                     )
@@ -1453,12 +1741,14 @@ impl AdapterService {
         if !self.code_execution_healthy.load(Ordering::Acquire) {
             return Err(AdapterError::sandbox_unavailable());
         }
-        let reserved = self.registry.reserve(
+        let reserved = self.registry.reserve_correlated(
             body.run_id,
             JobKind::Code,
             body.adapter_job_id,
             body.adapter_supervisor_id,
+            body.correlation_id,
         )?;
+        let lifecycle = reserved.lifecycle.clone();
         let mut cancellation = reserved.cancellation;
         let _completion_guard = RegistryCompletionGuard {
             registry: self.registry.clone(),
@@ -1634,6 +1924,23 @@ impl AdapterService {
                 return Err(AdapterError::sandbox_unavailable());
             }
         };
+        let payload_started = Arc::new(AtomicBool::new(false));
+        let stdout = AuditedReader::new(
+            stdout,
+            body.correlation_id,
+            body.adapter_job_id,
+            prepared.init_pid,
+            payload_started.clone(),
+            lifecycle.clone(),
+        );
+        let stderr = AuditedReader::new(
+            stderr,
+            body.correlation_id,
+            body.adapter_job_id,
+            prepared.init_pid,
+            payload_started,
+            lifecycle.clone(),
+        );
         let lease_monitor = match self.broker.monitor_prepared(&prepared) {
             Ok(monitor) => monitor,
             Err(error) => {
@@ -1737,13 +2044,14 @@ impl AdapterService {
             .await?;
             return Err(error);
         }
-        let relay_connect = CodeRelay::connect(
+        let relay_connect = CodeRelay::connect_with_lifecycle(
             self.config.callback_url.clone(),
             callback_token,
             binding,
             body.run_id,
             relay_fd,
             deadline,
+            lifecycle,
         );
         tokio::pin!(relay_connect);
         let relay_result = tokio::select! {
@@ -2085,6 +2393,105 @@ impl AdapterService {
         .await
     }
 
+    async fn health(
+        &self,
+        request_id: Uuid,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<(), AdapterError> {
+        let config = self.config.clone();
+        let identity = tokio::task::spawn_blocking(move || {
+            verify_adapter_socket(&config.adapter_socket)?;
+            config.read_callback_token()?;
+            let auth = crate::config::read_private_file(&config.codex_auth_file, 1024 * 1024)
+                .map_err(|_| AdapterError::codex_unavailable())?;
+            parse_json_strict::<Value>(&auth).map_err(|_| AdapterError::codex_unavailable())?;
+            deterministic_protocol_self_check()?;
+            verify_installed_health_identity(&config.protocol_root)
+        })
+        .await
+        .map_err(|_| AdapterError::codex_unavailable())??;
+        let broker = self.broker.clone();
+        tokio::task::spawn_blocking(move || broker.health())
+            .await
+            .map_err(|_| AdapterError::sandbox_unavailable())??;
+        write_response(
+            writer,
+            &AdapterResponse::Result {
+                version: VersionOne,
+                request_id,
+                body: HealthResultBody {
+                    version: VersionOne,
+                    status: "ok",
+                    codex_cli_version: identity.codex_cli_version,
+                    codex_artifact_sha256: identity.codex_artifact_sha256,
+                    codex_protocol_schema_sha256: identity.codex_protocol_schema_sha256,
+                    broker_protocol_sha256: BROKER_CONTRACT_SHA256,
+                    model: crate::app_server::MODEL,
+                    reasoning_effort: crate::app_server::EFFORT,
+                },
+            },
+        )
+        .await
+    }
+
+    async fn status(
+        &self,
+        request_id: Uuid,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<(), AdapterError> {
+        let broker = self.broker.clone();
+        let status = tokio::task::spawn_blocking(move || broker.status())
+            .await
+            .map_err(|_| AdapterError::sandbox_unavailable())??;
+        write_response(
+            writer,
+            &AdapterResponse::Result {
+                version: VersionOne,
+                request_id,
+                body: StatusResultBody {
+                    version: VersionOne,
+                    prepared_host_jobs: status.prepared_jobs,
+                    starting_host_jobs: status.starting_jobs,
+                    running_host_jobs: status.running_jobs,
+                    unsettled_host_jobs: status.unsettled_jobs,
+                    orphan_processes: status.orphan_processes,
+                },
+            },
+        )
+        .await
+    }
+
+    async fn diagnose_host_job(
+        &self,
+        request_id: Uuid,
+        body: DiagnoseHostJobRequestBody,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<(), AdapterError> {
+        if body.correlation_id.is_nil() || body.job_id.is_nil() {
+            return Err(AdapterError::model_protocol());
+        }
+        let broker = self.broker.clone();
+        let correlation_id = body.correlation_id;
+        let job_id = body.job_id;
+        let diagnostic =
+            tokio::task::spawn_blocking(move || broker.diagnose(correlation_id, job_id))
+                .await
+                .map_err(|_| AdapterError::sandbox_unavailable())??;
+        let lifecycle = self
+            .registry
+            .lifecycle_counts(body.correlation_id, body.job_id)
+            .ok_or_else(AdapterError::not_found)?;
+        write_response(
+            writer,
+            &AdapterResponse::Result {
+                version: VersionOne,
+                request_id,
+                body: diagnose_result(diagnostic, lifecycle),
+            },
+        )
+        .await
+    }
+
     async fn confirm_ambiguous_start_cleanup(
         &self,
         job_id: Uuid,
@@ -2193,6 +2600,476 @@ impl AdapterService {
             return Err(AdapterError::codex_unavailable());
         }
         Ok(())
+    }
+}
+
+fn deterministic_protocol_self_check() -> Result<(), AdapterError> {
+    use crate::decision::{
+        Effect, classify, normalize_model_decision_envelope, parse_decision_envelope,
+    };
+    let first = parse_decision_envelope(
+        r#"{"decision":{"type":"action","version":1,"action":{"kind":"snapshot"}}}"#,
+    )
+    .map(normalize_model_decision_envelope)
+    .map_err(|_| AdapterError::model_protocol())?;
+    let second = parse_decision_envelope(
+        r#"{"decision":{"type":"final","version":1,"output":"health-ok"}}"#,
+    )
+    .map(normalize_model_decision_envelope)
+    .map_err(|_| AdapterError::model_protocol())?;
+    if classify(&first) != Effect::ReadOnly
+        || !matches!(
+            second,
+            crate::protocol::ModelDecisionV1::Final { ref output, .. }
+                if output == "health-ok"
+        )
+    {
+        return Err(AdapterError::model_protocol());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InstalledHealthIdentity {
+    codex_cli_version: String,
+    codex_artifact_sha256: String,
+    codex_protocol_schema_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct InstalledManifest {
+    format_version: u8,
+    build_timestamp: String,
+    codex_app_server: InstalledCodexManifest,
+    code_runtime: InstalledCodeRuntime,
+    bundle_digests: BTreeMap<String, String>,
+    policy_hashes: BTreeMap<String, String>,
+    broker_contract_sha256: String,
+    binary_hashes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct InstalledCodexManifest {
+    format_version: u8,
+    source_identity: InstalledCodexIdentity,
+    artifact_sha256: String,
+    protocol_sha256: String,
+    feature_sha256: String,
+    gate_attestation_sha256: String,
+    model: String,
+    reasoning_effort: String,
+    build_timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct InstalledCodexIdentity {
+    executable_path: String,
+    resolved_path: String,
+    device: String,
+    inode: String,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct InstalledCodeRuntime {
+    node: String,
+    python: String,
+    bash: String,
+    javascript_playwright: String,
+    python_playwright: String,
+    relay_protocol: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RootfsIdentity {
+    version: u8,
+    bundle_id: String,
+    rootfs_sha256: String,
+}
+
+fn verify_adapter_socket(path: &Path) -> Result<(), AdapterError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| AdapterError::sandbox_unavailable())?;
+    if !metadata.file_type().is_socket()
+        || metadata.file_type().is_symlink()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.uid() != effective_uid()?
+    {
+        return Err(AdapterError::sandbox_unavailable());
+    }
+    Ok(())
+}
+
+fn verify_installed_health_identity(
+    protocol_root: &Path,
+) -> Result<InstalledHealthIdentity, AdapterError> {
+    let protocol_parent = protocol_root
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "protocol"))
+        .ok_or_else(AdapterError::codex_unavailable)?;
+    let install_root = protocol_parent
+        .parent()
+        .ok_or_else(AdapterError::codex_unavailable)?;
+    let expected_uid = if install_root == Path::new("/opt/firecrawl") {
+        0
+    } else {
+        effective_uid()?
+    };
+    let install_metadata =
+        fs::metadata(install_root).map_err(|_| AdapterError::codex_unavailable())?;
+    if !install_metadata.is_dir()
+        || install_metadata.uid() != expected_uid
+        || install_metadata.mode() & 0o022 != 0
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let current = install_root.join("current");
+    let current_metadata =
+        fs::symlink_metadata(&current).map_err(|_| AdapterError::codex_unavailable())?;
+    let current_target = fs::read_link(&current).map_err(|_| AdapterError::codex_unavailable())?;
+    let target_text = current_target
+        .to_str()
+        .ok_or_else(AdapterError::codex_unavailable)?;
+    let generation_name = target_text
+        .strip_prefix("generations/host-")
+        .filter(|name| valid_sha256(name))
+        .ok_or_else(AdapterError::codex_unavailable)?;
+    if !current_metadata.file_type().is_symlink()
+        || current_metadata.uid() != expected_uid
+        || generation_name.is_empty()
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let stable_protocol = install_root.join("protocol");
+    let stable_protocol_metadata =
+        fs::symlink_metadata(&stable_protocol).map_err(|_| AdapterError::codex_unavailable())?;
+    if !stable_protocol_metadata.file_type().is_symlink()
+        || stable_protocol_metadata.uid() != expected_uid
+        || fs::read_link(&stable_protocol).map_err(|_| AdapterError::codex_unavailable())?
+            != Path::new("current/protocol")
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let generations = fs::canonicalize(install_root.join("generations"))
+        .map_err(|_| AdapterError::codex_unavailable())?;
+    let generation = fs::canonicalize(&current).map_err(|_| AdapterError::codex_unavailable())?;
+    let generations_metadata =
+        fs::metadata(&generations).map_err(|_| AdapterError::codex_unavailable())?;
+    let generation_metadata =
+        fs::metadata(&generation).map_err(|_| AdapterError::codex_unavailable())?;
+    if generation.parent() != Some(generations.as_path())
+        || !generations_metadata.is_dir()
+        || !generation_metadata.is_dir()
+        || generations_metadata.uid() != expected_uid
+        || generation_metadata.uid() != expected_uid
+        || generations_metadata.mode() & 0o022 != 0
+        || generation_metadata.mode() & 0o022 != 0
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let canonical_protocol =
+        fs::canonicalize(protocol_root).map_err(|_| AdapterError::codex_unavailable())?;
+    if canonical_protocol != generation.join("protocol/codex-app-server") {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let manifest_raw =
+        secure_regular_bytes(&generation.join("manifest.json"), expected_uid, 1 << 20)?;
+    let manifest: InstalledManifest =
+        parse_json_strict(&manifest_raw).map_err(|_| AdapterError::codex_unavailable())?;
+    validate_installed_manifest(&manifest)?;
+    verify_generation_checksums(&generation, expected_uid)?;
+    verify_manifest_bindings(&generation, expected_uid, &manifest)?;
+    crate::app_server::ProtocolBundle::load(protocol_root)
+        .map_err(|_| AdapterError::codex_unavailable())?;
+    crate::broker_client::validate_installed_contract_at(
+        &protocol_parent.join("sandbox-broker-v1.contract.json"),
+        expected_uid,
+    )?;
+    if manifest.codex_app_server.protocol_sha256
+        != protocol_manifest_digest(protocol_root, expected_uid)?
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    Ok(InstalledHealthIdentity {
+        codex_cli_version: manifest.codex_app_server.source_identity.version,
+        codex_artifact_sha256: manifest.codex_app_server.artifact_sha256,
+        codex_protocol_schema_sha256: manifest.codex_app_server.protocol_sha256,
+    })
+}
+
+fn verify_manifest_bindings(
+    generation: &Path,
+    expected_uid: u32,
+    manifest: &InstalledManifest,
+) -> Result<(), AdapterError> {
+    if secure_regular_sha256(&generation.join("codex-app-server.tar"), expected_uid)?
+        != manifest.codex_app_server.artifact_sha256
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    for (name, expected) in &manifest.binary_hashes {
+        if secure_regular_sha256(&generation.join("bin").join(name), expected_uid)? != *expected {
+            return Err(AdapterError::codex_unavailable());
+        }
+    }
+    for (name, expected) in &manifest.policy_hashes {
+        if secure_regular_sha256(&generation.join("policy").join(name), expected_uid)? != *expected
+        {
+            return Err(AdapterError::codex_unavailable());
+        }
+    }
+    for (bundle_id, expected) in &manifest.bundle_digests {
+        let raw = secure_regular_bytes(
+            &generation
+                .join("bundles")
+                .join(bundle_id)
+                .join("rootfs.identity.json"),
+            expected_uid,
+            4096,
+        )?;
+        let identity: RootfsIdentity =
+            parse_json_strict(&raw).map_err(|_| AdapterError::codex_unavailable())?;
+        if identity.version != 1
+            || identity.bundle_id != *bundle_id
+            || identity.rootfs_sha256 != *expected
+        {
+            return Err(AdapterError::codex_unavailable());
+        }
+    }
+    Ok(())
+}
+
+fn validate_installed_manifest(manifest: &InstalledManifest) -> Result<(), AdapterError> {
+    let codex = &manifest.codex_app_server;
+    let identity = &codex.source_identity;
+    if manifest.format_version != 1
+        || manifest.build_timestamp != codex.build_timestamp
+        || manifest.broker_contract_sha256 != BROKER_CONTRACT_SHA256
+        || codex.format_version != 1
+        || codex.model != crate::app_server::MODEL
+        || codex.reasoning_effort != crate::app_server::EFFORT
+        || !valid_sha256(&codex.artifact_sha256)
+        || !valid_sha256(&codex.protocol_sha256)
+        || !valid_sha256(&codex.feature_sha256)
+        || !valid_sha256(&codex.gate_attestation_sha256)
+        || !valid_semver(&identity.version)
+        || !Path::new(&identity.executable_path).is_absolute()
+        || !Path::new(&identity.resolved_path).is_absolute()
+        || identity.device.is_empty()
+        || !identity.device.bytes().all(|byte| byte.is_ascii_digit())
+        || identity.inode.is_empty()
+        || !identity.inode.bytes().all(|byte| byte.is_ascii_digit())
+        || manifest.code_runtime.node != "22.22.1"
+        || manifest.code_runtime.python != "3.12.3"
+        || manifest.code_runtime.bash != "5.2.21"
+        || manifest.code_runtime.javascript_playwright != "1.61.1"
+        || manifest.code_runtime.python_playwright != "1.61.0"
+        || manifest.code_runtime.relay_protocol != "code-relay-v1"
+        || manifest
+            .bundle_digests
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != ["code-v1", "codex-v1"]
+        || manifest
+            .policy_hashes
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != ["bundles.json", "code-seccomp.json", "codex-seccomp.json"]
+        || manifest
+            .binary_hashes
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != [
+                "acceptance-restart-broker",
+                "firecrawl-browser-execution-adapter",
+                "firecrawl-sandbox-broker",
+            ]
+        || manifest
+            .bundle_digests
+            .values()
+            .chain(manifest.policy_hashes.values())
+            .chain(manifest.binary_hashes.values())
+            .any(|digest| !valid_sha256(digest))
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    Ok(())
+}
+
+fn verify_generation_checksums(generation: &Path, expected_uid: u32) -> Result<(), AdapterError> {
+    let sums = secure_regular_bytes(&generation.join("SHA256SUMS"), expected_uid, 4 << 20)?;
+    let sums = std::str::from_utf8(&sums).map_err(|_| AdapterError::codex_unavailable())?;
+    if sums.is_empty() || !sums.ends_with('\n') {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let mut previous: Option<&str> = None;
+    for line in sums.lines() {
+        let (digest, relative) = line
+            .split_once("  ")
+            .ok_or_else(AdapterError::codex_unavailable)?;
+        if !valid_sha256(digest)
+            || previous.is_some_and(|value| value >= relative)
+            || !safe_relative_path(relative)
+            || relative == "SHA256SUMS"
+            || secure_regular_sha256(&generation.join(relative), expected_uid)? != digest
+        {
+            return Err(AdapterError::codex_unavailable());
+        }
+        previous = Some(relative);
+    }
+    Ok(())
+}
+
+fn protocol_manifest_digest(
+    protocol_root: &Path,
+    expected_uid: u32,
+) -> Result<String, AdapterError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct ProtocolManifest {
+        format_version: u8,
+        codex_identity: InstalledCodexIdentity,
+        schema_inventory: Vec<String>,
+        schema_digest: String,
+    }
+    let raw = secure_regular_bytes(&protocol_root.join("manifest.json"), expected_uid, 1 << 20)?;
+    let manifest: ProtocolManifest =
+        parse_json_strict(&raw).map_err(|_| AdapterError::codex_unavailable())?;
+    if manifest.format_version != 1
+        || manifest.schema_inventory.is_empty()
+        || !valid_semver(&manifest.codex_identity.version)
+        || !valid_sha256(&manifest.schema_digest)
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    Ok(manifest.schema_digest)
+}
+
+fn secure_regular_bytes(
+    path: &Path,
+    expected_uid: u32,
+    maximum: usize,
+) -> Result<Vec<u8>, AdapterError> {
+    use std::io::Read;
+    let mut file = secure_regular_file(path, expected_uid)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdapterError::codex_unavailable())?;
+    if metadata.len() > maximum as u64 {
+        return Err(AdapterError::codex_unavailable());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AdapterError::codex_unavailable())?;
+    if bytes.len() > maximum {
+        return Err(AdapterError::codex_unavailable());
+    }
+    Ok(bytes)
+}
+
+fn secure_regular_sha256(path: &Path, expected_uid: u32) -> Result<String, AdapterError> {
+    use std::io::Read;
+    let mut file = secure_regular_file(path, expected_uid)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| AdapterError::codex_unavailable())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn secure_regular_file(path: &Path, expected_uid: u32) -> Result<fs::File, AdapterError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| AdapterError::codex_unavailable())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AdapterError::codex_unavailable())?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(AdapterError::codex_unavailable());
+    }
+    Ok(file)
+}
+
+fn safe_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !Path::new(path).is_absolute()
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'@' | b'-')
+        })
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_semver(value: &str) -> bool {
+    let core_end = value.find(['-', '+']).unwrap_or(value.len());
+    let core = &value[..core_end];
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == &"0" || !part.starts_with('0'))
+        })
+        && value[core_end..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+fn diagnose_result(
+    diagnostic: BrokerDiagnostic,
+    lifecycle: LifecycleCounts,
+) -> DiagnoseHostJobResultBody {
+    DiagnoseHostJobResultBody {
+        version: VersionOne,
+        correlation_id: diagnostic.correlation_id,
+        job_id: diagnostic.job_id,
+        phase: diagnostic.phase,
+        host_init_pid: diagnostic.init_pid,
+        pidfd_live: diagnostic.pidfd_live,
+        pidfd_pid_matches: diagnostic.pidfd_pid_matches,
+        control_lease_connected: diagnostic.control_lease_connected,
+        inert_relay_fd_present: diagnostic.inert_relay_fd_present,
+        relay_listener_present: diagnostic.relay_listener_present,
+        cdp_relay_opened: diagnostic.cdp_relay_opened,
+        payload_started_count: lifecycle.payload_started_count,
+        payload_marker_present: diagnostic.payload_marker_present,
+        callback_count: lifecycle.callback_count,
+        browser_effect_count: lifecycle.browser_effect_count,
+        runc_state: diagnostic.runc_state,
+        cgroup_present: diagnostic.cgroup_present,
+        job_directory_present: diagnostic.job_directory_present,
+        child_count: diagnostic.child_count,
+        cleanup_failure: diagnostic.cleanup_failure,
     }
 }
 
@@ -2491,6 +3368,7 @@ struct AuditedReader<R> {
     job_id: Uuid,
     init_pid: u32,
     emitted: Arc<AtomicBool>,
+    lifecycle: JobLifecycle,
 }
 
 impl<R> AuditedReader<R> {
@@ -2500,6 +3378,7 @@ impl<R> AuditedReader<R> {
         job_id: Uuid,
         init_pid: u32,
         emitted: Arc<AtomicBool>,
+        lifecycle: JobLifecycle,
     ) -> Self {
         Self {
             inner,
@@ -2507,6 +3386,7 @@ impl<R> AuditedReader<R> {
             job_id,
             init_pid,
             emitted,
+            lifecycle,
         }
     }
 }
@@ -2526,6 +3406,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AuditedReader<R> 
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            self.lifecycle.record_payload_started();
             emit_lifecycle(
                 "payload_started",
                 self.correlation_id,
@@ -2535,6 +3416,16 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AuditedReader<R> 
         }
         result
     }
+}
+
+fn operation_has_browser_effect(operation: &BrowserOperation) -> bool {
+    !matches!(
+        operation,
+        BrowserOperation::Snapshot
+            | BrowserOperation::Wait { .. }
+            | BrowserOperation::GetText { .. }
+            | BrowserOperation::GetUrl
+    )
 }
 
 #[cfg(test)]
@@ -2579,9 +3470,17 @@ mod tests {
         let registry = JobRegistry::new(1, 2).unwrap();
         let unproven_run = Uuid::new_v4();
         let unproven_job = Uuid::new_v4();
-        registry
-            .reserve(unproven_run, JobKind::Code, unproven_job, Uuid::new_v4())
+        let unproven_correlation = Uuid::new_v4();
+        let reserved = registry
+            .reserve_correlated(
+                unproven_run,
+                JobKind::Code,
+                unproven_job,
+                Uuid::new_v4(),
+                unproven_correlation,
+            )
             .unwrap();
+        reserved.lifecycle.record_payload_started();
         let unproven = registry.request_cancel(unproven_run).unwrap();
         assert!(!registry.complete_reserved(
             unproven_run,
@@ -2591,6 +3490,13 @@ mod tests {
         assert!(registry.fail_cleanup_reserved(unproven_run, unproven_job));
         assert_eq!(*unproven.borrow(), JobCompletion::CleanupUnproven);
         assert!(registry.terminal_jobs().is_empty());
+        assert_eq!(
+            registry
+                .lifecycle_counts(unproven_correlation, unproven_job)
+                .unwrap()
+                .payload_started_count,
+            1
+        );
 
         let proven_run = Uuid::new_v4();
         let binding = AdapterAuthorizationBinding::new(Uuid::new_v4(), Uuid::new_v4(), 9).unwrap();

@@ -74,13 +74,108 @@ fn start_and_cancel_linearize_under_one_registry_lock() {
 #[test]
 fn terminal_metadata_is_bounded() {
     let registry = JobRegistry::new(1, 2).unwrap();
-    for _ in 0..140 {
+    for _ in 0..4_200 {
         let run_id = Uuid::new_v4();
         let binding = binding();
         registry.admit(run_id, JobKind::Prompt, binding).unwrap();
         assert!(registry.complete(run_id, binding, None));
     }
-    assert_eq!(registry.terminal_jobs().len(), 128);
+    assert_eq!(registry.terminal_jobs().len(), 4_096);
+}
+
+#[test]
+fn terminal_diagnostics_survive_high_churn_until_retention_expires() {
+    let registry = JobRegistry::new(1, 2).unwrap();
+    let first_correlation = Uuid::new_v4();
+    let first_job = Uuid::new_v4();
+    for index in 0..512 {
+        let run_id = Uuid::new_v4();
+        let job_id = if index == 0 {
+            first_job
+        } else {
+            Uuid::new_v4()
+        };
+        let correlation_id = if index == 0 {
+            first_correlation
+        } else {
+            Uuid::new_v4()
+        };
+        let reserved = registry
+            .reserve_correlated(
+                run_id,
+                JobKind::Prompt,
+                job_id,
+                Uuid::new_v4(),
+                correlation_id,
+            )
+            .unwrap();
+        if index == 0 {
+            reserved.lifecycle.record_payload_started();
+        }
+        assert!(registry.complete_reserved(run_id, job_id, None));
+    }
+    assert_eq!(
+        registry
+            .lifecycle_counts(first_correlation, first_job)
+            .unwrap()
+            .payload_started_count,
+        1
+    );
+
+    let expiring =
+        JobRegistry::new_with_terminal_retention(1, 2, std::time::Duration::from_millis(1))
+            .unwrap();
+    let run_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    expiring
+        .reserve_correlated(
+            run_id,
+            JobKind::Prompt,
+            job_id,
+            Uuid::new_v4(),
+            correlation_id,
+        )
+        .unwrap();
+    assert!(expiring.complete_reserved(run_id, job_id, None));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert_eq!(expiring.lifecycle_counts(correlation_id, job_id), None);
+}
+
+#[test]
+fn diagnostic_metadata_is_exact_pair_scoped_and_survives_terminal_state() {
+    let registry = JobRegistry::new(1, 2).unwrap();
+    let run_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    let correlation_id = Uuid::new_v4();
+    let supervisor_id = Uuid::new_v4();
+    let reserved = registry
+        .reserve_correlated(
+            run_id,
+            JobKind::Prompt,
+            job_id,
+            supervisor_id,
+            correlation_id,
+        )
+        .unwrap();
+    reserved.lifecycle.record_payload_started();
+    reserved.lifecycle.record_callback();
+    reserved.lifecycle.record_browser_effect();
+    let expected = reserved.lifecycle.snapshot();
+    assert_eq!(
+        registry.lifecycle_counts(correlation_id, job_id),
+        Some(expected)
+    );
+    assert_eq!(registry.lifecycle_counts(Uuid::new_v4(), job_id), None);
+    assert_eq!(
+        registry.lifecycle_counts(correlation_id, Uuid::new_v4()),
+        None
+    );
+    assert!(registry.complete_reserved(run_id, job_id, None));
+    assert_eq!(
+        registry.lifecycle_counts(correlation_id, job_id),
+        Some(expected)
+    );
 }
 
 #[test]
@@ -114,7 +209,9 @@ fn preparing_job_reserves_capacity_and_can_be_cancelled_before_binding() {
         [firecrawl_browser_execution_adapter::jobs::TerminalJob {
             run_id,
             adapter_job_id: job_id,
+            correlation_id: None,
             category: Some(AdapterErrorCategory::Cancelled),
+            lifecycle: Default::default(),
         }]
     );
 }

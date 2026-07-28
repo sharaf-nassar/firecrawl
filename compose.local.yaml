@@ -34,10 +34,12 @@ services:
     environment:
       USE_DB_AUTHENTICATION: "false"
       LOCAL_PERSISTENCE_ENABLED: ${LOCAL_PERSISTENCE_ENABLED}
-      LOCAL_BROWSER_SERVICE_ENABLED: "false"
+      LOCAL_BROWSER_SERVICE_ENABLED: "true"
       LOCAL_BROWSER_STATE_ROOT: ${LOCAL_BROWSER_STATE_ROOT:-/var/lib/firecrawl-browser-volume/state}
       BROWSER_SERVICE_URL: http://browser-service:3010
       BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY}
+      BROWSER_EXECUTION_ADAPTER_SOCKET: /run/firecrawl-adapter/adapter.sock
+      BROWSER_ADAPTER_TOKEN_FILE: /run/firecrawl-adapter/adapter.token
       BROWSER_REPLAY_INGEST_URL: http://127.0.0.1:${INTERNAL_PORT:-3002}
       BROWSER_REPLAY_INGEST_API_KEY: ${BROWSER_REPLAY_INGEST_API_KEY}
       BROWSER_SERVICE_REQUEST_TIMEOUT_MS: ${BROWSER_SERVICE_REQUEST_TIMEOUT_MS:-30000}
@@ -59,6 +61,11 @@ services:
       ARTIFACT_MINIO_SECRET_KEY: ${ARTIFACT_MINIO_SECRET_KEY}
       ARTIFACT_MINIO_BUCKET: ${ARTIFACT_MINIO_BUCKET}
       ARTIFACT_MINIO_REGION: ${ARTIFACT_MINIO_REGION}
+    volumes:
+      - type: bind
+        source: ${LOCAL_FIRECRAWL_HOST_RUNTIME_DIR}
+        target: /run/firecrawl-adapter
+        read_only: true
   browser-state-init:
     build:
       context: .
@@ -82,10 +89,10 @@ services:
     read_only: true
     environment:
       PORT: "3010"
-      LOCAL_BROWSER_SERVICE_ENABLED: "false"
+      LOCAL_BROWSER_SERVICE_ENABLED: "true"
       LOCAL_BROWSER_STATE_ROOT: /var/lib/firecrawl-browser-volume/state
       BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY}
-      MAX_BROWSER_SESSIONS: ${MAX_BROWSER_SESSIONS:-8}
+      MAX_BROWSER_SESSIONS: ${MAX_BROWSER_SESSIONS:-4}
     networks:
       - backend
     volumes:

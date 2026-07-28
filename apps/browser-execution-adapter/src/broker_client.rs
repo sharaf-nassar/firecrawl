@@ -32,7 +32,7 @@ const CODEX_BUNDLE: &str = "codex-v1";
 const BROKER_CONTRACT: &str =
     include_str!("../../../host/browser-runtime/protocol/sandbox-broker-v1.contract.json");
 pub const BROKER_CONTRACT_SHA256: &str =
-    "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4";
+    "709ed34abc51ca9a9b44d96e1496667ac535ea8ff53d372d10817f4b613c48a1";
 pub const INSTALLED_BROKER_CONTRACT_PATH: &str =
     "/opt/firecrawl/protocol/sandbox-broker-v1.contract.json";
 
@@ -198,6 +198,7 @@ enum BrokerRequest {
         correlation_id: Uuid,
         job_id: Uuid,
     },
+    Status,
     Health,
 }
 
@@ -247,6 +248,10 @@ enum BrokerResponse {
     Diagnostic {
         #[serde(flatten)]
         diagnostic: BrokerDiagnostic,
+    },
+    StatusResult {
+        #[serde(flatten)]
+        status: BrokerAggregateStatus,
     },
     OwnerCancelled,
     Healthy,
@@ -303,6 +308,15 @@ pub struct BrokerDiagnostic {
     pub job_directory_present: bool,
     pub child_count: u32,
     pub cleanup_failure: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrokerAggregateStatus {
+    pub prepared_jobs: u32,
+    pub starting_jobs: u32,
+    pub running_jobs: u32,
+    pub unsettled_jobs: u32,
+    pub orphan_processes: u32,
 }
 
 impl BrokerClient {
@@ -764,6 +778,13 @@ impl BrokerClient {
         }
     }
 
+    pub fn status(&self) -> Result<BrokerAggregateStatus, AdapterError> {
+        match self.exchange_one_shot(&BrokerRequest::Status)? {
+            BrokerResponse::StatusResult { status } => Ok(status),
+            _ => Err(AdapterError::sandbox_unavailable()),
+        }
+    }
+
     pub fn diagnose(
         &self,
         correlation_id: Uuid,
@@ -780,6 +801,9 @@ impl BrokerClient {
                 if diagnostic.correlation_id == correlation_id && diagnostic.job_id == job_id =>
             {
                 Ok(diagnostic)
+            }
+            BrokerResponse::Error { category, .. } if category == "unauthorized" => {
+                Err(AdapterError::not_found())
             }
             _ => Err(AdapterError::sandbox_unavailable()),
         }
@@ -922,10 +946,6 @@ impl BrokerClient {
         response.truncate(read);
         let parsed: BrokerResponse =
             parse_json_strict(&response).map_err(|_| AdapterError::sandbox_unavailable())?;
-        if let BrokerResponse::Error { category, message } = &parsed {
-            let _ = (category, message);
-            return Err(AdapterError::sandbox_unavailable());
-        }
         Ok((parsed, received_descriptors))
     }
 }
@@ -1237,6 +1257,7 @@ pub fn validate_shared_contract() -> Result<(), AdapterError> {
             correlation_id,
             job_id,
         }),
+        serde_json::to_value(BrokerRequest::Status),
         serde_json::to_value(BrokerRequest::Health),
     ];
     for packet in packets {
@@ -1292,6 +1313,14 @@ pub fn validate_shared_contract() -> Result<(), AdapterError> {
         }),
         serde_json::json!({"type":"error","category":"invalid","message":"rejected"}),
         serde_json::json!({"type":"owner_cancelled"}),
+        serde_json::json!({
+            "type":"status_result",
+            "prepared_jobs":1,
+            "starting_jobs":2,
+            "running_jobs":3,
+            "unsettled_jobs":4,
+            "orphan_processes":5
+        }),
         serde_json::json!({"type":"healthy"}),
     ] {
         let parsed: BrokerResponse = serde_json::from_value(packet.clone())
@@ -1433,6 +1462,8 @@ pub fn validate_shared_contract_bytes(raw: &[u8]) -> Result<serde_json::Value, A
         "prepared",
         "start",
         "started",
+        "status",
+        "status_result",
         "terminal",
         "aborted",
     ];
@@ -1469,7 +1500,14 @@ pub fn validate_shared_contract_bytes(raw: &[u8]) -> Result<serde_json::Value, A
         exact_value_keys(discriminator, &["field", "value"])?;
         let expected_field = if matches!(
             name.as_str(),
-            "prepare" | "start" | "abort" | "cancel" | "cancel_owner" | "diagnose" | "health"
+            "prepare"
+                | "start"
+                | "abort"
+                | "cancel"
+                | "cancel_owner"
+                | "diagnose"
+                | "status"
+                | "health"
         ) {
             "method"
         } else {
@@ -1545,6 +1583,15 @@ pub fn validate_shared_contract_bytes(raw: &[u8]) -> Result<serde_json::Value, A
                 "relay_listener_present",
                 "runc_state",
                 "type",
+            ],
+            "status" => &["method"],
+            "status_result" => &[
+                "orphan_processes",
+                "prepared_jobs",
+                "running_jobs",
+                "starting_jobs",
+                "type",
+                "unsettled_jobs",
             ],
             "owner_cancelled" | "health" | "healthy" => &[expected_field],
             "terminal" => &["artifacts", "init_pid", "job_id", "outcome", "type"],

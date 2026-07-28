@@ -5,6 +5,10 @@ import { TextDecoder } from "node:util";
 import type { AdapterAuthorizationBinding } from "../browser-state/types";
 import {
   adapterAuthorizationAckSchema,
+  adapterHealthRequestSchema,
+  adapterHealthResultSchema,
+  adapterHostStatusResultSchema,
+  adapterStatusRequestSchema,
   adapterResponseSchema,
   cancelAdapterRequestSchema,
   cancelRunResultSchema,
@@ -14,9 +18,15 @@ import {
   EXECUTION_ADAPTER_MAX_RUNTIME_MS,
   executeCodeAdapterRequestSchema,
   executePromptAdapterRequestSchema,
+  diagnoseHostJobAdapterRequestSchema,
+  diagnoseHostJobRequestBodySchema,
+  diagnoseHostJobResultSchema,
   promptRunRequestSchema,
   promptRunResultSchema,
   adapterRequestIdSchema,
+  type AdapterHealthResult,
+  type AdapterHostStatusResult,
+  type DiagnoseHostJobResult,
 } from "./execution-adapter-contracts";
 import {
   createPreAdmissionExecutionAdapterError,
@@ -33,7 +43,13 @@ import {
   type PromptRunResult,
 } from "./protocol";
 
-type AdapterMethod = "execute_prompt" | "execute_code" | "cancel";
+type AdapterMethod =
+  | "execute_prompt"
+  | "execute_code"
+  | "cancel"
+  | "health"
+  | "status"
+  | "diagnose_host_job";
 
 type SocketExecutionAdapterOptions = {
   socketPath: string;
@@ -52,6 +68,16 @@ type ExecuteRequestOptions<T> = {
   >;
   onAccepted?: (binding: AdapterAuthorizationBinding) => Promise<void>;
   parseResult(body: unknown): T;
+};
+
+type SocketExecutionAdapter = BrowserExecutionAdapter & {
+  health(signal?: AbortSignal): Promise<AdapterHealthResult>;
+  status(signal?: AbortSignal): Promise<AdapterHostStatusResult>;
+  diagnoseHostJob(
+    correlationId: string,
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<DiagnoseHostJobResult>;
 };
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
@@ -190,9 +216,11 @@ function executeSocketRequest<T>(
       const requestId = (input.request as { requestId: string }).requestId;
       if (response.requestId !== requestId) throw protocolError();
 
+      const requiresAuthorization =
+        input.method === "execute_prompt" || input.method === "execute_code";
       if (response.type === "accepted") {
         if (
-          input.method === "cancel" ||
+          !requiresAuthorization ||
           accepted ||
           terminalSeen ||
           input.expectedBinding === undefined ||
@@ -218,7 +246,7 @@ function executeSocketRequest<T>(
         return;
       }
 
-      if (input.method !== "cancel" && (!accepted || !authorized)) {
+      if (requiresAuthorization && (!accepted || !authorized)) {
         throw protocolError();
       }
       if (terminalSeen) throw protocolError();
@@ -263,7 +291,13 @@ function executeSocketRequest<T>(
       connected = true;
       try {
         const frame = serializeFrame(input.request);
-        if (input.method === "cancel") socket.end(frame);
+        if (
+          input.method === "cancel" ||
+          input.method === "health" ||
+          input.method === "status" ||
+          input.method === "diagnose_host_job"
+        )
+          socket.end(frame);
         else socket.write(frame);
       } catch (error) {
         fail(error instanceof Error ? error : protocolError());
@@ -322,7 +356,7 @@ function executeSocketRequest<T>(
 
 export function createSocketExecutionAdapter(
   options: SocketExecutionAdapterOptions,
-): BrowserExecutionAdapter {
+): SocketExecutionAdapter {
   const requestIdFactory = options.requestIdFactory ?? randomUUID;
 
   const executePromptRun = (
@@ -403,6 +437,65 @@ export function createSocketExecutionAdapter(
         signal: new AbortController().signal,
         deadline: undefined,
         parseResult: body => cancelRunResultSchema.parse(body),
+      });
+    },
+    async health(signal = new AbortController().signal) {
+      const requestId = adapterRequestIdSchema.parse(requestIdFactory());
+      const request = adapterHealthRequestSchema.parse({
+        version: 1,
+        requestId,
+        method: "health",
+        body: {},
+      });
+      return executeSocketRequest(options.socketPath, {
+        method: "health",
+        request,
+        signal,
+        deadline: new Date(Date.now() + 10_000),
+        unavailableCategory: "sandbox_unavailable",
+        parseResult: body => adapterHealthResultSchema.parse(body),
+      });
+    },
+    async status(signal = new AbortController().signal) {
+      const requestId = adapterRequestIdSchema.parse(requestIdFactory());
+      const request = adapterStatusRequestSchema.parse({
+        version: 1,
+        requestId,
+        method: "status",
+        body: {},
+      });
+      return executeSocketRequest(options.socketPath, {
+        method: "status",
+        request,
+        signal,
+        deadline: new Date(Date.now() + 10_000),
+        unavailableCategory: "sandbox_unavailable",
+        parseResult: body => adapterHostStatusResultSchema.parse(body),
+      });
+    },
+    async diagnoseHostJob(
+      correlationId,
+      jobId,
+      signal = new AbortController().signal,
+    ) {
+      const requestId = adapterRequestIdSchema.parse(requestIdFactory());
+      const body = diagnoseHostJobRequestBodySchema.parse({
+        correlationId,
+        jobId,
+      });
+      const request = diagnoseHostJobAdapterRequestSchema.parse({
+        version: 1,
+        requestId,
+        method: "diagnose_host_job",
+        body,
+      });
+      return executeSocketRequest(options.socketPath, {
+        method: "diagnose_host_job",
+        request,
+        signal,
+        deadline: new Date(Date.now() + 10_000),
+        unavailableCategory: "sandbox_unavailable",
+        parseResult: value => diagnoseHostJobResultSchema.parse(value),
       });
     },
   };

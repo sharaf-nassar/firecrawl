@@ -48,7 +48,7 @@ const CONTRACT_PATH = join(
   "host/browser-runtime/protocol/sandbox-broker-v1.contract.json",
 );
 const CONTRACT_SHA256 =
-  "587c8e3da5f7050ec1a9ac2fd26a349b9fef7e82ddfd424f74a61172968700e4";
+  "709ed34abc51ca9a9b44d96e1496667ac535ea8ff53d372d10817f4b613c48a1";
 const MODEL = "gpt-5.6-terra";
 const EFFORT = "medium";
 const MAX_COMMAND_OUTPUT = 16 * 1024 * 1024;
@@ -201,6 +201,88 @@ async function captureIdentity(failureCode = "codex_version_mismatch") {
 async function revalidateIdentity(expected) {
   const actual = await captureIdentity("codex_version_changed");
   assertSameCodexIdentity(expected, actual);
+}
+
+const CODEX_IDENTITY_FIELDS = Object.freeze([
+  "executablePath",
+  "resolvedPath",
+  "device",
+  "inode",
+  "version",
+]);
+
+async function validateIdentityOutputParent(output) {
+  if (!isAbsolute(output)) throw fail("codex_identity_path_invalid");
+  const parent = dirname(output);
+  const canonicalParent = await realpath(parent);
+  const metadata = await stat(canonicalParent);
+  if (
+    canonicalParent !== parent ||
+    !metadata.isDirectory() ||
+    metadata.uid !== process.getuid() ||
+    (metadata.mode & 0o022) !== 0
+  ) {
+    throw fail("codex_identity_parent_invalid");
+  }
+}
+
+async function readSealedIdentity(path) {
+  if (!isAbsolute(path)) throw fail("codex_identity_path_invalid");
+  const canonicalPath = await realpath(path);
+  if (canonicalPath !== path) throw fail("codex_identity_file_invalid");
+  const handle = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    const before = await handle.stat();
+    if (
+      !before.isFile() ||
+      before.nlink !== 1 ||
+      before.uid !== process.getuid() ||
+      (before.mode & 0o777) !== 0o600
+    ) {
+      throw fail("codex_identity_file_invalid");
+    }
+    let identity;
+    try {
+      identity = JSON.parse(await handle.readFile("utf8"));
+    } catch {
+      throw fail("codex_identity_file_invalid");
+    }
+    const after = await handle.stat();
+    const pathMetadata = await lstat(path);
+    if (
+      String(before.dev) !== String(after.dev) ||
+      String(before.ino) !== String(after.ino) ||
+      String(after.dev) !== String(pathMetadata.dev) ||
+      String(after.ino) !== String(pathMetadata.ino) ||
+      !hasExactKeys(identity, CODEX_IDENTITY_FIELDS) ||
+      CODEX_IDENTITY_FIELDS.some(
+        field => typeof identity[field] !== "string" || identity[field] === "",
+      )
+    ) {
+      throw fail("codex_identity_file_invalid");
+    }
+    return Object.freeze(identity);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function captureSealedIdentity(output) {
+  await validateIdentityOutputParent(output);
+  const identity = await captureIdentity();
+  await writeJson(output, identity, 0o600);
+  await readSealedIdentity(output);
+  process.stdout.write(`${output}\n`);
+}
+
+async function expectedIdentity(path) {
+  if (path === undefined) return captureIdentity();
+  const identity = await readSealedIdentity(path);
+  await revalidateIdentity(identity);
+  return identity;
 }
 
 function buildTimestamp(identityStat) {
@@ -731,7 +813,9 @@ async function finalizeStaging(staging, identity, timestamp, codexManifest) {
   await revalidateIdentity(identity);
 }
 
-async function build(output) {
+async function build(output, expectedIdentityPath) {
+  progress("capture-identity");
+  const identity = await expectedIdentity(expectedIdentityPath);
   progress("prerequisites");
   await checkPrerequisites();
   const workspace = await mkdtemp(join(tmpdir(), "firecrawl-host-build-"));
@@ -740,8 +824,6 @@ async function build(output) {
   let primaryFailure;
   try {
     await mkdir(staging, { mode: 0o700 });
-    progress("capture-identity");
-    const identity = await captureIdentity();
     const identityStat = await stat(identity.resolvedPath, { bigint: true });
     const timestamp = buildTimestamp({
       mtimeMs: Number(identityStat.mtimeMs),
@@ -1031,7 +1113,7 @@ async function verifyArtifactArchive(root, manifest, expectedUid) {
   }
 }
 
-async function verifyInstalled(manifestPath) {
+async function verifyInstalled(manifestPath, expectedIdentityPath) {
   if (!isAbsolute(manifestPath)) throw fail("installed_manifest_path_invalid");
   const canonicalManifest = await realpath(manifestPath);
   const root = dirname(canonicalManifest);
@@ -1113,7 +1195,7 @@ async function verifyInstalled(manifestPath) {
   ) {
     throw fail("installed_manifest_identity_mismatch");
   }
-  const identity = await captureIdentity();
+  const identity = await expectedIdentity(expectedIdentityPath);
   assertSameCodexIdentity(manifest.codexAppServer.sourceIdentity, identity);
   await verifyChecksumInventory(
     root,
@@ -1211,10 +1293,19 @@ async function verifyInstalled(manifestPath) {
       throw fail("installed_rootfs_identity_mismatch", bundle);
     }
   }
+  await revalidateIdentity(identity);
   process.stdout.write("firecrawl_host_identity: PASS\n");
 }
 
 function parseInvocation(args) {
+  if (
+    args.length === 3 &&
+    args[0] === "--capture-active-identity" &&
+    args[1] === "--output" &&
+    isAbsolute(args[2])
+  ) {
+    return { command: "capture", output: resolve(args[2]) };
+  }
   if (args[0] === "--staging-only") {
     if (args.length === 1) {
       const parent = join(homedir(), ".cache", "firecrawl-host-builds");
@@ -1231,6 +1322,19 @@ function parseInvocation(args) {
     ) {
       return { command: "build", output: resolve(args[2]) };
     }
+    if (
+      args.length === 5 &&
+      args[1] === "--output" &&
+      isAbsolute(args[2]) &&
+      args[3] === "--expected-identity" &&
+      isAbsolute(args[4])
+    ) {
+      return {
+        command: "build",
+        output: resolve(args[2]),
+        expectedIdentity: resolve(args[4]),
+      };
+    }
   }
   if (args[0] === "--verify-installed-identity") {
     if (args.length === 1) {
@@ -1246,12 +1350,29 @@ function parseInvocation(args) {
     ) {
       return { command: "verify", manifest: resolve(args[2]) };
     }
+    if (
+      args.length === 5 &&
+      args[1] === "--manifest" &&
+      isAbsolute(args[2]) &&
+      args[3] === "--expected-identity" &&
+      isAbsolute(args[4])
+    ) {
+      return {
+        command: "verify",
+        manifest: resolve(args[2]),
+        expectedIdentity: resolve(args[4]),
+      };
+    }
   }
   throw fail("host_build_arguments_invalid");
 }
 
 async function main() {
   const invocation = parseInvocation(process.argv.slice(2));
+  if (invocation.command === "capture") {
+    await captureSealedIdentity(invocation.output);
+    return;
+  }
   if (invocation.command === "build") {
     try {
       await lstat(invocation.output);
@@ -1273,9 +1394,9 @@ async function main() {
     ) {
       throw fail("host_build_output_parent_invalid");
     }
-    await build(invocation.output);
+    await build(invocation.output, invocation.expectedIdentity);
   } else {
-    await verifyInstalled(invocation.manifest);
+    await verifyInstalled(invocation.manifest, invocation.expectedIdentity);
   }
 }
 

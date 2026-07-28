@@ -95,6 +95,7 @@ let localRetentionService: LocalRetentionService | undefined;
 let localBrowserBillingWorker: { stop(): Promise<void> } | undefined;
 let localBrowserAdmissionWorker: { stop(): Promise<void> } | undefined;
 let localRuntimeStop: Promise<void> | undefined;
+let localRuntimeDrain: Promise<void> | undefined;
 
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
@@ -136,6 +137,15 @@ registerInternalRoutes(app, {
           browserClient: localBrowserRuntime.browserClient,
         }
       : undefined,
+  drainRuntime: async () => {
+    if (!localBrowserRuntime) {
+      throw new Error("Browser runtime is unavailable");
+    }
+    localRuntimeDrain ??= localBrowserRuntime.gate.close(
+      "local_runtime_drain",
+    ).drained;
+    await localRuntimeDrain;
+  },
 });
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json({ limit: "10mb" }));
@@ -371,6 +381,7 @@ async function stopLocalRuntime(): Promise<void> {
     await localRetentionService?.stop();
     await localBrowserRuntime?.pool.end();
     localBrowserRuntime = undefined;
+    localRuntimeDrain = undefined;
     localRetentionService = undefined;
     localBrowserBillingWorker = undefined;
     localBrowserAdmissionWorker = undefined;

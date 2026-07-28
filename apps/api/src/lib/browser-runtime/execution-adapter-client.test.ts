@@ -17,9 +17,9 @@ import { PROMPT_LOOP_POLICY_V1 } from "./protocol";
 
 const AUTHORIZATION_FIXTURE = JSON.parse(
   readFileSync(
-    new URL(
+    path.resolve(
+      __dirname,
       "../../../../../host/browser-runtime/protocol/execution-adapter-authorization-v1.fixture.json",
-      import.meta.url,
     ),
     "utf8",
   ),
@@ -65,6 +65,47 @@ const CODE_RESULT = {
   stderr: "",
   exitCode: 0,
   killed: false,
+};
+const SHA256 = "a".repeat(64);
+const HEALTH_RESULT = {
+  version: 1,
+  status: "ok",
+  codexCliVersion: "0.145.0",
+  codexArtifactSha256: SHA256,
+  codexProtocolSchemaSha256: "b".repeat(64),
+  brokerProtocolSha256: "c".repeat(64),
+  model: "gpt-5.6-terra",
+  reasoningEffort: "medium",
+};
+const HOST_STATUS_RESULT = {
+  version: 1,
+  preparedHostJobs: 1,
+  startingHostJobs: 2,
+  runningHostJobs: 3,
+  unsettledHostJobs: 4,
+  orphanProcesses: 0,
+};
+const DIAGNOSE_RESULT = {
+  version: 1,
+  correlationId: CORRELATION_ID,
+  jobId: JOB_ID,
+  phase: "running",
+  hostInitPid: 4242,
+  pidfdLive: true,
+  pidfdPidMatches: true,
+  controlLeaseConnected: true,
+  inertRelayFdPresent: false,
+  relayListenerPresent: true,
+  cdpRelayOpened: true,
+  payloadStartedCount: 1,
+  payloadMarkerPresent: true,
+  callbackCount: 0,
+  browserEffectCount: 0,
+  runcState: "running",
+  cgroupPresent: true,
+  jobDirectoryPresent: true,
+  childCount: 1,
+  cleanupFailure: false,
 };
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -193,6 +234,120 @@ async function accept(
 }
 
 describe("socket execution adapter", () => {
+  it("performs strict one-frame shallow health without authorization", async () => {
+    const server = await fakeAdapter(async (socket, readFrame) => {
+      expect(await readFrame()).toEqual({
+        version: 1,
+        requestId: REQUEST_ID,
+        method: "health",
+        body: {},
+      });
+      expect(await readFrame()).toBeNull();
+      socket.end(
+        `${JSON.stringify({
+          version: 1,
+          requestId: REQUEST_ID,
+          type: "result",
+          body: HEALTH_RESULT,
+        })}\n`,
+      );
+    });
+
+    await expect(adapter(server.socketPath).health()).resolves.toEqual(
+      HEALTH_RESULT,
+    );
+  });
+
+  it("returns authoritative aggregate host status", async () => {
+    const server = await fakeAdapter(async (socket, readFrame) => {
+      expect(await readFrame()).toEqual({
+        version: 1,
+        requestId: REQUEST_ID,
+        method: "status",
+        body: {},
+      });
+      expect(await readFrame()).toBeNull();
+      socket.end(
+        `${JSON.stringify({
+          version: 1,
+          requestId: REQUEST_ID,
+          type: "result",
+          body: HOST_STATUS_RESULT,
+        })}\n`,
+      );
+    });
+
+    await expect(adapter(server.socketPath).status()).resolves.toEqual(
+      HOST_STATUS_RESULT,
+    );
+  });
+
+  it("returns only the exact correlation-scoped host diagnostic", async () => {
+    const server = await fakeAdapter(async (socket, readFrame) => {
+      expect(await readFrame()).toEqual({
+        version: 1,
+        requestId: REQUEST_ID,
+        method: "diagnose_host_job",
+        body: {
+          correlationId: CORRELATION_ID,
+          jobId: JOB_ID,
+        },
+      });
+      expect(await readFrame()).toBeNull();
+      socket.end(
+        `${JSON.stringify({
+          version: 1,
+          requestId: REQUEST_ID,
+          type: "result",
+          body: DIAGNOSE_RESULT,
+        })}\n`,
+      );
+    });
+
+    await expect(
+      adapter(server.socketPath).diagnoseHostJob(CORRELATION_ID, JOB_ID),
+    ).resolves.toEqual(DIAGNOSE_RESULT);
+  });
+
+  it("rejects extra health, status, and diagnostic fields", async () => {
+    for (const testCase of [
+      {
+        body: { ...HEALTH_RESULT, path: "/home/private/.codex" },
+        method: "health",
+        invoke: (client: ReturnType<typeof adapter>) => client.health(),
+      },
+      {
+        body: { ...HOST_STATUS_RESULT, secret: "leak" },
+        method: "status",
+        invoke: (client: ReturnType<typeof adapter>) => client.status(),
+      },
+      {
+        body: { ...DIAGNOSE_RESULT, environment: { SECRET: "value" } },
+        method: "diagnose_host_job",
+        invoke: (client: ReturnType<typeof adapter>) =>
+          client.diagnoseHostJob(CORRELATION_ID, JOB_ID),
+      },
+    ]) {
+      const server = await fakeAdapter(async (socket, readFrame) => {
+        const request = (await readFrame()) as { method: string };
+        expect(await readFrame()).toBeNull();
+        socket.end(
+          `${JSON.stringify({
+            version: 1,
+            requestId: REQUEST_ID,
+            type: "result",
+            body: testCase.body,
+          })}\n`,
+        );
+        expect(request.method).toBe(testCase.method);
+      });
+      const client = adapter(server.socketPath);
+      await expect(testCase.invoke(client)).rejects.toMatchObject({
+        category: "adapter_protocol_error",
+      });
+    }
+  });
+
   it("sends the exact prompt body and authorizes its accepted binding", async () => {
     const accepted = vi.fn(async () => undefined);
     const server = await fakeAdapter(async (socket, readFrame) => {
