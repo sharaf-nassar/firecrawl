@@ -38,12 +38,9 @@ import {
   browserSessionIdSchema,
 } from "../../lib/scrape-interact/scrape-replay";
 import {
-  executePromptViaBrowserAgent,
-  executeCodeViaBrowserSession,
-  AgentResult,
   getPublicBrowserRuntime,
   PublicBrowserRuntimeError,
-} from "../../lib/scrape-interact/browser-agent";
+} from "../../lib/browser-runtime/public-browser-runtime";
 import { sanitizeUrlForTrace } from "../../lib/scrape-interact/langsmith";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { RequestWithAuth, ScrapeOptions } from "./types";
@@ -109,25 +106,15 @@ const interactAllowedDomainSchema = z
     }
   });
 
-export const browserExecuteRequestSchema = z
-  .strictObject({
-    code: z.string().min(1).max(100_000).optional(),
-    prompt: z.string().min(1).max(10_000).optional(),
-    language: z.enum(["python", "node", "bash"]).default("node"),
-    timeout: z.number().int().min(1).max(300).default(30),
-    origin: z.string().optional(),
-    integration: integrationSchema.optional().transform(val => val || null),
-    existingSessionId: browserSessionIdSchema.optional(),
-    allowedDomains: z.array(interactAllowedDomainSchema).max(8).default([]),
-  })
-  .superRefine((data, context) => {
-    if ((data.code === undefined) === (data.prompt === undefined)) {
-      context.addIssue({
-        code: "custom",
-        message: "Exactly one of 'code' or 'prompt' must be provided.",
-      });
-    }
-  });
+export const browserExecuteRequestSchema = z.strictObject({
+  prompt: z.string().min(1).max(10_000),
+  language: z.literal("node").optional(),
+  timeout: z.number().int().min(1).max(300).default(30),
+  origin: z.string().optional(),
+  integration: integrationSchema.optional().transform(val => val || null),
+  existingSessionId: browserSessionIdSchema.optional(),
+  allowedDomains: z.array(interactAllowedDomainSchema).max(8).default([]),
+});
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
 
@@ -174,11 +161,10 @@ function mapLocalInteractError(error: unknown): {
     return { status: 403, message: "Forbidden." };
   if (category === "target_blocked")
     return { status: 403, message: "Forbidden." };
-  if (
-    category === "concurrency_exceeded" ||
-    category === "action_limit_exceeded"
-  )
+  if (category === "concurrency_exceeded")
     return { status: 429, message: "Browser concurrency limit was reached." };
+  if (category === "action_limit_exceeded")
+    return { status: 422, message: "Browser action limit was reached." };
   if (category === "browser_expired")
     return { status: 410, message: "Browser session has expired." };
   if (
@@ -192,10 +178,12 @@ function mapLocalInteractError(error: unknown): {
       message:
         "Replay context is unavailable for this scrape job. Please rerun the scrape.",
     };
-  if (
-    category === "model_protocol_error" ||
-    category === "adapter_protocol_error"
-  )
+  if (category === "model_protocol_error")
+    return {
+      status: 422,
+      message: "Browser model returned an invalid protocol result.",
+    };
+  if (category === "adapter_protocol_error")
     return {
       status: 502,
       message: "Browser execution returned an invalid protocol result.",
@@ -227,7 +215,8 @@ export async function scrapeInteractController(
   req.body = browserExecuteRequestSchema.parse(req.body);
 
   const scrapeId = req.params.jobId;
-  const { code: rawCode, prompt, language, timeout, origin } = req.body;
+  const { prompt, timeout, origin } = req.body;
+  const deadline = new Date(Date.now() + timeout * 1_000);
 
   let logger = _logger.child({
     scrapeId,
@@ -311,10 +300,8 @@ export async function scrapeInteractController(
         requestId,
         ownerId: req.auth.team_id,
         scrapeId,
-        mode: prompt === undefined ? "code" : "prompt",
-        ...(prompt === undefined ? { source: rawCode! } : { prompt }),
-        language,
-        timeoutSeconds: timeout,
+        prompt,
+        deadline,
         correlationId,
         existingSessionId: req.body.existingSessionId,
         allowedDomains,
@@ -371,30 +358,15 @@ export async function scrapeInteractController(
         },
       });
       const result = executed.result;
-      if ("output" in result) {
-        return res.status(200).json({
-          success: true,
-          cdpUrl: executed.session.cdpUrl,
-          liveViewUrl: executed.session.liveViewUrl,
-          interactiveLiveViewUrl: executed.session.interactiveLiveViewUrl,
-          output: result.output,
-          turnCount: result.turnCount,
-          actionCount: result.actionCount,
-          usage: result.usage,
-        });
-      }
-      const hasError = result.exitCode !== 0 || result.killed;
       return res.status(200).json({
-        success: !hasError,
+        success: true,
         cdpUrl: executed.session.cdpUrl,
         liveViewUrl: executed.session.liveViewUrl,
         interactiveLiveViewUrl: executed.session.interactiveLiveViewUrl,
-        stdout: result.stdout,
-        result: result.result,
-        stderr: result.stderr,
-        exitCode: result.exitCode,
-        killed: result.killed,
-        ...(hasError ? { error: result.stderr || "Execution failed" } : {}),
+        output: result.output,
+        turnCount: result.turnCount,
+        actionCount: result.actionCount,
+        usage: result.usage,
       });
     } catch (error) {
       const mapped = mapLocalInteractError(error);
@@ -418,227 +390,9 @@ export async function scrapeInteractController(
     }
   }
 
-  // --- Build replay context from original scrape ---
-
-  const replay = buildReplayContextFromScrape(scrape);
-  if (!replay.context) {
-    return res.status(409).json({
-      success: false,
-      error:
-        replay.error ??
-        "Replay context is unavailable for this scrape job. Please rerun the scrape.",
-    });
-  }
-  const replayContext = replay.context;
-
-  if (!config.BROWSER_SERVICE_URL) {
-    return res.status(503).json({
-      success: false,
-      error:
-        "Browser feature is not configured (BROWSER_SERVICE_URL is missing).",
-    });
-  }
-
-  logger = logger.child({
-    replayTargetUrl: replayContext.targetUrl,
-    replayWaitForMs: replayContext.waitForMs,
-    replayActions: replayContext.actions.length,
-  });
-
-  // --- Ensure a browser session exists (create + replay if needed) ---
-
-  let session = await getBrowserSessionFromScrape(scrapeId);
-
-  if (!session && req.body.existingSessionId) {
-    const existing = await getBrowserSession(req.body.existingSessionId);
-    if (
-      existing &&
-      existing.team_id === req.auth.team_id &&
-      existing.status === "active"
-    ) {
-      await updateBrowserSessionScrapeId(existing.id, scrapeId);
-      session = { ...existing, scrape_id: scrapeId };
-      logger.info("Adopted pre-created browser session for scrape", {
-        scrapeId,
-        sessionId: session.id,
-        browserId: session.browser_id,
-      });
-    }
-  }
-
-  if (!session) {
-    const created = await createSessionForScrape(
-      req,
-      scrapeId,
-      replayContext,
-      logger,
-      (scrape.options as ScrapeOptions).profile,
-    );
-    if ("error" in created) {
-      if (
-        created.status === 429 &&
-        created.body.error === KEYLESS_CREDITS_MESSAGE
-      ) {
-        applyAgentAuthDiscoveryHeader(res);
-      }
-      return res.status(created.status).json(created.body);
-    }
-    session = created.session;
-
-    logger = logger.child({
-      sessionId: session.id,
-      browserId: session.browser_id,
-    });
-    logger.info("Browser session created for scrape", {
-      scrapeId,
-      sessionId: session.id,
-      browserId: session.browser_id,
-    });
-  }
-
-  if (session.team_id !== req.auth.team_id) {
-    return res.status(403).json({ success: false, error: "Forbidden." });
-  }
-  if (session.status === "destroyed") {
-    return res
-      .status(410)
-      .json({ success: false, error: "Browser session has been destroyed." });
-  }
-
-  updateBrowserSessionActivity(session.id).catch(() => {});
-
-  // --- Execute: prompt-based agent loop OR direct code ---
-  //
-  // Skip LangSmith tracing entirely for teams with forced zero-data-retention,
-  // matching how tracking.ts skips ClickHouse writes. The trace would otherwise
-  // ship the full prompt, tool I/O, and page snapshots to a third party.
-  const zdrForced = getScrapeZDR(req.acuc?.flags) === "forced";
-
-  // Upstream context from the scrape job — interact extends scrape, so
-  // every run carries the URL / wait / actions / origin that set the stage
-  // for what the agent does on top of it. URLs are stripped of query
-  // strings to avoid leaking PII into LangSmith.
-  const scrapeOptions = (scrape.options ?? {}) as {
-    origin?: string;
-  };
-  const traceScrapeContext = {
-    scrapeUrl: sanitizeUrlForTrace(scrape.url),
-    targetUrl: sanitizeUrlForTrace(replayContext.targetUrl),
-    scrapeWaitForMs: replayContext.waitForMs,
-    scrapeActions: replayContext.actions.length,
-    scrapeOrigin:
-      typeof scrapeOptions.origin === "string"
-        ? scrapeOptions.origin
-        : undefined,
-  };
-
-  // Identity fields below team_id — optional, normalized from null → undefined
-  // so LangSmith metadata filters don't match empty strings.
-  const traceIdentity = {
-    orgId: req.auth.org_id ?? undefined,
-    subUserId: req.acuc?.sub_user_id ?? undefined,
-  };
-
-  let execResult: BrowserServiceExecResponse | AgentResult;
-
-  if (prompt && !rawCode) {
-    logger.info("Starting agent loop from prompt", { prompt, timeout });
-
-    await markBrowserSessionUsedPrompt(session.id);
-
-    try {
-      execResult = await executePromptViaBrowserAgent(
-        prompt,
-        session.browser_id,
-        timeout,
-        logger,
-        {
-          sessionId: session.id,
-          scrapeId,
-          teamId: req.auth.team_id,
-          ...traceIdentity,
-          zeroDataRetention: zdrForced,
-          ...traceScrapeContext,
-        },
-      );
-    } catch (err) {
-      logger.error("Agent loop failed", { error: err });
-      return res.status(502).json({
-        success: false,
-        error: "Browser agent failed to execute the task.",
-      });
-    }
-
-    await enqueueBrowserSessionActivity({
-      team_id: req.auth.team_id,
-      session_id: session.id,
-      source: "interact",
-      language: "bash",
-      timeout,
-      exit_code: execResult.exitCode ?? null,
-      killed: execResult.killed ?? false,
-    });
-  } else {
-    logger.info("Executing code in browser session", { language, timeout });
-
-    try {
-      execResult = await executeCodeViaBrowserSession(
-        session.browser_id,
-        { code: rawCode!, language, timeout, origin },
-        {
-          sessionId: session.id,
-          scrapeId,
-          teamId: req.auth.team_id,
-          ...traceIdentity,
-          zeroDataRetention: zdrForced,
-          ...traceScrapeContext,
-        },
-      );
-    } catch (err) {
-      logger.error("Failed to execute code via browser service", {
-        error: err,
-      });
-      return res.status(502).json({
-        success: false,
-        error: "Failed to execute code in browser session.",
-      });
-    }
-
-    await enqueueBrowserSessionActivity({
-      team_id: req.auth.team_id,
-      session_id: session.id,
-      source: "interact",
-      language,
-      timeout,
-      exit_code: execResult.exitCode ?? null,
-      killed: execResult.killed ?? false,
-    });
-  }
-
-  // --- Respond ---
-
-  logger.debug("Execution result", {
-    exitCode: execResult.exitCode,
-    killed: execResult.killed,
-    stdoutLength: execResult.stdout?.length,
-    stderrLength: execResult.stderr?.length,
-  });
-
-  const hasError = execResult.exitCode !== 0 || execResult.killed;
-  const agentOutput = "output" in execResult ? execResult.output : undefined;
-
-  return res.status(200).json({
-    success: !hasError,
-    cdpUrl: session.cdp_url,
-    liveViewUrl: session.cdp_path,
-    interactiveLiveViewUrl: session.cdp_interactive_path,
-    ...(agentOutput ? { output: agentOutput } : {}),
-    stdout: execResult.stdout,
-    result: execResult.result,
-    stderr: execResult.stderr,
-    exitCode: execResult.exitCode,
-    killed: execResult.killed,
-    ...(hasError ? { error: execResult.stderr || "Execution failed" } : {}),
+  return res.status(503).json({
+    success: false,
+    error: "Local browser interaction is not enabled.",
   });
 }
 
@@ -802,298 +556,3 @@ export async function scrapeStopInteractiveBrowserController(
 // ---------------------------------------------------------------------------
 // Internal: create a browser session for a scrape, replay original context
 // ---------------------------------------------------------------------------
-
-async function createSessionForScrape(
-  req: RequestWithAuth<any, any, any>,
-  scrapeId: string,
-  replayContext: ReturnType<typeof buildReplayContextFromScrape> extends {
-    context?: infer C;
-  }
-    ? NonNullable<C>
-    : never,
-  logger: typeof _logger,
-  profile: { name: string; saveChanges: boolean } | undefined,
-): Promise<
-  | { session: Awaited<ReturnType<typeof insertBrowserSession>> }
-  | { status: number; body: { success: false; error: string }; error: true }
-> {
-  const sessionId = uuidv7();
-  const { ttl, activityTtl, streamWebView } = browserCreateRequestSchema.parse(
-    {},
-  );
-  const integration = req.body?.integration ?? null;
-
-  logger.info("No browser session found for scrape. Creating one.", {
-    scrapeId,
-    ttl,
-    activityTtl,
-  });
-
-  // Credit check (uses base rate — actual billing may be higher if prompts are used)
-  const estimatedCredits = calculateBrowserSessionCredits(ttl * 1000);
-  const reservation = await reserveKeylessCredits(
-    req.auth.team_id,
-    estimatedCredits,
-  );
-  if (!reservation.ok) {
-    return {
-      status: 429,
-      body: {
-        success: false,
-        error: KEYLESS_CREDITS_MESSAGE,
-      },
-      error: true,
-    };
-  }
-  const keylessReserved = estimatedCredits;
-
-  const autumnResult = await autumnService.checkCredits({
-    teamId: req.auth.team_id,
-    value: estimatedCredits,
-    properties: { source: "scrapeBrowserCreate", path: req.path },
-  });
-
-  if (autumnResult !== null && !autumnResult.allowed) {
-    adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(() => {});
-    return {
-      status: 402,
-      body: {
-        success: false,
-        error: `Insufficient credits for a ${ttl}s browser session (requires ~${estimatedCredits} credits). For more credits, you can upgrade your plan at https://firecrawl.dev/pricing.`,
-      },
-      error: true,
-    };
-  }
-
-  // Active session limit — uses the same concurrency pool as scrape/crawl
-  const concurrencyLimit = req.acuc?.concurrency ?? 2;
-  const activeCount = await getCombinedTeamActiveCount(req.auth.team_id);
-  if (activeCount >= concurrencyLimit) {
-    adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(() => {});
-    return {
-      status: 429,
-      body: {
-        success: false,
-        error: `You have reached the maximum number of concurrent jobs (${concurrencyLimit}). Please wait for existing jobs to complete or destroy browser sessions before creating new ones.`,
-      },
-      error: true,
-    };
-  }
-
-  // Create the browser session (retry up to 3 times)
-  const MAX_CREATE_RETRIES = 3;
-  let svcResponse: BrowserServiceCreateResponse | undefined;
-  let lastCreateError: unknown;
-
-  let persistentStorage: { uniqueId: string; write: boolean } | undefined;
-  if (profile) {
-    const teamHash = createHash("sha256")
-      .update(req.auth.team_id)
-      .digest("hex")
-      .slice(0, 16);
-    persistentStorage = {
-      uniqueId: `${teamHash}_${profile.name}`,
-      write: profile.saveChanges !== false,
-    };
-  }
-
-  for (let attempt = 1; attempt <= MAX_CREATE_RETRIES; attempt++) {
-    try {
-      svcResponse = await browserServiceRequest<BrowserServiceCreateResponse>(
-        "POST",
-        "/browsers",
-        {
-          ttl,
-          ...(activityTtl !== undefined ? { activityTtl } : {}),
-          ...(persistentStorage !== undefined ? { persistentStorage } : {}),
-        },
-      );
-      break;
-    } catch (err) {
-      if (err instanceof BrowserServiceError && err.status === 409) {
-        adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(
-          () => {},
-        );
-        return {
-          status: 409,
-          body: {
-            success: false,
-            error:
-              "Another session is currently writing to this profile. Only one writer is allowed at a time. You can still access it with saveChanges: false, or try again later.",
-          },
-          error: true,
-        };
-      }
-      lastCreateError = err;
-      logger.warn("Browser session creation attempt failed", {
-        attempt,
-        maxRetries: MAX_CREATE_RETRIES,
-        error: err,
-      });
-      if (attempt < MAX_CREATE_RETRIES) {
-        await new Promise(resolve => setTimeout(resolve, 200 * attempt));
-      }
-    }
-  }
-
-  if (!svcResponse) {
-    adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(() => {});
-    logger.error("Failed to create browser session after all retries", {
-      error: lastCreateError,
-    });
-    return {
-      status: 502,
-      body: { success: false, error: "Failed to create browser session." },
-      error: true,
-    };
-  }
-
-  // Replay original scrape context
-  try {
-    const replayResult =
-      await browserServiceRequest<BrowserServiceExecResponse>(
-        "POST",
-        `/browsers/${svcResponse.sessionId}/exec`,
-        {
-          code: buildReplayScript(replayContext),
-          language: "node",
-          timeout: estimateReplayTimeoutSeconds(replayContext),
-          origin: "scrape_replay",
-        },
-      );
-
-    if (replayResult.exitCode !== 0 || replayResult.killed) {
-      throw new Error(
-        replayResult.stderr?.trim() ||
-          replayResult.stdout?.trim() ||
-          "Replay script exited with an error.",
-      );
-    }
-
-    // Ensure only one tab exists with the content page in the foreground.
-    // The replay may have created extra tabs. Find the one with content,
-    // close everything else, update the REPL's page var, and bring to front.
-    await browserServiceRequest(
-      "POST",
-      `/browsers/${svcResponse.sessionId}/exec`,
-      {
-        code: [
-          `const ctx = page.context();`,
-          `const pages = ctx.pages();`,
-          `if (pages.length > 1) {`,
-          `  const target = pages.find(p => { const u = p.url(); return u && u !== 'about:blank'; }) || pages[pages.length - 1];`,
-          `  for (const p of pages) { if (p !== target) await p.close().catch(() => {}); }`,
-          `  page = target;`,
-          `}`,
-          `await page.bringToFront();`,
-        ].join("\n"),
-        language: "node",
-        timeout: 10,
-        origin: "tab_sync",
-      },
-    ).catch(() => {});
-
-    // Sync agent-browser to the correct page
-    const syncResult = await browserServiceRequest<BrowserServiceExecResponse>(
-      "POST",
-      `/browsers/${svcResponse.sessionId}/exec`,
-      {
-        code: `agent-browser get url`,
-        language: "bash",
-        timeout: 10,
-        origin: "scrape_replay_sync",
-      },
-    );
-
-    const agentUrl = (syncResult.stdout || "").trim();
-    if (!agentUrl || agentUrl === "about:blank") {
-      logger.info("agent-browser on wrong page after replay, navigating", {
-        agentUrl,
-        targetUrl: replayContext.targetUrl,
-      });
-      await browserServiceRequest<BrowserServiceExecResponse>(
-        "POST",
-        `/browsers/${svcResponse.sessionId}/exec`,
-        {
-          code: `await page.goto(${JSON.stringify(replayContext.targetUrl)}, { waitUntil: "networkidle0" });`,
-          language: "node",
-          timeout: 30,
-          origin: "scrape_replay_sync",
-        },
-      );
-    }
-  } catch (err) {
-    adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(() => {});
-    logger.error("Failed to initialize scrape browser session context", {
-      error: err,
-    });
-    await browserServiceRequest(
-      "DELETE",
-      `/browsers/${svcResponse.sessionId}`,
-    ).catch(() => {});
-    return {
-      status: 409,
-      body: {
-        success: false,
-        error:
-          "Failed to initialize browser session from the original scrape context. Please rerun the scrape and try again.",
-      },
-      error: true,
-    };
-  }
-
-  // Persist in Supabase
-  try {
-    await logRequest({
-      id: sessionId,
-      kind: "interact",
-      api_version: "v2",
-      team_id: req.auth.team_id,
-      target_hint: "Interact session",
-      origin: req.body?.origin ?? "api",
-      integration: integration ?? null,
-      zeroDataRetention: false,
-      api_key_id: req.acuc?.api_key_id ?? null,
-    });
-    const session = await insertBrowserSession({
-      id: sessionId,
-      team_id: req.auth.team_id,
-      scrape_id: scrapeId,
-      browser_id: svcResponse.sessionId,
-      workspace_id: "",
-      context_id: "",
-      cdp_url: svcResponse.cdpUrl,
-      cdp_path: svcResponse.iframeUrl,
-      cdp_interactive_path: svcResponse.interactiveIframeUrl,
-      stream_web_view: streamWebView,
-      status: "active",
-      ttl_total: ttl,
-      ttl_without_activity: activityTtl ?? null,
-      credits_used: null,
-    });
-
-    invalidateActiveBrowserSessionCount(req.auth.team_id).catch(() => {});
-
-    // Register in the shared concurrency limiter so this session counts
-    // against the team's concurrent job limit while it's active.
-    mirrorExternalSlotAcquire(req.auth.team_id, sessionId, ttl * 1000).catch(
-      () => {},
-    );
-
-    return { session };
-  } catch (err) {
-    adjustKeylessCredits(req.auth.team_id, -keylessReserved).catch(() => {});
-    logger.error("Failed to persist browser session, cleaning up", {
-      error: err,
-    });
-    await browserServiceRequest(
-      "DELETE",
-      `/browsers/${svcResponse.sessionId}`,
-    ).catch(() => {});
-    return {
-      status: 500,
-      body: { success: false, error: "Failed to persist browser session." },
-      error: true,
-    };
-  }
-}

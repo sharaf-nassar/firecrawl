@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -42,7 +43,9 @@ function action(
     runId: RUN_ID,
     sequence: 1,
     normalizedProposalHash: hash(operation),
-    effect: ["snapshot", "wait", "get_text", "get_url"].includes(operation.kind)
+    effect: ["wait", "extract", "hover", "hover_batch", "screenshot"].includes(
+      operation.kind,
+    )
       ? "read_only"
       : "side_effecting",
     expectedSessionVersion: 1,
@@ -57,19 +60,27 @@ function fakeElement(
 ): OperationElement {
   return {
     click: vi.fn(async () => undefined),
+    hover: vi.fn(async () => undefined),
     fill: vi.fn(async () => undefined),
     press: vi.fn(async () => undefined),
     type: vi.fn(async () => undefined),
     selectOption: vi.fn(async () => []),
     getAttribute: vi.fn(async () => null),
     textContent: vi.fn(async () => "element text"),
-    evaluate: vi.fn(async () => ({
-      connected: true,
-      tag: "button",
-      role: "button",
-      name: "Submit",
-      text: "Submit",
-    })),
+    innerText: vi.fn(async () => "element text"),
+    isVisible: vi.fn(async () => true),
+    evaluate: vi.fn(
+      async (_callback, limits?: { maximumCharacters?: number }) => [
+        {
+          connected: true,
+          tag: "button",
+          role: "button",
+          name: "Submit",
+          text:
+            limits?.maximumCharacters === 40_000 ? "element text" : "Submit",
+        },
+      ],
+    ),
     dispose: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -126,9 +137,34 @@ function fakePage(
   const decisions = new Map<string, "continue" | "fail">();
   let requestCounter = 0;
   let loaderCounter = 0;
-  let executionContextCounter = 0;
+  let batchedEvaluationCount = 0;
+  const hoverBatchDeltas: Array<string | Error> = [];
   let lastNavigation = Promise.resolve();
   let page!: OperationPage;
+  const unboundedElementHandles = vi.fn(async () => elements);
+  const elementHandleAt = vi.fn(
+    async (index: number) => elements[index] ?? null,
+  );
+  const allElementsLocator = {
+    count: vi.fn(async () => elements.length),
+    elementHandles: unboundedElementHandles,
+    nth: vi.fn((index: number) => ({
+      elementHandle: vi.fn(async () => elementHandleAt(index)),
+    })),
+  };
+  const bodyLocator = {
+    innerText: vi.fn(async () => body),
+    isVisible: vi.fn(async () => true),
+    evaluate: vi.fn(async () => [
+      {
+        connected: true,
+        tag: "BODY",
+        role: "",
+        name: "",
+        text: body,
+      },
+    ]),
+  };
 
   const listenersFor = (event: string) => cdpListeners.get(event) ?? [];
 
@@ -136,26 +172,6 @@ function fakePage(
     send: vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === "Page.getFrameTree") {
         return { frameTree: { frame: { id: "main" } } };
-      }
-      if (method === "Page.createIsolatedWorld") {
-        return { executionContextId: ++executionContextCounter };
-      }
-      if (method === "Runtime.evaluate") {
-        try {
-          return {
-            result: {
-              value: await page.evaluate(String(params?.expression ?? "")),
-            },
-          };
-        } catch (error) {
-          return {
-            result: {
-              description:
-                error instanceof Error ? error.message : String(error),
-            },
-            exceptionDetails: { text: "evaluation failed" },
-          };
-        }
       }
       if (method === "Page.navigate") {
         const next = String(params?.url ?? "");
@@ -254,15 +270,53 @@ function fakePage(
       lastNavigation = navigate(next, `loader-${++loaderCounter}`);
       await lastNavigation;
     }),
-    locator: vi.fn(() => ({
-      elementHandles: vi.fn(async () => elements),
-    })),
+    locator: vi.fn((selector: string) =>
+      selector === "body" ? bodyLocator : allElementsLocator,
+    ),
     mouse: {
       wheel: vi.fn(async () => undefined),
     },
     waitForTimeout: vi.fn(async () => undefined),
     waitForLoadState: vi.fn(async () => {
       await lastNavigation;
+    }),
+    screenshot: vi.fn(async () => Buffer.from("png")),
+    evaluateHandle: vi.fn(async (_callback, input: unknown) => {
+      if (typeof input !== "number") {
+        return {
+          evaluate: vi.fn(async () => {
+            const next = hoverBatchDeltas.shift() ?? "";
+            if (next instanceof Error) throw next;
+            return next;
+          }),
+          dispose: vi.fn(async () => undefined),
+        };
+      }
+      const maximumElements = input;
+      const retained = elements.slice(0, maximumElements);
+      return {
+        evaluate: vi.fn(async (callback, limits) => {
+          batchedEvaluationCount += 1;
+          return (
+            await Promise.all(
+              retained.map((element) => element.evaluate(callback, limits)),
+            )
+          ).flat();
+        }),
+        getProperties: vi.fn(
+          async () =>
+            new Map(
+              retained.map((element, index) => [
+                String(index),
+                {
+                  asElement: () => element,
+                  dispose: vi.fn(async () => undefined),
+                },
+              ]),
+            ),
+        ),
+        dispose: vi.fn(async () => undefined),
+      };
     }),
     evaluate: vi.fn(async (source: string) => {
       if (source.includes("document.title")) return JSON.stringify(title);
@@ -319,6 +373,13 @@ function fakePage(
     },
     emitRoute,
     cdpSession,
+    bodyLocator,
+    batchedEvaluationCount: () => batchedEvaluationCount,
+    queueHoverBatchDeltas: (...values: Array<string | Error>) => {
+      hoverBatchDeltas.push(...values);
+    },
+    elementHandleAt,
+    unboundedElementHandles,
     emitCdpClose: () => {
       for (const listener of [...listenersFor("close")]) listener({});
     },
@@ -396,6 +457,234 @@ describe("browser operation session", () => {
     }
   }, 15_000);
 
+  test("bounds hostile multibyte DOM text before browser transfer", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(
+        `<body><main>${"😀".repeat(50_000)}</main>` +
+          "<script>hidden-script</script><style>hidden-style</style>" +
+          "<template>hidden-template</template><noscript>hidden-noscript</noscript></body>",
+      );
+      await page.evaluate(() => {
+        Object.defineProperty(HTMLElement.prototype, "innerText", {
+          configurable: true,
+          get() {
+            throw new Error("unbounded innerText access");
+          },
+        });
+        Object.defineProperty(Node.prototype, "textContent", {
+          configurable: true,
+          get() {
+            throw new Error("unbounded textContent access");
+          },
+        });
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const execution = await session.execute({ kind: "extract" });
+        expect(execution.result.kind).toBe("extract");
+        if (execution.result.kind !== "extract") {
+          throw new Error("expected extract");
+        }
+        expect(Buffer.byteLength(execution.result.text, "utf8")).toBe(40_000);
+        expect(execution.result.text).toBe("😀".repeat(10_000));
+        expect(execution.page.snapshotExcerpt).not.toContain("hidden-");
+        expect(
+          Buffer.byteLength(execution.page.snapshotExcerpt, "utf8"),
+        ).toBeLessThanOrEqual(40_000);
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
+  test("exposes only bounded tooltip hints on their stable parent ref", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(`
+        <body>
+          <div id="target"><img alt="socket image">Equipment</div>
+        </body>
+      `);
+      await page.evaluate(() => {
+        const target = document.querySelector("#target")!;
+        target.setAttribute("data-tooltip-trigger", "true");
+        target.setAttribute(
+          "data-tooltip-id",
+          `item"\n\\${"😀".repeat(100)}`,
+        );
+        target.setAttribute("title", `Native ${"界".repeat(100)}`);
+        target.setAttribute("aria-describedby", "equipment-tooltip");
+        target.setAttribute("aria-haspopup", "dialog");
+        target.setAttribute("data-state", "open");
+        target.setAttribute("data-private", "must-not-leak");
+        target.setAttribute("class", "must-not-leak-class");
+        target.setAttribute("style", "--secret: must-not-leak-style");
+        target.setAttribute("onclick", "mustNotLeakHandler()");
+
+        for (let index = 0; index < 500; index += 1) {
+          const filler = document.createElement("div");
+          filler.setAttribute("data-tooltip-trigger", "true");
+          filler.setAttribute("data-tooltip-id", "x".repeat(1_000));
+          filler.textContent = `filler-${index}`;
+          document.body.append(filler);
+        }
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const first = await session.observe();
+        const second = await session.observe();
+        expect(second.snapshotExcerpt).toBe(first.snapshotExcerpt);
+        expect(
+          Buffer.byteLength(first.snapshotExcerpt, "utf8"),
+        ).toBeLessThanOrEqual(40_000);
+
+        const lines = first.snapshotExcerpt.split("\n");
+        const parentLine = lines[0]!;
+        const childLine = lines[1]!;
+        expect(parentLine).toContain("[ref=e1] <div>");
+        expect(parentLine).toContain(
+          'interaction-hints=[data-tooltip-trigger="true"',
+        );
+        expect(parentLine).toContain("data-tooltip-id=");
+        expect(parentLine).toContain('aria-describedby="equipment-tooltip"');
+        expect(parentLine).toContain('aria-haspopup="dialog"');
+        expect(childLine).toContain("[ref=e2] <img>");
+        expect(childLine).not.toContain("interaction-hints=");
+        expect(parentLine).not.toContain("data-state");
+        expect(parentLine).not.toContain("data-private");
+        expect(parentLine).not.toContain("must-not-leak");
+        expect(parentLine).not.toContain("onclick");
+
+        const encodedValues = [
+          ...parentLine.matchAll(
+            /(?:data-tooltip-id|title)=("(?:\\.|[^"\\])*")/gu,
+          ),
+        ];
+        expect(encodedValues).toHaveLength(2);
+        for (const match of encodedValues) {
+          const value = JSON.parse(match[1]!) as string;
+          expect(Buffer.byteLength(value, "utf8")).toBeLessThanOrEqual(128);
+        }
+        expect(parentLine).toContain('data-tooltip-id="item\\"\\n\\\\');
+
+        const execution = await session.execute({ kind: "extract" });
+        expect(
+          Buffer.byteLength(JSON.stringify(execution.page), "utf8"),
+        ).toBeLessThanOrEqual(56 * 1024);
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
+  test("hover_batch returns ordered portal and visibility text deltas", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(`
+        <body>
+          <main>
+            <p>unchanged body text</p>
+            <button id="portal-target">Portal item</button>
+            <button id="visibility-target">Visibility item</button>
+            <div id="hidden-tooltip" hidden>Hidden tooltip details</div>
+          </main>
+        </body>
+      `);
+      await page.evaluate(() => {
+        document
+          .querySelector("#portal-target")!
+          .addEventListener("mouseover", () => {
+            const tooltip = document.createElement("div");
+            tooltip.setAttribute("role", "tooltip");
+            tooltip.textContent = "Portal tooltip details";
+            document.body.append(tooltip);
+          });
+        document
+          .querySelector("#visibility-target")!
+          .addEventListener("mouseover", () => {
+            document
+              .querySelector("#hidden-tooltip")!
+              .removeAttribute("hidden");
+          });
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const initial = await session.observe();
+        const portalRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Portal item"/,
+        )?.[1];
+        const visibilityRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Visibility item"/,
+        )?.[1];
+        expect(portalRef).toBeDefined();
+        expect(visibilityRef).toBeDefined();
+
+        const execution = await session.execute({
+          kind: "hover_batch",
+          refs: [portalRef!, visibilityRef!],
+        });
+
+        expect(execution.result).toEqual({
+          kind: "hover_batch",
+          items: [
+            {
+              ref: portalRef,
+              outcome: "succeeded",
+              text: "Portal tooltip details",
+            },
+            {
+              ref: visibilityRef,
+              outcome: "succeeded",
+              text: "Hidden tooltip details",
+            },
+          ],
+        });
+        expect(JSON.stringify(execution.result)).not.toContain(
+          "unchanged body text",
+        );
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
   test("uses Playwright 1.61.1 ElementHandle.type from production declarations", () => {
     const require = createRequire(import.meta.url);
     const packageJsonPath = require.resolve("playwright/package.json");
@@ -444,7 +733,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    const execution = session.execute({ kind: "get_url" });
+    const execution = session.execute({ kind: "extract" });
     const disposal = session.dispose();
     release();
     await disposal;
@@ -459,7 +748,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     await session.dispose();
     expect(h.cdpSession.off).toHaveBeenCalledWith(
       "Fetch.requestPaused",
@@ -476,12 +765,12 @@ describe("browser operation session", () => {
       "framenavigated",
       expect.any(Function),
     );
-    await expect(session.execute({ kind: "get_url" })).rejects.toThrow(
+    await expect(session.execute({ kind: "extract" })).rejects.toThrow(
       "disposed",
     );
   });
 
-  test("dispatches all twelve operation discriminants", async () => {
+  test("dispatches every scalar operation discriminant", async () => {
     const element = fakeElement();
     const h = fakePage([element]);
     const session = createBrowserOperationSession({
@@ -490,51 +779,41 @@ describe("browser operation session", () => {
       initialOrigin: "https://example.test",
     });
 
-    expect((await session.execute({ kind: "snapshot" })).result).toEqual({
-      kind: "snapshot",
-      refCount: 1,
+    expect((await session.execute({ kind: "extract" })).result).toEqual({
+      kind: "extract",
+      text: "body text",
     });
     expect(
       (await session.execute({ kind: "click", ref: "e1" })).result,
     ).toEqual({ kind: "click", applied: true });
     expect(
-      (await session.execute({ kind: "fill", ref: "e1", value: "x" })).result,
-    ).toEqual({ kind: "fill", applied: true });
+      (await session.execute({ kind: "hover", ref: "e1" })).result,
+    ).toEqual({ kind: "hover", applied: true });
     expect(
       (
         await session.execute({
           kind: "type",
           ref: "e1",
-          value: "x",
-          delayMs: 5,
+          text: "x",
+          clear: true,
         })
       ).result,
     ).toEqual({ kind: "type", applied: true });
     expect(
-      (await session.execute({ kind: "press", ref: "e1", key: "Enter" }))
-        .result,
-    ).toEqual({ kind: "press", applied: true });
-    expect(
-      (
-        await session.execute({
-          kind: "select",
-          ref: "e1",
-          values: ["one"],
-        })
-      ).result,
-    ).toEqual({ kind: "select", applied: true });
-    expect(
-      (await session.execute({ kind: "scroll", deltaX: 1, deltaY: 2 })).result,
-    ).toEqual({ kind: "scroll", applied: true });
-    expect(
       (await session.execute({ kind: "wait", milliseconds: 10 })).result,
     ).toEqual({ kind: "wait", waitedMs: 10 });
     expect(
-      (await session.execute({ kind: "get_text", ref: "e1" })).result,
-    ).toEqual({ kind: "get_text", text: "element text" });
-    expect((await session.execute({ kind: "get_url" })).result).toEqual({
-      kind: "get_url",
-      url: "https://example.test/start",
+      (await session.execute({ kind: "extract", ref: "e1" })).result,
+    ).toEqual({ kind: "extract", text: "element text" });
+    expect(
+      (await session.execute({ kind: "screenshot", fullPage: true }, ACTION_ID))
+        .result,
+    ).toEqual({
+      kind: "screenshot",
+      artifactId: ACTION_ID,
+      contentType: "image/png",
+      byteSize: 3,
+      checksum: createHash("sha256").update("png").digest("hex"),
     });
     expect(
       (
@@ -544,42 +823,115 @@ describe("browser operation session", () => {
         })
       ).result,
     ).toEqual({ kind: "navigate", applied: true });
-    expect(
-      (
-        await session.execute({
-          kind: "evaluate",
-          expression: "document.title",
-          args: {},
-        })
-      ).result,
-    ).toEqual({ kind: "evaluate", value: "Example" });
-
-    expect(element.click).toHaveBeenCalledOnce();
-    expect(element.fill).toHaveBeenCalledWith("x");
-    expect(element.type).toHaveBeenCalledWith("x", { delay: 5 });
-    expect(element.press).toHaveBeenCalledWith("Enter");
-    expect(element.selectOption).toHaveBeenCalledWith(["one"]);
-    expect(h.page.mouse.wheel).toHaveBeenCalledWith(1, 2);
+    expect(element.click).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(element.click).toHaveBeenNthCalledWith(2);
+    expect(element.hover).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(element.hover).toHaveBeenNthCalledWith(2);
+    expect(element.fill).toHaveBeenCalledWith("");
+    expect(element.type).toHaveBeenCalledWith("x");
+    expect(h.page.screenshot).toHaveBeenCalledWith({
+      type: "png",
+      fullPage: true,
+    });
   });
 
-  test("caps server-held refs at 500 and snapshot text at 40,000 chars", async () => {
-    const elements = Array.from({ length: 501 }, () => fakeElement());
+  test("caps refs and observation strings by UTF-8 bytes", async () => {
+    const oversized = "😀".repeat(40_001);
+    const elements = Array.from({ length: 501 }, () =>
+      fakeElement({
+        evaluate: vi.fn(async () => [
+          {
+            connected: true,
+            tag: "button",
+            role: "button",
+            name: "Submit",
+            text: oversized,
+          },
+        ]),
+      }),
+    );
     const h = fakePage(elements);
+    h.setTitle(oversized);
+    h.setBody(oversized);
     const session = createBrowserOperationSession({
       page: h.page,
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    const execution = await session.execute({ kind: "snapshot" });
+    const execution = await session.execute({ kind: "extract" });
 
-    expect(execution.result).toEqual({ kind: "snapshot", refCount: 500 });
+    expect(execution.result.kind).toBe("extract");
+    if (execution.result.kind !== "extract")
+      throw new Error("expected extract");
     expect(
-      Array.from(execution.page.snapshotExcerpt).length,
+      Buffer.byteLength(execution.result.text, "utf8"),
     ).toBeLessThanOrEqual(40_000);
-    expect(elements[500]!.dispose).toHaveBeenCalledOnce();
+    expect(Buffer.byteLength(execution.page.title, "utf8")).toBeLessThanOrEqual(
+      4_096,
+    );
+    expect(
+      Buffer.byteLength(execution.page.snapshotExcerpt, "utf8"),
+    ).toBeLessThanOrEqual(40_000);
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({
+          version: 1,
+          type: "action_result",
+          sequence: 1,
+          actionId: ACTION_ID,
+          actionKind: "extract",
+          outcome: "succeeded",
+          result: execution.result,
+          page: execution.page,
+        }),
+        "utf8",
+      ),
+    ).toBeLessThanOrEqual(64 * 1024);
+    expect(h.page.evaluateHandle).toHaveBeenCalled();
+    expect(h.batchedEvaluationCount()).toBe(1);
+    expect(h.unboundedElementHandles).not.toHaveBeenCalled();
+    expect(elements[500]!.dispose).not.toHaveBeenCalled();
     await expect(
       session.execute({ kind: "click", ref: "e501" }),
     ).rejects.toBeInstanceOf(OperationNoEffectError);
+  });
+
+  test("extracts rendered visible text and suppresses hidden refs", async () => {
+    const hiddenInnerText = vi.fn(async () => "hidden element");
+    const hidden = fakeElement({
+      innerText: hiddenInnerText,
+      isVisible: vi.fn(async () => false),
+      textContent: vi.fn(async () => "hidden element"),
+    });
+    const h = fakePage([hidden]);
+    h.setBody("visible body");
+    vi.mocked(h.page.textContent).mockResolvedValueOnce(
+      "visible body hidden script style template noscript",
+    );
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+
+    await expect(session.execute({ kind: "extract" })).resolves.toMatchObject({
+      result: { kind: "extract", text: "visible body" },
+    });
+    await expect(
+      session.execute({ kind: "extract", ref: "e1" }),
+    ).resolves.toMatchObject({
+      result: { kind: "extract", text: "" },
+    });
+    expect(h.bodyLocator.evaluate).toHaveBeenCalledOnce();
+    expect(h.bodyLocator.innerText).not.toHaveBeenCalled();
+    expect(h.page.textContent).not.toHaveBeenCalled();
+    expect(hiddenInnerText).not.toHaveBeenCalled();
   });
 
   test("rejects blocked direct navigation before goto", async () => {
@@ -608,7 +960,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test", "other.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     await expect(
       session.execute({ kind: "click", ref: "e1" }),
     ).rejects.toMatchObject({ category: "target_blocked" });
@@ -625,7 +977,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     await expect(
       session.execute({ kind: "click", ref: "e1" }),
     ).rejects.toMatchObject({ category: "target_blocked" });
@@ -647,11 +999,15 @@ describe("browser operation session", () => {
       url: "https://other.test/first",
     });
     h.setUrl("https://example.test/return");
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     await expect(
       session.execute({ kind: "click", ref: "e1" }),
     ).resolves.toMatchObject({ result: { kind: "click" } });
-    expect(element.click).toHaveBeenCalledOnce();
+    expect(element.click).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(element.click).toHaveBeenNthCalledWith(2);
   });
 
   test("does not deadlock when navigation waits for Fetch continue", async () => {
@@ -686,7 +1042,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test", "other.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     vi.mocked(h.page.goto).mockImplementationOnce(async (next: string) => {
       await expect(
         h.emitRoute(
@@ -725,7 +1081,7 @@ describe("browser operation session", () => {
         url: "https://other.test/start",
       }),
     ).rejects.toThrow("navigation blocked before following");
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     await expect(
       session.execute({ kind: "click", ref: "e1" }),
     ).rejects.toMatchObject({ category: "target_blocked" });
@@ -735,7 +1091,8 @@ describe("browser operation session", () => {
   test("blocks page-script navigation without learning its origin", async () => {
     const element = fakeElement();
     const h = fakePage([element]);
-    vi.mocked(element.click).mockImplementationOnce(async () => {
+    vi.mocked(element.click).mockImplementation(async (options) => {
+      if (options?.trial === true) return;
       expect(await h.emitRoute("https://other.test/script-navigation")).toBe(
         false,
       );
@@ -745,7 +1102,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test", "other.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     await expect(
       session.execute({ kind: "click", ref: "e1" }),
     ).resolves.toMatchObject({ result: { kind: "click" } });
@@ -800,7 +1157,7 @@ describe("browser operation session", () => {
     for (const domain of domains.slice(0, 6)) {
       await session.execute({ kind: "navigate", url: `https://${domain}/` });
     }
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     let release!: () => void;
     const delayed = new Promise<void>((resolve) => {
       release = resolve;
@@ -828,7 +1185,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test", "other.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     await expect(h.emitRoute("https://other.test/background")).resolves.toBe(
       false,
     );
@@ -839,7 +1196,7 @@ describe("browser operation session", () => {
         url: "https://other.test/target",
       }),
     ).rejects.toThrow("navigation blocked before following");
-    await expect(session.execute({ kind: "get_url" })).rejects.toThrow(
+    await expect(session.execute({ kind: "extract" })).rejects.toThrow(
       "route continue failed",
     );
   });
@@ -851,9 +1208,9 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     await h.emitRoute("https://example.test/background", true);
-    await expect(session.execute({ kind: "get_url" })).rejects.toThrow(
+    await expect(session.execute({ kind: "extract" })).rejects.toThrow(
       "route continue failed",
     );
   });
@@ -865,7 +1222,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     h.cdpSession.send.mockRejectedValueOnce(new Error("disable failed"));
     await expect(session.dispose()).rejects.toThrow("disable failed");
     await expect(session.dispose()).rejects.toThrow("disable failed");
@@ -887,7 +1244,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     let pause: Promise<boolean> | undefined;
     h.cdpSession.send.mockImplementationOnce(async (method) => {
       expect(method).toBe("Fetch.disable");
@@ -915,14 +1272,14 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     vi.mocked(h.page.waitForTimeout).mockImplementationOnce(async () => {
       h.emitCdpClose();
     });
     await expect(
       session.execute({ kind: "wait", milliseconds: 1 }),
     ).rejects.toThrow("CDP session closed unexpectedly");
-    await expect(session.execute({ kind: "get_url" })).rejects.toThrow(
+    await expect(session.execute({ kind: "extract" })).rejects.toThrow(
       "CDP session closed unexpectedly",
     );
   });
@@ -934,7 +1291,7 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "get_url" });
+    await session.execute({ kind: "extract" });
     const implementation = h.cdpSession.send.getMockImplementation()!;
     let release!: () => void;
     const delayed = new Promise<void>((resolve) => {
@@ -988,173 +1345,12 @@ describe("browser operation session", () => {
       initialOrigin: "https://example.test",
       cdpSetupTimeoutMs: 5,
     });
-    await expect(session.execute({ kind: "get_url" })).rejects.toThrow(
+    await expect(session.execute({ kind: "extract" })).rejects.toThrow(
       "CDP setup timed out",
     );
     await expect(session.dispose()).rejects.toThrow("CDP setup timed out");
     release();
     await vi.waitFor(() => expect(h.cdpSession.detach).toHaveBeenCalledOnce());
-  });
-
-  test("rejects unsafe or non-JSON evaluate results as ambiguous", async () => {
-    const h = fakePage();
-    const session = createBrowserOperationSession({
-      page: h.page,
-      allowedDomains: ["example.test"],
-      initialOrigin: "https://example.test",
-    });
-    await expect(
-      session.execute({
-        kind: "evaluate",
-        expression: "fetch(args.url)",
-        args: { url: "https://example.test/" },
-      }),
-    ).rejects.toMatchObject({ category: "model_protocol_error" });
-
-    vi.mocked(h.page.evaluate).mockResolvedValueOnce(undefined);
-    await expect(
-      session.execute({
-        kind: "evaluate",
-        expression: "args.value",
-        args: { value: "x" },
-      }),
-    ).rejects.toThrow(/canonicalization|JSON-safe/);
-  });
-
-  test("canonicalizes in isolated world and preserves __proto__ args as data", async () => {
-    const h = fakePage();
-    vi.mocked(h.page.evaluate).mockResolvedValueOnce(
-      '{"__proto__":{"safe":true}}',
-    );
-    const session = createBrowserOperationSession({
-      page: h.page,
-      allowedDomains: ["example.test"],
-      initialOrigin: "https://example.test",
-    });
-    const args = JSON.parse('{"__proto__":{"safe":true}}') as {
-      __proto__: { safe: boolean };
-    };
-    const execution = await session.execute({
-      kind: "evaluate",
-      expression: "args",
-      args,
-    });
-    expect(execution.result).toMatchObject({
-      kind: "evaluate",
-      value: { __proto__: { safe: true } },
-    });
-    expect(h.cdpSession.send).toHaveBeenCalledWith(
-      "Runtime.evaluate",
-      expect.objectContaining({ contextId: expect.any(Number) }),
-    );
-    const source = vi.mocked(h.page.evaluate).mock.calls[0]![0];
-    expect(source).toEqual(expect.stringContaining("SafeJSON.parse.bind"));
-    expect(source).toEqual(
-      expect.stringContaining("SafeObject.getOwnPropertyDescriptors.bind"),
-    );
-    expect(source).toEqual(
-      expect.stringContaining("SafeObject.getOwnPropertySymbols.bind"),
-    );
-    expect(source).not.toContain("localeCompare");
-  });
-
-  test("matches host canonical ordering for mixed-case and non-ASCII keys", async () => {
-    const h = fakePage();
-    vi.mocked(h.page.evaluate).mockImplementationOnce(async (source: unknown) =>
-      (0, eval)(String(source)),
-    );
-    Object.defineProperty(globalThis, "document", {
-      configurable: true,
-      value: { body: { z: 1, A: 2, a: 3, ä: 4, Ω: 5 } },
-    });
-    try {
-      const session = createBrowserOperationSession({
-        page: h.page,
-        allowedDomains: ["example.test"],
-        initialOrigin: "https://example.test",
-      });
-      const execution = await session.execute({
-        kind: "evaluate",
-        expression: "document.body",
-        args: {},
-      });
-      expect(execution.result).toMatchObject({
-        kind: "evaluate",
-        value: { z: 1, A: 2, a: 3, ä: 4, Ω: 5 },
-      });
-      if (execution.result.kind !== "evaluate") {
-        throw new Error("expected evaluate result");
-      }
-      expect(Object.keys(execution.result.value as object)).toEqual([
-        "A",
-        "a",
-        "z",
-        "ä",
-        "Ω",
-      ]);
-    } finally {
-      Reflect.deleteProperty(globalThis, "document");
-    }
-  });
-
-  test("rejects unsafe values in isolated world before transport serialization", async () => {
-    const accessor = {};
-    Object.defineProperty(accessor, "value", {
-      enumerable: true,
-      get: () => "secret",
-    });
-    const symbolKeyed = { value: "x", [Symbol("secret")]: true };
-    const sparse = Array(2);
-    sparse[1] = "x";
-    const cyclic: { self?: unknown } = {};
-    cyclic.self = cyclic;
-    const customPrototype = Object.create({ inherited: true }) as object;
-    const unsafe = [
-      customPrototype,
-      accessor,
-      symbolKeyed,
-      sparse,
-      cyclic,
-      undefined,
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      1n,
-      "x".repeat(32 * 1024 + 1),
-    ];
-    const priorDocument = Object.getOwnPropertyDescriptor(
-      globalThis,
-      "document",
-    );
-    try {
-      for (const value of unsafe) {
-        Object.defineProperty(globalThis, "document", {
-          configurable: true,
-          value: { body: value },
-        });
-        const h = fakePage();
-        vi.mocked(h.page.evaluate).mockImplementationOnce(
-          async (source: unknown) => (0, eval)(String(source)),
-        );
-        const session = createBrowserOperationSession({
-          page: h.page,
-          allowedDomains: ["example.test"],
-          initialOrigin: "https://example.test",
-        });
-        await expect(
-          session.execute({
-            kind: "evaluate",
-            expression: "document.body",
-            args: {},
-          }),
-        ).rejects.toThrow();
-      }
-    } finally {
-      if (priorDocument === undefined) {
-        Reflect.deleteProperty(globalThis, "document");
-      } else {
-        Object.defineProperty(globalThis, "document", priorDocument);
-      }
-    }
   });
 
   test("does not downgrade ref probe transport failure to stale_ref", async () => {
@@ -1165,13 +1361,285 @@ describe("browser operation session", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await session.execute({ kind: "snapshot" });
+    await session.execute({ kind: "extract" });
     vi.mocked(element.evaluate).mockRejectedValueOnce(
       new Error("Chromium disconnected"),
     );
     const failure = session.execute({ kind: "click", ref: "e1" });
     await expect(failure).rejects.toThrow("Chromium disconnected");
     await expect(failure).rejects.not.toBeInstanceOf(OperationNoEffectError);
+  });
+
+  test("hover requires a current ref and returns a fresh tooltip observation", async () => {
+    const elements: OperationElement[] = [];
+    const tooltip = fakeElement({
+      evaluate: vi.fn(async () => [
+        {
+          connected: true,
+          tag: "div",
+          role: "tooltip",
+          name: "",
+          text: "Morior Invictus Grand Regalia",
+        },
+      ]),
+    });
+    const hover = vi.fn(
+      async (options?: Parameters<OperationElement["hover"]>[0]) => {
+        if (options?.trial !== true) elements.push(tooltip);
+      },
+    );
+    elements.push(fakeElement({ hover }));
+    const h = fakePage(elements);
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+
+    await session.observe();
+    const execution = await session.execute({ kind: "hover", ref: "e1" });
+
+    expect(execution.result).toEqual({ kind: "hover", applied: true });
+    expect(execution.page.snapshotExcerpt).toContain(
+      '[ref=e2] <div> role="tooltip" "Morior Invictus Grand Regalia"',
+    );
+    expect(hover).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(hover).toHaveBeenNthCalledWith(2);
+    await expect(
+      session.execute({ kind: "hover", ref: "missing" }),
+    ).rejects.toMatchObject({
+      category: "stale_ref",
+      message: "Locator reference is stale",
+    });
+
+    const detached = fakeElement({
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce([
+          {
+            connected: true,
+            tag: "div",
+            role: "",
+            name: "",
+            text: "gear",
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            connected: false,
+            tag: "div",
+            role: "",
+            name: "",
+            text: "gear",
+          },
+        ]),
+    });
+    const detachedPage = fakePage([detached]);
+    const detachedSession = createBrowserOperationSession({
+      page: detachedPage.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await detachedSession.observe();
+    await expect(
+      detachedSession.execute({ kind: "hover", ref: "e1" }),
+    ).rejects.toMatchObject({
+      category: "stale_ref",
+      message: "Locator reference is detached",
+    });
+  });
+
+  test("hover_batch prevalidates every ref before pointer movement", async () => {
+    const hover = vi.fn(async () => undefined);
+    const h = fakePage([fakeElement({ hover })]);
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await session.observe();
+
+    await expect(
+      session.execute({ kind: "hover_batch", refs: ["e1", "missing"] }),
+    ).rejects.toMatchObject({
+      category: "stale_ref",
+      message: "Hover batch locator reference is stale",
+    });
+    expect(hover).not.toHaveBeenCalled();
+  });
+
+  test("hover_batch preserves order and continues bounded per-target failures", async () => {
+    const successHover = vi.fn(async () => undefined);
+    const detached = fakeElement({
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce([
+          {
+            connected: true,
+            tag: "button",
+            role: "",
+            name: "",
+            text: "detached",
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            connected: true,
+            tag: "button",
+            role: "",
+            name: "",
+            text: "detached",
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            connected: false,
+            tag: "button",
+            role: "",
+            name: "",
+            text: "detached",
+          },
+        ]),
+    });
+    const coveredHover = vi.fn(
+      async (options?: Parameters<OperationElement["hover"]>[0]) => {
+        if (options?.trial === true) throw new Error("covered");
+      },
+    );
+    const covered = fakeElement({ hover: coveredHover });
+    const h = fakePage([
+      fakeElement({ hover: successHover }),
+      detached,
+      covered,
+    ]);
+    h.queueHoverBatchDeltas("tooltip details");
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await session.observe();
+
+    const execution = await session.execute({
+      kind: "hover_batch",
+      refs: ["e1", "e2", "e3"],
+    });
+
+    expect(execution.result).toEqual({
+      kind: "hover_batch",
+      items: [
+        {
+          ref: "e1",
+          outcome: "succeeded",
+          text: "tooltip details",
+        },
+        {
+          ref: "e2",
+          outcome: "failed_no_effect",
+          error: {
+            category: "stale_ref",
+            message: "Hover batch locator reference is detached",
+          },
+        },
+        {
+          ref: "e3",
+          outcome: "failed_no_effect",
+          error: {
+            category: "target_not_actionable",
+            message:
+              "Hover batch target did not become actionable within 1000 ms",
+          },
+        },
+      ],
+    });
+    expect(successHover).toHaveBeenCalledTimes(2);
+    expect(coveredHover).toHaveBeenCalledOnce();
+  });
+
+  test("hover_batch caps each tooltip delta by UTF-8 bytes", async () => {
+    const h = fakePage([fakeElement()]);
+    h.queueHoverBatchDeltas("😀".repeat(1_000));
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await session.observe();
+
+    const execution = await session.execute({
+      kind: "hover_batch",
+      refs: ["e1"],
+    });
+    expect(execution.result.kind).toBe("hover_batch");
+    if (execution.result.kind !== "hover_batch") {
+      throw new Error("expected hover_batch result");
+    }
+    const item = execution.result.items[0];
+    expect(item?.outcome).toBe("succeeded");
+    if (item?.outcome !== "succeeded") throw new Error("expected success");
+    expect(Buffer.byteLength(item.text, "utf8")).toBe(1_024);
+    expect(item.text).toBe("😀".repeat(256));
+  });
+
+  test("hover_batch never starts without its bounded deadline authority", async () => {
+    const hover = vi.fn(async () => undefined);
+    const h = fakePage([fakeElement({ hover })]);
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await session.observe();
+
+    await expect(
+      session.execute({ kind: "hover_batch", refs: ["e1"] }, undefined, {
+        deadlineAtMs: Date.now() + 100,
+      }),
+    ).rejects.toMatchObject({
+      category: "target_not_actionable",
+      message: "Hover batch requires 8000 ms of remaining action authority",
+    });
+    expect(hover).not.toHaveBeenCalled();
+  });
+
+  test("hover_batch keeps combined result and page within observation budget", async () => {
+    const elements = Array.from({ length: 48 }, () =>
+      fakeElement({
+        evaluate: vi.fn(async () => [
+          {
+            connected: true,
+            tag: "div",
+            role: "",
+            name: "",
+            text: "p".repeat(1_024),
+          },
+        ]),
+      }),
+    );
+    const h = fakePage(elements);
+    h.queueHoverBatchDeltas(
+      ...Array.from({ length: 16 }, () => "t".repeat(1_024)),
+    );
+    const session = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await session.observe();
+    const execution = await session.execute({
+      kind: "hover_batch",
+      refs: Array.from({ length: 16 }, (_, index) => `e${index + 1}`),
+    });
+
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({ page: execution.page, result: execution.result }),
+        "utf8",
+      ),
+    ).toBeLessThanOrEqual(63 * 1_024);
   });
 
   test("cancels downloads and never exposes them to callers", async () => {
@@ -1188,6 +1656,335 @@ describe("browser operation session", () => {
 });
 
 describe("cached action execution", () => {
+  test("sanitizes hover actionability failure as failed_no_effect", async () => {
+    const hover = vi.fn(
+      async (options?: Parameters<OperationElement["hover"]>[0]) => {
+        if (options?.trial === true) {
+          throw new Error("chromium secret: element remained covered");
+        }
+      },
+    );
+    const h = fakePage([fakeElement({ hover })]);
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.observe();
+    const closeAmbiguous = vi.fn(async () => undefined);
+    const result = await executeCachedAction({
+      cache: new SessionActionCache(),
+      request: action({ kind: "hover", ref: "e1" }),
+      withWriter: async <T>(run: () => Promise<T>) => run(),
+      executeOperation: (operation) => operationSession.execute(operation),
+      currentSessionVersion: () => 1,
+      currentPage: () => ({
+        url: "https://example.test/start",
+        title: "",
+        snapshotExcerpt: "",
+      }),
+      commitSuccess: () => 2,
+      closeAmbiguous,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed_no_effect",
+      error: {
+        category: "target_not_actionable",
+        message: "Hover target did not become actionable within 10000 ms",
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("chromium secret");
+    expect(hover).toHaveBeenCalledOnce();
+    expect(closeAmbiguous).not.toHaveBeenCalled();
+  });
+
+  test("replays a successful hover without dispatching pointer movement twice", async () => {
+    const hover = vi.fn(async () => undefined);
+    const h = fakePage([fakeElement({ hover })]);
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.observe();
+    const options = {
+      cache: new SessionActionCache(),
+      request: action({ kind: "hover", ref: "e1" }),
+      withWriter: async <T>(run: () => Promise<T>) => run(),
+      executeOperation: (operation: BrowserOperation) =>
+        operationSession.execute(operation),
+      currentSessionVersion: () => 1,
+      currentPage: () => ({
+        url: "https://example.test/start",
+        title: "",
+        snapshotExcerpt: "",
+      }),
+      commitSuccess: () => 2,
+      closeAmbiguous: vi.fn(async () => undefined),
+    };
+
+    const first = await executeCachedAction(options);
+    const replay = await executeCachedAction(options);
+
+    expect(first).toEqual(replay);
+    expect(first).toMatchObject({
+      outcome: "succeeded",
+      result: { kind: "hover", applied: true },
+    });
+    expect(hover).toHaveBeenCalledTimes(2);
+    expect(hover).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(hover).toHaveBeenNthCalledWith(2);
+  });
+
+  test("closes ambiguous session after hover_batch actual hover failure", async () => {
+    const hover = vi.fn(
+      async (options?: Parameters<OperationElement["hover"]>[0]) => {
+        if (options?.trial !== true)
+          throw new Error("pointer transport failed");
+      },
+    );
+    const h = fakePage([fakeElement({ hover })]);
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.observe();
+    const closeAmbiguous = vi.fn(async () => undefined);
+
+    await expect(
+      executeCachedAction({
+        cache: new SessionActionCache(),
+        request: action({ kind: "hover_batch", refs: ["e1"] }),
+        withWriter: async <T>(run: () => Promise<T>) => run(),
+        executeOperation: (operation) => operationSession.execute(operation),
+        currentSessionVersion: () => 1,
+        currentPage: () => ({
+          url: "https://example.test/start",
+          title: "",
+          snapshotExcerpt: "",
+        }),
+        commitSuccess: () => 2,
+        closeAmbiguous,
+      }),
+    ).rejects.toThrow("pointer transport failed");
+    expect(closeAmbiguous).toHaveBeenCalledOnce();
+  });
+
+  test("closes ambiguous session after hover_batch delta observation failure", async () => {
+    const hover = vi.fn(async () => undefined);
+    const h = fakePage([fakeElement({ hover })]);
+    h.queueHoverBatchDeltas(new Error("DOM observation transport failed"));
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.observe();
+    const closeAmbiguous = vi.fn(async () => undefined);
+
+    await expect(
+      executeCachedAction({
+        cache: new SessionActionCache(),
+        request: action({ kind: "hover_batch", refs: ["e1"] }),
+        withWriter: async <T>(run: () => Promise<T>) => run(),
+        executeOperation: (operation) => operationSession.execute(operation),
+        currentSessionVersion: () => 1,
+        currentPage: () => ({
+          url: "https://example.test/start",
+          title: "",
+          snapshotExcerpt: "",
+        }),
+        commitSuccess: () => 2,
+        closeAmbiguous,
+      }),
+    ).rejects.toThrow("DOM observation transport failed");
+    expect(closeAmbiguous).toHaveBeenCalledOnce();
+  });
+
+  test("replays hover_batch without additional pointer dispatch", async () => {
+    const firstHover = vi.fn(async () => undefined);
+    const secondHover = vi.fn(async () => undefined);
+    const h = fakePage([
+      fakeElement({ hover: firstHover }),
+      fakeElement({ hover: secondHover }),
+    ]);
+    h.queueHoverBatchDeltas("first tooltip", "second tooltip");
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.observe();
+    const options = {
+      cache: new SessionActionCache(),
+      request: action({ kind: "hover_batch", refs: ["e1", "e2"] }),
+      withWriter: async <T>(run: () => Promise<T>) => run(),
+      executeOperation: (operation: BrowserOperation) =>
+        operationSession.execute(operation),
+      currentSessionVersion: () => 1,
+      currentPage: () => ({
+        url: "https://example.test/start",
+        title: "",
+        snapshotExcerpt: "",
+      }),
+      commitSuccess: () => 2,
+      closeAmbiguous: vi.fn(async () => undefined),
+    };
+
+    const first = await executeCachedAction(options);
+    const replay = await executeCachedAction(options);
+
+    expect(replay).toEqual(first);
+    expect(first).toMatchObject({
+      outcome: "succeeded",
+      result: {
+        kind: "hover_batch",
+        items: [
+          { ref: "e1", outcome: "succeeded", text: "first tooltip" },
+          { ref: "e2", outcome: "succeeded", text: "second tooltip" },
+        ],
+      },
+    });
+    expect(firstHover).toHaveBeenCalledTimes(2);
+    expect(secondHover).toHaveBeenCalledTimes(2);
+  });
+
+  test("returns failed_no_effect when click actionability preflight fails", async () => {
+    const click = vi.fn(
+      async (options?: Parameters<OperationElement["click"]>[0]) => {
+        if (options?.trial === true) {
+          throw new Error("element remained covered");
+        }
+      },
+    );
+    const h = fakePage([fakeElement({ click })]);
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.execute({ kind: "extract" });
+    const closeAmbiguous = vi.fn(async () => undefined);
+    const result = await executeCachedAction({
+      cache: new SessionActionCache(),
+      request: action({ kind: "click", ref: "e1" }),
+      withWriter: async <T>(run: () => Promise<T>) => run(),
+      executeOperation: (operation) => operationSession.execute(operation),
+      currentSessionVersion: () => 1,
+      currentPage: () => ({
+        url: "https://example.test/start",
+        title: "",
+        snapshotExcerpt: "",
+      }),
+      commitSuccess: () => 2,
+      closeAmbiguous,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed_no_effect",
+      error: {
+        category: "target_not_actionable",
+        message: "Click target did not become actionable within 10000 ms",
+      },
+    });
+    expect(click).toHaveBeenCalledOnce();
+    expect(click).toHaveBeenCalledWith({
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(closeAmbiguous).not.toHaveBeenCalled();
+  });
+
+  test("keeps click failure after successful preflight ambiguous", async () => {
+    const click = vi.fn(
+      async (options?: Parameters<OperationElement["click"]>[0]) => {
+        if (options?.trial === true) return;
+        throw new Error("click dispatch outcome unknown");
+      },
+    );
+    const h = fakePage([fakeElement({ click })]);
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.execute({ kind: "extract" });
+    const closeAmbiguous = vi.fn(() => operationSession.dispose());
+    const cache = new SessionActionCache();
+
+    await expect(
+      executeCachedAction({
+        cache,
+        request: action({ kind: "click", ref: "e1" }),
+        withWriter: async <T>(run: () => Promise<T>) => run(),
+        executeOperation: (operation) => operationSession.execute(operation),
+        currentSessionVersion: () => 1,
+        currentPage: () => ({
+          url: "https://example.test/start",
+          title: "",
+          snapshotExcerpt: "",
+        }),
+        commitSuccess: () => 2,
+        closeAmbiguous,
+      }),
+    ).rejects.toThrow("click dispatch outcome unknown");
+    expect(click).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(click).toHaveBeenNthCalledWith(2);
+    expect(cache.size).toBe(0);
+    expect(closeAmbiguous).toHaveBeenCalledOnce();
+  });
+
+  test("executes click after successful actionability preflight", async () => {
+    const click = vi.fn(
+      async (_options?: Parameters<OperationElement["click"]>[0]) => undefined,
+    );
+    const h = fakePage([fakeElement({ click })]);
+    const operationSession = createBrowserOperationSession({
+      page: h.page,
+      allowedDomains: ["example.test"],
+      initialOrigin: "https://example.test",
+    });
+    await operationSession.execute({ kind: "extract" });
+    const closeAmbiguous = vi.fn(async () => undefined);
+    const commitSuccess = vi.fn(() => 2);
+
+    await expect(
+      executeCachedAction({
+        cache: new SessionActionCache(),
+        request: action({ kind: "click", ref: "e1" }),
+        withWriter: async <T>(run: () => Promise<T>) => run(),
+        executeOperation: (operation) => operationSession.execute(operation),
+        currentSessionVersion: () => 1,
+        currentPage: () => ({
+          url: "https://example.test/start",
+          title: "",
+          snapshotExcerpt: "",
+        }),
+        commitSuccess,
+        closeAmbiguous,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "succeeded",
+      result: { kind: "click", applied: true },
+      sessionVersion: 2,
+    });
+    expect(click).toHaveBeenNthCalledWith(1, {
+      trial: true,
+      timeout: 10_000,
+    });
+    expect(click).toHaveBeenNthCalledWith(2);
+    expect(commitSuccess).toHaveBeenCalledOnce();
+    expect(closeAmbiguous).not.toHaveBeenCalled();
+  });
+
   test("treats post-grant navigation failure as uncached ambiguity", async () => {
     const h = fakePage();
     vi.mocked(h.page.goto).mockRejectedValueOnce(
@@ -1232,7 +2029,7 @@ describe("cached action execution", () => {
       allowedDomains: ["example.test"],
       initialOrigin: "https://example.test",
     });
-    await operationSession.execute({ kind: "snapshot" });
+    await operationSession.execute({ kind: "extract" });
     vi.mocked(element.evaluate).mockRejectedValueOnce(
       new Error("Chromium disconnected during probe"),
     );
@@ -1261,11 +2058,11 @@ describe("cached action execution", () => {
 
   test("caches only a fully validated response and replays without dispatch", async () => {
     const cache = new SessionActionCache();
-    const operation = { kind: "get_url" } as const;
+    const operation = { kind: "extract" } as const;
     const executeOperation = vi.fn(async () => ({
       result: {
-        kind: "get_url" as const,
-        url: "https://example.test/",
+        kind: "extract" as const,
+        text: "Example",
       },
       page: {
         url: "https://example.test/",
@@ -1303,11 +2100,8 @@ describe("cached action execution", () => {
     const cache = new SessionActionCache();
     const closeAmbiguous = vi.fn(async () => undefined);
     const operation = {
-      kind: "evaluate",
-      expression: "args.value",
-      args: {
-        value: "x",
-      },
+      kind: "navigate",
+      url: "https://example.test/next",
     } as const;
     const executeOperation = vi.fn(async () => {
       throw new Error("Chromium disconnected");
@@ -1339,9 +2133,8 @@ describe("cached action execution", () => {
   test("preserves session-close failure with the ambiguous action error", async () => {
     const cache = new SessionActionCache();
     const operation = {
-      kind: "evaluate",
-      expression: "args.value",
-      args: { value: "x" },
+      kind: "navigate",
+      url: "https://example.test/next",
     } as const;
     await expect(
       executeCachedAction({
@@ -1536,30 +2329,33 @@ test("SessionRegistry exposes cached executeAction and closes ambiguity", async 
       lockdown: true,
     },
   });
-  const getUrl = action(
-    { kind: "get_url" },
+  const extract = action(
+    { kind: "extract" },
     { expectedSessionVersion: session.sessionVersion },
   );
 
-  const first = await registry.executeAction(session.runtimeSessionId, getUrl);
-  const urlCalls = vi.mocked(h.page.url).mock.calls.length;
-  const replay = await registry.executeAction(session.runtimeSessionId, getUrl);
+  const first = await registry.executeAction(session.runtimeSessionId, extract);
+  const textCalls = h.bodyLocator.innerText.mock.calls.length;
+  const replay = await registry.executeAction(
+    session.runtimeSessionId,
+    extract,
+  );
   expect(replay).toEqual(first);
-  expect(vi.mocked(h.page.url).mock.calls.length).toBe(urlCalls);
+  expect(h.bodyLocator.innerText.mock.calls.length).toBe(textCalls);
 
-  const evaluate = action(
-    { kind: "evaluate", expression: "args.value", args: { value: "x" } },
+  const navigate = action(
+    { kind: "navigate", url: "https://example.test/next" },
     {
       actionId: "dddddddd-4444-4444-8444-444444444444",
       sequence: 2,
       expectedSessionVersion: first.sessionVersion,
     },
   );
-  vi.mocked(h.page.evaluate).mockRejectedValueOnce(
+  vi.mocked(h.page.goto).mockRejectedValueOnce(
     new Error("Chromium disconnected"),
   );
   await expect(
-    registry.executeAction(session.runtimeSessionId, evaluate),
+    registry.executeAction(session.runtimeSessionId, navigate),
   ).rejects.toThrow("Chromium disconnected");
   expect(registry.get(session.runtimeSessionId)).toBeUndefined();
   expect(context.close).toHaveBeenCalledOnce();

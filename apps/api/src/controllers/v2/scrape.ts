@@ -5,6 +5,7 @@ import {
   Document,
   FormatObject,
   RequestWithAuth,
+  projectBaseScrapeOptions,
   ScrapeRequest,
   scrapeRequestSchema,
   ScrapeResponse,
@@ -266,7 +267,7 @@ export async function scrapeController(
                     mode: "single_urls",
                     team_id: req.auth.team_id,
                     scrapeOptions: {
-                      ...req.body,
+                      ...projectBaseScrapeOptions(req.body),
                       ...((req.body as any).__experimental_cache
                         ? {
                             maxAge: req.body.maxAge ?? 4 * 60 * 60 * 1000, // 4 hours

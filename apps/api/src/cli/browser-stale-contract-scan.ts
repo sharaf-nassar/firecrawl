@@ -43,7 +43,6 @@ export const browserContractDiscovery = {
   closureEntryPoints: [
     "apps/api/src/lib/local-runtime-config.ts",
     "apps/api/src/services/local-retention-worker.ts",
-    "apps/api/src/controllers/internal/browser-runs.ts",
     "apps/api/src/controllers/v2/browser.ts",
     "apps/api/src/controllers/v2/scrape-browser.ts",
     "apps/api/src/controllers/v2/browser-proxy.ts",
@@ -52,7 +51,6 @@ export const browserContractDiscovery = {
   scanOnlyBridgeFiles: [
     "apps/api/src/config.ts",
     "apps/api/src/controllers/v2/types.ts",
-    "apps/api/src/routes/internal.ts",
     "apps/api/src/routes/v2.ts",
     "apps/api/src/index.ts",
     "apps/api/src/harness.ts",
@@ -78,7 +76,7 @@ export const browserContractDiscovery = {
     "apps/api/src/lib/browser-state/legacy-compatibility.ts",
     "apps/api/src/lib/scrape-interact/replay-envelope.ts",
   ],
-  taskPlan: "docs/superpowers/plans/2026-07-19-browser-service-and-api.md",
+  taskPlan: null,
   reviewedExclusions: [
     {
       id: "test_or_negative_fixture",
@@ -116,7 +114,6 @@ export const browserSchemaRolePolicy = {
     "apps/api/src/lib/scrape-interact/",
   ],
   browserSchemaExactFiles: [
-    "apps/api/src/controllers/internal/browser-runs.ts",
     "apps/api/src/controllers/v2/browser.ts",
     "apps/api/src/controllers/v2/scrape-browser.ts",
     "apps/api/src/controllers/v2/browser-proxy.ts",
@@ -147,21 +144,11 @@ export const browserBridgeImportClassifications: Readonly<
       "apps/api/src/lib/logger.ts",
     ].map(path => [path, "reviewed_non_browser_boundary"]),
   ]),
-  "apps/api/src/controllers/internal/browser-runs.ts": Object.fromEntries([
-    ...[
-      "apps/api/src/lib/browser-runtime/action-coordinator.ts",
-      "apps/api/src/lib/browser-runtime/artifacts.ts",
-      "apps/api/src/lib/browser-runtime/startup-gate.ts",
-      "apps/api/src/lib/browser-state/capability-store.ts",
-      "apps/api/src/lib/browser-state/store.ts",
-      "apps/api/src/lib/browser-state/types.ts",
-      "apps/api/src/lib/scrape-interact/browser-service-client.ts",
-      "apps/api/src/lib/scrape-interact/browser-service-contracts.ts",
-    ].map(path => [path, "browser_follow"]),
-    ["apps/api/src/lib/artifacts/index.ts", "reviewed_non_browser_boundary"],
-  ]),
   "apps/api/src/controllers/v2/browser.ts": Object.fromEntries([
-    ["apps/api/src/lib/scrape-interact/browser-agent.ts", "browser_follow"],
+    [
+      "apps/api/src/lib/browser-runtime/public-browser-runtime.ts",
+      "browser_follow",
+    ],
     ...[
       "apps/api/src/config.ts",
       "apps/api/src/controllers/v2/types.ts",
@@ -179,9 +166,9 @@ export const browserBridgeImportClassifications: Readonly<
   "apps/api/src/controllers/v2/scrape-browser.ts": Object.fromEntries([
     ...[
       "apps/api/src/controllers/v2/browser.ts",
-      "apps/api/src/lib/scrape-interact/browser-agent.ts",
-      "apps/api/src/lib/scrape-interact/langsmith.ts",
+      "apps/api/src/lib/browser-runtime/public-browser-runtime.ts",
       "apps/api/src/lib/scrape-interact/legacy-browser-service-client.ts",
+      "apps/api/src/lib/scrape-interact/langsmith.ts",
       "apps/api/src/lib/scrape-interact/scrape-replay.ts",
     ].map(path => [path, "browser_follow"]),
     ...[
@@ -254,9 +241,6 @@ export const browserBridgeImportClassifications: Readonly<
       "apps/api/src/types/product.ts",
     ].map(path => [path, "reviewed_non_browser_boundary"]),
   ),
-  "apps/api/src/routes/internal.ts": {
-    "apps/api/src/controllers/internal/browser-runs.ts": "browser_follow",
-  },
   "apps/api/src/routes/v2.ts": Object.fromEntries([
     ...[
       "apps/api/src/controllers/v2/browser.ts",
@@ -318,7 +302,6 @@ export const browserBridgeImportClassifications: Readonly<
       "apps/api/src/lib/local-runtime-config.ts",
       "apps/api/src/lib/scrape-interact/browser-service-client.ts",
       "apps/api/src/lib/scrape-interact/replay-store.ts",
-      "apps/api/src/routes/internal.ts",
       "apps/api/src/controllers/v2/browser-proxy.ts",
       "apps/api/src/services/local-retention-worker.ts",
       "apps/api/src/services/browser-admission-cleanup.ts",
@@ -377,7 +360,7 @@ export type BrowserContractDiscoveryPolicy = {
   scanOnlyBridgeFiles: readonly string[];
   explicitProductionRoots: readonly string[];
   requiredProductionPaths: readonly string[];
-  taskPlan: string;
+  taskPlan: string | null;
   reviewedExclusions: readonly (
     | { id: string; suffix: RegExp; requireMatch?: boolean }
     | { id: string; prefix: string; requireMatch?: boolean }
@@ -1112,8 +1095,11 @@ export function buildBrowserContractInventory(
     }
   }
 
-  const planPath = resolve(root, policy.discovery.taskPlan);
-  if (existsSync(planPath)) {
+  const planPath =
+    policy.discovery.taskPlan === null
+      ? null
+      : resolve(root, policy.discovery.taskPlan);
+  if (planPath !== null && existsSync(planPath)) {
     for (const path of taskPaths(readFileSync(planPath, "utf8"))) {
       if (
         isExcluded(path, policy.discovery) ||
@@ -1462,168 +1448,6 @@ function scanTypeScript(
   return out;
 }
 
-function codeResultFindings(
-  sources: readonly BrowserContractSource[],
-): BrowserContractFinding[] {
-  const target = sources.find(
-    source => source.path === "apps/api/src/lib/browser-runtime/protocol.ts",
-  );
-  if (!target) return [];
-  const file = ts.createSourceFile(
-    target.path,
-    target.text,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TS,
-  );
-  let schema: ts.VariableDeclaration | undefined;
-  let aliasValid = false;
-  for (const statement of file.statements) {
-    if (ts.isVariableStatement(statement)) {
-      for (const declaration of statement.declarationList.declarations) {
-        if (
-          ts.isIdentifier(declaration.name) &&
-          declaration.name.text === "codeRunResultSchema"
-        ) {
-          schema = declaration;
-        }
-      }
-    }
-    if (
-      ts.isTypeAliasDeclaration(statement) &&
-      statement.name.text === "CodeRunResult"
-    ) {
-      aliasValid =
-        statement.modifiers?.some(
-          modifier => modifier.kind === ts.SyntaxKind.ExportKeyword,
-        ) === true &&
-        /\bz\.infer\s*<\s*typeof\s+codeRunResultSchema\s*>/.test(
-          statement.type.getText(file),
-        );
-    }
-  }
-  const out: BrowserContractFinding[] = [];
-  const keys = new Set<string>();
-  if (schema) {
-    const visit = (node: ts.Node) => {
-      if (
-        ts.isCallExpression(node) &&
-        ts.isPropertyAccessExpression(node.expression) &&
-        node.expression.name.text === "strictObject" &&
-        node.arguments[0] &&
-        ts.isObjectLiteralExpression(node.arguments[0]) &&
-        keys.size === 0
-      ) {
-        for (const property of node.arguments[0].properties) {
-          const name =
-            ts.isPropertyAssignment(property) ||
-            ts.isShorthandPropertyAssignment(property) ||
-            ts.isMethodDeclaration(property)
-              ? propertyName(property.name)
-              : undefined;
-          if (name) keys.add(name);
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(schema);
-  }
-  const expected = ["exitCode", "killed", "result", "stderr", "stdout"];
-  if (
-    !schema ||
-    expected.some(key => !keys.has(key)) ||
-    [...keys].some(key => !expected.includes(key)) ||
-    !aliasValid
-  ) {
-    out.push(
-      finding(
-        "stale_code_result",
-        target,
-        schema?.getStart(file) ?? 0,
-        `keys=${[...keys].sort().join(",")} alias=${aliasValid}`,
-      ),
-    );
-  }
-  return out;
-}
-
-function aggregateActivationFindings(
-  sources: readonly BrowserContractSource[],
-): BrowserContractFinding[] {
-  const exactExports: { source: BrowserContractSource; offset: number }[] = [];
-  const stale: BrowserContractFinding[] = [];
-  for (const source of sources) {
-    if (!SOURCE_EXTENSIONS.some(extension => source.path.endsWith(extension)))
-      continue;
-    const file = ts.createSourceFile(
-      source.path,
-      source.text,
-      ts.ScriptTarget.Latest,
-      true,
-      scriptKind(source.path),
-    );
-    const visit = (node: ts.Node) => {
-      const name =
-        (ts.isFunctionDeclaration(node) ||
-          ts.isMethodDeclaration(node) ||
-          ts.isVariableDeclaration(node)) &&
-        node.name &&
-        ts.isIdentifier(node.name)
-          ? node.name.text
-          : undefined;
-      if (name === "activateAdapterProcess") {
-        const variableStatement =
-          ts.isVariableDeclaration(node) &&
-          ts.isVariableDeclarationList(node.parent) &&
-          ts.isVariableStatement(node.parent.parent)
-            ? node.parent.parent
-            : undefined;
-        const exported =
-          (ts.isFunctionDeclaration(node) &&
-            node.modifiers?.some(
-              modifier => modifier.kind === ts.SyntaxKind.ExportKeyword,
-            ) === true) ||
-          variableStatement?.modifiers?.some(
-            modifier => modifier.kind === ts.SyntaxKind.ExportKeyword,
-          ) === true;
-        if (exported) {
-          exactExports.push({ source, offset: node.getStart(file) });
-        }
-      } else if (
-        name &&
-        /^(?:activateAdapter|activateRun|activateCapability|activateAdapterRun|activateAdapterCapability)$/.test(
-          name,
-        )
-      ) {
-        stale.push(
-          finding(
-            "split_adapter_activation",
-            source,
-            node.getStart(file),
-            name,
-          ),
-        );
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(file);
-  }
-  if (exactExports.length !== 1) {
-    const duplicate = exactExports[1] ?? exactExports[0];
-    const source = duplicate?.source ??
-      sources[0] ?? { path: "<inventory>", text: "" };
-    stale.push(
-      finding(
-        "split_adapter_activation",
-        source,
-        duplicate?.offset ?? 0,
-        `expected exactly one exported activateAdapterProcess; found ${exactExports.length}`,
-      ),
-    );
-  }
-  return stale;
-}
-
 function compareFindings(
   left: BrowserContractFinding,
   right: BrowserContractFinding,
@@ -1670,10 +1494,6 @@ function scanSourcesWithDerivedRoles(
       ),
     );
   }
-  findings.push(
-    ...aggregateActivationFindings(sources),
-    ...codeResultFindings(sources),
-  );
   return findings.sort(compareFindings);
 }
 

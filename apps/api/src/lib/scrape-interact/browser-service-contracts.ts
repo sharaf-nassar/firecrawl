@@ -10,7 +10,8 @@ const MAX_REPLAY_REQUEST_BYTES = 16 * 1024 * 1024;
 const MAX_STORAGE_STATE_BYTES = 2 * 1024 * 1024;
 const MAX_ACTION_OPERATION_BYTES = 64 * 1024;
 const MAX_ACTION_RESULT_BYTES = 64 * 1024;
-const MAX_EVALUATE_RESULT_BYTES = 32 * 1024;
+const MAX_HOVER_BATCH_REFS = 16;
+const MAX_HOVER_BATCH_TEXT_BYTES = 1_024;
 const MAX_RECONCILIATION_REFERENCES = 25_000;
 export const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 const MAX_RUN_ARTIFACT_BYTES = 32 * 1024 * 1024;
@@ -243,62 +244,42 @@ const jsonSafeSchema = z.custom<JsonSafe>(value => {
   }
 });
 
-const jsonObjectSchema = z.custom<Record<string, JsonSafe>>(value => {
-  try {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      return false;
-    }
-    return isJsonSafeValue(value, new Set<object>(), 0);
-  } catch {
-    return false;
-  }
-});
-
 const refSchema = z.string().min(1).max(128);
 const textSchema = z.string().max(20_000);
 const safeIntegerSchema = z.number().int().safe().nonnegative();
+const hoverBatchRefsSchema = z
+  .array(refSchema)
+  .min(1)
+  .max(MAX_HOVER_BATCH_REFS)
+  .superRefine((refs, context) => {
+    if (new Set(refs).size !== refs.length) {
+      context.addIssue({ code: "custom", message: "duplicate locator ref" });
+    }
+  });
 
 const browserOperationSchema = z
   .discriminatedUnion("kind", [
-    z.strictObject({ kind: z.literal("snapshot") }),
+    z.strictObject({ kind: z.literal("navigate"), url: httpUrlSchema }),
     z.strictObject({ kind: z.literal("click"), ref: refSchema }),
+    z.strictObject({ kind: z.literal("hover"), ref: refSchema }),
     z.strictObject({
-      kind: z.literal("fill"),
-      ref: refSchema,
-      value: textSchema,
+      kind: z.literal("hover_batch"),
+      refs: hoverBatchRefsSchema,
     }),
     z.strictObject({
       kind: z.literal("type"),
       ref: refSchema,
-      value: textSchema,
-      delayMs: z.number().int().min(0).max(250),
-    }),
-    z.strictObject({
-      kind: z.literal("press"),
-      ref: refSchema,
-      key: z.string().min(1).max(64),
-    }),
-    z.strictObject({
-      kind: z.literal("select"),
-      ref: refSchema,
-      values: z.array(z.string().max(512)).max(20),
-    }),
-    z.strictObject({
-      kind: z.literal("scroll"),
-      deltaX: z.number().int().min(-10_000).max(10_000),
-      deltaY: z.number().int().min(-10_000).max(10_000),
+      text: textSchema,
+      clear: z.boolean().optional(),
     }),
     z.strictObject({
       kind: z.literal("wait"),
       milliseconds: z.number().int().min(0).max(30_000),
     }),
-    z.strictObject({ kind: z.literal("get_text"), ref: refSchema.optional() }),
-    z.strictObject({ kind: z.literal("get_url") }),
-    z.strictObject({ kind: z.literal("navigate"), url: httpUrlSchema }),
+    z.strictObject({ kind: z.literal("extract"), ref: refSchema.optional() }),
     z.strictObject({
-      kind: z.literal("evaluate"),
-      expression: textSchema,
-      args: jsonObjectSchema,
+      kind: z.literal("screenshot"),
+      fullPage: z.boolean().optional(),
     }),
   ])
   .superRefine((operation, context) => {
@@ -337,47 +318,65 @@ const boundedPageStateSchema = z.strictObject({
   snapshotExcerpt: z.string().max(40_000),
 });
 
-const evaluateOperationResultSchema = z
-  .strictObject({ kind: z.literal("evaluate"), value: jsonSafeSchema })
-  .superRefine((result, context) => {
-    addSizeIssue(
-      result.value,
-      MAX_EVALUATE_RESULT_BYTES,
-      context,
-      "evaluate result exceeds 32 KiB",
-    );
-  });
+const hoverBatchTextSchema = z.string().superRefine((value, context) => {
+  if (Buffer.byteLength(value, "utf8") > MAX_HOVER_BATCH_TEXT_BYTES) {
+    context.addIssue({
+      code: "custom",
+      message: "hover batch item text exceeds 1,024 UTF-8 bytes",
+    });
+  }
+});
+
+const hoverBatchItemErrorSchema = z.strictObject({
+  category: z.enum(["stale_ref", "target_not_actionable"]),
+  message: z.string().max(1_024),
+});
+
+const hoverBatchItemResultSchema = z.discriminatedUnion("outcome", [
+  z.strictObject({
+    ref: refSchema,
+    outcome: z.literal("succeeded"),
+    text: hoverBatchTextSchema,
+  }),
+  z.strictObject({
+    ref: refSchema,
+    outcome: z.literal("failed_no_effect"),
+    error: hoverBatchItemErrorSchema,
+  }),
+]);
 
 /** @public */
 export const browserOperationResultSchema = z
   .discriminatedUnion("kind", [
     z.strictObject({
-      kind: z.literal("snapshot"),
-      refCount: z.number().int().min(0).max(500),
+      kind: z.literal("navigate"),
+      applied: z.literal(true),
     }),
-    ...(
-      [
-        "click",
-        "fill",
-        "type",
-        "press",
-        "select",
-        "scroll",
-        "navigate",
-      ] as const
-    ).map(kind =>
-      z.strictObject({ kind: z.literal(kind), applied: z.literal(true) }),
-    ),
+    z.strictObject({ kind: z.literal("click"), applied: z.literal(true) }),
+    z.strictObject({ kind: z.literal("hover"), applied: z.literal(true) }),
+    z.strictObject({
+      kind: z.literal("hover_batch"),
+      items: z
+        .array(hoverBatchItemResultSchema)
+        .min(1)
+        .max(MAX_HOVER_BATCH_REFS),
+    }),
+    z.strictObject({ kind: z.literal("type"), applied: z.literal(true) }),
     z.strictObject({
       kind: z.literal("wait"),
       waitedMs: z.number().int().min(0).max(30_000),
     }),
     z.strictObject({
-      kind: z.literal("get_text"),
+      kind: z.literal("extract"),
       text: z.string().max(40_000),
     }),
-    z.strictObject({ kind: z.literal("get_url"), url: httpUrlSchema }),
-    evaluateOperationResultSchema,
+    z.strictObject({
+      kind: z.literal("screenshot"),
+      artifactId: canonicalUuidSchema,
+      contentType: z.literal("image/png"),
+      byteSize: z.number().int().safe().positive().max(MAX_ARTIFACT_BYTES),
+      checksum: sha256Schema,
+    }),
   ])
   .superRefine((result, context) => {
     addSizeIssue(
@@ -1464,9 +1463,10 @@ const PRIVATE_V1_CUSTOM_CONSTANTS = {
   jsonSafeMaxKeyChars: JSON_SAFE_MAX_KEY_CHARS,
   jsonSafeMaxStringBytes: JSON_SAFE_MAX_STRING_BYTES,
   operationMaxBytes: MAX_ACTION_OPERATION_BYTES,
-  evaluateResultMaxBytes: MAX_EVALUATE_RESULT_BYTES,
   operationResultMaxBytes: MAX_ACTION_RESULT_BYTES,
   actionResponseMaxBytes: MAX_PRIVATE_RESPONSE_BYTES,
+  hoverBatchMaxRefs: MAX_HOVER_BATCH_REFS,
+  hoverBatchMaxTextBytes: MAX_HOVER_BATCH_TEXT_BYTES,
   storageStateMaxBytes: MAX_STORAGE_STATE_BYTES,
   headerMaxCount: HEADER_MAX_COUNT,
   headerMaxBytes: HEADER_MAX_BYTES,
@@ -1541,17 +1541,17 @@ const PRIVATE_V1_SEMANTIC_RULE_REGISTRY = {
   },
   operation_request_v1: {
     target: "browserOperationSchema",
-    constantKeys: ["operationMaxBytes"],
-    behaviorKeys: [],
+    constantKeys: ["operationMaxBytes", "hoverBatchMaxRefs"],
+    behaviorKeys: ["hover_batch_unique_refs"],
   },
   operation_result_v1: {
     target: "actionExecutionResultSchema",
     constantKeys: [
-      "evaluateResultMaxBytes",
       "operationResultMaxBytes",
       "actionResponseMaxBytes",
+      "hoverBatchMaxTextBytes",
     ],
-    behaviorKeys: [],
+    behaviorKeys: ["hover_batch_utf8_item_text_bound"],
   },
   indexeddb_v1: {
     target: "storageStateV1Schema",
@@ -1919,10 +1919,14 @@ const AUTH_SEMANTIC_RULE_REGISTRY = {
 export const BROWSER_SERVICE_ERROR_STATUS = {
   browser_service_runtime_mismatch: 503,
   browser_unavailable: 503,
+  concurrency_exceeded: 429,
   unauthorized: 401,
   invalid_request: 400,
   request_too_large: 413,
   deadline_expired: 408,
+  session_not_found: 404,
+  replay_unavailable: 409,
+  replay_unsupported: 409,
   control_generation_required: 503,
   control_generation_in_progress: 409,
   control_generation_conflict: 409,
@@ -2284,7 +2288,6 @@ export function buildApiPrivateV1Inventory(
         maxActionOperationBytes: MAX_ACTION_OPERATION_BYTES,
         maxActionResultBytes: MAX_ACTION_RESULT_BYTES,
         maxArtifactBytes: MAX_ARTIFACT_BYTES,
-        maxEvaluateResultBytes: MAX_EVALUATE_RESULT_BYTES,
         maxPrivateRequestBytes: MAX_PRIVATE_REQUEST_BYTES,
         maxPrivateResponseBytes: MAX_PRIVATE_RESPONSE_BYTES,
         maxReconciliationReferences: MAX_RECONCILIATION_REFERENCES,

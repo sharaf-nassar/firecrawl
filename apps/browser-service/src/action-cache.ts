@@ -12,10 +12,11 @@ import {
 export type BrowserOperationEffect = BrowserActionExecutionV1["effect"];
 
 const READ_ONLY_OPERATIONS = new Set<BrowserOperation["kind"]>([
-  "snapshot",
+  "extract",
+  "hover",
+  "hover_batch",
+  "screenshot",
   "wait",
-  "get_text",
-  "get_url",
 ]);
 
 export function trustedEffectForOperation(
@@ -47,6 +48,7 @@ const pendingActionBrand: unique symbol = Symbol("pendingAction");
 
 export type PendingAction = Readonly<{
   actionId: string;
+  runId: string;
   sequence: number;
   [pendingActionBrand]: true;
 }>;
@@ -96,7 +98,9 @@ function assertResultIdentity(
     result.sequence !== request.sequence ||
     result.normalizedProposalHash !== request.normalizedProposalHash
   ) {
-    throw new TypeError("terminal action result identity does not match request");
+    throw new TypeError(
+      "terminal action result identity does not match request",
+    );
   }
 }
 
@@ -113,12 +117,12 @@ function assertSuccessResultKind(
 }
 
 export class SessionActionCache {
-  readonly #byActionId = new Map<string, TerminalEntry>();
-  readonly #actionIdBySequence = new Map<number, string>();
+  readonly #byRunSequence = new Map<string, TerminalEntry>();
+  readonly #runSequenceByActionId = new Map<string, string>();
   #pendingEntry: PendingEntry | null = null;
 
   get size(): number {
-    return this.#byActionId.size;
+    return this.#byRunSequence.size;
   }
 
   get pending(): boolean {
@@ -126,7 +130,7 @@ export class SessionActionCache {
   }
 
   has(actionId: string): boolean {
-    return this.#byActionId.has(actionId);
+    return this.#runSequenceByActionId.has(actionId);
   }
 
   begin(untrustedRequest: BrowserActionExecutionV1): ActionCacheLookup {
@@ -145,17 +149,18 @@ export class SessionActionCache {
     }
 
     const identity = canonicalJson(request);
-    const existing = this.#byActionId.get(request.actionId);
+    const runSequence = `${request.runId}:${request.sequence}`;
+    const existing = this.#byRunSequence.get(runSequence);
     if (existing !== undefined) {
       if (existing.identity !== identity) {
-        protocolError("action ID was reused with another identity");
+        protocolError("action run sequence was reused with another identity");
       }
       return Object.freeze({ kind: "replay", result: existing.result });
     }
 
-    const sequenceActionId = this.#actionIdBySequence.get(request.sequence);
-    if (sequenceActionId !== undefined) {
-      protocolError("action sequence was reused by another action");
+    const actionRunSequence = this.#runSequenceByActionId.get(request.actionId);
+    if (actionRunSequence !== undefined) {
+      protocolError("action ID was reused with another identity");
     }
 
     if (this.#pendingEntry !== null) {
@@ -164,6 +169,7 @@ export class SessionActionCache {
 
     const token = Object.freeze({
       actionId: request.actionId,
+      runId: request.runId,
       sequence: request.sequence,
       [pendingActionBrand]: true as const,
     });
@@ -208,9 +214,7 @@ export class SessionActionCache {
       actionExecutionResultSchema.parse(untrustedResult),
     );
     if (result.outcome !== expectedOutcome) {
-      throw new TypeError(
-        `terminal action result must be ${expectedOutcome}`,
-      );
+      throw new TypeError(`terminal action result must be ${expectedOutcome}`);
     }
     assertResultIdentity(entry.request, result);
     assertSuccessResultKind(entry.request, result);
@@ -220,11 +224,9 @@ export class SessionActionCache {
       identity: entry.identity,
       result,
     });
-    this.#byActionId.set(entry.request.actionId, terminal);
-    this.#actionIdBySequence.set(
-      entry.request.sequence,
-      entry.request.actionId,
-    );
+    const runSequence = `${entry.request.runId}:${entry.request.sequence}`;
+    this.#byRunSequence.set(runSequence, terminal);
+    this.#runSequenceByActionId.set(entry.request.actionId, runSequence);
     return result;
   }
 }

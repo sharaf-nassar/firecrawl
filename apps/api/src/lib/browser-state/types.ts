@@ -4,8 +4,6 @@ import type {
   browser_session_activities,
   browser_sessions,
 } from "../../db/schema/public";
-import { z } from "zod";
-import { canonicalUuidSchema } from "../scrape-interact/browser-service-contracts";
 import type { BrowserOperationResultV1 } from "../scrape-interact/browser-service-contracts";
 
 /** @public */
@@ -45,46 +43,20 @@ export type BrowserInteractActionState =
 export type BrowserOperationEffect = "read_only" | "side_effecting";
 
 export type BrowserOperation =
-  | { kind: "snapshot" }
-  | { kind: "click"; ref: string }
-  | { kind: "fill"; ref: string; value: string }
-  | { kind: "type"; ref: string; value: string; delayMs: number }
-  | { kind: "press"; ref: string; key: string }
-  | { kind: "select"; ref: string; values: string[] }
-  | { kind: "scroll"; deltaX: number; deltaY: number }
-  | { kind: "wait"; milliseconds: number }
-  | { kind: "get_text"; ref?: string }
-  | { kind: "get_url" }
   | { kind: "navigate"; url: string }
-  | { kind: "evaluate"; expression: string; args: Record<string, unknown> };
+  | { kind: "click"; ref: string }
+  | { kind: "hover"; ref: string }
+  | { kind: "hover_batch"; refs: string[] }
+  | { kind: "type"; ref: string; text: string; clear?: boolean }
+  | { kind: "wait"; milliseconds: number }
+  | { kind: "extract"; ref?: string }
+  | { kind: "screenshot"; fullPage?: boolean };
 
 export interface BoundedPageState {
   url: string;
   title: string;
   snapshotExcerpt: string;
 }
-
-export const adapterAuthorizationBindingSchema = z.strictObject({
-  adapterJobId: canonicalUuidSchema,
-  adapterSupervisorId: canonicalUuidSchema,
-  adapterProcessId: z.number().int().positive().safe(),
-});
-
-export type AdapterAuthorizationBinding = z.infer<
-  typeof adapterAuthorizationBindingSchema
->;
-
-export type AdapterPendingBinding = Omit<
-  AdapterAuthorizationBinding,
-  "adapterProcessId"
-> & { adapterProcessId: null };
-
-export type AdapterPendingAuthorizationInput = {
-  adapterJobId: string;
-  adapterSupervisorId: string;
-  capabilityToken: string;
-  onAccepted(binding: AdapterAuthorizationBinding): Promise<void>;
-};
 
 export type ObservationV1 =
   | {
@@ -181,9 +153,7 @@ export type CreateInteractRunInput = Omit<
 export type InteractRunTransitionPatch = Partial<
   Pick<
     BrowserInteractRunRow,
-    | "adapter_process_id"
     | "adapter_job_id"
-    | "adapter_supervisor_id"
     | "started_at"
     | "finished_at"
     | "cancelled_at"

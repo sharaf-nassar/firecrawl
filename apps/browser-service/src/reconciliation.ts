@@ -2127,6 +2127,9 @@ async function validateAuthorities(
         );
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
+          if (reference.kind === "replay_checkpoint_cleanup_intent") {
+            continue;
+          }
           throw err("reconciliation_reference_missing", "authority is missing");
         }
         throw error;

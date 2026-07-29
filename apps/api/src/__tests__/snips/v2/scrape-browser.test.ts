@@ -29,8 +29,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function interactWithReplicaRetry(
   jobId: string,
   body: {
-    code: string;
-    language?: "python" | "node" | "bash";
+    prompt: string;
     timeout?: number;
   },
   identity: Identity,
@@ -109,144 +108,13 @@ describe("Scrape browser interact replay", () => {
   const canRunLocalReplayContracts =
     canRunLocalBrowserContracts && HAS_PLAYWRIGHT;
 
-  itIf(canRunReplayHappyPath)(
-    "replays scrape URL/waitFor/actions before interactive code runs",
-    async () => {
-      const marker = crypto.randomUUID();
-      const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
-      let scrapeId: string | null = null;
-
-      try {
-        const scrapeResponse = await scrapeRaw(
-          {
-            url,
-            origin: "website-replay-test",
-            waitFor: 500,
-            actions: [
-              {
-                type: "executeJavascript",
-                script: `window.__firecrawlReplayMarker = "${marker}";`,
-              },
-            ],
-          },
-          identity,
-        );
-
-        expect(scrapeResponse.statusCode).toBe(200);
-        expect(scrapeResponse.body.success).toBe(true);
-        expect(typeof scrapeResponse.body.scrape_id).toBe("string");
-        scrapeId = scrapeResponse.body.scrape_id as string;
-        scrapes.add(scrapeId);
-
-        const executeResponse = await interactWithReplicaRetry(
-          scrapeId,
-          {
-            language: "node",
-            timeout: 60,
-            code: `
-              const replayMarker = await page.evaluate(() => window.__firecrawlReplayMarker ?? null);
-              console.log(replayMarker ?? "missing-marker");
-            `,
-          },
-          identity,
-        );
-
-        expect(executeResponse.statusCode).toBe(200);
-        expect(executeResponse.body.success).toBe(true);
-        expect(executeResponse.body.stdout).toContain(marker);
-        expect(typeof executeResponse.body.cdpUrl).toBe("string");
-        expect(executeResponse.body.cdpUrl.length).toBeGreaterThan(0);
-      } finally {
-        if (scrapeId) {
-          await stopTrackedScrape(scrapeId);
-        }
-      }
-    },
-    scrapeTimeout,
-  );
-
-  itIf(canRunReplayHappyPath)(
-    "keeps a non-blank replay tab in the foreground for follow-up execs",
-    async () => {
-      const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
-      let scrapeId: string | null = null;
-
-      try {
-        const scrapeResponse = await scrapeRaw(
-          {
-            url,
-            origin: "website-replay-test",
-            actions: [
-              {
-                type: "executeJavascript",
-                script: "window.open('about:blank', '_blank');",
-              },
-            ],
-          },
-          identity,
-        );
-
-        expect(scrapeResponse.statusCode).toBe(200);
-        expect(scrapeResponse.body.success).toBe(true);
-        expect(typeof scrapeResponse.body.scrape_id).toBe("string");
-        scrapeId = scrapeResponse.body.scrape_id as string;
-        scrapes.add(scrapeId);
-
-        const executeResponse = await interactWithReplicaRetry(
-          scrapeId,
-          {
-            language: "node",
-            timeout: 60,
-            code: `
-              const visibleUrls = [];
-              for (const candidate of page.context().pages()) {
-                try {
-                  const isVisible = await candidate.evaluate(
-                    () => document.visibilityState === "visible",
-                  );
-                  if (isVisible) {
-                    visibleUrls.push(candidate.url());
-                  }
-                } catch {}
-              }
-
-              const visibleNonBlankUrl =
-                visibleUrls.find(value => value !== "about:blank") ?? "about:blank";
-              console.log(visibleNonBlankUrl);
-            `,
-          },
-          identity,
-        );
-
-        expect(executeResponse.statusCode).toBe(200);
-        expect(executeResponse.body.success).toBe(true);
-
-        const visibleUrl =
-          executeResponse.body.stdout
-            ?.trim()
-            .split("\n")
-            .filter(Boolean)
-            .pop() ?? "";
-
-        expect(visibleUrl).not.toBe("about:blank");
-        expect(visibleUrl).toContain(TEST_SUITE_WEBSITE);
-      } finally {
-        if (scrapeId) {
-          await stopTrackedScrape(scrapeId);
-        }
-      }
-    },
-    scrapeTimeout,
-  );
-
   itIf(!TEST_SELF_HOST)(
     "returns 400 for invalid scrape job id format",
     async () => {
       const response = await scrapeInteractRaw(
         "not-a-valid-uuid",
         {
-          code: "console.log('hi')",
-          language: "node",
+          prompt: "Read the page heading.",
         },
         identity,
       );
@@ -265,8 +133,7 @@ describe("Scrape browser interact replay", () => {
       const response = await scrapeInteractRaw(
         crypto.randomUUID(),
         {
-          code: "console.log('hi')",
-          language: "node",
+          prompt: "Read the page heading.",
         },
         identity,
       );
@@ -296,8 +163,7 @@ describe("Scrape browser interact replay", () => {
       const executeResponse = await interactWithReplicaRetry(
         scrapeId,
         {
-          code: "console.log('should fail')",
-          language: "node",
+          prompt: "Read the page heading.",
         },
         otherIdentity,
       );
@@ -329,8 +195,7 @@ describe("Scrape browser interact replay", () => {
       const executeResponse = await interactWithReplicaRetry(
         scrapeId,
         {
-          code: "console.log('should not run')",
-          language: "node",
+          prompt: "Read the page heading.",
         },
         identity,
       );
@@ -345,12 +210,11 @@ describe("Scrape browser interact replay", () => {
   );
 
   itIf(canRunLocalBrowserContracts)(
-    "enforces prompt/code XOR before looking up replay state",
+    "requires a prompt and rejects code before looking up replay state",
     async () => {
-      const both = await scrapeInteractRaw(
+      const code = await scrapeInteractRaw(
         crypto.randomUUID(),
         {
-          prompt: "read",
           code: "console.log('must not run')",
         } as never,
         identity,
@@ -361,8 +225,8 @@ describe("Scrape browser interact replay", () => {
         identity,
       );
 
-      expect(both.statusCode).toBe(400);
-      expect(both.body.success).toBe(false);
+      expect(code.statusCode).toBe(400);
+      expect(code.body.success).toBe(false);
       expect(neither.statusCode).toBe(400);
       expect(neither.body.success).toBe(false);
     },
@@ -391,7 +255,6 @@ describe("Scrape browser interact replay", () => {
           scrapeId!,
           {
             prompt: "Read the controlled fixture heading.",
-            language: "node",
             timeout: 5,
             origin: "local-browser-snip",
             integration: "_local-browser-snip",
@@ -419,7 +282,7 @@ describe("Scrape browser interact replay", () => {
   );
 
   itIf(canRunLocalReplayContracts)(
-    "returns typed unavailability for a controlled prompt replay",
+    "completes a controlled prompt replay",
     async () => {
       let scrapeId: string | undefined;
       try {
@@ -440,9 +303,9 @@ describe("Scrape browser interact replay", () => {
         const response = await scrapeInteractRaw(
           scrapeId!,
           {
-            prompt: "Read the controlled fixture heading.",
-            language: "node",
-            timeout: 5,
+            prompt:
+              "Return exactly the page heading text and no other commentary.",
+            timeout: 60,
             origin: "local-browser-snip",
             integration: "_local-browser-snip",
             allowedDomains: [],
@@ -450,11 +313,11 @@ describe("Scrape browser interact replay", () => {
           identity,
         );
 
-        expect(response.statusCode).toBe(503);
-        expect(response.body).toEqual({
-          success: false,
-          error: "Browser state is temporarily unavailable.",
-        });
+        expect(response.statusCode).toBe(200);
+        expect(response.body.success).toBe(true);
+        expect(response.body.output).toContain("Firecrawl Test Website");
+        expect(response.body.turnCount).toBeGreaterThan(0);
+        expect(response.body.actionCount).toBeGreaterThanOrEqual(0);
       } finally {
         if (scrapeId) {
           await stopTrackedScrape(scrapeId);

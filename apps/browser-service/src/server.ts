@@ -85,17 +85,6 @@ import { artifactMetadataHeaders, type ArtifactService } from "./artifacts.js";
 export const RELAY_TOKEN_HEADER = "x-firecrawl-relay-token";
 
 const RECONCILIATION_DEADLINE_MS = 60_000;
-const ERROR_STATUS = Object.freeze({
-  invalid_request: 400,
-  browser_unavailable: 503,
-  replay_unavailable: 409,
-  replay_unsupported: 409,
-  concurrency_exceeded: 429,
-  session_not_found: 404,
-  profile_prepare_failed: 503,
-  profile_finalize_failed: 409,
-  profile_discard_failed: 409,
-});
 
 type ProfileTransport = Pick<
   ProfileStore,
@@ -256,7 +245,9 @@ function errorEnvelope(cause: unknown): ErrorEnvelope {
     category = cause.category;
     message = safeMessage(cause);
     status =
-      (ERROR_STATUS as Readonly<Record<string, number>>)[category] ?? 503;
+      (BROWSER_SERVICE_ERROR_STATUS as Readonly<Record<string, number>>)[
+        category
+      ] ?? BROWSER_SERVICE_ERROR_STATUS.browser_unavailable;
   } else if (cause instanceof z.ZodError || cause instanceof SyntaxError) {
     category = "invalid_request";
     message = "invalid private request";
@@ -519,9 +510,11 @@ function boundedReconciliationAdmission(
   deadlineAtMs: number,
 ): Readonly<{
   admission: ReconciliationExecutionAdmission;
+  retainGenerationAdmission(): void;
   cleanup(): void;
 }> {
   const controller = new AbortController();
+  let requestBoundaryActive = true;
   let deadlineExpired = Date.now() >= deadlineAtMs;
   const abortForDeadline = (): void => {
     deadlineExpired = true;
@@ -540,14 +533,17 @@ function boundedReconciliationAdmission(
     admission: Object.freeze({
       signal: controller.signal,
       assertAdmitted(): void {
-        if (deadlineExpired || Date.now() >= deadlineAtMs) {
+        if (
+          requestBoundaryActive &&
+          (deadlineExpired || Date.now() >= deadlineAtMs)
+        ) {
           abortForDeadline();
           throw new BrowserServiceError(
             "reconciliation_deadline_exceeded",
             "reconciliation deadline exceeded",
           );
         }
-        if (transportSignal.aborted) {
+        if (requestBoundaryActive && transportSignal.aborted) {
           throw new BrowserServiceError(
             "reconciliation_required",
             "reconciliation transport is unavailable",
@@ -556,10 +552,20 @@ function boundedReconciliationAdmission(
         admission.assertAdmitted();
       },
     }),
+    retainGenerationAdmission() {
+      controller.signal.throwIfAborted();
+      admission.assertAdmitted();
+      requestBoundaryActive = false;
+      clearTimeout(timer);
+      transportSignal.removeEventListener("abort", abort);
+    },
     cleanup() {
       clearTimeout(timer);
-      admission.signal.removeEventListener("abort", abort);
       transportSignal.removeEventListener("abort", abort);
+      if (requestBoundaryActive) {
+        admission.signal.removeEventListener("abort", abort);
+        controller.abort();
+      }
     },
   });
 }
@@ -887,11 +893,13 @@ export function createBrowserServiceServer(
             );
             try {
               bounded.admission.assertAdmitted();
-              return await options.reconcile(
+              const outcome = await options.reconcile(
                 requestValue,
                 bounded.admission,
                 authorization.correlationId,
               );
+              bounded.retainGenerationAdmission();
+              return outcome;
             } finally {
               bounded.cleanup();
             }

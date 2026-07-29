@@ -326,7 +326,7 @@ async function configureLocalPersistenceHarness(
   const mode = localPersistenceHarnessMode(command);
   if (mode === null) return;
 
-  localBrowserHarness = mode === "browser" || mode === "real-codex-browser";
+  localBrowserHarness = mode === "browser";
   if (localBrowserHarness) {
     assertNoHarnessBrowserUserOverrides(process.env);
   }

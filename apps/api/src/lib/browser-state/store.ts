@@ -42,12 +42,11 @@ import {
   calculateBrowserSessionCredits,
 } from "../browser-billing";
 import {
-  codeRunResultSchema,
   promptRunResultSchema,
   runtimeUuidSchema,
-  type CodeRunResult,
   type PromptRunResult,
 } from "../browser-runtime/protocol";
+import { BROWSER_ACTION_OPERATION_TIMEOUT_MS } from "../browser-runtime/operation-timeout";
 import {
   normalizeBrowserAction,
   submitBrowserActionV1Schema,
@@ -703,15 +702,15 @@ export async function getBrowserActionByIdentity(
 export type ActiveBrowserRunAuthority = {
   runId: string;
   ownerId: string;
+  requestId: string;
   sessionId: string;
   runtimeSessionId: string;
   expectedSessionVersion: number;
   adapterJobId: string;
-  adapterSupervisorId: string;
-  adapterProcessId: number;
   deadline: Date;
   perOperationTimeoutMs: number;
   allowedDomains?: readonly string[];
+  deleteAfter: Date | null;
   zeroDataRetention: false;
 };
 
@@ -725,12 +724,11 @@ export async function getActiveBrowserRunAuthority(
     .select({
       runId: schema.browser_interact_runs.id,
       ownerId: schema.browser_interact_runs.owner_id,
+      requestId: schema.browser_interact_runs.request_id,
       sessionId: schema.browser_interact_runs.session_id,
       runtimeSessionId: schema.browser_sessions.browser_id,
       expectedSessionVersion: schema.browser_sessions.runtime_epoch,
       adapterJobId: schema.browser_interact_runs.adapter_job_id,
-      adapterSupervisorId: schema.browser_interact_runs.adapter_supervisor_id,
-      adapterProcessId: schema.browser_interact_runs.adapter_process_id,
       deadline: schema.browser_interact_runs.deadline_at,
       runState: schema.browser_interact_runs.state,
       sessionState: schema.browser_sessions.state,
@@ -738,32 +736,13 @@ export async function getActiveBrowserRunAuthority(
       sessionOwnerId: schema.browser_sessions.owner_id,
       absoluteDeadline: schema.browser_sessions.absolute_deadline_at,
       allowedDomains: schema.browser_sessions.workspace_id,
-      perOperationTimeoutMs:
-        schema.browser_capabilities.per_operation_timeout_ms,
-      capabilityActivatedAt: schema.browser_capabilities.activated_at,
-      capabilityRevokedAt: schema.browser_capabilities.revoked_at,
-      capabilityExpiresAt: schema.browser_capabilities.expires_at,
-      capabilityWallDeadlineAt: schema.browser_capabilities.wall_deadline_at,
       requestTargetHint: schema.requests.target_hint,
+      requestDeleteAfter: schema.requests.dr_clean_by,
     })
     .from(schema.browser_interact_runs)
     .innerJoin(
       schema.browser_sessions,
       eq(schema.browser_sessions.id, schema.browser_interact_runs.session_id),
-    )
-    .innerJoin(
-      schema.browser_capabilities,
-      and(
-        eq(schema.browser_capabilities.run_id, schema.browser_interact_runs.id),
-        eq(
-          schema.browser_capabilities.owner_id,
-          schema.browser_interact_runs.owner_id,
-        ),
-        eq(
-          schema.browser_capabilities.session_id,
-          schema.browser_interact_runs.session_id,
-        ),
-      ),
     )
     .innerJoin(
       schema.requests,
@@ -782,29 +761,22 @@ export async function getActiveBrowserRunAuthority(
     row.ownerId !== row.sessionOwnerId ||
     row.runtimeSessionId === null ||
     row.adapterJobId === null ||
-    row.adapterSupervisorId === null ||
-    row.adapterProcessId === null ||
-    row.capabilityActivatedAt === null ||
-    row.capabilityRevokedAt !== null ||
     row.requestTargetHint === "<redacted due to zero data retention>" ||
     new Date(row.deadline).getTime() <= Date.now() ||
-    new Date(row.absoluteDeadline).getTime() <= Date.now() ||
-    new Date(row.capabilityExpiresAt).getTime() <= Date.now() ||
-    new Date(row.capabilityWallDeadlineAt).getTime() <= Date.now()
+    new Date(row.absoluteDeadline).getTime() <= Date.now()
   ) {
     return null;
   }
   return {
     runId: row.runId,
     ownerId: row.ownerId,
+    requestId: row.requestId,
     sessionId: row.sessionId,
     runtimeSessionId: row.runtimeSessionId,
     expectedSessionVersion: row.expectedSessionVersion,
     adapterJobId: row.adapterJobId,
-    adapterSupervisorId: row.adapterSupervisorId,
-    adapterProcessId: row.adapterProcessId,
     deadline: new Date(row.deadline),
-    perOperationTimeoutMs: row.perOperationTimeoutMs,
+    perOperationTimeoutMs: BROWSER_ACTION_OPERATION_TIMEOUT_MS,
     allowedDomains: Object.freeze(
       (() => {
         try {
@@ -819,6 +791,8 @@ export async function getActiveBrowserRunAuthority(
         }
       })(),
     ),
+    deleteAfter:
+      row.requestDeleteAfter === null ? null : new Date(row.requestDeleteAfter),
     // Request logging persists this exact redaction sentinel for ZDR. Reject
     // it above before returning the narrow non-ZDR proof consumed before
     // artifact bytes are read.
@@ -1382,7 +1356,6 @@ async function lockAdapterRun(
 ): Promise<Record<string, unknown>> {
   const result = await lease.transaction.query(
     `SELECT r.id, r.mode, r.state, r.session_id, r.adapter_job_id,
-            r.adapter_supervisor_id, r.adapter_process_id,
             s.state AS session_state, s.current_run_id
        FROM browser_interact_runs r
        JOIN browser_sessions s ON s.id = r.session_id
@@ -1394,6 +1367,37 @@ async function lockAdapterRun(
     throw new Error("Browser adapter run does not exist");
   }
   return result.rows[0] as Record<string, unknown>;
+}
+
+/** @public Starts a prompt-only action run without host process bindings. */
+export async function startAdapterRun(
+  lease: BrowserStateMutationLease,
+  runId: string,
+): Promise<void> {
+  const parsedRunId = runtimeUuidSchema.parse(runId);
+  const row = await lockAdapterRun(lease, parsedRunId);
+  if (
+    row.mode !== "prompt" ||
+    row.state !== "queued" ||
+    row.session_state !== "executing" ||
+    row.current_run_id !== row.id
+  ) {
+    throw new Error("Browser adapter run is not startable");
+  }
+  const started = await lease.transaction.query(
+    `UPDATE browser_interact_runs
+        SET state = 'running',
+            adapter_job_id = $1,
+            started_at = COALESCE(started_at, now())
+      WHERE id = $1
+        AND mode = 'prompt'
+        AND state = 'queued'
+      RETURNING id`,
+    [parsedRunId],
+  );
+  if (started.rows.length !== 1) {
+    throw new Error("Browser adapter run start lost ownership");
+  }
 }
 
 /** @public Counts the exact durable action ledger under a mutation lease. */
@@ -1414,35 +1418,27 @@ export async function countInteractActions(
 export async function finishAdapterRun(
   lease: BrowserStateMutationLease,
   runId: string,
-  untrustedResult: PromptRunResult | CodeRunResult,
+  untrustedResult: PromptRunResult,
 ): Promise<void> {
   const row = await lockAdapterRun(lease, runId);
   if (
-    !["prompt", "code"].includes(String(row.mode)) ||
+    row.mode !== "prompt" ||
     row.state !== "running" ||
-    row.adapter_job_id === null ||
-    row.adapter_supervisor_id === null ||
-    row.adapter_process_id === null ||
+    row.adapter_job_id !== row.id ||
     row.session_state !== "executing" ||
     row.current_run_id !== row.id
   ) {
     throw new Error("Browser adapter run is not active");
   }
 
-  let outputReference: Record<string, unknown>;
-  if (row.mode === "prompt") {
-    const result = promptRunResultSchema.parse(untrustedResult);
-    const actionCount = await countInteractActions(lease, runId);
-    if (result.actionCount !== actionCount) {
-      throw Object.assign(new Error("Adapter action count mismatch"), {
-        category: "model_protocol_error",
-      });
-    }
-    outputReference = { version: 1, mode: "prompt", ...result };
-  } else {
-    const result = codeRunResultSchema.parse(untrustedResult);
-    outputReference = { version: 1, mode: "code", ...result };
+  const result = promptRunResultSchema.parse(untrustedResult);
+  const actionCount = await countInteractActions(lease, runId);
+  if (result.actionCount !== actionCount) {
+    throw Object.assign(new Error("Adapter action count mismatch"), {
+      category: "model_protocol_error",
+    });
   }
+  const outputReference = { version: 1, mode: "prompt", ...result };
 
   const run = await lease.transaction.query(
     `UPDATE browser_interact_runs
@@ -1488,10 +1484,8 @@ export async function failAdapterRun(
 ): Promise<void> {
   const row = await lockAdapterRun(lease, runId);
   if (
-    !["prompt", "code"].includes(String(row.mode)) ||
-    !["starting", "running"].includes(String(row.state)) ||
-    row.adapter_job_id === null ||
-    row.adapter_supervisor_id === null
+    row.mode !== "prompt" ||
+    !["queued", "running"].includes(String(row.state))
   ) {
     if (
       ["failed", "cancelled", "timed_out", "interrupted"].includes(
@@ -1515,7 +1509,7 @@ export async function failAdapterRun(
             output_reference = NULL,
             finished_at = COALESCE(finished_at, now())
       WHERE id = $1
-        AND state IN ('starting', 'running')
+        AND state IN ('queued', 'running')
       RETURNING id`,
     [
       runtimeUuidSchema.parse(runId),

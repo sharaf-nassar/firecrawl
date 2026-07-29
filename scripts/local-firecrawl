@@ -9,15 +9,16 @@ compose=(
   --project-name "$project_name"
   --project-directory "$repo_root"
   -f "$repo_root/compose.yaml"
-  -f "$repo_root/compose.local.yaml"
 )
-compose_config_sources="$repo_root/compose.yaml,$repo_root/compose.local.yaml"
+compose_config_sources="$repo_root/compose.yaml"
+legacy_compose_config_sources="$repo_root/compose.yaml,$repo_root/compose.local.yaml"
 if [[ -n "${LOCAL_FIRECRAWL_COMPOSE_OVERRIDE:-}" ]]; then
   if [[ "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE" != /* ]] ||
     [[ ! -f "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE" ]] ||
     [[ -L "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE" ]] ||
     [[ "$(readlink -f -- "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE")" != "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE" ]]; then
-    printf '%s\n' 'LOCAL_FIRECRAWL_COMPOSE_OVERRIDE must be a canonical file' >&2
+    printf '%s\n' \
+      'LOCAL_FIRECRAWL_COMPOSE_OVERRIDE must be a canonical file' >&2
     exit 64
   fi
   compose+=(-f "$LOCAL_FIRECRAWL_COMPOSE_OVERRIDE")
@@ -26,6 +27,7 @@ fi
 if [[ -n "${LOCAL_FIRECRAWL_ENV_FILE:-}" ]]; then
   compose+=(--env-file "$LOCAL_FIRECRAWL_ENV_FILE")
 fi
+
 control_runtime_root="${XDG_RUNTIME_DIR:-/run/user/${UID}}"
 control_runtime_dir="$control_runtime_root/firecrawl-control"
 runtime_lock_path="$control_runtime_dir/lifecycle.lock"
@@ -37,24 +39,10 @@ if [[ "$project_name" != firecrawl ]]; then
   fi
   runtime_lock_path="$control_runtime_dir/lifecycle.${project_name}.lock"
 fi
+
 lock_wait_seconds="${LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS:-30}"
 one_shot_timeout_seconds="${LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS:-300}"
-drain_timeout_seconds="${LOCAL_FIRECRAWL_DRAIN_TIMEOUT_SECONDS:-45}"
-host_runtime_dir="${LOCAL_FIRECRAWL_HOST_RUNTIME_DIR:-/run/user/${UID}/firecrawl}"
-host_manifest_path="${LOCAL_FIRECRAWL_HOST_MANIFEST:-/opt/firecrawl/current/manifest.json}"
-host_builder="${LOCAL_FIRECRAWL_HOST_BUILDER:-$repo_root/scripts/build-firecrawl-host}"
-host_gate_script="${LOCAL_FIRECRAWL_GATE_SCRIPT:-$repo_root/scripts/codex-browser-gate/run.mjs}"
-node22="/home/mamba/.nvm/versions/node/v22.22.1/bin/node"
-sealed_identity_dir=
-sealed_identity_path=
-if [[ "${LOCAL_FIRECRAWL_TESTING:-0}" != 1 ]] &&
-  { [[ "$host_runtime_dir" != "/run/user/${UID}/firecrawl" ]] ||
-    [[ "$host_manifest_path" != /opt/firecrawl/current/manifest.json ]] ||
-    [[ "$host_builder" != "$repo_root/scripts/build-firecrawl-host" ]] ||
-    [[ "$host_gate_script" != "$repo_root/scripts/codex-browser-gate/run.mjs" ]]; }; then
-  printf '%s\n' 'Local Firecrawl test path overrides are disabled' >&2
-  exit 64
-fi
+health_wait_timeout_seconds="${LOCAL_FIRECRAWL_HEALTH_WAIT_TIMEOUT_SECONDS:-180}"
 dependency_services=(
   playwright-service
   nuq-postgres
@@ -63,17 +51,23 @@ dependency_services=(
   app-postgres
   minio
 )
-long_running_services=(api browser-service "${dependency_services[@]}")
-one_shot_services=(browser-state-init minio-init)
+long_running_services=(
+  api
+  browser-service
+  browser-interaction-worker
+  browser-interaction-egress-proxy
+  "${dependency_services[@]}"
+)
+one_shot_services=(browser-state-init app-db-migrate minio-init)
 diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
 
 usage() {
   printf '%s\n' \
-    "Usage: ${0##*/} {install-host|start|stop|restart|lock-path}" \
+    "Usage: ${0##*/} {start|stop|restart|lock-path}" \
     "       ${0##*/} status [--json]" \
-    "       ${0##*/} health [--json] [--live-codex]" \
-    "       ${0##*/} logs [all|api|browser-service|adapter|broker] [correlation-id]" \
-    "       ${0##*/} diagnose-host-job --correlation-id <uuid> --job-id <uuid> --json" \
+    "       ${0##*/} health [--json]" \
+    "       ${0##*/} probe-egress" \
+    "       ${0##*/} logs [all|api|browser-service|browser-interaction-worker|browser-interaction-egress-proxy] [correlation-id]" \
     >&2
 }
 
@@ -88,11 +82,116 @@ validate_runtime_options() {
       'LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS must be a positive integer' >&2
     exit 64
   fi
-  if [[ ! "$drain_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ ! "$health_wait_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
     printf '%s\n' \
-      'LOCAL_FIRECRAWL_DRAIN_TIMEOUT_SECONDS must be a positive integer' >&2
+      'LOCAL_FIRECRAWL_HEALTH_WAIT_TIMEOUT_SECONDS must be a positive integer' >&2
     exit 64
   fi
+}
+
+resolve_local_codex_runtime() {
+  local auth_mode
+  local auth_path
+  local ca_bundle_input
+  local ca_bundle_path
+  local command_path
+  local package_dir
+  local resolved_path
+  local seen
+  local -a resolved_entrypoints=()
+
+  while IFS= read -r command_path; do
+    if [[ "$command_path" != /* ]] || [[ "$command_path" == *$'\n'* ]]; then
+      continue
+    fi
+    resolved_path="$(readlink -e -- "$command_path" 2>/dev/null || true)"
+    if [[ -z "$resolved_path" ]] || [[ ! -f "$resolved_path" ]]; then
+      continue
+    fi
+    seen=false
+    for package_dir in "${resolved_entrypoints[@]}"; do
+      if [[ "$package_dir" == "$resolved_path" ]]; then
+        seen=true
+        break
+      fi
+    done
+    if [[ "$seen" == false ]]; then
+      resolved_entrypoints+=("$resolved_path")
+    fi
+  done < <(type -a -P codex 2>/dev/null || true)
+
+  if (( ${#resolved_entrypoints[@]} == 0 )); then
+    printf '%s\n' \
+      'Local Codex package is unavailable: codex is not an external executable on PATH' \
+      >&2
+    return 1
+  fi
+  if (( ${#resolved_entrypoints[@]} != 1 )); then
+    printf '%s\n' \
+      'Local Codex package is ambiguous: PATH resolves codex to multiple installations' \
+      >&2
+    return 1
+  fi
+
+  resolved_path="${resolved_entrypoints[0]}"
+  package_dir="$(readlink -e -- "$(dirname -- "$(dirname -- "$resolved_path")")" \
+    2>/dev/null || true)"
+  if [[ -z "$package_dir" ]] ||
+    [[ ! -f "$package_dir/package.json" ]] ||
+    [[ "$(readlink -e -- "$package_dir/bin/codex.js" 2>/dev/null || true)" != "$resolved_path" ]] ||
+    ! jq -e '
+      .name == "@openai/codex" and
+      .bin.codex == "bin/codex.js"
+    ' "$package_dir/package.json" >/dev/null 2>&1; then
+    printf '%s\n' \
+      'Local Codex package is invalid: active codex is not an @openai/codex package entrypoint' \
+      >&2
+    return 1
+  fi
+
+  if [[ -z "${HOME:-}" ]] || [[ "$HOME" != /* ]]; then
+    printf '%s\n' 'Local Codex auth is unavailable: HOME is not absolute' >&2
+    return 1
+  fi
+  auth_path="$(readlink -e -- "$HOME/.codex/auth.json" 2>/dev/null || true)"
+  if [[ -z "$auth_path" ]] || [[ ! -f "$auth_path" ]]; then
+    printf '%s\n' \
+      'Local Codex auth is unavailable: ~/.codex/auth.json is missing' >&2
+    return 1
+  fi
+  if [[ "$(stat -c '%u:%h' -- "$auth_path")" != "$UID:1" ]]; then
+    printf '%s\n' \
+      'Local Codex auth is unsafe: ~/.codex/auth.json ownership or link count is invalid' \
+      >&2
+    return 1
+  fi
+  auth_mode="$(stat -c '%a' -- "$auth_path")"
+  if [[ "$auth_mode" != 400 && "$auth_mode" != 600 ]]; then
+    printf '%s\n' \
+      'Local Codex auth is unsafe: ~/.codex/auth.json must use mode 0400 or 0600' \
+      >&2
+    return 1
+  fi
+
+  ca_bundle_input="${LOCAL_FIRECRAWL_CA_BUNDLE_FILE:-/etc/ssl/certs/ca-certificates.crt}"
+  if [[ "$ca_bundle_input" != /* ]] || [[ "$ca_bundle_input" == *$'\n'* ]]; then
+    printf '%s\n' \
+      'Local CA bundle is invalid: LOCAL_FIRECRAWL_CA_BUNDLE_FILE must be absolute' \
+      >&2
+    return 1
+  fi
+  ca_bundle_path="$(readlink -e -- "$ca_bundle_input" 2>/dev/null || true)"
+  if [[ -z "$ca_bundle_path" ]] || [[ ! -f "$ca_bundle_path" ]] ||
+    [[ ! -r "$ca_bundle_path" ]] || [[ ! -s "$ca_bundle_path" ]]; then
+    printf '%s\n' \
+      'Local CA bundle is unavailable: expected a readable nonempty regular file' \
+      >&2
+    return 1
+  fi
+
+  export LOCAL_CODEX_PACKAGE_DIR="$package_dir"
+  export LOCAL_CODEX_AUTH_FILE="$auth_path"
+  export LOCAL_CODEX_CA_BUNDLE_FILE="$ca_bundle_path"
 }
 
 acquire_runtime_lock() {
@@ -136,7 +235,8 @@ acquire_runtime_lock() {
     return 70
   fi
   exec {runtime_lock_fd}<> "$runtime_lock_path"
-  fd_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "/proc/$$/fd/$runtime_lock_fd")"
+  fd_identity="$(stat -Lc '%d:%i:%u:%a:%h' \
+    -- "/proc/$$/fd/$runtime_lock_fd")"
   if [[ "$fd_identity" != "$lock_identity" ]] ||
     [[ "$(stat -c '%d:%i:%u:%a:%h' -- "$runtime_lock_path")" != "$lock_identity" ]]; then
     printf '%s\n' 'Lifecycle lock changed while opening' >&2
@@ -155,598 +255,775 @@ acquire_runtime_lock() {
   runtime_lock_held="$mode"
 }
 
-cleanup_sealed_identity() {
-  if [[ -n "$sealed_identity_dir" ]]; then
-    rm -rf -- "$sealed_identity_dir"
-  fi
-}
-
-trap cleanup_sealed_identity EXIT
-
-capture_host_identity_locked() {
-  [[ "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Identity capture requires the lifecycle lock' >&2; return 70; }
-  [[ -z "$sealed_identity_dir" ]] ||
-    { printf '%s\n' 'Host identity was already captured' >&2; return 70; }
-  sealed_identity_dir="$(mktemp -d \
-    "/tmp/firecrawl-host-identity.${UID}.XXXXXXXX")"
-  chmod 0700 -- "$sealed_identity_dir"
-  [[ "$(stat -c '%u:%a' -- "$sealed_identity_dir")" == "$UID:700" ]] ||
-    { printf '%s\n' 'Host identity directory is unsafe' >&2; return 1; }
-  sealed_identity_path="$sealed_identity_dir/codex-identity.json"
-  "$host_builder" \
-    --capture-active-identity --output "$sealed_identity_path" >/dev/null
-  [[ -f "$sealed_identity_path" &&
-    ! -L "$sealed_identity_path" &&
-    "$(stat -c '%u:%a:%h' -- "$sealed_identity_path")" == "$UID:600:1" ]] ||
-    { printf '%s\n' 'Captured host identity is unsafe' >&2; return 1; }
-}
-
-build_host_staging_locked() {
-  local cache_root
-  local staging
-
-  [[ "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Host publication requires the lifecycle lock' >&2; return 70; }
-  cache_root="$(getent passwd "$UID" | cut -d: -f6)/.cache/firecrawl-host-builds"
-  staging="$cache_root/staging-$BASHPID"
-  "$host_builder" \
-    --staging-only --output "$staging" \
-    --expected-identity "$sealed_identity_path" >&2 || return $?
-  jq -e --slurpfile identity "$sealed_identity_path" '
-    .codexAppServer.sourceIdentity == $identity[0]
-  ' "$staging/manifest.json" >/dev/null || return $?
-  printf '%s\n' "$staging"
-}
-
-publish_host_from_staging_locked() {
-  local staging="$1"
-  local mode="$2"
-  local -a sudo_command=(sudo)
-
-  [[ "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Host publication requires the lifecycle lock' >&2; return 70; }
-  [[ "$mode" == initial || "$mode" == refresh ]] ||
-    { printf '%s\n' 'Host publication mode is invalid' >&2; return 64; }
-  [[ "$staging" == /* && "$(readlink -f -- "$staging")" == "$staging" ]] ||
-    { printf '%s\n' 'Host staging path is invalid' >&2; return 64; }
-  if [[ "$mode" == refresh ]]; then
-    sudo_command+=( -n )
-  fi
-  "${sudo_command[@]}" \
-    "$repo_root/host/browser-runtime/install-root.sh" \
-    --staging "$staging" \
-    --adapter-user "$(id -un)" \
-    --adapter-uid "$UID"
-  systemctl --user daemon-reload
-  systemctl --user enable firecrawl-execution-adapter.service
-}
-
-refresh_host_locked() {
-  local prechecked_drift="${1:-0}"
-  local staging
-  if [[ ! -f "$host_manifest_path" ]]; then
-    printf '%s\n' \
-      'Browser host is not installed; run scripts/local-firecrawl install-host' \
-      >&2
-    return 1
-  fi
-  if [[ "$prechecked_drift" != 1 ]] && "$host_builder" \
-    --verify-installed-identity --manifest "$host_manifest_path" \
-    --expected-identity "$sealed_identity_path" >/dev/null; then
-    return
-  fi
-  staging="$(build_host_staging_locked)"
-  publish_host_from_staging_locked "$staging" refresh
-  "$host_builder" \
-    --verify-installed-identity --manifest "$host_manifest_path" \
-    --expected-identity "$sealed_identity_path" >/dev/null
-}
-
-prepare_host_runtime_locked() {
-  local token
-
-  [[ "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Runtime preparation requires the lifecycle lock' >&2; return 70; }
-  [[ "$host_runtime_dir" == /* ]] ||
-    { printf '%s\n' 'Host runtime directory is invalid' >&2; return 70; }
-  if [[ -L "$host_runtime_dir" ]]; then
-    printf '%s\n' 'Host runtime directory must not be a symlink' >&2
-    return 1
-  fi
-  install -d -m 0700 -- "$host_runtime_dir"
-  rm -f -- "$host_runtime_dir/clean-stop"
-  [[ "$(stat -c '%u:%a' -- "$host_runtime_dir")" == "$UID:700" ]] ||
-    { printf '%s\n' 'Host runtime directory ownership is invalid' >&2; return 1; }
-  if [[ ! -e "$host_runtime_dir/adapter.token" ]]; then
-    token="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-    umask 077
-    ( set -o noclobber; printf '%s\n' "$token" > "$host_runtime_dir/adapter.token" )
-  fi
-  [[ -f "$host_runtime_dir/adapter.token" &&
-    ! -L "$host_runtime_dir/adapter.token" ]] ||
-    { printf '%s\n' 'Adapter token file is unsafe' >&2; return 1; }
-  chmod 0600 -- "$host_runtime_dir/adapter.token"
-  [[ "$(stat -c '%u:%a' -- "$host_runtime_dir/adapter.token")" == "$UID:600" ]] ||
-    { printf '%s\n' 'Adapter token ownership is invalid' >&2; return 1; }
-  token="$(<"$host_runtime_dir/adapter.token")"
-  [[ "$token" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
-    { printf '%s\n' 'Adapter token is invalid' >&2; return 1; }
-}
-
-start_host_services_locked() {
-  [[ "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Host service start requires the lifecycle lock' >&2; return 70; }
-  if ! systemctl is-active --quiet firecrawl-sandbox-broker.socket; then
-    printf '%s\n' \
-      'Sandbox broker socket is inactive; rerun install-host as an administrator' \
-      >&2
-    return 1
-  fi
-  prepare_host_runtime_locked
-  systemctl --user daemon-reload
-  systemctl --user start firecrawl-execution-adapter.service
-  systemctl --user is-active --quiet firecrawl-execution-adapter.service
-}
-
-stop_host_services_locked() {
-  [[ "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Host service stop requires the lifecycle lock' >&2; return 70; }
-  if systemctl --user is-active --quiet \
-    firecrawl-execution-adapter.service; then
-    systemctl --user stop firecrawl-execution-adapter.service
-  fi
-  if systemctl --user is-active --quiet \
-    firecrawl-execution-adapter.service; then
-    printf '%s\n' 'Browser execution adapter did not stop' >&2
-    return 1
-  fi
-}
-
-api_image_cli() {
-  "${compose[@]}" run --rm --no-deps api \
-    node "dist/src/cli/$1.js" "${@:2}"
-}
-
-api_running_cli() {
-  "${compose[@]}" exec -T api \
-    node "dist/src/cli/$1.js" "${@:2}"
-}
-
-clean_stop_proven() {
-  [[ -f "$host_runtime_dir/clean-stop" &&
-    ! -L "$host_runtime_dir/clean-stop" &&
-    "$(stat -c '%u:%a' -- "$host_runtime_dir/clean-stop")" == "$UID:600" &&
-    "$(<"$host_runtime_dir/clean-stop")" == version=1 ]]
-}
-
-verify_adapter_health_json() {
-  local health_json="$1"
-  jq -e \
-    --slurpfile manifest "$host_manifest_path" \
-    'keys == [
-       "brokerProtocolSha256",
-       "codexArtifactSha256",
-       "codexCliVersion",
-       "codexProtocolSchemaSha256",
-       "model",
-       "reasoningEffort",
-       "status",
-       "version"
-     ] and
-     .version == 1 and .status == "ok" and
-     .codexCliVersion == $manifest[0].codexAppServer.sourceIdentity.version and
-     .codexArtifactSha256 == $manifest[0].codexAppServer.artifactSha256 and
-     .codexProtocolSchemaSha256 ==
-       $manifest[0].codexAppServer.protocolSha256 and
-     .brokerProtocolSha256 == $manifest[0].brokerContractSha256 and
-     .model == "gpt-5.6-terra" and .reasoningEffort == "medium"' \
-    <<< "$health_json" >/dev/null
-}
-
-verify_runtime_status_json() {
-  local status_json="$1"
-  jq -e '
-    keys == [
-      "activeBrowserSessions",
-      "activeCapabilities",
-      "activeCodeJobs",
-      "activePromptJobs",
-      "activeProxyGrants",
-      "activeWriterLeases",
-      "brokerProtocolSha256",
-      "codexArtifactSha256",
-      "codexCliVersion",
-      "codexProtocolSchemaSha256",
-      "firecrawlCloudFallbackAttempts",
-      "model",
-      "orphanProcesses",
-      "preparedHostJobs",
-      "reasoningEffort",
-      "runningHostJobs",
-      "startingHostJobs",
-      "status",
-      "unknownActionOutcomes",
-      "unsettledHostJobs",
-      "version"
-    ] and
-    .firecrawlCloudFallbackAttempts == 0 and
-    all(
-      .activeBrowserSessions,
-      .activeCapabilities,
-      .activeCodeJobs,
-      .activePromptJobs,
-      .activeProxyGrants,
-      .activeWriterLeases,
-      .orphanProcesses,
-      .preparedHostJobs,
-      .runningHostJobs,
-      .startingHostJobs,
-      .unsettledHostJobs,
-      .unknownActionOutcomes;
-      type == "number" and . >= 0 and floor == .
-    )
-  ' <<< "$status_json" >/dev/null
-  verify_adapter_health_json "$(
-    jq '{
-      version, status, codexCliVersion, codexArtifactSha256,
-      codexProtocolSchemaSha256, brokerProtocolSha256, model,
-      reasoningEffort
-    }' <<< "$status_json"
-  )"
-}
-
-shallow_host_health() {
-  local health_json
-  "$host_builder" \
-    --verify-installed-identity --manifest "$host_manifest_path" >/dev/null
-  systemctl is-active --quiet firecrawl-sandbox-broker.socket
-  systemctl is-active --quiet firecrawl-sandbox-broker.service
-  systemctl --user is-active --quiet firecrawl-execution-adapter.service
-  health_json="$(api_image_cli browser-runtime-status --health-only)"
-  verify_adapter_health_json "$health_json"
+prepare_recovery_compose_sources() {
+  # Compose expands bind sources even for read-only recovery commands. These
+  # inert placeholders let Compose address existing containers without
+  # depending on the current Codex installation or auth seed.
+  export LOCAL_CODEX_PACKAGE_DIR=/dev/null
+  export LOCAL_CODEX_AUTH_FILE=/dev/null
+  export LOCAL_CODEX_CA_BUNDLE_FILE=/dev/null
 }
 
 validate_compose() {
+  local failed_invariant
+  local source_mode="${1:-current}"
   local rendered
 
-  "${compose[@]}" config --quiet
-  rendered="$("${compose[@]}" config --format json)"
-  jq -e \
-    --arg runtime "$host_runtime_dir" \
-    '
-      .services.api.environment.LOCAL_BROWSER_SERVICE_ENABLED == "true" and
-      .services["browser-service"].environment
-        .LOCAL_BROWSER_SERVICE_ENABLED == "true" and
-      .services["browser-service"].environment.MAX_BROWSER_SESSIONS == "4" and
-      (
-        .services.api.environment.BROWSER_SERVICE_API_KEY |
-        test("^[A-Za-z0-9_-]{43}$")
-      ) and
-      .services.api.environment.BROWSER_EXECUTION_ADAPTER_SOCKET ==
-        "/run/firecrawl-adapter/adapter.sock" and
-      .services.api.environment.BROWSER_ADAPTER_TOKEN_FILE ==
-        "/run/firecrawl-adapter/adapter.token" and
-      (
-        [.services.api.volumes[] | select(
-          .type == "bind" and .source == $runtime and
-          .target == "/run/firecrawl-adapter" and .read_only == true
-        )] | length
-      ) == 1 and
-      (
-        [.services | to_entries[] |
-          select((.value.ports // []) | length > 0) | .key]
-      ) == ["api"]
-    ' <<< "$rendered" >/dev/null || {
-      printf '%s\n' \
-        'Local browser environment is invalid; run scripts/upgrade-local-env-browser-runtime' \
-        >&2
-      return 1
-    }
-}
-
-run_one_shot() {
-  local service="$1"
-  local status
-
-  set +e
-  timeout --signal=TERM --kill-after=10s "${one_shot_timeout_seconds}s" \
-    "${compose[@]}" up --no-deps --force-recreate \
-    --abort-on-container-exit --exit-code-from "$service" "$service"
-  status=$?
-  set -e
-  if (( status != 0 )); then
-    "${compose[@]}" stop --timeout 10 "$service" >/dev/null 2>&1 || true
-    "${compose[@]}" kill "$service" >/dev/null 2>&1 || true
-    printf '%s failed or timed out (status: %s)\n' "$service" "$status" >&2
-    return "$status"
-  fi
-  require_completed_one_shot "$service"
-}
-
-start_runtime() {
-  local status_json
-
-  "${compose[@]}" build api browser-state-init browser-service
-  shallow_host_health
-  run_one_shot browser-state-init
-  "${compose[@]}" up -d --no-deps --wait browser-service
-  "${compose[@]}" up -d --wait "${dependency_services[@]}"
-  run_one_shot minio-init
-  "${compose[@]}" up -d --no-deps --wait api
-  "${compose[@]}" exec -T api node -e \
-    "fetch('http://127.0.0.1:' + (process.env.PORT || '3002') + '/', {
-       signal: AbortSignal.timeout(10000),
-     }).then(response => {
-       if (response.status >= 500) process.exit(1);
-     }).catch(() => process.exit(1))"
-  status_json="$(api_running_cli browser-runtime-status)"
-  verify_runtime_status_json "$status_json"
-  verify_adapter_health_json "$(
-    jq '{
-      version, status, codexCliVersion, codexArtifactSha256,
-      codexProtocolSchemaSha256, brokerProtocolSha256, model, reasoningEffort
-    }' <<< "$status_json"
-  )"
-  check_port_policy
-}
-
-verify_quiescent_runtime_status() {
-  local status_json="$1"
-
-  verify_runtime_status_json "$status_json" || return $?
-  jq -e '
-    all(
-      .activeBrowserSessions,
-      .activeCapabilities,
-      .activeCodeJobs,
-      .activePromptJobs,
-      .activeProxyGrants,
-      .activeWriterLeases,
-      .orphanProcesses,
-      .preparedHostJobs,
-      .runningHostJobs,
-      .startingHostJobs,
-      .unsettledHostJobs,
-      .unknownActionOutcomes;
-      . == 0
-    )
-  ' <<< "$status_json" >/dev/null
-}
-
-drain_and_stop_runtime() {
-  local api_container
-  local clean_shutdown=0
-  local shutdown_failure=0
-  local status_json
-
-  api_container="$("${compose[@]}" ps -q api)"
-  if [[ -n "$api_container" ]]; then
-    if timeout --signal=TERM --kill-after=5s "${drain_timeout_seconds}s" \
-      "${compose[@]}" exec -T api \
-        node dist/src/cli/browser-runtime-drain.js; then
-      if status_json="$(api_running_cli browser-runtime-status)" &&
-        verify_quiescent_runtime_status "$status_json"; then
-        clean_shutdown=1
-      else
-        printf '%s\n' \
-          'Browser runtime remained active after graceful drain' >&2
-        shutdown_failure=1
-      fi
-      "${compose[@]}" stop api
-    else
-      printf '%s\n' \
-        'Graceful browser drain timed out; stopping API before forced drain' \
-        >&2
-      "${compose[@]}" stop --timeout 10 api
-      if timeout --signal=TERM --kill-after=5s "${drain_timeout_seconds}s" \
-        "${compose[@]}" run --rm --no-deps api \
-        node dist/src/cli/browser-runtime-drain.js --force-after-api-stop; then
-        if status_json="$(api_image_cli browser-runtime-status)" &&
-          verify_quiescent_runtime_status "$status_json"; then
-          clean_shutdown=1
-        else
-          printf '%s\n' \
-            'Browser runtime remained active after forced drain' >&2
-          shutdown_failure=1
-        fi
-      else
-        printf '%s\n' \
-          'Forced browser drain failed after API stop' >&2
-        shutdown_failure=1
-      fi
-    fi
-  elif systemctl --user is-active --quiet \
-    firecrawl-execution-adapter.service; then
-    if timeout --signal=TERM --kill-after=5s "${drain_timeout_seconds}s" \
-      "${compose[@]}" run --rm --no-deps api \
-      node dist/src/cli/browser-runtime-drain.js --force-after-api-stop; then
-      if status_json="$(api_image_cli browser-runtime-status)" &&
-        verify_quiescent_runtime_status "$status_json"; then
-        clean_shutdown=1
-      else
-        printf '%s\n' \
-          'Browser runtime remained active after forced drain' >&2
-        shutdown_failure=1
-      fi
-    else
-      printf '%s\n' 'Forced browser drain failed while API was stopped' >&2
-      shutdown_failure=1
-    fi
-  elif clean_stop_proven; then
-    clean_shutdown=1
+  if [[ "$source_mode" == current ]]; then
+    resolve_local_codex_runtime
+  elif [[ "$source_mode" == recovery ]]; then
+    prepare_recovery_compose_sources
   else
-    printf '%s\n' \
-      'Browser runtime shutdown cannot be proven from the stopped state' >&2
-    shutdown_failure=1
+    printf '%s\n' 'Internal Compose validation mode is invalid' >&2
+    return 70
   fi
-  "${compose[@]}" stop browser-service
-  stop_host_services_locked
-  "${compose[@]}" stop "${dependency_services[@]}"
-  if (( clean_shutdown == 1 && shutdown_failure == 0 )); then
-    install -d -m 0700 -- "$host_runtime_dir"
-    rm -f -- "$host_runtime_dir/clean-stop"
-    ( set -o noclobber
-      umask 077
-      printf '%s\n' 'version=1' > "$host_runtime_dir/clean-stop"
-    )
-  fi
-  if (( shutdown_failure != 0 )); then
-    return 1
-  fi
-}
-
-disposable_browser_health() {
-  local base_url="http://127.0.0.1:${PORT:-3002}"
-  local create_response
-  local execute_response
-  local session_id=
-
-  cleanup_disposable_browser() {
-    if [[ -n "$session_id" ]]; then
-      curl --fail --silent --show-error --max-time 15 \
-        -X DELETE --output /dev/null \
-        "$base_url/v2/browser/$session_id" || true
-    fi
-  }
-  trap cleanup_disposable_browser RETURN
-  create_response="$(
-    curl --fail --silent --show-error --max-time 30 \
-      -H 'content-type: application/json' \
-      --data '{"ttl":30,"activityTtl":10,"streamWebView":false}' \
-      "$base_url/v2/browser"
+  "${compose[@]}" --profile maintenance config --quiet
+  rendered="$(
+    "${compose[@]}" --profile maintenance config --format json
   )"
-  session_id="$(jq -er '
-    if keys == ["cdpUrl","expiresAt","id","interactiveLiveViewUrl",
-      "liveViewUrl","success"] and .success == true and
-      (.id | type == "string")
-    then .id else error("invalid disposable browser response") end
-  ' <<< "$create_response")"
-  for expected in 1 2; do
-    execute_response="$(
-      curl --fail --silent --show-error --max-time 30 \
-        -H 'content-type: application/json' \
-        --data \
-          "{\"code\":\"return $expected\",\"language\":\"node\",\"timeout\":10}" \
-        "$base_url/v2/browser/$session_id/execute"
-    )"
-    jq -e --arg expected "$expected" '
-      .success == true and .exitCode == 0 and .killed == false and
-      ((.result | tostring) == $expected)
-    ' <<< "$execute_response" >/dev/null
-  done
-  cleanup_disposable_browser
-  session_id=
-  trap - RETURN
-}
-
-redact_local_logs() {
-  sed -E \
-    -e 's/("(authorization|bearer|token|secret|password|capability|prompt|source|page(Value|Text)?)"[[:space:]]*:[[:space:]]*)"([^"\\]|\\.)*"/\1"[REDACTED]"/Ig' \
-    -e 's/(Bearer[[:space:]]+)[^[:space:],;}]*/\1[REDACTED]/Ig' \
-    -e 's/(authorization|token|secret|password|capability|prompt|source|page(Value|Text)?)([=:][[:space:]]*)[^,;}]*/\1\3[REDACTED]/Ig' \
-    -e 's#(/home/|/root/)[^ ,;}]*(auth\\.json|config\\.toml)#[REDACTED_PATH]#g'
-}
-
-run_live_codex_gate() {
-  local attestation
-  local gate_dir
-  local gate_status
-
-  gate_dir="$(mktemp -d "$control_runtime_dir/live-codex-gate.XXXXXXXX")"
-  chmod 0700 -- "$gate_dir"
-  attestation="$gate_dir/attestation.json"
-  set +e
-  "$node22" "$host_gate_script" \
-    --runs 3 --attestation-out "$attestation" >/dev/null
-  gate_status=$?
-  set -e
-  if (( gate_status != 0 )); then
-    rm -rf -- "$gate_dir"
-    return "$gate_status"
-  fi
-  if [[ ! -f "$attestation" ]] ||
-    [[ -L "$attestation" ]] ||
-    [[ "$(stat -c '%u:%a:%h' -- "$attestation")" != "$UID:600:1" ]] ||
-    ! jq -e --slurpfile manifest "$host_manifest_path" '
-      keys == [
-        "actions",
-        "approvals",
-        "codexIdentity",
-        "featureSha256",
-        "formatVersion",
-        "model",
-        "reasoningEffort",
-        "runCount",
-        "schemaSha256",
-        "tools",
-        "turns",
-        "writes"
-      ] and
-      .formatVersion == 1 and
-      .codexIdentity == $manifest[0].codexAppServer.sourceIdentity and
-      .runCount == 3 and
-      .model == $manifest[0].codexAppServer.model and
-      .reasoningEffort == $manifest[0].codexAppServer.reasoningEffort and
-      .schemaSha256 == $manifest[0].codexAppServer.protocolSha256 and
-      .featureSha256 == $manifest[0].codexAppServer.featureSha256 and
-      .turns == 6 and .actions == 3 and .writes == 3 and
-      .tools == 0 and .approvals == 0
-    ' "$attestation" >/dev/null; then
-    rm -rf -- "$gate_dir"
-    printf '%s\n' 'Live Codex Gate attestation is invalid' >&2
-    return 1
-  fi
-  if ! "$host_builder" \
-    --verify-installed-identity --manifest "$host_manifest_path" >/dev/null; then
-    rm -rf -- "$gate_dir"
-    printf '%s\n' 'Codex identity changed during live Gate' >&2
-    return 78
-  fi
-  rm -rf -- "$gate_dir"
-}
-
-filter_correlation() {
-  local correlation="${1:-}"
-  if [[ -z "$correlation" ]]; then
-    cat
-  else
-    awk -v correlation="$correlation" 'index($0, correlation) != 0'
-  fi
-}
-
-show_logs() {
-  local target="$1"
-  local correlation="${2:-}"
-
-  case "$target" in
-    all)
+  if ! failed_invariant="$(
+    jq -r \
+    --arg codex_package "$LOCAL_CODEX_PACKAGE_DIR" \
+    --arg codex_auth "$LOCAL_CODEX_AUTH_FILE" \
+    --arg codex_ca_bundle "$LOCAL_CODEX_CA_BUNDLE_FILE" '
+    [
       {
-        "${compose[@]}" logs --no-color --tail=200 \
-          "${diagnostic_services[@]}"
-        journalctl --user --no-pager -n 200 \
-          --user-unit=firecrawl-execution-adapter.service
-        journalctl --no-pager -n 200 \
-          -u firecrawl-sandbox-broker.service \
-          -u firecrawl-sandbox-broker.socket
-      } 2>&1
-      ;;
-    api|browser-service)
-      "${compose[@]}" logs --no-color --tail=200 "$target" 2>&1
-      ;;
-    adapter)
-      journalctl --user --no-pager -n 200 \
-        --user-unit=firecrawl-execution-adapter.service 2>&1
-      ;;
-    broker)
-      journalctl --no-pager -n 200 \
-        -u firecrawl-sandbox-broker.service \
-        -u firecrawl-sandbox-broker.socket 2>&1
-      ;;
+        name: "api_local_browser_service_enabled",
+        ok: (.services.api.environment.LOCAL_BROWSER_SERVICE_ENABLED == "true")
+      },
+      {
+        name: "browser_service_local_enabled",
+        ok: (
+          .services["browser-service"].environment
+            .LOCAL_BROWSER_SERVICE_ENABLED == "true"
+        )
+      },
+      {
+        name: "browser_service_session_limit",
+        ok: (
+          .services["browser-service"].environment.MAX_BROWSER_SESSIONS == "4"
+        )
+      },
+      {
+        name: "api_browser_service_key_format",
+        ok: (
+          (.services.api.environment.BROWSER_SERVICE_API_KEY // "") |
+          test("^[A-Za-z0-9_-]{43}$")
+        )
+      },
+      {
+        name: "api_worker_token_format",
+        ok: (
+          (.services.api.environment.BROWSER_INTERACTION_WORKER_TOKEN // "") |
+          test("^[A-Za-z0-9_-]{43}$")
+        )
+      },
+      {
+        name: "worker_token_consistency",
+        ok: (
+          .services.api.environment.BROWSER_INTERACTION_WORKER_TOKEN ==
+          .services["browser-interaction-worker"].environment
+            .BROWSER_INTERACTION_WORKER_TOKEN
+        )
+      },
+      {
+        name: "api_worker_socket_path",
+        ok: (
+          .services.api.environment.BROWSER_INTERACTION_WORKER_SOCKET_PATH ==
+          "/run/firecrawl-interaction/worker.sock"
+        )
+      },
+      {
+        name: "worker_socket_path",
+        ok: (
+          .services["browser-interaction-worker"].environment
+            .BROWSER_INTERACTION_WORKER_SOCKET_PATH ==
+          "/run/firecrawl-interaction/worker.sock"
+        )
+      },
+      {
+        name: "api_worker_group",
+        ok: (.services.api.group_add == ["1000"])
+      },
+      {
+        name: "worker_user",
+        ok: (.services["browser-interaction-worker"].user == "1000:1000")
+      },
+      {
+        name: "worker_read_only_rootfs",
+        ok: (.services["browser-interaction-worker"].read_only == true)
+      },
+      {
+        name: "worker_capabilities",
+        ok: (.services["browser-interaction-worker"].cap_drop == ["ALL"])
+      },
+      {
+        name: "worker_no_new_privileges",
+        ok: (
+          (.services["browser-interaction-worker"].security_opt // []) |
+          index("no-new-privileges:true") != null
+        )
+      },
+      {
+        name: "worker_pid_limit",
+        ok: (.services["browser-interaction-worker"].pids_limit == 512)
+      },
+      {
+        name: "worker_ca_environment",
+        ok: (
+          .services["browser-interaction-worker"].environment
+            .CODEX_CA_CERTIFICATE ==
+          "/run/certs/host-ca-certificates.crt" and
+          .services["browser-interaction-worker"].environment.SSL_CERT_FILE ==
+          "/run/certs/host-ca-certificates.crt" and
+          .services["browser-interaction-worker"].environment
+            .NODE_EXTRA_CA_CERTS ==
+          "/run/certs/host-ca-certificates.crt"
+        )
+      },
+      {
+        name: "worker_proxy_environment",
+        ok: (
+          .services["browser-interaction-worker"].environment
+            .MODEL_EGRESS_PROXY_SOCKET_PATH ==
+          "/run/firecrawl-model-egress/proxy.sock" and
+          .services["browser-interaction-worker"].environment.HTTP_PROXY ==
+          "http://127.0.0.1:3128" and
+          .services["browser-interaction-worker"].environment.HTTPS_PROXY ==
+          "http://127.0.0.1:3128" and
+          .services["browser-interaction-worker"].environment.http_proxy ==
+          "http://127.0.0.1:3128" and
+          .services["browser-interaction-worker"].environment.https_proxy ==
+          "http://127.0.0.1:3128" and
+          .services["browser-interaction-worker"].environment.NO_PROXY == "" and
+          .services["browser-interaction-worker"].environment.no_proxy == ""
+        )
+      },
+      {
+        name: "worker_mounts",
+        ok: ((
+          [
+            (.services["browser-interaction-worker"].volumes // [])[] | {
+              type,
+              source,
+              target,
+              read_only: (.read_only // false),
+              create_host_path: .bind.create_host_path
+            }
+          ] |
+          sort_by(.target)
+        ) == [
+          {
+            type: "bind",
+            source: $codex_package,
+            target: "/opt/codex",
+            read_only: true,
+            create_host_path: false
+          },
+          {
+            type: "bind",
+            source: $codex_ca_bundle,
+            target: "/run/certs/host-ca-certificates.crt",
+            read_only: true,
+            create_host_path: false
+          },
+          {
+            type: "volume",
+            source: "browser-interaction-socket",
+            target: "/run/firecrawl-interaction",
+            read_only: false,
+            create_host_path: null
+          },
+          {
+            type: "volume",
+            source: "browser-interaction-egress-socket",
+            target: "/run/firecrawl-model-egress",
+            read_only: false,
+            create_host_path: null
+          },
+          {
+            type: "bind",
+            source: $codex_auth,
+            target: "/run/secrets/codex-auth.json",
+            read_only: true,
+            create_host_path: false
+          },
+          {
+            type: "volume",
+            source: "codex-auth-state",
+            target: "/var/lib/firecrawl-codex-auth-state",
+            read_only: false,
+            create_host_path: null
+          }
+        ])
+      },
+      {
+        name: "worker_network_disabled",
+        ok: (
+          .services["browser-interaction-worker"].network_mode == "none" and
+          ((.services["browser-interaction-worker"].networks // {}) |
+            length == 0)
+        )
+      },
+      {
+        name: "api_networks",
+        ok: ((
+          (.services.api.networks // {}) | keys | sort
+        ) == ["backend"])
+      },
+      {
+        name: "model_uplink_exclusive",
+        ok: ((
+          [
+            .services | to_entries[] |
+            select((.value.networks // {}) | has("model-uplink")) | .key
+          ]
+        ) == ["browser-interaction-egress-proxy"])
+      },
+      {
+        name: "egress_proxy_networks",
+        ok: (
+          (.services["browser-interaction-egress-proxy"].networks // {}) |
+          keys == ["model-uplink"]
+        )
+      },
+      {
+        name: "egress_proxy_identity",
+        ok: (
+          .services["browser-interaction-egress-proxy"].user == "1000:1000" and
+          .services["browser-interaction-egress-proxy"].read_only == true and
+          .services["browser-interaction-egress-proxy"].cap_drop == ["ALL"] and
+          .services["browser-interaction-egress-proxy"].pids_limit == 64 and
+          ((.services["browser-interaction-egress-proxy"].security_opt // []) |
+            index("no-new-privileges:true") != null)
+        )
+      },
+      {
+        name: "egress_proxy_mounts",
+        ok: ((
+          [
+            (.services["browser-interaction-egress-proxy"].volumes // [])[] | {
+              type,
+              source,
+              target,
+              read_only: (.read_only // false),
+              create_host_path: .bind.create_host_path
+            }
+          ]
+        ) == [
+          {
+            type: "volume",
+            source: "browser-interaction-egress-socket",
+            target: "/run/firecrawl-model-egress",
+            read_only: false,
+            create_host_path: null
+          }
+        ])
+      },
+      {
+        name: "egress_proxy_no_external_surface",
+        ok: (
+          ((.services["browser-interaction-egress-proxy"].ports // []) |
+            length == 0) and
+          ((.services["browser-interaction-egress-proxy"].expose // []) |
+            length == 0) and
+          ((.services["browser-interaction-egress-proxy"].volumes // []) |
+            map(.target) | index("/var/run/docker.sock") == null)
+        )
+      },
+      {
+        name: "egress_proxy_secret_minimization",
+        ok: (
+          (.services["browser-interaction-egress-proxy"].environment // {}) |
+          keys == ["MODEL_EGRESS_PROXY_SOCKET_PATH"]
+        )
+      },
+      {
+        name: "egress_socket_exclusive",
+        ok: ((
+          [
+            .services | to_entries[] |
+            select(
+              ((.value.volumes // []) |
+                map(.source) |
+                index("browser-interaction-egress-socket")) != null
+            ) |
+            .key
+          ] | sort
+        ) == [
+          "browser-interaction-egress-proxy",
+          "browser-interaction-worker"
+        ])
+      },
+      {
+        name: "api_mounts",
+        ok: ((
+          [
+            (.services.api.volumes // [])[] | {
+              type,
+              source,
+              target,
+              read_only: (.read_only // false)
+            }
+          ] |
+          sort_by(.target)
+        ) == [
+          {
+            type: "volume",
+            source: "browser-interaction-socket",
+            target: "/run/firecrawl-interaction",
+            read_only: true
+          },
+          {
+            type: "volume",
+            source: "fdb-cluster-file",
+            target: "/var/fdb",
+            read_only: true
+          }
+        ])
+      },
+      {
+        name: "worker_no_ports",
+        ok: (
+          (.services["browser-interaction-worker"].ports // []) | length == 0
+        )
+      },
+      {
+        name: "worker_no_expose",
+        ok: (
+          (.services["browser-interaction-worker"].expose // []) | length == 0
+        )
+      },
+      {
+        name: "worker_secret_minimization",
+        ok: (
+          (.services["browser-interaction-worker"].environment // {}) |
+          has("BROWSER_SERVICE_API_KEY") == false and
+          has("BROWSER_REPLAY_INGEST_API_KEY") == false and
+          has("APPLICATION_DATABASE_URL") == false and
+          has("ARTIFACT_MINIO_ACCESS_KEY") == false and
+          has("ARTIFACT_MINIO_SECRET_KEY") == false and
+          has("MINIO_ROOT_USER") == false and
+          has("MINIO_ROOT_PASSWORD") == false
+        )
+      },
+      {
+        name: "external_ports_api_only",
+        ok: ((
+          [
+            .services | to_entries[] |
+            select((.value.ports // []) | length > 0) | .key
+          ]
+        ) == ["api"])
+      },
+      {
+        name: "migration_backend_network",
+        ok: (
+          (.services["app-db-migrate"].networks // {}) | has("backend")
+        )
+      }
+    ] |
+    map(select(.ok | not)) |
+    .[0].name // empty
+  ' <<< "$rendered" 2>/dev/null
+  )"; then
+    failed_invariant=compose_schema_invalid
+  fi
+  if [[ -n "$failed_invariant" ]]; then
+    printf 'Local browser environment invariant failed: %s\n' \
+      "$failed_invariant" >&2
+    return 1
+  fi
+}
+
+known_legacy_compose_sources() {
+  local config_sources="$1"
+  local saw_local=
+  local saw_root=
+  local source
+  local -a sources
+
+  IFS=',' read -r -a sources <<< "$config_sources"
+  if (( ${#sources[@]} == 0 )); then
+    return 1
+  fi
+  for source in "${sources[@]}"; do
+    case "$source" in
+      "$repo_root/compose.yaml")
+        [[ -z "$saw_root" ]] || return 1
+        saw_root=1
+        ;;
+      "$repo_root/compose.local.yaml")
+        [[ -z "$saw_local" ]] || return 1
+        saw_local=1
+        ;;
+      "$repo_root/docker-compose.yaml") ;;
+      *) return 1 ;;
+    esac
+  done
+  [[ -n "$saw_root" || -n "$saw_local" ]]
+}
+
+api_container_provenance() {
+  local api_container_id="$1"
+  local config_sources
+  local environment
+  local mounts
+  local project
+  local service
+  local working_dir
+
+  config_sources="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
+      "$api_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  environment="$(
+    docker inspect --format \
+      '{{range .Config.Env}}{{println .}}{{end}}' \
+      "$api_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  mounts="$(
+    docker inspect --format \
+      '{{range .Mounts}}{{println .Destination}}{{end}}' \
+      "$api_container_id" | sed '/^$/d' | LC_ALL=C sort
+  )" || { printf '%s\n' unknown; return; }
+  project="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project"}}' \
+      "$api_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  service="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.service"}}' \
+      "$api_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  working_dir="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+      "$api_container_id"
+  )" || { printf '%s\n' unknown; return; }
+
+  if [[ "$project" != "$project_name" ]] ||
+    [[ "$service" != api ]] ||
+    [[ "$working_dir" != "$repo_root" ]]; then
+    printf '%s\n' unknown_identity
+    return
+  fi
+
+  if [[ "$config_sources" == "$compose_config_sources" ]] &&
+    grep -Fxq 'LOCAL_BROWSER_SERVICE_ENABLED=true' <<< "$environment" &&
+    [[ "$mounts" == $'/run/firecrawl-interaction\n/var/fdb' ]]; then
+    printf '%s\n' current
+    return
+  fi
+  if [[ "$config_sources" == "$legacy_compose_config_sources" ]] &&
+    grep -Fxq 'LOCAL_BROWSER_SERVICE_ENABLED=true' <<< "$environment" &&
+    [[ "$mounts" == $'/run/firecrawl-interaction\n/var/fdb' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+
+  if known_legacy_compose_sources "$config_sources" &&
+    [[ "$mounts" == /var/fdb ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+
+  if known_legacy_compose_sources "$config_sources" &&
+    [[ "$mounts" == $'/run/firecrawl-adapter\n/var/fdb' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+
+  if ! known_legacy_compose_sources "$config_sources"; then
+    printf '%s\n' unknown_sources
+  elif [[ "$mounts" != /var/fdb ]] &&
+    [[ "$mounts" != $'/run/firecrawl-adapter\n/var/fdb' ]] &&
+    [[ "$mounts" != $'/run/firecrawl-interaction\n/var/fdb' ]]; then
+    printf 'unknown_mounts:%s\n' "${mounts//$'\n'/,}"
+  else
+    printf '%s\n' unknown_environment
+  fi
+}
+
+browser_worker_container_provenance() {
+  local worker_container_id="$1"
+  local config_sources
+  local mounts
+  local project
+  local service
+  local working_dir
+
+  config_sources="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
+      "$worker_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  project="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project"}}' \
+      "$worker_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  service="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.service"}}' \
+      "$worker_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  working_dir="$(
+    docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+      "$worker_container_id"
+  )" || { printf '%s\n' unknown; return; }
+  mounts="$(
+    docker inspect --format \
+      '{{range .Mounts}}{{println .Type "|" .Destination "|" .RW}}{{end}}' \
+      "$worker_container_id" | sed '/^$/d' | LC_ALL=C sort
+  )" || { printf '%s\n' unknown; return; }
+
+  if [[ "$config_sources" == "$compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/certs/host-ca-certificates.crt | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /run/firecrawl-model-egress | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' current
+    return
+  fi
+  if [[ "$config_sources" == "$compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+  if [[ "$config_sources" == "$compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/certs/host-ca-certificates.crt | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+  if [[ "$config_sources" == "$legacy_compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/certs/host-ca-certificates.crt | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+  if [[ "$config_sources" == "$legacy_compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+  if [[ "$config_sources" == "$legacy_compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' legacy
+    return
+  fi
+
+  printf '%s\n' unknown
+}
+
+validate_running_api_provenance() {
+  local api_container_id
+  local provenance
+
+  api_container_id="$("${compose[@]}" ps -q api)"
+  if [[ -z "$api_container_id" ]]; then
+    return 0
+  fi
+  provenance="$(api_container_provenance "$api_container_id")"
+  case "$provenance" in
+    current|legacy) ;;
     *)
-      return 64
+      printf 'API container provenance does not match: %s\n' \
+        "$provenance" >&2
+      return 1
       ;;
-  esac | filter_correlation "$correlation" | tail -n 200 | redact_local_logs
+  esac
+}
+
+validate_running_project_provenance() {
+  local worker_container_id
+
+  validate_running_api_provenance
+  worker_container_id="$(
+    "${compose[@]}" ps --all -q browser-interaction-worker
+  )"
+  if [[ -z "$worker_container_id" ]]; then
+    return 0
+  fi
+  if [[ "$worker_container_id" == *$'\n'* ]] ||
+    [[ ! "$worker_container_id" =~ ^[0-9a-f]{64}$ ]] ||
+    [[ ! "$(browser_worker_container_provenance "$worker_container_id")" =~ ^(current|legacy)$ ]]; then
+    printf '%s\n' \
+      'Browser interaction worker provenance or mount shape does not match' \
+      >&2
+    return 1
+  fi
+}
+
+require_current_api_provenance() {
+  local api_container_id
+
+  api_container_id="$("${compose[@]}" ps -q api)"
+  if [[ -z "$api_container_id" ]]; then
+    printf '%s\n' 'API container provenance is unavailable' >&2
+    return 1
+  fi
+  if [[ "$(api_container_provenance "$api_container_id")" != current ]]; then
+    printf '%s\n' \
+      'API container predates Docker-only browser runtime; run scripts/local-firecrawl restart' \
+      >&2
+    return 1
+  fi
+}
+
+build_runtime_images() {
+  "${compose[@]}" build \
+    api browser-state-init browser-service browser-interaction-egress-proxy \
+    browser-interaction-worker playwright-service
+}
+
+load_one_shot_state() {
+  local service="$1"
+  local ids
+  local snapshot
+
+  ids="$("${compose[@]}" ps --all -q "$service")" || return 1
+  one_shot_container_id=
+  one_shot_status=missing
+  one_shot_running=false
+  one_shot_oom_killed=false
+  one_shot_exit_code=0
+  if [[ -z "$ids" ]]; then
+    return 0
+  fi
+  if [[ "$ids" == *$'\n'* ]] || [[ ! "$ids" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s container identity is ambiguous\n' "$service" >&2
+    return 1
+  fi
+  snapshot="$(
+    docker inspect --format \
+      '{{.State.Status}}|{{.State.Running}}|{{.State.OOMKilled}}|{{.State.ExitCode}}' \
+      "$ids"
+  )" || return 1
+  IFS='|' read -r \
+    one_shot_status one_shot_running one_shot_oom_killed \
+    one_shot_exit_code <<< "$snapshot"
+  if [[ ! "$one_shot_status" =~ ^(created|running|exited|paused|restarting|removing|dead)$ ]] ||
+    [[ ! "$one_shot_running" =~ ^(true|false)$ ]] ||
+    [[ ! "$one_shot_oom_killed" =~ ^(true|false)$ ]] ||
+    [[ ! "$one_shot_exit_code" =~ ^[0-9]+$ ]] ||
+    (( one_shot_exit_code > 255 )); then
+    printf '%s container state is invalid\n' "$service" >&2
+    return 1
+  fi
+  one_shot_container_id="$ids"
+}
+
+one_shot_state_summary() {
+  printf 'status=%s,running=%s,exit=%s,oom=%s' \
+    "$one_shot_status" "$one_shot_running" \
+    "$one_shot_exit_code" "$one_shot_oom_killed"
+}
+
+remove_nonrunning_one_shot_remnant() {
+  local service="$1"
+  local container_id
+
+  load_one_shot_state "$service" || return 1
+  container_id="$one_shot_container_id"
+  if [[ -z "$container_id" ]]; then
+    return 0
+  fi
+  if [[ "$one_shot_running" != false ]] ||
+    [[ ! "$one_shot_status" =~ ^(created|exited)$ ]]; then
+    printf '%s has a non-removable container: %s\n' \
+      "$service" "$(one_shot_state_summary)" >&2
+    return 1
+  fi
+  if ! timeout --verbose --signal=TERM --kill-after=5s 15s \
+    docker rm "$container_id" >/dev/null; then
+    printf '%s stopped container could not be removed\n' "$service" >&2
+    return 1
+  fi
+}
+
+cleanup_failed_one_shot() {
+  local service="$1"
+  local expected_container_id="$2"
+  local container_id
+
+  if ! load_one_shot_state "$service"; then
+    printf '%s failed container cleanup is unproven\n' "$service" >&2
+    return 1
+  fi
+  container_id="$one_shot_container_id"
+  if [[ -z "$container_id" ]]; then
+    return 0
+  fi
+  if [[ -n "$expected_container_id" &&
+    "$container_id" != "$expected_container_id" ]]; then
+    printf '%s failed container identity changed; cleanup refused\n' \
+      "$service" >&2
+    return 1
+  fi
+  if [[ "$one_shot_running" == true ]]; then
+    if ! timeout --verbose --signal=TERM --kill-after=5s 20s \
+      docker stop --timeout 10 "$container_id" >/dev/null; then
+      printf '%s failed container did not stop\n' "$service" >&2
+      return 1
+    fi
+    load_one_shot_state "$service" || return 1
+    if [[ "$one_shot_container_id" != "$container_id" ]]; then
+      printf '%s failed container identity changed after stop\n' \
+        "$service" >&2
+      return 1
+    fi
+  fi
+  if [[ "$one_shot_running" != false ]] ||
+    [[ ! "$one_shot_status" =~ ^(created|exited)$ ]]; then
+    printf '%s failed container cleanup refused: %s\n' \
+      "$service" "$(one_shot_state_summary)" >&2
+    return 1
+  fi
+  if ! timeout --verbose --signal=TERM --kill-after=5s 15s \
+    docker rm "$container_id" >/dev/null; then
+    printf '%s failed stopped container could not be removed\n' \
+      "$service" >&2
+    return 1
+  fi
+}
+
+report_one_shot_orchestration_failure() {
+  local service="$1"
+  local phase="$2"
+  local status="$3"
+  local classification=failed
+
+  if (( status == 124 )); then
+    classification='timed out'
+  elif (( status == 137 )); then
+    classification='was killed after termination failed'
+  fi
+  if load_one_shot_state "$service"; then
+    printf '%s orchestration %s during %s (status: %s; %s)\n' \
+      "$service" "$classification" "$phase" "$status" \
+      "$(one_shot_state_summary)" >&2
+  else
+    printf '%s orchestration %s during %s (status: %s; state unavailable)\n' \
+      "$service" "$classification" "$phase" "$status" >&2
+  fi
 }
 
 require_completed_one_shot() {
@@ -759,8 +1036,88 @@ require_completed_one_shot() {
   if [[ "$state" != "exited 0" ]]; then
     printf '%s did not complete successfully (state: %s)\n' \
       "$service" "${state:-missing}" >&2
-    exit 1
+    return 1
   fi
+}
+
+run_one_shot() {
+  local service="$1"
+  local exit_code
+  local wait_output
+  local started_container_id
+  local status
+
+  remove_nonrunning_one_shot_remnant "$service" || return 1
+  set +e
+  timeout --verbose --signal=TERM --kill-after=10s \
+    "${one_shot_timeout_seconds}s" \
+    "${compose[@]}" up -d --no-deps --no-build "$service"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    report_one_shot_orchestration_failure "$service" start "$status"
+    cleanup_failed_one_shot "$service" "" || true
+    return 1
+  fi
+  load_one_shot_state "$service" || {
+    printf '%s orchestration could not identify its container\n' \
+      "$service" >&2
+    cleanup_failed_one_shot "$service" "" || true
+    return 1
+  }
+  started_container_id="$one_shot_container_id"
+  if [[ -z "$started_container_id" ]]; then
+    printf '%s orchestration did not create a container\n' "$service" >&2
+    return 1
+  fi
+  if [[ "$one_shot_running" == true ]]; then
+    set +e
+    wait_output="$(
+      timeout --verbose --signal=TERM --kill-after=10s \
+        "${one_shot_timeout_seconds}s" \
+        docker wait "$started_container_id"
+    )"
+    status=$?
+    set -e
+    if (( status != 0 )); then
+      report_one_shot_orchestration_failure "$service" wait "$status"
+      cleanup_failed_one_shot "$service" "$started_container_id" || true
+      return 1
+    fi
+    if [[ ! "$wait_output" =~ ^[0-9]+$ ]] ||
+      (( wait_output < 0 || wait_output > 255 )); then
+      printf '%s wait returned an invalid exit status\n' "$service" >&2
+      cleanup_failed_one_shot "$service" "$started_container_id" || true
+      return 1
+    fi
+    exit_code="$wait_output"
+    load_one_shot_state "$service" || {
+      printf '%s final container state is unavailable\n' "$service" >&2
+      cleanup_failed_one_shot "$service" "$started_container_id" || true
+      return 1
+    }
+    if [[ "$one_shot_container_id" != "$started_container_id" ]]; then
+      printf '%s container identity changed while waiting\n' "$service" >&2
+      return 1
+    fi
+  else
+    exit_code="$one_shot_exit_code"
+  fi
+  if [[ "$one_shot_status" != exited ||
+    "$one_shot_running" != false ||
+    "$exit_code" != "$one_shot_exit_code" ]]; then
+    printf '%s ended in an inconsistent state: %s\n' \
+      "$service" "$(one_shot_state_summary)" >&2
+    cleanup_failed_one_shot "$service" "$started_container_id" || true
+    return 1
+  fi
+  if (( exit_code != 0 )); then
+    printf '%s container exited %s (OOMKilled=%s)\n' \
+      "$service" "$exit_code" "$one_shot_oom_killed" >&2
+    cleanup_failed_one_shot "$service" "$started_container_id" || true
+    return 1
+  fi
+  require_completed_one_shot "$service"
 }
 
 check_port_policy() {
@@ -816,7 +1173,8 @@ validate_browser_rollback_request() {
 
 quiesce_browser_writers() {
   current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
-  "${compose[@]}" stop api browser-service
+  "${compose[@]}" stop api browser-interaction-worker browser-service
+  "${compose[@]}" stop browser-interaction-egress-proxy
 }
 
 check_browser_rollback_offline() {
@@ -846,11 +1204,124 @@ check_browser_rollback_offline() {
     /var/lib/firecrawl-browser-volume/state
 }
 
-verify_deep_health_locked() {
-  local live_codex="${1:-0}"
-  local api_compose_source
+start_runtime() {
+  run_one_shot browser-state-init
+  "${compose[@]}" up -d --wait \
+    --wait-timeout "$health_wait_timeout_seconds" \
+    "${dependency_services[@]}"
+  run_one_shot app-db-migrate
+  run_one_shot minio-init
+  "${compose[@]}" up -d --no-deps --wait \
+    --wait-timeout "$health_wait_timeout_seconds" browser-service
+  "${compose[@]}" up -d --no-deps --wait \
+    --wait-timeout "$health_wait_timeout_seconds" \
+    browser-interaction-egress-proxy
+  "${compose[@]}" up -d --no-deps --wait \
+    --wait-timeout "$health_wait_timeout_seconds" \
+    browser-interaction-worker
+  "${compose[@]}" up -d --no-deps --wait \
+    --wait-timeout "$health_wait_timeout_seconds" api
+  "${compose[@]}" exec -T api node -e \
+    "fetch('http://127.0.0.1:' + (process.env.PORT || '3002') + '/', {
+       signal: AbortSignal.timeout(10000),
+     }).then(response => {
+       if (response.status >= 500) process.exit(1);
+     }).catch(() => process.exit(1))"
+  require_current_api_provenance
+  check_port_policy
+}
+
+stop_runtime() {
+  "${compose[@]}" stop api browser-interaction-worker browser-service
+  "${compose[@]}" stop browser-interaction-egress-proxy
+  "${compose[@]}" stop "${dependency_services[@]}"
+}
+
+probe_worker_egress() {
+  "${compose[@]}" exec -T browser-interaction-worker node -e \
+    "const net = require('node:net');
+     const probe = authority => new Promise(resolve => {
+       const socket = net.createConnection({
+         host: '127.0.0.1',
+         port: 3128,
+       });
+       let response = '';
+       const finish = status => {
+         socket.destroy();
+         resolve({ authority, status });
+       };
+       socket.setTimeout(10000, () => finish(null));
+       socket.on('error', () => finish(null));
+       socket.on('connect', () => socket.write(
+         'CONNECT ' + authority + ' HTTP/1.1\\r\\n' +
+         'Host: ' + authority + '\\r\\n\\r\\n'
+       ));
+       socket.on('data', chunk => {
+         response += chunk.toString('ascii');
+         const match = /^HTTP\\/1\\.1 (\\d{3}) /u.exec(response);
+         if (match) finish(Number(match[1]));
+       });
+     });
+     (async () => {
+       const results = [];
+       for (const authority of [
+         'api.openai.com:443',
+         'chatgpt.com:443',
+         'example.com:443',
+         '169.254.169.254:443',
+       ]) results.push(await probe(authority));
+       process.stdout.write(JSON.stringify(results) + '\\n');
+       const statuses = results.map(result => result.status);
+       if (
+         statuses[0] !== 200 ||
+         statuses[1] !== 200 ||
+         statuses[2] !== 403 ||
+         statuses[3] !== 403
+       ) process.exitCode = 1;
+     })().catch(() => {
+       process.stdout.write(
+         JSON.stringify({ error: 'worker_egress_probe_failed' }) + '\\n'
+       );
+       process.exitCode = 1;
+     });"
+}
+
+redact_local_logs() {
+  sed -E \
+    -e 's/("(authorization|bearer|token|secret|password|capability|prompt|source|page(Value|Text)?)"[[:space:]]*:[[:space:]]*)"([^"\\]|\\.)*"/\1"[REDACTED]"/Ig' \
+    -e 's/(Bearer[[:space:]]+)[^[:space:],;}]*/\1[REDACTED]/Ig' \
+    -e 's/(authorization|token|secret|password|capability|prompt|source|page(Value|Text)?)([=:][[:space:]]*)[^,;}]*/\1\3[REDACTED]/Ig'
+}
+
+filter_correlation() {
+  local correlation="${1:-}"
+  if [[ -z "$correlation" ]]; then
+    cat
+  else
+    awk -v correlation="$correlation" 'index($0, correlation) != 0'
+  fi
+}
+
+show_logs() {
+  local target="$1"
+  local correlation="${2:-}"
+  local -a services
+
+  case "$target" in
+    all) services=("${diagnostic_services[@]}") ;;
+    api|browser-service|browser-interaction-worker|browser-interaction-egress-proxy)
+      services=("$target")
+      ;;
+    *) return 64 ;;
+  esac
+  "${compose[@]}" logs --no-color --tail=200 "${services[@]}" 2>&1 |
+    filter_correlation "$correlation" |
+    tail -n 200 |
+    redact_local_logs
+}
+
+verify_health() {
   local api_container_id
-  local health_json
   local latest_applied_checksum
   local latest_applied_migration
   local latest_checked_in_checksum
@@ -859,34 +1330,17 @@ verify_deep_health_locked() {
   local redis_response
 
   [[ "$runtime_lock_held" == shared || "$runtime_lock_held" == exclusive ]] ||
-    { printf '%s\n' 'Deep health requires the lifecycle lock' >&2; return 70; }
-  [[ "$live_codex" == 0 || "$live_codex" == 1 ]] ||
-    { printf '%s\n' 'Deep health live Codex option is invalid' >&2; return 64; }
-  validate_compose
-  shallow_host_health
-  health_json="$(api_running_cli browser-runtime-status)"
-  verify_runtime_status_json "$health_json"
-  jq -e '.orphanProcesses == 0' <<< "$health_json" >/dev/null || {
-    printf '%s\n' 'Broker orphan processes are present' >&2
-    return 1
-  }
-  verify_adapter_health_json "$(
-    jq '{
-      version, status, codexCliVersion, codexArtifactSha256,
-      codexProtocolSchemaSha256, brokerProtocolSha256, model,
-      reasoningEffort
-    }' <<< "$health_json"
-  )"
+    { printf '%s\n' 'Health requires the lifecycle lock' >&2; return 70; }
+  validate_compose current
+  require_current_api_provenance
 
   redis_response="$("${compose[@]}" exec -T redis redis-cli ping)"
-  if [[ "$redis_response" != "PONG" ]]; then
+  if [[ "$redis_response" != PONG ]]; then
     printf 'Redis health check returned %q, expected PONG\n' \
       "$redis_response" >&2
     return 1
   fi
-
-  "${compose[@]}" exec -T rabbitmq \
-    rabbitmq-diagnostics -q check_running
+  "${compose[@]}" exec -T rabbitmq rabbitmq-diagnostics -q check_running
   "${compose[@]}" exec -T nuq-postgres sh -c \
     'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
   "${compose[@]}" exec -T app-postgres sh -c \
@@ -925,21 +1379,8 @@ verify_deep_health_locked() {
     return 1
   fi
 
-  api_container_id="$("${compose[@]}" ps -q api)"
-  if [[ -z "$api_container_id" ]]; then
-    printf '%s\n' 'API container provenance is unavailable' >&2
-    return 1
-  fi
-  api_compose_source="$(
-    docker inspect --format \
-      '{{index .Config.Labels "com.docker.compose.project.config_files"}}' \
-      "$api_container_id"
-  )"
-  if [[ "$api_compose_source" != "$compose_config_sources" ]]; then
-    printf '%s\n' 'API compose provenance does not match' >&2
-    return 1
-  fi
-
+  require_completed_one_shot browser-state-init
+  require_completed_one_shot app-db-migrate
   require_completed_one_shot minio-init
   "${compose[@]}" exec -T minio curl --fail --silent --show-error \
     --max-time 10 --output /dev/null \
@@ -948,26 +1389,52 @@ verify_deep_health_locked() {
     'test -z "${MINIO_ROOT_USER+x}" && test -z "${MINIO_ROOT_PASSWORD+x}" && node dist/src/cli/artifact-health.js'
   "${compose[@]}" exec -T playwright-service node -e \
     "fetch('http://127.0.0.1:3000/health', {
-        signal: AbortSignal.timeout(10000),
-      })
-      .then(response => {
-        if (!response.ok) {
-          throw new Error('Playwright health check returned ' + response.status);
-        }
-      })
-      .catch(error => {
-        console.error(error);
-        process.exit(1);
-      })"
+       signal: AbortSignal.timeout(10000),
+     }).then(response => {
+       if (!response.ok) process.exit(1);
+     }).catch(() => process.exit(1))"
+  "${compose[@]}" exec -T browser-service node -e \
+    "const headers = {
+       authorization: 'Bearer ' + process.env.BROWSER_SERVICE_API_KEY,
+       'x-firecrawl-correlation-id': 'local-health',
+       'x-firecrawl-deadline': new Date(Date.now() + 10000).toISOString(),
+     };
+     fetch('http://127.0.0.1:3010/health/live', {
+       headers,
+       signal: AbortSignal.timeout(4000),
+     }).then(response => {
+       if (!response.ok) process.exit(1);
+     }).catch(() => process.exit(1))"
+  "${compose[@]}" exec -T browser-interaction-egress-proxy node -e \
+    "const net = require('node:net');
+     const socket = net.createConnection({
+       path: '/run/firecrawl-model-egress/proxy.sock',
+     });
+     socket.setTimeout(4000, () => process.exit(1));
+     socket.on('error', () => process.exit(1));
+     socket.on('connect', () => {
+       socket.end();
+       process.exit(0);
+     });"
+  "${compose[@]}" exec -T browser-interaction-worker node -e \
+    "const http = require('node:http');
+     const request = http.request({
+       socketPath: '/run/firecrawl-interaction/worker.sock',
+       path: '/health/ready',
+       signal: AbortSignal.timeout(4000),
+     }, response => {
+       response.resume();
+       response.on('end', () => process.exit(
+         response.statusCode === 200 ? 0 : 1
+       ));
+     });
+     request.on('error', () => process.exit(1));
+     request.end();"
   curl --fail --silent --show-error --max-time 10 \
     --output /dev/null "http://127.0.0.1:${PORT:-3002}/"
   check_port_policy
-  disposable_browser_health
-  if (( live_codex == 1 )); then
-    run_live_codex_gate
-  fi
-  deep_health_json="$(jq -c 'del(.unsettledHostJobs)' <<< "$health_json")"
-  deep_health_migration="$latest_applied_migration"
+
+  health_migration="$latest_applied_migration"
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -994,204 +1461,90 @@ case "$command" in
     require_no_arguments "$@"
     printf '%s\n' "$runtime_lock_path"
     ;;
-  install-host)
-    require_no_arguments "$@"
-    validate_runtime_options
-    [[ -t 0 && -t 1 ]] || {
-      printf '%s\n' 'install-host requires an interactive terminal' >&2
-      exit 64
-    }
-    acquire_runtime_lock exclusive
-    capture_host_identity_locked
-    staging="$(build_host_staging_locked)"
-    printf 'Staging: %s\n' "$staging"
-    jq -r \
-      '"Codex: " + .codexAppServer.sourceIdentity.version +
-       "\\nModel: " + .codexAppServer.model +
-       "\\nEffort: " + .codexAppServer.reasoningEffort' \
-      "$staging/manifest.json"
-    printf '%s\n' \
-      'System units: firecrawl-sandbox-broker.socket, firecrawl-sandbox-broker.service' \
-      'User unit: firecrawl-execution-adapter.service'
-    publish_host_from_staging_locked "$staging" initial
-    "$host_builder" \
-      --verify-installed-identity --manifest "$host_manifest_path" \
-      --expected-identity "$sealed_identity_path" >/dev/null
-    ;;
   start)
     require_no_arguments "$@"
     validate_runtime_options
     acquire_runtime_lock exclusive
-    [[ -f "$host_manifest_path" ]] ||
-      { printf '%s\n' \
-          'Browser host is not installed; run scripts/local-firecrawl install-host' \
-          >&2; exit 1; }
-    capture_host_identity_locked
-    if "$host_builder" --verify-installed-identity \
-      --manifest "$host_manifest_path" \
-      --expected-identity "$sealed_identity_path" >/dev/null; then
-      host_identity_drift=0
-    else
-      verify_status=$?
-      if (( verify_status == 78 )); then
-        exit 78
-      fi
-      host_identity_drift=1
-    fi
-    validate_compose
+    validate_compose current
     validate_browser_rollback_request
+    build_runtime_images
+    validate_running_project_provenance
     current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
-    drain_and_stop_runtime
-    refresh_host_locked "$host_identity_drift"
+    quiesce_browser_writers
     check_browser_rollback_offline
-    start_host_services_locked
+    "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
     ;;
   stop)
     require_no_arguments "$@"
     validate_runtime_options
     acquire_runtime_lock exclusive
-    validate_compose
-    drain_and_stop_runtime
+    validate_compose recovery
+    validate_running_project_provenance
+    stop_runtime
     ;;
   restart)
     require_no_arguments "$@"
     validate_runtime_options
     acquire_runtime_lock exclusive
-    [[ -f "$host_manifest_path" ]] ||
-      { printf '%s\n' \
-          'Browser host is not installed; run scripts/local-firecrawl install-host' \
-          >&2; exit 1; }
-    capture_host_identity_locked
-    if "$host_builder" --verify-installed-identity \
-      --manifest "$host_manifest_path" \
-      --expected-identity "$sealed_identity_path" >/dev/null; then
-      host_identity_drift=0
-    else
-      verify_status=$?
-      if (( verify_status == 78 )); then
-        exit 78
-      fi
-      host_identity_drift=1
-    fi
-    validate_compose
+    validate_compose current
     validate_browser_rollback_request
+    build_runtime_images
+    validate_running_project_provenance
     current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
-    drain_and_stop_runtime
-    refresh_host_locked "$host_identity_drift"
+    quiesce_browser_writers
     check_browser_rollback_offline
-    start_host_services_locked
+    "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
     ;;
+  probe-egress)
+    require_no_arguments "$@"
+    validate_runtime_options
+    acquire_runtime_lock exclusive
+    validate_compose current
+    validate_running_project_provenance
+    probe_worker_egress
+    ;;
   status)
-    if (( $# > 1 )) || (( $# == 1 )) && [[ "$1" != --json ]]; then
+    if (( $# > 1 )) ||
+      { (( $# == 1 )) && [[ "$1" != --json ]]; }; then
       usage
       exit 64
     fi
     validate_runtime_options
     acquire_runtime_lock shared
-    validate_compose
-    [[ -f "$host_manifest_path" ]] ||
-      { printf '%s\n' 'Browser host is not installed' >&2; exit 1; }
-    durable='{
-      "activePromptJobs": 0,
-      "activeCodeJobs": 0,
-      "preparedHostJobs": 0,
-      "startingHostJobs": 0,
-      "runningHostJobs": 0,
-      "activeBrowserSessions": 0,
-      "activeCapabilities": 0,
-      "activeProxyGrants": 0,
-      "activeWriterLeases": 0,
-      "unknownActionOutcomes": 0,
-      "firecrawlCloudFallbackAttempts": 0
-    }'
-    if [[ -n "$("${compose[@]}" ps -q api)" ]]; then
-      durable="$(api_running_cli browser-runtime-status)"
-      verify_runtime_status_json "$durable"
-    elif systemctl --user is-active --quiet \
-      firecrawl-execution-adapter.service; then
-      [[ -n "$("${compose[@]}" ps -q app-postgres)" ]] || {
-        printf '%s\n' \
-          'Runtime status is unavailable while adapter jobs may still exist' \
-          >&2
-        exit 1
-      }
-      durable="$(api_image_cli browser-runtime-status)"
-      verify_runtime_status_json "$durable"
-    elif ! clean_stop_proven; then
-      printf '%s\n' \
-        'Runtime status is unproven after an unclean stop; run restart' >&2
-      exit 1
-    fi
-    status_json="$(
-      jq -cn \
-        --slurpfile manifest "$host_manifest_path" \
-        --argjson durable "$durable" \
-        '{
-          codexCliVersion:
-            $manifest[0].codexAppServer.sourceIdentity.version,
-          codexExecutablePath:
-            $manifest[0].codexAppServer.sourceIdentity.executablePath,
-          codexResolvedPath:
-            $manifest[0].codexAppServer.sourceIdentity.resolvedPath,
-          codexDevice: $manifest[0].codexAppServer.sourceIdentity.device,
-          codexInode: $manifest[0].codexAppServer.sourceIdentity.inode,
-          codexArtifactSha256:
-            $manifest[0].codexAppServer.artifactSha256,
-          codexProtocolSchemaSha256:
-            $manifest[0].codexAppServer.protocolSha256,
-          brokerProtocolSha256: $manifest[0].brokerContractSha256,
-          activePromptJobs: ($durable.activePromptJobs // 0),
-          activeCodeJobs: ($durable.activeCodeJobs // 0),
-          preparedHostJobs: ($durable.preparedHostJobs // 0),
-          startingHostJobs: ($durable.startingHostJobs // 0),
-          runningHostJobs: ($durable.runningHostJobs // 0),
-          activeBrowserSessions: ($durable.activeBrowserSessions // 0),
-          activeCapabilities: ($durable.activeCapabilities // 0),
-          activeProxyGrants: ($durable.activeProxyGrants // 0),
-          activeWriterLeases: ($durable.activeWriterLeases // 0),
-          unknownActionOutcomes: ($durable.unknownActionOutcomes // 0),
-          orphanProcesses: ($durable.orphanProcesses // 0),
-          firecrawlCloudFallbackAttempts:
-            ($durable.firecrawlCloudFallbackAttempts // 0)
-        }'
-    )"
+    validate_compose recovery
+    validate_running_project_provenance
     if [[ "${1:-}" == --json ]]; then
-      printf '%s\n' "$status_json"
+      "${compose[@]}" ps --all --format json |
+        jq -cs 'sort_by(.Service)'
     else
-      jq . <<< "$status_json"
+      printf '%s\n' 'Long-running services:'
+      "${compose[@]}" ps --all "${long_running_services[@]}"
+      printf '\n%s\n' 'Initialization and migration one-shots:'
+      "${compose[@]}" ps --all "${one_shot_services[@]}"
     fi
     ;;
   health)
-    health_json_output=0
-    live_codex=0
-    for argument in "$@"; do
-      case "$argument" in
-        --json)
-          (( health_json_output == 0 )) || { usage; exit 64; }
-          health_json_output=1
-          ;;
-        --live-codex)
-          (( live_codex == 0 )) || { usage; exit 64; }
-          live_codex=1
-          ;;
-        *)
-          usage
-          exit 64
-          ;;
-      esac
-    done
+    if (( $# > 1 )) ||
+      { (( $# == 1 )) && [[ "$1" != --json ]]; }; then
+      usage
+      exit 64
+    fi
     validate_runtime_options
     acquire_runtime_lock shared
-    verify_deep_health_locked "$live_codex"
-    health_json="$deep_health_json"
-    latest_applied_migration="$deep_health_migration"
-    if (( health_json_output == 1 )); then
-      printf '%s\n' "$health_json"
+    verify_health
+    if [[ "${1:-}" == --json ]]; then
+      jq -cn \
+        --arg endpoint "http://127.0.0.1:${PORT:-3002}" \
+        --arg migration "$health_migration" \
+        '{status:"healthy", endpoint:$endpoint,
+          migration:$migration, artifacts:"MinIO", browserService:"healthy",
+          browserInteractionWorker:"healthy",
+          browserInteractionEgressProxy:"healthy"}'
     else
       printf '%s\n' \
-        "Local Firecrawl is healthy at http://127.0.0.1:${PORT:-3002}; migrations: $latest_applied_migration; artifacts: MinIO; browser probe: PASS"
+        "Local Firecrawl is healthy at http://127.0.0.1:${PORT:-3002}; migrations: $health_migration; artifacts: MinIO; browser service: PASS; browser interaction worker: PASS; browser interaction egress proxy: PASS"
     fi
     ;;
   logs)
@@ -1208,31 +1561,12 @@ case "$command" in
     fi
     validate_runtime_options
     acquire_runtime_lock shared
-    validate_compose
+    validate_compose recovery
+    validate_running_project_provenance
     show_logs "$log_target" "$correlation" || {
       usage
       exit 64
     }
-    ;;
-  diagnose-host-job)
-    if (( $# != 5 )) ||
-      [[ "$1" != --correlation-id || "$3" != --job-id || "$5" != --json ]]; then
-      usage
-      exit 64
-    fi
-    correlation="$2"
-    job_id="$4"
-    canonical_uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-    if [[ ! "$correlation" =~ $canonical_uuid ||
-      ! "$job_id" =~ $canonical_uuid ]]; then
-      printf '%s\n' 'Correlation ID or job ID is invalid' >&2
-      exit 64
-    fi
-    validate_runtime_options
-    acquire_runtime_lock shared
-    validate_compose
-    api_running_cli browser-runtime-status \
-      --diagnose-host-job "$correlation" "$job_id"
     ;;
   *)
     usage

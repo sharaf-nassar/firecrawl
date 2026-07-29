@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 import {
   reconciliationReferenceV1Schema,
@@ -72,6 +72,62 @@ function mapRows(
   });
 }
 
+async function readBrowserReconciliationSnapshot(
+  query: <Row extends Record<string, unknown> = never>(
+    text: string,
+  ) => Promise<{ rows: Row[] }>,
+): Promise<BrowserReconciliationSnapshot> {
+  const checkpoints = await query<AuthorityRow>(
+    `SELECT id, state_path, checksum
+       FROM browser_replay_checkpoints
+      WHERE state_path IS NOT NULL
+        AND file_deleted_at IS NULL`,
+  );
+  const generations = await query<AuthorityRow>(
+    `SELECT id, state_path, checksum
+       FROM browser_profile_generations
+      WHERE state_path IS NOT NULL
+        AND file_deleted_at IS NULL`,
+  );
+  const cleanupIntents = await query<AuthorityRow>(
+    `SELECT id, state_path, checksum
+       FROM browser_replay_checkpoint_cleanup_intents`,
+  );
+
+  const references = [
+    ...mapRows("replay_checkpoint", checkpoints.rows),
+    ...mapRows("profile_generation", generations.rows),
+    ...mapRows("replay_checkpoint_cleanup_intent", cleanupIntents.rows),
+  ].sort(
+    (left, right) =>
+      rawCompare(left.kind, right.kind) ||
+      rawCompare(left.id, right.id) ||
+      rawCompare(left.path, right.path),
+  );
+  if (references.length > MAX_RECONCILIATION_REFERENCES) {
+    throw new BrowserReconciliationSnapshotError();
+  }
+
+  const identities = new Set<string>();
+  const pathChecksums = new Map<string, string>();
+  for (const reference of references) {
+    const identity = `${reference.kind}\u0000${reference.id}`;
+    if (identities.has(identity)) {
+      throw new BrowserReconciliationSnapshotError();
+    }
+    identities.add(identity);
+    const prior = pathChecksums.get(reference.path);
+    if (prior !== undefined && prior !== reference.checksum) {
+      throw new BrowserReconciliationSnapshotError();
+    }
+    pathChecksums.set(reference.path, reference.checksum);
+  }
+
+  const canonical = JSON.stringify({ version: 1, references });
+  const snapshotDigest = createHash("sha256").update(canonical).digest("hex");
+  return { snapshotDigest, references };
+}
+
 /** @public */
 export async function loadBrowserReconciliationSnapshot(
   pool: Pick<Pool, "connect">,
@@ -123,57 +179,10 @@ export async function loadBrowserReconciliationSnapshot(
   try {
     await query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     transaction = true;
-    const checkpoints = await query<AuthorityRow>(
-      `SELECT id, state_path, checksum
-         FROM browser_replay_checkpoints
-        WHERE state_path IS NOT NULL
-          AND file_deleted_at IS NULL`,
-    );
-    const generations = await query<AuthorityRow>(
-      `SELECT id, state_path, checksum
-         FROM browser_profile_generations
-        WHERE state_path IS NOT NULL
-          AND file_deleted_at IS NULL`,
-    );
-    const cleanupIntents = await query<AuthorityRow>(
-      `SELECT id, state_path, checksum
-         FROM browser_replay_checkpoint_cleanup_intents`,
-    );
-
-    const references = [
-      ...mapRows("replay_checkpoint", checkpoints.rows),
-      ...mapRows("profile_generation", generations.rows),
-      ...mapRows("replay_checkpoint_cleanup_intent", cleanupIntents.rows),
-    ].sort(
-      (left, right) =>
-        rawCompare(left.kind, right.kind) ||
-        rawCompare(left.id, right.id) ||
-        rawCompare(left.path, right.path),
-    );
-    if (references.length > MAX_RECONCILIATION_REFERENCES) {
-      throw new BrowserReconciliationSnapshotError();
-    }
-
-    const identities = new Set<string>();
-    const pathChecksums = new Map<string, string>();
-    for (const reference of references) {
-      const identity = `${reference.kind}\u0000${reference.id}`;
-      if (identities.has(identity)) {
-        throw new BrowserReconciliationSnapshotError();
-      }
-      identities.add(identity);
-      const prior = pathChecksums.get(reference.path);
-      if (prior !== undefined && prior !== reference.checksum) {
-        throw new BrowserReconciliationSnapshotError();
-      }
-      pathChecksums.set(reference.path, reference.checksum);
-    }
-
-    const canonical = JSON.stringify({ version: 1, references });
-    const snapshotDigest = createHash("sha256").update(canonical).digest("hex");
+    const snapshot = await readBrowserReconciliationSnapshot(query);
     await query("COMMIT");
     transaction = false;
-    return { snapshotDigest, references };
+    return snapshot;
   } catch (error) {
     if (transaction) {
       try {
@@ -186,5 +195,32 @@ export async function loadBrowserReconciliationSnapshot(
     throw new BrowserReconciliationSnapshotError(error);
   } finally {
     if (!destroyed) client.release();
+  }
+}
+
+/** @public */
+export async function loadBrowserReconciliationSnapshotFromTransaction(
+  transaction: Pick<PoolClient, "query">,
+  signal?: AbortSignal,
+): Promise<BrowserReconciliationSnapshot> {
+  const query = async <Row extends Record<string, unknown> = never>(
+    text: string,
+  ) => {
+    signal?.throwIfAborted();
+    const pending = transaction.query<Row>(text);
+    if (!signal) return pending;
+    return new Promise<Awaited<typeof pending>>((resolve, reject) => {
+      const aborted = () => reject(signal.reason);
+      signal.addEventListener("abort", aborted, { once: true });
+      pending.then(resolve, reject).finally(() => {
+        signal.removeEventListener("abort", aborted);
+      });
+    });
+  };
+  try {
+    return await readBrowserReconciliationSnapshot(query);
+  } catch (error) {
+    if (error instanceof BrowserReconciliationSnapshotError) throw error;
+    throw new BrowserReconciliationSnapshotError(error);
   }
 }

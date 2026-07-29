@@ -520,6 +520,33 @@ describe("bounded loopback proxy", () => {
     });
     expect(dial).not.toHaveBeenCalled();
   });
+
+  test("blocks ad hosts without weakening allowed-domain confinement", async () => {
+    const dial = vi.fn<EgressDial>();
+    const proxy = await createEgressProxy({
+      allowedDomains: ["doubleclick.net"],
+      blockAds: true,
+      lookup: lookup("93.184.216.34"),
+      dial,
+    });
+    closers.push(proxy.close);
+
+    const adResponse = await sendRaw(
+      proxy.port,
+      "CONNECT ads.doubleclick.net:443 HTTP/1.1\r\n" +
+        "Host: ads.doubleclick.net:443\r\n\r\n",
+    );
+    const outsideResponse = await sendRaw(
+      proxy.port,
+      "CONNECT outside.test:443 HTTP/1.1\r\n" +
+        "Host: outside.test:443\r\n\r\n",
+    );
+
+    expect(adResponse).toContain("403 Forbidden");
+    expect(outsideResponse).toContain("403 Forbidden");
+    expect(dial).not.toHaveBeenCalled();
+  });
+
   test("locks every production bound to its exact default", () => {
     expect(MAX_REQUEST_HEADER_BYTES).toBe(32 * 1024);
     expect(MAX_RESPONSE_HEADER_BYTES).toBe(64 * 1024);

@@ -1,16 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
 
 import { z } from "zod";
 
-import {
-  adapterAuthorizationBindingSchema,
-  type AdapterAuthorizationBinding,
-} from "../browser-state/types";
-import {
-  createCapabilityStore,
-  type AdapterCapabilityBinding,
-  type IssuedAdapterCapability,
-} from "../browser-state/capability-store";
 import {
   claimBrowserSessionStop,
   commitPreparedProfileGeneration,
@@ -18,21 +10,21 @@ import {
   failAdapterRun,
   finishAdapterRun,
   finishBrowserSessionStop,
+  getActiveBrowserRunAuthority,
   renewBrowserSessionStop,
+  startAdapterRun,
 } from "../browser-state/store";
 import type { BrowserSessionBillingClaim } from "../browser-state/store";
+import type { BrowserExecutionAdapter } from "./execution-adapter";
+import type { BrowserActionCoordinator } from "./action-coordinator";
+import { normalizeBrowserAction } from "./action-normalization";
 import {
-  isPreAdmissionExecutionAdapterError,
-  type BrowserExecutionAdapter,
-} from "./execution-adapter";
-import {
-  codeRunInputSchema,
-  codeRunResultSchema,
+  normalizeModelDecisionEnvelopeV1,
   PROMPT_LOOP_POLICY_V1,
   promptRunInputSchema,
   promptRunResultSchema,
   runtimeUuidSchema,
-  type CodeRunResult,
+  type DecisionHistoryEntryV1,
   type ObservationV1,
   type PromptRunResult,
 } from "./protocol";
@@ -41,14 +33,11 @@ import type {
   BrowserStateMutationLease,
 } from "./startup-gate";
 
-type PendingRun = {
-  runId: string;
-  adapterJobId: string;
-  adapterSupervisorId: string;
-  capabilityToken: string;
-};
-
 type BrowserOrchestratorStores = {
+  startAdapterRun(
+    lease: BrowserStateMutationLease,
+    runId: string,
+  ): Promise<void>;
   countInteractActions(
     lease: BrowserStateMutationLease,
     runId: string,
@@ -56,13 +45,14 @@ type BrowserOrchestratorStores = {
   finishAdapterRun(
     lease: BrowserStateMutationLease,
     runId: string,
-    result: PromptRunResult | CodeRunResult,
+    result: PromptRunResult,
   ): Promise<void>;
   failAdapterRun(
     lease: BrowserStateMutationLease,
     runId: string,
     error: unknown,
   ): Promise<void>;
+  getActiveRun(runId: string): ReturnType<typeof getActiveBrowserRunAuthority>;
   claimStop(
     lease: BrowserStateMutationLease,
     sessionId: string,
@@ -86,17 +76,6 @@ type BrowserOrchestratorStores = {
     claim: BrowserSessionStopClaim,
     prepared: PreparedProfileGeneration,
   ): Promise<void>;
-};
-
-type OrchestratorCapabilityStore = {
-  beginAdapterRun(
-    input: Omit<PendingRun, "capabilityToken"> & { adapterProcessId: null },
-  ): Promise<IssuedAdapterCapability>;
-  activateAdapterProcess(
-    runId: string,
-    binding: AdapterAuthorizationBinding,
-  ): Promise<AdapterCapabilityBinding>;
-  revoke(runId: string): Promise<boolean>;
 };
 
 /** @public */
@@ -134,15 +113,6 @@ type PromptExecutionInput = {
   runId: string;
   prompt: string;
   initialObservation: ObservationV1 & { type: "initial"; sequence: 0 };
-  deadline: Date;
-  correlationId: string;
-  signal?: AbortSignal;
-};
-
-type CodeExecutionInput = {
-  runId: string;
-  language: "node" | "python" | "bash";
-  source: string;
   deadline: Date;
   correlationId: string;
   signal?: AbortSignal;
@@ -202,15 +172,6 @@ const publicPromptInputSchema = z.strictObject({
   signal: abortSignalSchema,
 });
 
-const publicCodeInputSchema = z.strictObject({
-  runId: runtimeUuidSchema,
-  language: z.enum(["node", "python", "bash"]),
-  source: z.string().max(100_000),
-  deadline: codeRunInputSchema.shape.deadline,
-  correlationId: runtimeUuidSchema,
-  signal: abortSignalSchema,
-});
-
 function executionError(
   category: "cancelled" | "timed_out" | "capability_denied",
   message: string,
@@ -221,6 +182,7 @@ function executionError(
 type BrowserSessionOrchestratorDependencies = {
   gate: BrowserStartupGate;
   adapter: BrowserExecutionAdapter;
+  actionCoordinator: BrowserActionCoordinator;
   closeSession: (
     claim: BrowserSessionStopClaim,
     reason: string,
@@ -233,7 +195,6 @@ function createBrowserSessionOrchestratorCore(
   deps: BrowserSessionOrchestratorDependencies & {
     stores: BrowserOrchestratorStores;
   },
-  capabilities: OrchestratorCapabilityStore,
 ) {
   const active = new Map<
     string,
@@ -244,64 +205,7 @@ function createBrowserSessionOrchestratorCore(
   >();
   const stops = new Map<string, Promise<BrowserSessionBillingClaim | null>>();
 
-  const startBinding = async (runId: string): Promise<PendingRun> => {
-    const requested = {
-      runId,
-      adapterJobId: randomUUID(),
-      adapterSupervisorId: randomUUID(),
-      adapterProcessId: null,
-    };
-    const issued = await capabilities.beginAdapterRun(requested);
-    if (
-      issued.capability.runId !== requested.runId ||
-      issued.capability.adapterJobId !== requested.adapterJobId ||
-      issued.capability.adapterSupervisorId !== requested.adapterSupervisorId ||
-      issued.capability.adapterProcessId !== null
-    ) {
-      throw executionError(
-        "capability_denied",
-        "Capability store returned a mismatched pending binding",
-      );
-    }
-    return {
-      runId,
-      adapterJobId: requested.adapterJobId,
-      adapterSupervisorId: requested.adapterSupervisorId,
-      capabilityToken: issued.token,
-    };
-  };
-
-  const accept =
-    (
-      pending: PendingRun,
-      signal: AbortSignal,
-      markAccepted: () => void,
-    ): ((binding: AdapterAuthorizationBinding) => Promise<void>) =>
-    async untrusted => {
-      if (signal.aborted) throw signal.reason;
-      const parsed = adapterAuthorizationBindingSchema.safeParse(untrusted);
-      if (!parsed.success) {
-        throw executionError(
-          "capability_denied",
-          "Browser capability was denied",
-        );
-      }
-      const binding = parsed.data;
-      if (
-        binding.adapterJobId !== pending.adapterJobId ||
-        binding.adapterSupervisorId !== pending.adapterSupervisorId
-      ) {
-        throw Object.assign(new Error("Browser capability was denied"), {
-          category: "capability_denied",
-        });
-      }
-      await capabilities.activateAdapterProcess(pending.runId, binding);
-      if (signal.aborted) throw signal.reason;
-      markAccepted();
-    };
-
   const fail = async (runId: string, error: unknown): Promise<void> => {
-    await capabilities.revoke(runId);
     await deps.gate.withBrowserStateMutationLease(
       "filesystem_and_database",
       lease => deps.stores.failAdapterRun(lease, runId, error),
@@ -310,9 +214,8 @@ function createBrowserSessionOrchestratorCore(
 
   const finish = async (
     runId: string,
-    result: PromptRunResult | CodeRunResult,
+    result: PromptRunResult,
   ): Promise<void> => {
-    await capabilities.revoke(runId);
     await deps.gate.withBrowserStateMutationLease(
       "filesystem_and_database",
       lease => deps.stores.finishAdapterRun(lease, runId, result),
@@ -323,10 +226,9 @@ function createBrowserSessionOrchestratorCore(
     runId: string,
     deadline: Date,
     parentSignal: AbortSignal | undefined,
-    invoke: (signal: AbortSignal, markAccepted: () => void) => Promise<T>,
+    invoke: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> => {
     const controller = new AbortController();
-    let accepted = false;
     let cancelPromise: Promise<void> | undefined;
     const cancel = (reason: string): Promise<void> => {
       if (!cancelPromise) {
@@ -383,19 +285,8 @@ function createBrowserSessionOrchestratorCore(
         );
         throw controller.signal.reason;
       }
-      const result = await Promise.race([
-        invoke(controller.signal, () => {
-          accepted = true;
-        }),
-        aborted,
-      ]);
+      const result = await Promise.race([invoke(controller.signal), aborted]);
       if (controller.signal.aborted) throw controller.signal.reason;
-      if (!accepted) {
-        throw executionError(
-          "capability_denied",
-          "Adapter returned before accepted binding activation",
-        );
-      }
       return result;
     } catch (error) {
       const reason =
@@ -405,16 +296,14 @@ function createBrowserSessionOrchestratorCore(
         typeof error.category === "string"
           ? error.category
           : "failed";
-      if (!isPreAdmissionExecutionAdapterError(error)) {
-        try {
-          await cancel(reason);
-        } catch (cancellationError) {
-          if (error instanceof Error && Object.isExtensible(error)) {
-            Object.defineProperty(error, "cancellationError", {
-              configurable: true,
-              value: cancellationError,
-            });
-          }
+      try {
+        await cancel(reason);
+      } catch (cancellationError) {
+        if (error instanceof Error && Object.isExtensible(error)) {
+          Object.defineProperty(error, "cancellationError", {
+            configurable: true,
+            value: cancellationError,
+          });
         }
       }
       throw error;
@@ -527,40 +416,155 @@ function createBrowserSessionOrchestratorCore(
     },
 
     async executePrompt(input: PromptExecutionInput): Promise<PromptRunResult> {
-      const parsed = publicPromptInputSchema.parse(input);
-      if (parsed.signal?.aborted) {
-        throw (
-          parsed.signal.reason ??
-          executionError("cancelled", "Browser execution cancelled")
-        );
-      }
-      const pending = await startBinding(parsed.runId);
       try {
+        const parsed = publicPromptInputSchema.parse(input);
+        const startedAtMs = Date.now();
+        if (parsed.signal?.aborted) {
+          throw (
+            parsed.signal.reason ??
+            executionError("cancelled", "Browser execution cancelled")
+          );
+        }
+        await deps.gate.withBrowserStateMutationLease(
+          "filesystem_and_database",
+          lease => deps.stores.startAdapterRun(lease, parsed.runId),
+        );
+        const validatedInput = promptRunInputSchema.parse({
+          runId: parsed.runId,
+          prompt: parsed.prompt,
+          initialObservation: parsed.initialObservation,
+          deadline: parsed.deadline,
+          correlationId: parsed.correlationId,
+          decisionSchemaVersion: 1,
+          observationSchemaVersion: 1,
+          loopPolicy: PROMPT_LOOP_POLICY_V1,
+        });
         const result = promptRunResultSchema.parse(
           await executeHost(
             parsed.runId,
             parsed.deadline,
             parsed.signal,
-            (signal, markAccepted) =>
-              deps.adapter.executePromptRun(
-                promptRunInputSchema.parse({
-                  runId: parsed.runId,
-                  prompt: parsed.prompt,
-                  initialObservation: parsed.initialObservation,
-                  deadline: parsed.deadline,
-                  correlationId: parsed.correlationId,
-                  adapterJobId: pending.adapterJobId,
-                  adapterSupervisorId: pending.adapterSupervisorId,
-                  capabilityToken: pending.capabilityToken,
-                  onAccepted: accept(pending, signal, markAccepted),
-                  model: "gpt-5.6-terra",
-                  reasoningEffort: "medium",
-                  decisionSchemaVersion: 1,
-                  observationSchemaVersion: 1,
-                  loopPolicy: PROMPT_LOOP_POLICY_V1,
-                }),
-                signal,
-              ),
+            async signal => {
+              let observation: ObservationV1 =
+                validatedInput.initialObservation;
+              const history: DecisionHistoryEntryV1[] = [];
+              let aggregateObservationBytes = Buffer.byteLength(
+                JSON.stringify(observation),
+                "utf8",
+              );
+              for (
+                let turn = 0;
+                turn < PROMPT_LOOP_POLICY_V1.maxTurns;
+                turn += 1
+              ) {
+                let screenshot:
+                  | Awaited<
+                      ReturnType<BrowserActionCoordinator["loadScreenshot"]>
+                    >
+                  | undefined;
+                if (
+                  observation.type === "action_result" &&
+                  observation.outcome === "succeeded" &&
+                  observation.actionKind === "screenshot" &&
+                  observation.result?.kind === "screenshot"
+                ) {
+                  const activeRun = await deps.stores.getActiveRun(
+                    parsed.runId,
+                  );
+                  if (activeRun === null) {
+                    throw Object.assign(
+                      new Error("Browser run authority is unavailable"),
+                      { category: "capability_denied" },
+                    );
+                  }
+                  screenshot = await deps.actionCoordinator.loadScreenshot(
+                    activeRun,
+                    observation,
+                  );
+                }
+                const decision = normalizeModelDecisionEnvelopeV1(
+                  await deps.adapter.requestDecision(
+                    {
+                      runId: parsed.runId,
+                      prompt: parsed.prompt,
+                      turn,
+                      startedAtMs,
+                      deadlineMs: parsed.deadline.getTime(),
+                      history,
+                      observation,
+                      ...(screenshot === undefined ? {} : { screenshot }),
+                    },
+                    signal,
+                  ),
+                );
+                if (decision.type === "final") {
+                  return {
+                    output: decision.output,
+                    turnCount: turn + 1,
+                    actionCount: turn,
+                    usage: { inputTokens: 0, outputTokens: 0 },
+                    protocol: {
+                      toolEventCount: 0,
+                      approvalEventCount: 0,
+                      decisionSchemaVersion: 1,
+                      observationSchemaVersion: 1,
+                    },
+                  };
+                }
+                if (turn >= PROMPT_LOOP_POLICY_V1.maxActions) {
+                  throw Object.assign(
+                    new Error("Browser action limit exceeded"),
+                    { category: "model_protocol_error" },
+                  );
+                }
+                const activeRun = await deps.stores.getActiveRun(parsed.runId);
+                if (activeRun === null) {
+                  throw Object.assign(
+                    new Error("Browser run authority is unavailable"),
+                    { category: "capability_denied" },
+                  );
+                }
+                const normalized = normalizeBrowserAction(decision.action);
+                observation = await deps.actionCoordinator.handleProposal(
+                  activeRun,
+                  {
+                    version: 1,
+                    adapterJobId: activeRun.adapterJobId,
+                    sequence: turn + 1,
+                    actionId: randomUUID(),
+                    proposalHash: normalized.normalizedProposalHash,
+                    effect: normalized.effect,
+                    operation: decision.action,
+                  },
+                  {
+                    correlationId: parsed.correlationId,
+                    deadline: parsed.deadline,
+                    signal,
+                  },
+                );
+                history.push({
+                  turn,
+                  action: decision.action,
+                  observation,
+                });
+                aggregateObservationBytes += Buffer.byteLength(
+                  JSON.stringify(observation),
+                  "utf8",
+                );
+                if (
+                  aggregateObservationBytes >
+                  PROMPT_LOOP_POLICY_V1.maxAggregateObservationBytes
+                ) {
+                  throw Object.assign(
+                    new Error("Browser observations exceed their limit"),
+                    { category: "model_protocol_error" },
+                  );
+                }
+              }
+              throw Object.assign(new Error("Browser turn limit exceeded"), {
+                category: "model_protocol_error",
+              });
+            },
           ),
         );
         if (result.turnCount !== result.actionCount + 1) {
@@ -581,47 +585,7 @@ function createBrowserSessionOrchestratorCore(
         await finish(parsed.runId, result);
         return result;
       } catch (error) {
-        await fail(parsed.runId, error);
-        throw error;
-      }
-    },
-
-    async executeCode(input: CodeExecutionInput): Promise<CodeRunResult> {
-      const parsed = publicCodeInputSchema.parse(input);
-      if (parsed.signal?.aborted) {
-        throw (
-          parsed.signal.reason ??
-          executionError("cancelled", "Browser execution cancelled")
-        );
-      }
-      const pending = await startBinding(parsed.runId);
-      try {
-        const result = codeRunResultSchema.parse(
-          await executeHost(
-            parsed.runId,
-            parsed.deadline,
-            parsed.signal,
-            (signal, markAccepted) =>
-              deps.adapter.executeCodeRun(
-                codeRunInputSchema.parse({
-                  runId: parsed.runId,
-                  language: parsed.language,
-                  source: parsed.source,
-                  deadline: parsed.deadline,
-                  correlationId: parsed.correlationId,
-                  adapterJobId: pending.adapterJobId,
-                  adapterSupervisorId: pending.adapterSupervisorId,
-                  capabilityToken: pending.capabilityToken,
-                  onAccepted: accept(pending, signal, markAccepted),
-                }),
-                signal,
-              ),
-          ),
-        );
-        await finish(parsed.runId, result);
-        return result;
-      } catch (error) {
-        await fail(parsed.runId, error);
+        await fail(input.runId, error);
         throw error;
       }
     },
@@ -727,13 +691,6 @@ function createBrowserSessionOrchestratorCore(
             }
           }
         }
-        if (claim.runId !== null) {
-          try {
-            await capabilities.revoke(claim.runId);
-          } catch (error) {
-            errors.push(error);
-          }
-        }
         if (heartbeat) clearInterval(heartbeat);
         await heartbeatPending;
         if (heartbeatFailure !== undefined) errors.push(heartbeatFailure);
@@ -766,23 +723,22 @@ function createBrowserSessionOrchestratorCore(
   };
 }
 
-/** @public Production composition always owns its durable capability store. */
+/** @public */
 export function createBrowserSessionOrchestrator(
   deps: BrowserSessionOrchestratorDependencies,
 ) {
-  return createBrowserSessionOrchestratorCore(
-    {
-      ...deps,
-      stores: {
-        countInteractActions,
-        finishAdapterRun,
-        failAdapterRun,
-        claimStop: claimBrowserSessionStop,
-        renewStop: renewBrowserSessionStop,
-        finishStop: finishBrowserSessionStop,
-        commitPreparedProfile: commitPreparedProfileGeneration,
-      },
+  return createBrowserSessionOrchestratorCore({
+    ...deps,
+    stores: {
+      startAdapterRun,
+      countInteractActions,
+      finishAdapterRun,
+      failAdapterRun,
+      getActiveRun: getActiveBrowserRunAuthority,
+      claimStop: claimBrowserSessionStop,
+      renewStop: renewBrowserSessionStop,
+      finishStop: finishBrowserSessionStop,
+      commitPreparedProfile: commitPreparedProfileGeneration,
     },
-    createCapabilityStore({ gate: deps.gate }),
-  );
+  });
 }

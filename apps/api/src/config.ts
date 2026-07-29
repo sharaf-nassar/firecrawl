@@ -1,6 +1,4 @@
 import "dotenv/config";
-import path from "node:path";
-
 import { z } from "zod";
 import { resolveLocalRuntimeConfig } from "./lib/local-runtime-config";
 
@@ -17,20 +15,6 @@ const emptyStringAsUndefined = <T extends z.ZodTypeAny>(schema: T) =>
 
 const emptyStringAsDefault = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess(value => (value === "" ? undefined : value), schema);
-
-export const canonicalAbsoluteUnixSocketPathSchema = z
-  .string()
-  .min(2)
-  .refine(value => !value.includes("\0"), "socket path contains NUL")
-  .refine(value => path.isAbsolute(value), "socket path must be absolute")
-  .refine(
-    value => path.normalize(value) === value,
-    "socket path must be lexically canonical",
-  )
-  .refine(
-    value => !value.endsWith(path.sep),
-    "socket path must not end with a separator",
-  );
 
 // Ethereum address schema: validates 0x followed by 40 hex characters
 const ethereumAddress = z
@@ -158,11 +142,17 @@ export const configSchema = z.object({
   ),
   BROWSER_SERVICE_URL: emptyStringAsUndefined(z.string()),
   BROWSER_SERVICE_API_KEY: emptyStringAsUndefined(z.string()),
+  BROWSER_INTERACTION_WORKER_SOCKET_PATH: emptyStringAsUndefined(
+    z.literal("/run/firecrawl-interaction/worker.sock"),
+  ),
+  BROWSER_INTERACTION_WORKER_TOKEN: emptyStringAsUndefined(
+    z.string().min(32).max(4_096),
+  ),
   BROWSER_PUBLIC_API_ORIGIN: emptyStringAsUndefined(z.string()),
   BROWSER_REPLAY_INGEST_URL: emptyStringAsUndefined(z.string()),
   BROWSER_REPLAY_INGEST_API_KEY: emptyStringAsUndefined(z.string()),
   BROWSER_SERVICE_REQUEST_TIMEOUT_MS: emptyStringAsDefault(
-    z.coerce.number().int().min(100).max(60_000).default(30_000),
+    z.coerce.number().int().min(100).max(60_000).default(60_000),
   ),
   BROWSER_RECONCILIATION_TIMEOUT_MS: emptyStringAsDefault(
     z.coerce.number().int().min(5_000).max(60_000).default(60_000),
@@ -184,10 +174,6 @@ export const configSchema = z.object({
   ),
   BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS: emptyStringAsDefault(
     z.coerce.number().int().min(5_000).max(300_000).default(30_000),
-  ),
-  BROWSER_ADAPTER_TOKEN_FILE: emptyStringAsUndefined(z.string()),
-  BROWSER_EXECUTION_ADAPTER_SOCKET: emptyStringAsUndefined(
-    canonicalAbsoluteUnixSocketPathSchema,
   ),
   APPLICATION_DATABASE_URL: emptyStringAsUndefined(z.string().url()),
   LOCAL_OWNER_ID: emptyStringAsUndefined(z.string().uuid()),
@@ -413,4 +399,12 @@ export const configSchema = z.object({
 });
 
 export const config = configSchema.parse(process.env);
+if (
+  (config.BROWSER_INTERACTION_WORKER_SOCKET_PATH === undefined) !==
+  (config.BROWSER_INTERACTION_WORKER_TOKEN === undefined)
+) {
+  throw new Error(
+    "BROWSER_INTERACTION_WORKER_SOCKET_PATH and BROWSER_INTERACTION_WORKER_TOKEN must be configured together",
+  );
+}
 resolveLocalRuntimeConfig(config);

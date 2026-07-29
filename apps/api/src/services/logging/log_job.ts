@@ -70,9 +70,12 @@ async function robustInsert(
   force: boolean,
   _logger: Logger,
   conflictUpdate?: {
-    target: typeof schema.requests.id;
+    target:
+      | typeof schema.requests.id
+      | typeof schema.scrapes.id
+      | typeof schema.parses.id;
     set: Record<string, unknown>;
-    setWhere: SQL;
+    setWhere?: SQL;
   },
 ) {
   const logger = _logger.child({
@@ -309,37 +312,45 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
   });
 
   const tableName = scrape.is_parse ? "parses" : "scrapes";
+  const scrapeData = {
+    id: scrape.id,
+    request_id: scrape.request_id,
+    url: scrape.zeroDataRetention
+      ? "<redacted due to zero data retention>"
+      : scrape.url,
+    is_successful: scrape.is_successful,
+    error: scrape.error ?? null,
+    time_taken: scrape.time_taken,
+    team_id: resolveScrapePersistenceOwner(scrape.team_id),
+    options: scrape.zeroDataRetention ? null : scrape.options,
+    cost_tracking: scrape.zeroDataRetention
+      ? null
+      : (scrape.cost_tracking ?? null),
+    pdf_num_pages: scrape.zeroDataRetention
+      ? null
+      : (scrape.pdf_num_pages ?? null),
+    credits_cost: scrape.credits_cost,
+    ...(scrape.is_parse
+      ? {}
+      : {
+          monitor_id: scrape.monitor_id ?? null,
+          monitor_check_id: scrape.monitor_check_id ?? null,
+          content_type: scrape.content_type ?? null,
+        }),
+  };
+  const { id: _scrapeId, ...scrapeUpdate } = scrapeData;
 
   await robustInsert(
     tableName,
-    {
-      id: scrape.id,
-      request_id: scrape.request_id,
-      url: scrape.zeroDataRetention
-        ? "<redacted due to zero data retention>"
-        : scrape.url,
-      is_successful: scrape.is_successful,
-      error: scrape.error ?? null,
-      time_taken: scrape.time_taken,
-      team_id: resolveScrapePersistenceOwner(scrape.team_id),
-      options: scrape.zeroDataRetention ? null : scrape.options,
-      cost_tracking: scrape.zeroDataRetention
-        ? null
-        : (scrape.cost_tracking ?? null),
-      pdf_num_pages: scrape.zeroDataRetention
-        ? null
-        : (scrape.pdf_num_pages ?? null),
-      credits_cost: scrape.credits_cost,
-      ...(scrape.is_parse
-        ? {}
-        : {
-            monitor_id: scrape.monitor_id ?? null,
-            monitor_check_id: scrape.monitor_check_id ?? null,
-            content_type: scrape.content_type ?? null,
-          }),
-    },
+    scrapeData,
     force,
     logger,
+    config.LOCAL_PERSISTENCE_ENABLED && force
+      ? {
+          target: scrape.is_parse ? schema.parses.id : schema.scrapes.id,
+          set: scrapeUpdate,
+        }
+      : undefined,
   );
 
   if (!scrape.is_parse && scrape.is_successful) {

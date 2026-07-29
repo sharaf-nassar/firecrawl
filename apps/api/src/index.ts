@@ -56,7 +56,7 @@ import {
   type BrowserControlGenerationHandoff,
   type BrowserReconciliationCoordinator,
 } from "./lib/browser-runtime/reconciliation-coordinator";
-import { loadBrowserReconciliationSnapshot } from "./lib/browser-runtime/reconciliation-snapshot";
+import { loadBrowserReconciliationSnapshotFromTransaction } from "./lib/browser-runtime/reconciliation-snapshot";
 import { runApiStartupLifecycle } from "./lib/browser-runtime/api-startup-lifecycle";
 import { registerReplayPersistenceAuthorityRoute } from "./lib/scrape-interact/replay-store";
 import {
@@ -65,12 +65,14 @@ import {
   runLocalRetentionLoop,
   type LocalRetentionService,
 } from "./services/local-retention-worker";
-import { registerInternalRoutes } from "./routes/internal";
 import {
   createPublicBrowserRuntime,
   registerPublicBrowserRuntime,
 } from "./lib/browser-runtime/public-browser-runtime";
-import { createSocketExecutionAdapter } from "./lib/browser-runtime/execution-adapter";
+import {
+  createUnixSocketBrowserExecutionAdapter,
+  unavailableExecutionAdapter,
+} from "./lib/browser-runtime/execution-adapter";
 import { createBrowserProxyGrantStore } from "./lib/browser-state/proxy-grant-store";
 import { registerBrowserProxyRuntime } from "./controllers/v2/browser-proxy";
 import {
@@ -80,7 +82,6 @@ import {
 } from "./services/worker/nuq-router";
 import { startBrowserBillingOutboxWorker } from "./services/browser-billing-outbox";
 import { startBrowserAdmissionCleanupWorker } from "./services/browser-admission-cleanup";
-import { BROWSER_RELAY_WS_OPTIONS } from "./lib/browser-runtime/relay-limits";
 
 type LocalBrowserRuntime = {
   pool: Pool;
@@ -114,9 +115,7 @@ cacheableLookup.install(https.globalAgent);
 
 // Initialize Express with WebSocket support
 const expressApp = express();
-const ws = expressWs(expressApp, undefined, {
-  wsOptions: { ...BROWSER_RELAY_WS_OPTIONS },
-});
+const ws = expressWs(expressApp);
 const app = ws.app;
 
 global.isProduction = config.IS_PRODUCTION;
@@ -127,25 +126,6 @@ registerReplayPersistenceAuthorityRoute(app, {
   apiKey: config.BROWSER_REPLAY_INGEST_API_KEY,
   getGate: () => localBrowserRuntime?.gate,
   getBrowserClient: () => localBrowserRuntime?.browserClient,
-});
-registerInternalRoutes(app, {
-  adapterTokenFile: config.BROWSER_ADAPTER_TOKEN_FILE,
-  getRuntime: () =>
-    localBrowserRuntime
-      ? {
-          gate: localBrowserRuntime.gate,
-          browserClient: localBrowserRuntime.browserClient,
-        }
-      : undefined,
-  drainRuntime: async () => {
-    if (!localBrowserRuntime) {
-      throw new Error("Browser runtime is unavailable");
-    }
-    localRuntimeDrain ??= localBrowserRuntime.gate.close(
-      "local_runtime_drain",
-    ).drained;
-    await localRuntimeDrain;
-  },
 });
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json({ limit: "10mb" }));
@@ -253,7 +233,7 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
     },
     inspectProcessIdentity: inspectBrowserStateProcessIdentity,
     serviceClient,
-    loadSnapshot: loadBrowserReconciliationSnapshot,
+    loadSnapshot: loadBrowserReconciliationSnapshotFromTransaction,
     interruptUnfinishedBrowserWork,
     recoverBrowserCleanupIntentsBeforeSnapshot,
     pauseBrowserRetention: async () => undefined,
@@ -283,11 +263,14 @@ async function prepareLocalRuntimeBeforeMigrations(): Promise<BrowserControlGene
       createPublicBrowserRuntime({
         gate,
         browserClient: serviceClient,
-        adapter: config.BROWSER_EXECUTION_ADAPTER_SOCKET
-          ? createSocketExecutionAdapter({
-              socketPath: config.BROWSER_EXECUTION_ADAPTER_SOCKET,
-            })
-          : undefined,
+        adapter:
+          config.BROWSER_INTERACTION_WORKER_SOCKET_PATH !== undefined &&
+          config.BROWSER_INTERACTION_WORKER_TOKEN !== undefined
+            ? createUnixSocketBrowserExecutionAdapter({
+                socketPath: config.BROWSER_INTERACTION_WORKER_SOCKET_PATH,
+                token: config.BROWSER_INTERACTION_WORKER_TOKEN,
+              })
+            : unavailableExecutionAdapter,
         getActiveCount: getCombinedTeamActiveCount,
         acquireAdmission: mirrorExternalSlotAcquire,
         releaseAdmissionBackend: releaseExternalSlotBackend,

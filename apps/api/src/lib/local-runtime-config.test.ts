@@ -167,7 +167,7 @@ describe("resolveLocalRuntimeConfig", () => {
 
   it("locks bounded reconciliation retry defaults", () => {
     expect(resolveLocalRuntimeConfig(enabledBrowserSettings)).toMatchObject({
-      browserServiceRequestTimeoutMs: 30_000,
+      browserServiceRequestTimeoutMs: 60_000,
       browserReconciliationTimeoutMs: 60_000,
       browserReconciliationMaxAttempts: 4,
       browserReconciliationInitialBackoffMs: 250,
@@ -176,6 +176,21 @@ describe("resolveLocalRuntimeConfig", () => {
       browserReconciliationMonitorIntervalMs: 5_000,
       browserReconciliationRetryCooldownMs: 30_000,
     });
+  });
+
+  it("caps the browser service request envelope at 60 seconds", () => {
+    expect(
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_REQUEST_TIMEOUT_MS: "60000",
+      }),
+    ).toMatchObject({ browserServiceRequestTimeoutMs: 60_000 });
+    expect(() =>
+      resolveLocalRuntimeConfig({
+        ...enabledBrowserSettings,
+        BROWSER_SERVICE_REQUEST_TIMEOUT_MS: "60001",
+      }),
+    ).toThrow(/BROWSER_SERVICE_REQUEST_TIMEOUT_MS/);
   });
 
   it.each([
@@ -197,23 +212,6 @@ describe("resolveLocalRuntimeConfig", () => {
         ...overrides,
       }),
     ).toThrow(/BROWSER_RECONCILIATION_/);
-  });
-
-  it("requires an absolute adapter token file when configured", () => {
-    expect(() =>
-      resolveLocalRuntimeConfig({
-        ...enabledBrowserSettings,
-        BROWSER_ADAPTER_TOKEN_FILE: "adapter.token",
-      }),
-    ).toThrow(/BROWSER_ADAPTER_TOKEN_FILE/);
-    expect(
-      resolveLocalRuntimeConfig({
-        ...enabledBrowserSettings,
-        BROWSER_ADAPTER_TOKEN_FILE: "/run/secrets/browser-adapter-token",
-      }),
-    ).toMatchObject({
-      browserAdapterTokenFile: "/run/secrets/browser-adapter-token",
-    });
   });
 
   it("requires an application database URL when enabled", () => {
@@ -348,7 +346,7 @@ describe("configSchema browser settings", () => {
     expect(configSchema.parse({})).toMatchObject({
       LOCAL_BROWSER_SERVICE_ENABLED: false,
       LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser",
-      BROWSER_SERVICE_REQUEST_TIMEOUT_MS: 30_000,
+      BROWSER_SERVICE_REQUEST_TIMEOUT_MS: 60_000,
       BROWSER_RECONCILIATION_TIMEOUT_MS: 60_000,
       BROWSER_RECONCILIATION_MAX_ATTEMPTS: 4,
     });

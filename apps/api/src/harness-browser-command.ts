@@ -3,10 +3,7 @@ export const BROWSER_HARNESS_MARKER =
 
 const CONTROL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
-type LocalPersistenceHarnessMode =
-  | "persistence"
-  | "browser"
-  | "real-codex-browser";
+type LocalPersistenceHarnessMode = "persistence" | "browser";
 
 export function localPersistenceHarnessMode(
   command: readonly string[],
@@ -14,8 +11,6 @@ export function localPersistenceHarnessMode(
   if (command[0] !== "pnpm") return null;
   if (command[1] === "test:snips:local-persistence") return "persistence";
   if (command[1] === "test:snips:local-browser") return "browser";
-  if (command[1] === "test:snips:real-codex-browser")
-    return "real-codex-browser";
   return null;
 }
 
@@ -65,13 +60,4 @@ export function createHarnessBrowserCommandEnvironment(
     throw new Error("Harness Browser command environment is invalid");
   }
   return environment;
-}
-
-export function shouldRunRealCodexBrowserSmoke(
-  env: NodeJS.ProcessEnv,
-): boolean {
-  return (
-    env.RUN_REAL_CODEX_BROWSER_SMOKE === "1" &&
-    isHarnessControlledBrowserEnvironment(env)
-  );
 }

@@ -23,7 +23,6 @@ export type LocalRuntimeConfigSource = {
   BROWSER_RECONCILIATION_STARTUP_BUDGET_MS?: number | string;
   BROWSER_RECONCILIATION_MONITOR_INTERVAL_MS?: number | string;
   BROWSER_RECONCILIATION_RETRY_COOLDOWN_MS?: number | string;
-  BROWSER_ADAPTER_TOKEN_FILE?: string;
   APPLICATION_DATABASE_URL?: string;
   LOCAL_OWNER_ID?: string;
   ARTIFACT_STORE_PROVIDER?: "none" | "minio" | "gcs";
@@ -62,7 +61,6 @@ type EnabledBrowserServiceRuntimeConfig = {
   browserReconciliationStartupBudgetMs: number;
   browserReconciliationMonitorIntervalMs: number;
   browserReconciliationRetryCooldownMs: number;
-  browserAdapterTokenFile?: string;
 };
 
 type BrowserServiceRuntimeConfig =
@@ -191,7 +189,7 @@ export function resolveLocalRuntimeConfig(
   const artifactProvider = source.ARTIFACT_STORE_PROVIDER ?? "none";
   const browserServiceRequestTimeoutMs = boundedInteger(
     source.BROWSER_SERVICE_REQUEST_TIMEOUT_MS,
-    30_000,
+    60_000,
     100,
     60_000,
     "BROWSER_SERVICE_REQUEST_TIMEOUT_MS",
@@ -310,12 +308,6 @@ export function resolveLocalRuntimeConfig(
       );
     }
     if (
-      source.BROWSER_ADAPTER_TOKEN_FILE !== undefined &&
-      !path.isAbsolute(source.BROWSER_ADAPTER_TOKEN_FILE)
-    ) {
-      issues.push("BROWSER_ADAPTER_TOKEN_FILE must be absolute");
-    }
-    if (
       browserReconciliationMaxBackoffMs < browserReconciliationInitialBackoffMs
     ) {
       issues.push(
@@ -405,7 +397,6 @@ export function resolveLocalRuntimeConfig(
           browserReconciliationStartupBudgetMs,
           browserReconciliationMonitorIntervalMs,
           browserReconciliationRetryCooldownMs,
-          browserAdapterTokenFile: source.BROWSER_ADAPTER_TOKEN_FILE,
         }
       : {};
   const common = {

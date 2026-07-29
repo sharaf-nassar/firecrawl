@@ -372,14 +372,6 @@ export type BrowserCreateInput = {
   };
 };
 
-export type BrowserExecuteInput = {
-  code: string;
-  language?: "python" | "node" | "bash";
-  timeout?: number;
-  origin?: string;
-  allowedDomains?: string[];
-};
-
 export async function browserCreateRaw(
   body: BrowserCreateInput,
   identity: Identity,
@@ -399,18 +391,6 @@ export async function browserListRaw(
     .get("/v2/browser")
     .set("Authorization", `Bearer ${identity.apiKey}`);
   return await (status === undefined ? response : response.query({ status }));
-}
-
-export async function browserExecuteRaw(
-  id: string,
-  body: BrowserExecuteInput,
-  identity: Identity,
-) {
-  return await request(TEST_API_URL)
-    .post(`/v2/browser/${encodeURIComponent(id)}/execute`)
-    .set("Authorization", `Bearer ${identity.apiKey}`)
-    .set("Content-Type", "application/json")
-    .send(body);
 }
 
 export async function browserDeleteRaw(id: string, identity: Identity) {

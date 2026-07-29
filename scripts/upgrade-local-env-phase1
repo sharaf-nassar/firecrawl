@@ -118,13 +118,13 @@ validate_phase_values() {
   if [[ "${managed_values[LOCAL_PERSISTENCE_ENABLED]}" != true ]]; then
     fail_field LOCAL_PERSISTENCE_ENABLED
   fi
-  if [[ "${managed_values[LOCAL_BROWSER_SERVICE_ENABLED]}" != false ]]; then
-    fail_field LOCAL_BROWSER_SERVICE_ENABLED
-  fi
   if [[ "${managed_values[LOCAL_BROWSER_STATE_ROOT]}" != /var/lib/firecrawl-browser-volume/state ]]; then
     fail_field LOCAL_BROWSER_STATE_ROOT
   fi
-  if [[ ! "${managed_values[BROWSER_SERVICE_API_KEY]}" =~ ^[0-9a-f]{64}$ ]]; then
+  if [[ "${managed_values[LOCAL_BROWSER_SERVICE_ENABLED]}" != true ]]; then
+    fail_field LOCAL_BROWSER_SERVICE_ENABLED
+  fi
+  if [[ ! "${managed_values[BROWSER_SERVICE_API_KEY]}" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
     fail_field BROWSER_SERVICE_API_KEY
   fi
   if [[ ! "${managed_values[BROWSER_REPLAY_INGEST_API_KEY]}" =~ ^[0-9a-f]{64}$ ]]; then
@@ -132,6 +132,13 @@ validate_phase_values() {
   fi
   if [[ "${managed_values[BROWSER_REPLAY_INGEST_API_KEY]}" == "${managed_values[BROWSER_SERVICE_API_KEY]}" ]]; then
     fail_field BROWSER_REPLAY_INGEST_API_KEY
+  fi
+  if [[ ! "${managed_values[BROWSER_INTERACTION_WORKER_TOKEN]}" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+    fail_field BROWSER_INTERACTION_WORKER_TOKEN
+  fi
+  if [[ "${managed_values[BROWSER_INTERACTION_WORKER_TOKEN]}" == "${managed_values[BROWSER_SERVICE_API_KEY]}" ]] ||
+    [[ "${managed_values[BROWSER_INTERACTION_WORKER_TOKEN]}" == "${managed_values[BROWSER_REPLAY_INGEST_API_KEY]}" ]]; then
+    fail_field BROWSER_INTERACTION_WORKER_TOKEN
   fi
 
   expected_database_url="postgresql://${managed_values[APP_POSTGRES_USER]}:${managed_values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${managed_values[APP_POSTGRES_DB]}"
@@ -212,6 +219,7 @@ phase_keys=(
   LOCAL_BROWSER_STATE_ROOT
   BROWSER_SERVICE_API_KEY
   BROWSER_REPLAY_INGEST_API_KEY
+  BROWSER_INTERACTION_WORKER_TOKEN
   APPLICATION_DATABASE_URL
   LOCAL_OWNER_ID
   LOCAL_RECORD_RETENTION_DAYS
@@ -270,49 +278,85 @@ declare -A candidate_values=()
 parse_environment "${snapshot_file}" original_values
 copy_environment original_values candidate_values
 
-declare -a missing_keys=()
+declare -a changed_keys=()
+declare -A changed_key_set=()
+
+mark_changed() {
+  local key="$1"
+  if [[ ! -v "changed_key_set[${key}]" ]]; then
+    changed_key_set["${key}"]=1
+    changed_keys+=("${key}")
+  fi
+}
 
 set_default() {
   local key="$1"
   local value="$2"
   if [[ ! -v "candidate_values[${key}]" ]]; then
     candidate_values["${key}"]="${value}"
-    missing_keys+=("${key}")
+    mark_changed "${key}"
   fi
+}
+
+generate_base64url_secret() {
+  openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
 }
 
 set_default APP_POSTGRES_USER firecrawl
 if [[ ! -v 'candidate_values[APP_POSTGRES_PASSWORD]' ]]; then
   candidate_values[APP_POSTGRES_PASSWORD]="$(openssl rand -hex 32)"
-  missing_keys+=(APP_POSTGRES_PASSWORD)
+  mark_changed APP_POSTGRES_PASSWORD
 fi
 set_default APP_POSTGRES_DB firecrawl
 set_default LOCAL_PERSISTENCE_ENABLED true
-set_default LOCAL_BROWSER_SERVICE_ENABLED false
+if [[ ! -v 'candidate_values[LOCAL_BROWSER_SERVICE_ENABLED]' ]] ||
+  [[ "${candidate_values[LOCAL_BROWSER_SERVICE_ENABLED]}" == false ]]; then
+  candidate_values[LOCAL_BROWSER_SERVICE_ENABLED]=true
+  mark_changed LOCAL_BROWSER_SERVICE_ENABLED
+elif [[ "${candidate_values[LOCAL_BROWSER_SERVICE_ENABLED]}" != true ]]; then
+  fail_field LOCAL_BROWSER_SERVICE_ENABLED
+fi
 set_default LOCAL_BROWSER_STATE_ROOT /var/lib/firecrawl-browser-volume/state
-if [[ ! -v 'candidate_values[BROWSER_SERVICE_API_KEY]' ]]; then
-  candidate_values[BROWSER_SERVICE_API_KEY]="$(openssl rand -hex 32)"
-  missing_keys+=(BROWSER_SERVICE_API_KEY)
+if [[ ! -v 'candidate_values[BROWSER_SERVICE_API_KEY]' ]] ||
+  [[ "${candidate_values[BROWSER_SERVICE_API_KEY]}" =~ ^[0-9a-f]{64}$ ]]; then
+  candidate_values[BROWSER_SERVICE_API_KEY]="$(generate_base64url_secret)"
+  while { [[ -v 'candidate_values[BROWSER_REPLAY_INGEST_API_KEY]' ]] &&
+      [[ "${candidate_values[BROWSER_SERVICE_API_KEY]}" == "${candidate_values[BROWSER_REPLAY_INGEST_API_KEY]}" ]]; } ||
+    { [[ -v 'candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]' ]] &&
+      [[ "${candidate_values[BROWSER_SERVICE_API_KEY]}" == "${candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]}" ]]; }; do
+    candidate_values[BROWSER_SERVICE_API_KEY]="$(generate_base64url_secret)"
+  done
+  mark_changed BROWSER_SERVICE_API_KEY
+elif [[ ! "${candidate_values[BROWSER_SERVICE_API_KEY]}" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+  fail_field BROWSER_SERVICE_API_KEY
 fi
 if [[ ! -v 'candidate_values[BROWSER_REPLAY_INGEST_API_KEY]' ]]; then
   candidate_values[BROWSER_REPLAY_INGEST_API_KEY]="$(openssl rand -hex 32)"
   while [[ "${candidate_values[BROWSER_REPLAY_INGEST_API_KEY]}" == "${candidate_values[BROWSER_SERVICE_API_KEY]}" ]]; do
     candidate_values[BROWSER_REPLAY_INGEST_API_KEY]="$(openssl rand -hex 32)"
   done
-  missing_keys+=(BROWSER_REPLAY_INGEST_API_KEY)
+  mark_changed BROWSER_REPLAY_INGEST_API_KEY
+fi
+if [[ ! -v 'candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]' ]]; then
+  candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]="$(generate_base64url_secret)"
+  while [[ "${candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]}" == "${candidate_values[BROWSER_SERVICE_API_KEY]}" ]] ||
+    [[ "${candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]}" == "${candidate_values[BROWSER_REPLAY_INGEST_API_KEY]}" ]]; do
+    candidate_values[BROWSER_INTERACTION_WORKER_TOKEN]="$(generate_base64url_secret)"
+  done
+  mark_changed BROWSER_INTERACTION_WORKER_TOKEN
 fi
 set_default APPLICATION_DATABASE_URL \
   "postgresql://${candidate_values[APP_POSTGRES_USER]}:${candidate_values[APP_POSTGRES_PASSWORD]}@app-postgres:5432/${candidate_values[APP_POSTGRES_DB]}"
 if [[ ! -v 'candidate_values[LOCAL_OWNER_ID]' ]]; then
   candidate_values[LOCAL_OWNER_ID]="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
-  missing_keys+=(LOCAL_OWNER_ID)
+  mark_changed LOCAL_OWNER_ID
 fi
 set_default LOCAL_RECORD_RETENTION_DAYS 30
 set_default LOCAL_ARTIFACT_RETENTION_DAYS 30
 set_default MINIO_ROOT_USER firecrawl-root
 if [[ ! -v 'candidate_values[MINIO_ROOT_PASSWORD]' ]]; then
   candidate_values[MINIO_ROOT_PASSWORD]="$(openssl rand -hex 32)"
-  missing_keys+=(MINIO_ROOT_PASSWORD)
+  mark_changed MINIO_ROOT_PASSWORD
 fi
 set_default ARTIFACT_STORE_PROVIDER minio
 set_default ARTIFACT_MINIO_ENDPOINT http://minio:9000
@@ -322,25 +366,33 @@ if [[ ! -v 'candidate_values[ARTIFACT_MINIO_SECRET_KEY]' ]]; then
   while [[ "${candidate_values[ARTIFACT_MINIO_SECRET_KEY]}" == "${candidate_values[MINIO_ROOT_PASSWORD]}" ]]; do
     candidate_values[ARTIFACT_MINIO_SECRET_KEY]="$(openssl rand -hex 32)"
   done
-  missing_keys+=(ARTIFACT_MINIO_SECRET_KEY)
+  mark_changed ARTIFACT_MINIO_SECRET_KEY
 fi
 set_default ARTIFACT_MINIO_BUCKET firecrawl-artifacts
 set_default ARTIFACT_MINIO_REGION us-east-1
 
 validate_phase_values candidate_values
 
-if (( ${#missing_keys[@]} == 0 )); then
+if (( ${#changed_keys[@]} == 0 )); then
   printf 'Phase 1 environment is already configured: %s\n' "${env_file}"
   exit 0
 fi
 
 output_file="$(mktemp "${env_file}.firecrawl-secret-tmp.output.XXXXXX")"
-cp -- "${snapshot_file}" "${output_file}"
-if [[ -s "${output_file}" ]]; then
-  printf '\n' >> "${output_file}"
-fi
-for key in "${missing_keys[@]}"; do
-  printf '%s=%s\n' "${key}" "${candidate_values[${key}]}" >> "${output_file}"
+: > "${output_file}"
+while IFS= read -r line || [[ -n "${line}" ]]; do
+  if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] &&
+    [[ -v "changed_key_set[${BASH_REMATCH[1]}]" ]]; then
+    key="${BASH_REMATCH[1]}"
+    printf '%s=%s\n' "${key}" "${candidate_values[${key}]}" >> "${output_file}"
+  else
+    printf '%s\n' "${line}" >> "${output_file}"
+  fi
+done < "${snapshot_file}"
+for key in "${changed_keys[@]}"; do
+  if [[ ! -v "original_values[${key}]" ]]; then
+    printf '%s=%s\n' "${key}" "${candidate_values[${key}]}" >> "${output_file}"
+  fi
 done
 chmod 0600 "${output_file}"
 
@@ -353,7 +405,7 @@ if ! cmp -s "${snapshot_file}" "${env_file}"; then
   exit 1
 fi
 copy_environment current_values revalidated_values
-for key in "${missing_keys[@]}"; do
+for key in "${changed_keys[@]}"; do
   revalidated_values["${key}"]="${candidate_values[${key}]}"
 done
 validate_phase_values revalidated_values
@@ -364,4 +416,4 @@ rm -f -- "${snapshot_file}"
 snapshot_file=""
 trap - EXIT HUP INT TERM
 
-printf 'Added Phase 1 environment fields: %s\n' "${env_file}"
+printf 'Updated Phase 1 environment fields: %s\n' "${env_file}"

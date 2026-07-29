@@ -1,36 +1,65 @@
+import { Buffer } from "node:buffer";
+import { createHash, randomUUID } from "node:crypto";
+
 import {
-  MAX_EVALUATE_RESULT_BYTES,
   actionExecutionRequestSchema,
   actionExecutionResultSchema,
   browserOperationResultSchema,
-  canonicalJson,
-  encodedBytes,
-  jsonSafeSchema,
   type BrowserActionExecutionResultV1,
   type BrowserActionExecutionV1,
   type BrowserOperation,
   type BrowserOperationResultV1,
-  type JsonSafe,
 } from "./contracts.js";
-import {
-  type PendingAction,
-  type SessionActionCache,
-} from "./action-cache.js";
-import {
-  EvaluatePolicyError,
-  parseAndValidateEvaluateExpression,
-} from "./evaluate-policy.js";
-import type { CDPSession, ElementHandle, Page } from "playwright";
+import { type PendingAction, type SessionActionCache } from "./action-cache.js";
+import type { CDPSession, ElementHandle, JSHandle, Page } from "playwright";
 
 const MAX_LOCATOR_REFS = 500;
 const MAX_PAGE_TEXT_CHARS = 40_000;
+const MAX_PAGE_TITLE_BYTES = 4_096;
+const MAX_PAGE_TEXT_BYTES = 40_000;
+const MAX_PAGE_STATE_JSON_BYTES = 56 * 1024;
+const MAX_ACTION_OBSERVATION_COMPONENT_JSON_BYTES = 63 * 1024;
 const MAX_NAVIGATION_ORIGINS = 8;
+const MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024;
+const MAX_ELEMENT_TEXT_NODES = 128;
+const MAX_ELEMENT_SOURCE_CHARACTERS = 4_096;
+const MAX_INTERACTION_HINT_NAME_CHARACTERS = 64;
+const MAX_INTERACTION_HINT_NAME_BYTES = 64;
+const MAX_INTERACTION_HINT_VALUE_CHARACTERS = 128;
+const MAX_INTERACTION_HINT_VALUE_BYTES = 128;
+const MAX_INTERACTION_HINTS_BYTES = 768;
+const MAX_PAGE_TEXT_NODES = 50_000;
+const MAX_PAGE_SOURCE_CHARACTERS = 160_000;
+const CLICK_ACTIONABILITY_TIMEOUT_MS = 10_000;
+const HOVER_ACTIONABILITY_TIMEOUT_MS = 10_000;
+const HOVER_BATCH_ACTIONABILITY_TIMEOUT_MS = 1_000;
+const HOVER_BATCH_PHASE_TIMEOUT_MS = 8_000;
+const HOVER_BATCH_SETTLE_MS = 75;
+const HOVER_BATCH_TEXT_BYTES = 1_024;
+
+type DomObservationLimits = Readonly<{
+  maximumCharacters: number;
+  maximumBytes: number;
+  maximumNodes: number;
+  maximumSourceCharacters: number;
+  maximumInteractionHintNameCharacters: number;
+  maximumInteractionHintNameBytes: number;
+  maximumInteractionHintValueCharacters: number;
+  maximumInteractionHintValueBytes: number;
+  maximumInteractionHintsBytes: number;
+}>;
 
 export type OperationElementSnapshot = Readonly<{
   connected: boolean;
   tag: string;
   role: string;
   name: string;
+  interactionHints: ReadonlyArray<
+    Readonly<{
+      name: string;
+      value: string;
+    }>
+  >;
   text: string;
 }>;
 
@@ -46,12 +75,35 @@ export type BoundedPageState = Readonly<{
 export type OperationExecution = Readonly<{
   result: BrowserOperationResultV1;
   page: BoundedPageState;
+  artifact?: Readonly<{
+    contentType: "image/png";
+    bytes: Uint8Array;
+  }>;
+}>;
+
+export type OperationExecutionContext = Readonly<{
+  signal?: AbortSignal;
+  deadlineAtMs?: number;
 }>;
 
 export type BrowserOperationSession = Readonly<{
-  execute(operation: BrowserOperation): Promise<OperationExecution>;
+  observe(): Promise<BoundedPageState>;
+  execute(
+    operation: BrowserOperation,
+    artifactId?: string,
+    context?: OperationExecutionContext,
+  ): Promise<OperationExecution>;
   dispose(): Promise<void>;
 }>;
+
+type VisibleTextDeltaTracker = {
+  capture(): string;
+};
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  throw signal.reason ?? new Error("browser operation authority ended");
+}
 
 export class OperationNoEffectError extends Error {
   readonly category: string;
@@ -63,8 +115,386 @@ export class OperationNoEffectError extends Error {
   }
 }
 
-function truncate(value: string, maximum: number): string {
-  return Array.from(value).slice(0, maximum).join("");
+function boundedDomObservationsInPage(
+  roots: Node | readonly Node[],
+  limits: DomObservationLimits,
+): OperationElementSnapshot[] {
+  function observe(root: Node): OperationElementSnapshot {
+    function boundedValue(
+      value: string,
+      maximumCharacters: number,
+      maximumBytes: number,
+    ): string {
+      const chunks: string[] = [];
+      let characters = 0;
+      let bytes = 0;
+      for (const character of value) {
+        const codePoint = character.codePointAt(0)!;
+        const width =
+          codePoint <= 0x7f
+            ? 1
+            : codePoint <= 0x7ff
+              ? 2
+              : codePoint <= 0xffff
+                ? 3
+                : 4;
+        if (
+          characters + 1 > maximumCharacters ||
+          bytes + width > maximumBytes
+        ) {
+          break;
+        }
+        chunks.push(character);
+        characters += 1;
+        bytes += width;
+      }
+      return chunks.join("");
+    }
+
+    const elementRoot = root instanceof Element ? root : null;
+    const interactionHints: Array<{ name: string; value: string }> = [];
+    let interactionHintBytes = 0;
+    if (elementRoot !== null) {
+      // Fixed semantic attributes can identify native or scripted tooltip
+      // targets without exposing arbitrary page attributes, selectors, or code.
+      const allowedInteractionHints = [
+        "data-tooltip-trigger",
+        "data-tooltip-id",
+        "title",
+        "aria-describedby",
+        "aria-haspopup",
+      ] as const;
+      for (const attributeName of allowedInteractionHints) {
+        const rawValue = elementRoot.getAttribute(attributeName);
+        if (rawValue === null) continue;
+        const name = boundedValue(
+          attributeName,
+          limits.maximumInteractionHintNameCharacters,
+          limits.maximumInteractionHintNameBytes,
+        );
+        const value = boundedValue(
+          rawValue,
+          limits.maximumInteractionHintValueCharacters,
+          limits.maximumInteractionHintValueBytes,
+        );
+        let hintBytes = 1;
+        for (const character of name) hintBytes += utf8Width(character);
+        for (const character of value) hintBytes += utf8Width(character);
+        if (
+          interactionHintBytes + hintBytes >
+          limits.maximumInteractionHintsBytes
+        ) {
+          break;
+        }
+        interactionHints.push({ name, value });
+        interactionHintBytes += hintBytes;
+      }
+    }
+    const observation: OperationElementSnapshot = {
+      connected: root.isConnected,
+      tag:
+        elementRoot === null
+          ? ""
+          : boundedValue(elementRoot.tagName ?? "", 64, 64),
+      role:
+        elementRoot === null
+          ? ""
+          : boundedValue(elementRoot.getAttribute("role") ?? "", 128, 128),
+      name:
+        elementRoot === null
+          ? ""
+          : boundedValue(
+              elementRoot.getAttribute("aria-label") ??
+                elementRoot.getAttribute("name") ??
+                "",
+              512,
+              512,
+            ),
+      interactionHints,
+      text: "",
+    };
+    if (elementRoot === null) return observation;
+
+    const chunks: string[] = [];
+    let outputCharacters = 0;
+    let outputBytes = 0;
+    let visitedNodes = 0;
+    let sourceCharacters = 0;
+    let pendingSpace = false;
+    let exhausted = false;
+
+    function isWhitespace(character: string): boolean {
+      return /\s/u.test(character);
+    }
+
+    function utf8Width(character: string): number {
+      const codePoint = character.codePointAt(0)!;
+      if (codePoint <= 0x7f) return 1;
+      if (codePoint <= 0x7ff) return 2;
+      if (codePoint <= 0xffff) return 3;
+      return 4;
+    }
+
+    function appendText(value: string): void {
+      for (const character of value) {
+        sourceCharacters += 1;
+        if (sourceCharacters > limits.maximumSourceCharacters) {
+          exhausted = true;
+          return;
+        }
+        if (isWhitespace(character)) {
+          pendingSpace = outputCharacters !== 0;
+          continue;
+        }
+        const separatorCharacters =
+          pendingSpace && outputCharacters !== 0 ? 1 : 0;
+        const separatorBytes = separatorCharacters;
+        const characterBytes = utf8Width(character);
+        if (
+          outputCharacters + separatorCharacters + 1 >
+            limits.maximumCharacters ||
+          outputBytes + separatorBytes + characterBytes > limits.maximumBytes
+        ) {
+          exhausted = true;
+          return;
+        }
+        if (separatorCharacters !== 0) {
+          chunks.push(" ");
+          outputCharacters += 1;
+          outputBytes += 1;
+        }
+        chunks.push(character);
+        outputCharacters += 1;
+        outputBytes += characterBytes;
+        pendingSpace = false;
+      }
+    }
+
+    function inspectElement(element: Element): {
+      descend: boolean;
+      separatesText: boolean;
+    } {
+      const tag = element.tagName;
+      if (
+        tag === "SCRIPT" ||
+        tag === "STYLE" ||
+        tag === "TEMPLATE" ||
+        tag === "NOSCRIPT" ||
+        element.hasAttribute("hidden") ||
+        (tag === "INPUT" &&
+          element.getAttribute("type")?.toLowerCase() === "hidden")
+      ) {
+        return { descend: false, separatesText: false };
+      }
+      const style = getComputedStyle(element);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        style.contentVisibility === "hidden"
+      ) {
+        return { descend: false, separatesText: false };
+      }
+      return {
+        descend: true,
+        separatesText:
+          tag === "BR" ||
+          (style.display !== "inline" &&
+            style.display !== "inline-block" &&
+            style.display !== "contents"),
+      };
+    }
+
+    let node: Node | null = root;
+    while (node !== null && !exhausted && visitedNodes < limits.maximumNodes) {
+      visitedNodes += 1;
+      let descend = true;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const inspected = inspectElement(node as Element);
+        descend = inspected.descend;
+        if (inspected.separatesText && outputCharacters !== 0) {
+          pendingSpace = true;
+        }
+      } else if (node.nodeType === Node.TEXT_NODE) {
+        appendText(node.nodeValue ?? "");
+      } else {
+        descend = false;
+      }
+
+      if (descend && node.firstChild !== null) {
+        node = node.firstChild;
+        continue;
+      }
+      while (node !== root && node.nextSibling === null) {
+        node = node.parentNode!;
+      }
+      node = node === root ? null : node.nextSibling;
+    }
+
+    return { ...observation, text: chunks.join("") };
+  }
+
+  return (Array.isArray(roots) ? roots : [roots]).map((root) => observe(root));
+}
+
+function visibleTextDeltaTrackerInPage(limits: {
+  maximumBytes: number;
+  maximumNodes: number;
+  maximumSourceCharacters: number;
+}): VisibleTextDeltaTracker {
+  const previous = new Map<Node, string>();
+
+  function isWhitespace(character: string): boolean {
+    return /\s/u.test(character);
+  }
+
+  function utf8Width(character: string): number {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x7f) return 1;
+    if (codePoint <= 0x7ff) return 2;
+    if (codePoint <= 0xffff) return 3;
+    return 4;
+  }
+
+  function inspectElement(element: Element): boolean {
+    const tag = element.tagName;
+    if (
+      tag === "SCRIPT" ||
+      tag === "STYLE" ||
+      tag === "TEMPLATE" ||
+      tag === "NOSCRIPT" ||
+      element.hasAttribute("hidden") ||
+      (tag === "INPUT" &&
+        element.getAttribute("type")?.toLowerCase() === "hidden")
+    ) {
+      return false;
+    }
+    const style = getComputedStyle(element);
+    return !(
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.contentVisibility === "hidden"
+    );
+  }
+
+  function captureCurrent(includeDelta: boolean): string {
+    const current = new Map<Node, string>();
+    const deltaChunks: string[] = [];
+    let deltaBytes = 0;
+    let visitedNodes = 0;
+    let sourceCharacters = 0;
+    let pendingSpace = false;
+    let deltaExhausted = false;
+
+    function appendDelta(value: string): void {
+      if (deltaExhausted) return;
+      for (const character of value) {
+        if (isWhitespace(character)) {
+          pendingSpace = deltaChunks.length !== 0;
+          continue;
+        }
+        const characterBytes = utf8Width(character);
+        const separatorBytes = pendingSpace && deltaChunks.length !== 0 ? 1 : 0;
+        if (
+          deltaBytes + separatorBytes + characterBytes >
+          limits.maximumBytes
+        ) {
+          deltaExhausted = true;
+          return;
+        }
+        if (separatorBytes !== 0) {
+          deltaChunks.push(" ");
+          deltaBytes += 1;
+        }
+        deltaChunks.push(character);
+        deltaBytes += characterBytes;
+        pendingSpace = false;
+      }
+    }
+
+    const root = document.body;
+    let node: Node | null = root;
+    while (
+      node !== null &&
+      visitedNodes < limits.maximumNodes &&
+      sourceCharacters <= limits.maximumSourceCharacters
+    ) {
+      visitedNodes += 1;
+      let descend = true;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        descend = inspectElement(node as Element);
+      } else if (node.nodeType === Node.TEXT_NODE) {
+        const value = node.nodeValue ?? "";
+        sourceCharacters += Array.from(value).length;
+        if (sourceCharacters > limits.maximumSourceCharacters) break;
+        current.set(node, value);
+        if (includeDelta && previous.get(node) !== value) appendDelta(value);
+      } else {
+        descend = false;
+      }
+
+      if (descend && node.firstChild !== null) {
+        node = node.firstChild;
+        continue;
+      }
+      while (node !== root && node.nextSibling === null) {
+        node = node.parentNode!;
+      }
+      node = node === root ? null : node.nextSibling;
+    }
+
+    previous.clear();
+    for (const [textNode, value] of current) previous.set(textNode, value);
+    return deltaChunks.join("");
+  }
+
+  captureCurrent(false);
+  return { capture: () => captureCurrent(true) };
+}
+
+function encodedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function truncateUtf8(
+  value: string,
+  maximumCharacters: number,
+  maximumBytes = maximumCharacters,
+): string {
+  const characters = Array.from(value).slice(0, maximumCharacters);
+  let low = 0;
+  let high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = characters.slice(0, middle).join("");
+    if (Buffer.byteLength(candidate, "utf8") <= maximumBytes) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return characters.slice(0, low).join("");
+}
+
+function truncateForJsonBudget(
+  value: string,
+  withinBudget: (candidate: string) => boolean,
+): string {
+  if (withinBudget(value)) return value;
+  const characters = Array.from(value);
+  let low = 0;
+  let high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = characters.slice(0, middle).join("");
+    if (withinBudget(candidate)) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return characters.slice(0, low).join("");
 }
 
 function hostnameAllowed(
@@ -73,8 +503,7 @@ function hostnameAllowed(
 ): boolean {
   const lower = hostname.toLowerCase();
   return allowedDomains.some(
-    (domain) =>
-      lower === domain || lower.endsWith(`.${domain}`),
+    (domain) => lower === domain || lower.endsWith(`.${domain}`),
   );
 }
 
@@ -83,9 +512,13 @@ function checkedHttpUrl(value: string): URL {
   try {
     url = new URL(value);
   } catch (error) {
-    throw new OperationNoEffectError("target_blocked", "Target URL is invalid", {
-      cause: error,
-    });
+    throw new OperationNoEffectError(
+      "target_blocked",
+      "Target URL is invalid",
+      {
+        cause: error,
+      },
+    );
   }
   if (
     (url.protocol !== "http:" && url.protocol !== "https:") ||
@@ -118,39 +551,31 @@ function postEffectHttpUrl(value: string): URL {
   }
 }
 
-function snapshotLine(
-  ref: string,
-  snapshot: OperationElementSnapshot,
-): string {
-  const tag = truncate(snapshot.tag.toLowerCase(), 64);
+function snapshotLine(ref: string, snapshot: OperationElementSnapshot): string {
+  const tag = truncateUtf8(snapshot.tag.toLowerCase(), 64);
   const role =
-    snapshot.role === "" ? "" : ` role=${JSON.stringify(truncate(snapshot.role, 128))}`;
+    snapshot.role === ""
+      ? ""
+      : ` role=${JSON.stringify(truncateUtf8(snapshot.role, 128))}`;
   const name =
-    snapshot.name === "" ? "" : ` name=${JSON.stringify(truncate(snapshot.name, 512))}`;
-  const text =
-    snapshot.text === "" ? "" : ` ${JSON.stringify(truncate(snapshot.text, 1_024))}`;
-  return `[ref=${ref}] <${tag}>${role}${name}${text}`;
-}
-
-function compareUtf8(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
-}
-
-function canonicalEvaluateJson(value: JsonSafe): string {
-  if (value === null || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "number" || typeof value === "string") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalEvaluateJson(item)).join(",")}]`;
-  }
-  const keys = Object.keys(value).sort(compareUtf8);
-  return `{${keys
+    snapshot.name === ""
+      ? ""
+      : ` name=${JSON.stringify(truncateUtf8(snapshot.name, 512))}`;
+  const interactionHints = (snapshot.interactionHints ?? [])
     .map(
-      (key) =>
-        `${JSON.stringify(key)}:${canonicalEvaluateJson(value[key]!)}`,
+      (hint) =>
+        `${truncateUtf8(hint.name, MAX_INTERACTION_HINT_NAME_BYTES)}=${JSON.stringify(
+          truncateUtf8(hint.value, MAX_INTERACTION_HINT_VALUE_BYTES),
+        )}`,
     )
-    .join(",")}}`;
+    .join(" ");
+  const hints =
+    interactionHints === "" ? "" : ` interaction-hints=[${interactionHints}]`;
+  const text =
+    snapshot.text === ""
+      ? ""
+      : ` ${JSON.stringify(truncateUtf8(snapshot.text, 1_024))}`;
+  return `[ref=${ref}] <${tag}>${role}${name}${hints}${text}`;
 }
 
 async function observedWithin<T>(
@@ -232,10 +657,7 @@ export function createBrowserOperationSession(options: {
   function recordInterceptorFailure(error: unknown, context: string): void {
     const cause = toError(error);
     if (interceptorFailure === null) {
-      interceptorFailure = new Error(
-        `${context}: ${cause.message}`,
-        { cause },
-      );
+      interceptorFailure = new Error(`${context}: ${cause.message}`, { cause });
     }
   }
 
@@ -387,10 +809,7 @@ export function createBrowserOperationSession(options: {
   ): void {
     if (cdpTeardownFailure === null) {
       const cause = toError(error);
-      cdpTeardownFailure = new Error(
-        `${context}: ${cause.message}`,
-        { cause },
-      );
+      cdpTeardownFailure = new Error(`${context}: ${cause.message}`, { cause });
     }
     errors.push(cdpTeardownFailure);
   }
@@ -444,11 +863,7 @@ export function createBrowserOperationSession(options: {
       session.off("close", cdpCloseHandler);
     } catch (error) {
       expectedCdpClose = false;
-      retainTeardownFailure(
-        error,
-        "CDP close listener removal failed",
-        errors,
-      );
+      retainTeardownFailure(error, "CDP close listener removal failed", errors);
       return false;
     }
     expectedCdpClose = false;
@@ -553,20 +968,23 @@ export function createBrowserOperationSession(options: {
   async function describeElement(
     element: OperationElement,
   ): Promise<OperationElementSnapshot> {
-    return element.evaluate((node) => {
-      const elementNode = node as Element;
-      const html = node as HTMLElement;
-      return {
-        connected: node.isConnected,
-        tag: elementNode.tagName ?? "",
-        role: elementNode.getAttribute("role") ?? "",
-        name:
-          elementNode.getAttribute("aria-label") ??
-          elementNode.getAttribute("name") ??
-          "",
-        text: html.innerText ?? node.textContent ?? "",
-      };
+    const [snapshot] = await element.evaluate(boundedDomObservationsInPage, {
+      maximumCharacters: 1_024,
+      maximumBytes: 1_024,
+      maximumNodes: MAX_ELEMENT_TEXT_NODES,
+      maximumSourceCharacters: MAX_ELEMENT_SOURCE_CHARACTERS,
+      maximumInteractionHintNameCharacters:
+        MAX_INTERACTION_HINT_NAME_CHARACTERS,
+      maximumInteractionHintNameBytes: MAX_INTERACTION_HINT_NAME_BYTES,
+      maximumInteractionHintValueCharacters:
+        MAX_INTERACTION_HINT_VALUE_CHARACTERS,
+      maximumInteractionHintValueBytes: MAX_INTERACTION_HINT_VALUE_BYTES,
+      maximumInteractionHintsBytes: MAX_INTERACTION_HINTS_BYTES,
     });
+    if (snapshot === undefined) {
+      throw new Error("browser returned an empty element observation");
+    }
+    return snapshot;
   }
 
   async function requireRef(ref: string): Promise<OperationElement> {
@@ -593,33 +1011,196 @@ export function createBrowserOperationSession(options: {
     const [title, body] = await Promise.all([
       page.title(),
       snapshotExcerpt === undefined
-        ? page.textContent("body")
+        ? extractVisibleText(undefined)
         : Promise.resolve(snapshotExcerpt),
     ]);
+    const url = page.url();
+    const boundedTitle = truncateUtf8(title, 4_096, MAX_PAGE_TITLE_BYTES);
+    const boundedExcerpt = truncateUtf8(
+      body ?? "",
+      MAX_PAGE_TEXT_CHARS,
+      MAX_PAGE_TEXT_BYTES,
+    );
     return {
-      url: page.url(),
-      title: truncate(title, 4_096),
-      snapshotExcerpt: truncate(body ?? "", MAX_PAGE_TEXT_CHARS),
+      url,
+      title: boundedTitle,
+      snapshotExcerpt: truncateForJsonBudget(
+        boundedExcerpt,
+        (candidate) =>
+          encodedBytes({
+            url,
+            title: boundedTitle,
+            snapshotExcerpt: candidate,
+          }) <= MAX_PAGE_STATE_JSON_BYTES,
+      ),
     };
   }
 
-  async function takeSnapshot(): Promise<OperationExecution> {
-    const handles = await page.locator("body *").elementHandles();
-    const retained = handles.slice(0, MAX_LOCATOR_REFS);
-    const excess = handles.slice(MAX_LOCATOR_REFS);
+  async function boundedElements(): Promise<
+    ReadonlyArray<
+      Readonly<{
+        element: OperationElement;
+        snapshot: OperationElementSnapshot;
+      }>
+    >
+  > {
+    const collection = await page.evaluateHandle((maximumElements) => {
+      const retained: Element[] = [];
+      const root = document.body;
+      let element = root?.firstElementChild ?? null;
+      while (element !== null && retained.length < maximumElements) {
+        retained.push(element);
+        if (element.firstElementChild !== null) {
+          element = element.firstElementChild;
+          continue;
+        }
+        let ancestor: Element | null = element;
+        while (
+          ancestor !== null &&
+          ancestor !== root &&
+          ancestor.nextElementSibling === null
+        ) {
+          ancestor = ancestor.parentElement;
+        }
+        element =
+          ancestor === null || ancestor === root
+            ? null
+            : ancestor.nextElementSibling;
+      }
+      return retained;
+    }, MAX_LOCATOR_REFS);
+    const handles: OperationElement[] = [];
+    try {
+      const snapshots = await collection.evaluate(
+        boundedDomObservationsInPage,
+        {
+          maximumCharacters: 1_024,
+          maximumBytes: 1_024,
+          maximumNodes: MAX_ELEMENT_TEXT_NODES,
+          maximumSourceCharacters: MAX_ELEMENT_SOURCE_CHARACTERS,
+          maximumInteractionHintNameCharacters:
+            MAX_INTERACTION_HINT_NAME_CHARACTERS,
+          maximumInteractionHintNameBytes: MAX_INTERACTION_HINT_NAME_BYTES,
+          maximumInteractionHintValueCharacters:
+            MAX_INTERACTION_HINT_VALUE_CHARACTERS,
+          maximumInteractionHintValueBytes: MAX_INTERACTION_HINT_VALUE_BYTES,
+          maximumInteractionHintsBytes: MAX_INTERACTION_HINTS_BYTES,
+        },
+      );
+      const properties = await collection.getProperties();
+      const retained: Array<{
+        element: OperationElement;
+        snapshot: OperationElementSnapshot;
+      }> = [];
+      for (let index = 0; index < MAX_LOCATOR_REFS; index += 1) {
+        const property = properties.get(String(index));
+        if (property === undefined) break;
+        const element = property.asElement();
+        if (element === null) {
+          await property.dispose();
+          continue;
+        }
+        handles.push(element);
+        const snapshot = snapshots[index];
+        if (snapshot === undefined) {
+          await element.dispose().catch(() => undefined);
+          handles.pop();
+          continue;
+        }
+        retained.push({ element, snapshot });
+      }
+      return retained;
+    } catch (error) {
+      await Promise.all(
+        handles.map((handle) => handle.dispose().catch(() => undefined)),
+      );
+      throw error;
+    } finally {
+      await collection.dispose();
+    }
+  }
+
+  async function extractVisibleText(ref: string | undefined): Promise<string> {
+    if (ref === undefined) {
+      const body = page.locator("body");
+      if (!(await body.isVisible())) return "";
+      const [observation] = await body.evaluate(boundedDomObservationsInPage, {
+        maximumCharacters: MAX_PAGE_TEXT_CHARS,
+        maximumBytes: MAX_PAGE_TEXT_BYTES,
+        maximumNodes: MAX_PAGE_TEXT_NODES,
+        maximumSourceCharacters: MAX_PAGE_SOURCE_CHARACTERS,
+        maximumInteractionHintNameCharacters:
+          MAX_INTERACTION_HINT_NAME_CHARACTERS,
+        maximumInteractionHintNameBytes: MAX_INTERACTION_HINT_NAME_BYTES,
+        maximumInteractionHintValueCharacters:
+          MAX_INTERACTION_HINT_VALUE_CHARACTERS,
+        maximumInteractionHintValueBytes: MAX_INTERACTION_HINT_VALUE_BYTES,
+        maximumInteractionHintsBytes: MAX_INTERACTION_HINTS_BYTES,
+      });
+      if (observation === undefined) return "";
+      return observation.text;
+    }
+    const element = await requireRef(ref);
+    if (!(await element.isVisible())) return "";
+    const [observation] = await element.evaluate(boundedDomObservationsInPage, {
+      maximumCharacters: MAX_PAGE_TEXT_CHARS,
+      maximumBytes: MAX_PAGE_TEXT_BYTES,
+      maximumNodes: MAX_PAGE_TEXT_NODES,
+      maximumSourceCharacters: MAX_PAGE_SOURCE_CHARACTERS,
+      maximumInteractionHintNameCharacters:
+        MAX_INTERACTION_HINT_NAME_CHARACTERS,
+      maximumInteractionHintNameBytes: MAX_INTERACTION_HINT_NAME_BYTES,
+      maximumInteractionHintValueCharacters:
+        MAX_INTERACTION_HINT_VALUE_CHARACTERS,
+      maximumInteractionHintValueBytes: MAX_INTERACTION_HINT_VALUE_BYTES,
+      maximumInteractionHintsBytes: MAX_INTERACTION_HINTS_BYTES,
+    });
+    if (observation === undefined) return "";
+    return observation.text;
+  }
+
+  async function createVisibleTextDeltaTracker(): Promise<
+    JSHandle<VisibleTextDeltaTracker>
+  > {
+    return page.evaluateHandle(visibleTextDeltaTrackerInPage, {
+      maximumBytes: HOVER_BATCH_TEXT_BYTES,
+      maximumNodes: MAX_PAGE_TEXT_NODES,
+      maximumSourceCharacters: MAX_PAGE_SOURCE_CHARACTERS,
+    });
+  }
+
+  async function prevalidateHoverBatch(
+    batchRefs: readonly string[],
+  ): Promise<ReadonlyArray<{ ref: string; element: OperationElement }>> {
+    const retained = batchRefs.map((ref) => {
+      const element = refs.get(ref);
+      if (element === undefined) {
+        throw new OperationNoEffectError(
+          "stale_ref",
+          "Hover batch locator reference is stale",
+        );
+      }
+      return { ref, element };
+    });
+    const snapshots = await Promise.all(
+      retained.map(({ element }) => describeElement(element)),
+    );
+    if (snapshots.some((snapshot) => !snapshot.connected)) {
+      throw new OperationNoEffectError(
+        "stale_ref",
+        "Hover batch locator reference is detached",
+      );
+    }
+    return retained;
+  }
+
+  async function observePage(): Promise<BoundedPageState> {
+    const retained = await boundedElements();
     await clearRefs();
-    await Promise.allSettled(excess.map((element) => element.dispose()));
     const lines: string[] = [];
     for (let index = 0; index < retained.length; index += 1) {
-      const element = retained[index]!;
+      const { element, snapshot } = retained[index]!;
       const ref = `e${index + 1}`;
-      let snapshot: OperationElementSnapshot;
-      try {
-        snapshot = await describeElement(element);
-      } catch {
-        await element.dispose().catch(() => undefined);
-        continue;
-      }
       if (!snapshot.connected) {
         await element.dispose().catch(() => undefined);
         continue;
@@ -627,132 +1208,27 @@ export function createBrowserOperationSession(options: {
       refs.set(ref, element);
       lines.push(snapshotLine(ref, snapshot));
     }
-    const excerpt = truncate(lines.join("\n"), MAX_PAGE_TEXT_CHARS);
-    return {
-      result: { kind: "snapshot", refCount: refs.size },
-      page: await pageState(excerpt),
-    };
-  }
-
-  async function evaluateOperation(
-    expression: string,
-    args: Readonly<Record<string, JsonSafe>>,
-  ): Promise<JsonSafe> {
-    try {
-      parseAndValidateEvaluateExpression(expression);
-    } catch (error) {
-      if (error instanceof EvaluatePolicyError) {
-        throw new OperationNoEffectError(error.category, error.message, {
-          cause: error,
-        });
-      }
-      throw error;
-    }
-    const argsJson = canonicalEvaluateJson(args);
-    const source = `(() => {
-const SafeArray=Array;const SafeObject=Object;const SafeJSON=JSON;const SafeNumber=Number;const SafeSet=Set;const SafeString=String;const SafeTextEncoder=TextEncoder;const SafeTypeError=TypeError;const SafeRangeError=RangeError;
-const reflectApply=Reflect.apply.bind(Reflect);const arrayJoinMethod=SafeArray.prototype.join;const arraySortMethod=SafeArray.prototype.sort;const setAddMethod=SafeSet.prototype.add;const setDeleteMethod=SafeSet.prototype.delete;const setHasMethod=SafeSet.prototype.has;
-const arrayPrototype=SafeArray.prototype;const objectPrototype=SafeObject.prototype;const objectKeys=SafeObject.keys.bind(SafeObject);
-const objectGetOwnPropertyDescriptor=SafeObject.getOwnPropertyDescriptor.bind(SafeObject);
-const objectGetOwnPropertyDescriptors=SafeObject.getOwnPropertyDescriptors.bind(SafeObject);
-const objectGetOwnPropertyNames=SafeObject.getOwnPropertyNames.bind(SafeObject);
-const objectGetOwnPropertySymbols=SafeObject.getOwnPropertySymbols.bind(SafeObject);
-const objectGetPrototypeOf=SafeObject.getPrototypeOf.bind(SafeObject);
-const arrayIsArray=SafeArray.isArray.bind(SafeArray);
-const stringify=SafeJSON.stringify.bind(SafeJSON);const parse=SafeJSON.parse.bind(SafeJSON);
-const numberIsFinite=SafeNumber.isFinite.bind(SafeNumber);const utf8=new SafeTextEncoder();const utf8Encode=utf8.encode.bind(utf8);
-const args=parse(${JSON.stringify(argsJson)});
-const seen=new SafeSet();const compareUtf8=(left,right)=>{const a=utf8Encode(left);const b=utf8Encode(right);const length=a.length<b.length?a.length:b.length;for(let index=0;index<length;index++){if(a[index]!==b[index])return a[index]-b[index];}return a.length-b.length;};
-const value=(\n${expression}\n);
-const encode=(input,depth)=>{
-if(depth>16)throw new SafeTypeError("unsafe evaluate result");
-if(input===null||typeof input==="boolean")return stringify(input);
-if(typeof input==="number"){if(!numberIsFinite(input))throw new SafeTypeError("unsafe evaluate result");return stringify(input);}
-if(typeof input==="string"){if(utf8Encode(input).length>65536)throw new SafeTypeError("unsafe evaluate result");return stringify(input);}
-if(typeof input!=="object"||reflectApply(setHasMethod,seen,[input])||objectGetOwnPropertySymbols(input).length!==0)throw new SafeTypeError("unsafe evaluate result");
-reflectApply(setAddMethod,seen,[input]);
-try{
-if(arrayIsArray(input)){if(objectGetPrototypeOf(input)!==arrayPrototype||input.length>1000||objectGetOwnPropertyNames(input).length!==input.length+1)throw new SafeTypeError("unsafe evaluate result");const values=[];for(let index=0;index<input.length;index++){const descriptor=objectGetOwnPropertyDescriptor(input,SafeString(index));if(!descriptor||!descriptor.enumerable||descriptor.get||descriptor.set)throw new SafeTypeError("unsafe evaluate result");values[index]=encode(descriptor.value,depth+1);}return "["+reflectApply(arrayJoinMethod,values,[","])+"]";}
-const prototype=objectGetPrototypeOf(input);if(prototype!==objectPrototype&&prototype!==null)throw new SafeTypeError("unsafe evaluate result");
-const descriptors=objectGetOwnPropertyDescriptors(input);const keys=objectKeys(descriptors);if(keys.length>256)throw new SafeTypeError("unsafe evaluate result");reflectApply(arraySortMethod,keys,[compareUtf8]);const properties=[];
-for(let index=0;index<keys.length;index++){const key=keys[index];const descriptor=descriptors[key];if(!descriptor.enumerable||descriptor.get||descriptor.set||key.length>256)throw new SafeTypeError("unsafe evaluate result");properties[index]=stringify(key)+":"+encode(descriptor.value,depth+1);}return "{"+reflectApply(arrayJoinMethod,properties,[","])+"}";
-}finally{reflectApply(setDeleteMethod,seen,[input]);}
-};
-const canonical=encode(value,0);
-if(utf8Encode(canonical).length>${MAX_EVALUATE_RESULT_BYTES})throw new SafeRangeError("evaluate result exceeds 32 KiB");
-return canonical;
-})()`;
-    const session = cdp;
-    if (session === null || mainFrameId === "") {
-      throw new Error("isolated evaluation context is unavailable");
-    }
-    const world = (await session.send("Page.createIsolatedWorld", {
-      frameId: mainFrameId,
-      worldName: "firecrawl-evaluate-v1",
-      grantUniveralAccess: false,
-    })) as { executionContextId?: number };
-    const contextId = world.executionContextId;
-    if (typeof contextId !== "number" || !Number.isSafeInteger(contextId)) {
-      throw new Error("isolated evaluation context was not created");
-    }
-    const response = (await session.send("Runtime.evaluate", {
-      expression: source,
-      contextId,
-      awaitPromise: true,
-      returnByValue: true,
-    })) as {
-      result?: { value?: unknown; description?: string };
-      exceptionDetails?: { text?: string };
-    };
-    if (response.exceptionDetails !== undefined) {
-      throw new Error(
-        response.result?.description ??
-          response.exceptionDetails.text ??
-          "isolated evaluation failed",
-      );
-    }
-    const canonical: unknown = response.result?.value;
-    if (typeof canonical !== "string") {
-      throw new TypeError("evaluate result canonicalization failed");
-    }
-    let value: unknown;
-    try {
-      value = JSON.parse(canonical);
-    } catch (error) {
-      throw new TypeError("evaluate result canonical bytes are invalid", {
-        cause: error,
-      });
-    }
-    const parsed = jsonSafeSchema.safeParse(value);
-    if (!parsed.success) {
-      throw new TypeError("evaluate result is not JSON-safe");
-    }
-    if (encodedBytes(parsed.data) > MAX_EVALUATE_RESULT_BYTES) {
-      throw new RangeError("evaluate result exceeds 32 KiB");
-    }
-    if (canonicalEvaluateJson(parsed.data) !== canonical) {
-      throw new TypeError("evaluate result canonical bytes differ");
-    }
-    return parsed.data;
+    const excerpt = truncateUtf8(
+      lines.join("\n"),
+      MAX_PAGE_TEXT_CHARS,
+      MAX_PAGE_TEXT_BYTES,
+    );
+    return pageState(excerpt);
   }
 
   async function execute(
     operation: BrowserOperation,
+    artifactId = randomUUID(),
+    context: OperationExecutionContext = {},
   ): Promise<OperationExecution> {
     assertOpen();
     await routeReady;
     assertOpen();
     assertInterceptorHealthy();
     let result: BrowserOperationResultV1;
-    let snapshotExcerpt: string | undefined;
+    let artifact: OperationExecution["artifact"];
 
     switch (operation.kind) {
-      case "snapshot":
-        {
-          const snapshot = await takeSnapshot();
-          await drainPausedJobs();
-          return snapshot;
-        }
       case "click": {
         const element = await requireRef(operation.ref);
         const href = await element.getAttribute("href");
@@ -769,6 +1245,18 @@ return canonical;
           }
           requireCommittedClickTarget(resolvedHref);
         }
+        try {
+          await element.click({
+            trial: true,
+            timeout: CLICK_ACTIONABILITY_TIMEOUT_MS,
+          });
+        } catch (error) {
+          throw new OperationNoEffectError(
+            "target_not_actionable",
+            "Click target did not become actionable within 10000 ms",
+            { cause: error },
+          );
+        }
         await element.click();
         const finalUrl = postEffectHttpUrl(page.url());
         if (!committedOrigins.has(finalUrl.origin)) {
@@ -777,54 +1265,210 @@ return canonical;
         result = { kind: "click", applied: true };
         break;
       }
-      case "fill":
-        await (await requireRef(operation.ref)).fill(operation.value);
-        result = { kind: "fill", applied: true };
+      case "hover": {
+        const element = await requireRef(operation.ref);
+        try {
+          await element.hover({
+            trial: true,
+            timeout: HOVER_ACTIONABILITY_TIMEOUT_MS,
+          });
+        } catch (error) {
+          throw new OperationNoEffectError(
+            "target_not_actionable",
+            "Hover target did not become actionable within 10000 ms",
+            { cause: error },
+          );
+        }
+        await element.hover();
+        result = { kind: "hover", applied: true };
         break;
-      case "type":
-        await (await requireRef(operation.ref)).type(
-          operation.value,
-          { delay: operation.delayMs },
+      }
+      case "hover_batch": {
+        const startedAtMs = Date.now();
+        throwIfAborted(context.signal);
+        if (
+          context.deadlineAtMs !== undefined &&
+          context.deadlineAtMs - startedAtMs < HOVER_BATCH_PHASE_TIMEOUT_MS
+        ) {
+          throw new OperationNoEffectError(
+            "target_not_actionable",
+            "Hover batch requires 8000 ms of remaining action authority",
+          );
+        }
+        const retained = await prevalidateHoverBatch(operation.refs);
+        const phaseDeadlineAtMs = Math.min(
+          startedAtMs + HOVER_BATCH_PHASE_TIMEOUT_MS,
+          context.deadlineAtMs ?? Number.POSITIVE_INFINITY,
         );
+        const tracker = await createVisibleTextDeltaTracker();
+        const items: Array<
+          | {
+              ref: string;
+              outcome: "succeeded";
+              text: string;
+            }
+          | {
+              ref: string;
+              outcome: "failed_no_effect";
+              error: {
+                category: "stale_ref" | "target_not_actionable";
+                message: string;
+              };
+            }
+        > = [];
+        try {
+          for (const { ref, element } of retained) {
+            throwIfAborted(context.signal);
+            const remainingBeforeProbe = phaseDeadlineAtMs - Date.now();
+            if (remainingBeforeProbe <= HOVER_BATCH_SETTLE_MS + 1) {
+              items.push({
+                ref,
+                outcome: "failed_no_effect",
+                error: {
+                  category: "target_not_actionable",
+                  message: "Hover batch phase deadline was exhausted",
+                },
+              });
+              continue;
+            }
+
+            const snapshot = await describeElement(element);
+            if (!snapshot.connected) {
+              items.push({
+                ref,
+                outcome: "failed_no_effect",
+                error: {
+                  category: "stale_ref",
+                  message: "Hover batch locator reference is detached",
+                },
+              });
+              continue;
+            }
+
+            try {
+              await element.hover({
+                trial: true,
+                timeout: Math.min(
+                  HOVER_BATCH_ACTIONABILITY_TIMEOUT_MS,
+                  Math.max(1, remainingBeforeProbe - HOVER_BATCH_SETTLE_MS),
+                ),
+              });
+            } catch (error) {
+              throwIfAborted(context.signal);
+              const afterProbe = await describeElement(element);
+              items.push(
+                afterProbe.connected
+                  ? {
+                      ref,
+                      outcome: "failed_no_effect",
+                      error: {
+                        category: "target_not_actionable",
+                        message:
+                          "Hover batch target did not become actionable within 1000 ms",
+                      },
+                    }
+                  : {
+                      ref,
+                      outcome: "failed_no_effect",
+                      error: {
+                        category: "stale_ref",
+                        message: "Hover batch locator reference is detached",
+                      },
+                    },
+              );
+              continue;
+            }
+
+            const remainingBeforeHover = phaseDeadlineAtMs - Date.now();
+            if (remainingBeforeHover <= HOVER_BATCH_SETTLE_MS + 1) {
+              items.push({
+                ref,
+                outcome: "failed_no_effect",
+                error: {
+                  category: "target_not_actionable",
+                  message: "Hover batch phase deadline was exhausted",
+                },
+              });
+              continue;
+            }
+            await element.hover({
+              timeout: Math.max(
+                1,
+                remainingBeforeHover - HOVER_BATCH_SETTLE_MS,
+              ),
+            });
+            throwIfAborted(context.signal);
+            const settleMs = Math.min(
+              HOVER_BATCH_SETTLE_MS,
+              Math.max(0, phaseDeadlineAtMs - Date.now()),
+            );
+            if (settleMs > 0) await page.waitForTimeout(settleMs);
+            const text = await tracker.evaluate((value) => value.capture());
+            items.push({
+              ref,
+              outcome: "succeeded",
+              text: truncateUtf8(
+                text,
+                HOVER_BATCH_TEXT_BYTES,
+                HOVER_BATCH_TEXT_BYTES,
+              ),
+            });
+          }
+        } finally {
+          await tracker.dispose();
+        }
+        result = { kind: "hover_batch", items };
+        break;
+      }
+      case "type": {
+        const element = await requireRef(operation.ref);
+        if (operation.clear === true) await element.fill("");
+        await element.type(operation.text);
         result = { kind: "type", applied: true };
         break;
-      case "press":
-        await (await requireRef(operation.ref)).press(operation.key);
-        result = { kind: "press", applied: true };
-        break;
-      case "select":
-        await (await requireRef(operation.ref)).selectOption(operation.values);
-        result = { kind: "select", applied: true };
-        break;
-      case "scroll":
-        await page.mouse.wheel(operation.deltaX, operation.deltaY);
-        result = { kind: "scroll", applied: true };
-        break;
+      }
       case "wait":
         await page.waitForTimeout(operation.milliseconds);
         result = { kind: "wait", waitedMs: operation.milliseconds };
         break;
-      case "get_text": {
-        const text =
-          operation.ref === undefined
-            ? await page.textContent("body")
-            : await (await requireRef(operation.ref)).textContent();
+      case "extract": {
+        const text = await extractVisibleText(operation.ref);
         result = {
-          kind: "get_text",
-          text: truncate(text ?? "", MAX_PAGE_TEXT_CHARS),
+          kind: "extract",
+          text: truncateUtf8(text, MAX_PAGE_TEXT_CHARS, MAX_PAGE_TEXT_BYTES),
         };
         break;
       }
-      case "get_url":
-        result = { kind: "get_url", url: checkedHttpUrl(page.url()).href };
+      case "screenshot": {
+        const bytes = await page.screenshot({
+          type: "png",
+          fullPage: operation.fullPage ?? false,
+        });
+        if (bytes.byteLength === 0 || bytes.byteLength > MAX_SCREENSHOT_BYTES) {
+          throw new OperationNoEffectError(
+            "artifact_too_large",
+            "Screenshot exceeds its byte limit",
+          );
+        }
+        result = {
+          kind: "screenshot",
+          artifactId,
+          contentType: "image/png",
+          byteSize: bytes.byteLength,
+          checksum: createHash("sha256").update(bytes).digest("hex"),
+        };
+        artifact = {
+          contentType: "image/png",
+          bytes: Uint8Array.from(bytes),
+        };
         break;
+      }
       case "navigate": {
         const target = requireNavigateTarget(operation.url);
         const grantsOrigin = !committedOrigins.has(target.origin);
         if (
           grantsOrigin &&
-          committedOrigins.size + reservedOrigins.size >=
-            MAX_NAVIGATION_ORIGINS
+          committedOrigins.size + reservedOrigins.size >= MAX_NAVIGATION_ORIGINS
         ) {
           throw new OperationNoEffectError(
             "target_blocked",
@@ -854,23 +1498,52 @@ return canonical;
         result = { kind: "navigate", applied: true };
         break;
       }
-      case "evaluate":
-        result = {
-          kind: "evaluate",
-          value: await evaluateOperation(operation.expression, operation.args),
-        };
-        break;
     }
 
     await drainPausedJobs();
+    let boundedPage = await observePage();
+    if (result.kind === "extract") {
+      result = {
+        ...result,
+        text: truncateForJsonBudget(
+          result.text,
+          (candidate) =>
+            encodedBytes({
+              page: boundedPage,
+              result: { kind: "extract", text: candidate },
+            }) <= MAX_ACTION_OBSERVATION_COMPONENT_JSON_BYTES,
+        ),
+      };
+    }
+    if (result.kind === "hover_batch") {
+      boundedPage = {
+        ...boundedPage,
+        snapshotExcerpt: truncateForJsonBudget(
+          boundedPage.snapshotExcerpt,
+          (candidate) =>
+            encodedBytes({
+              page: { ...boundedPage, snapshotExcerpt: candidate },
+              result,
+            }) <= MAX_ACTION_OBSERVATION_COMPONENT_JSON_BYTES,
+        ),
+      };
+    }
     const boundedResult = browserOperationResultSchema.parse(result);
     return {
       result: boundedResult,
-      page: await pageState(snapshotExcerpt),
+      page: boundedPage,
+      ...(artifact === undefined ? {} : { artifact }),
     };
   }
 
   return Object.freeze({
+    async observe() {
+      assertOpen();
+      await routeReady;
+      assertOpen();
+      assertInterceptorHealthy();
+      return observePage();
+    },
     execute,
     dispose() {
       if (disposePromise !== null) return disposePromise;
@@ -930,6 +1603,7 @@ type CachedActionOptions = {
   executeOperation(
     operation: BrowserOperation,
     signal: AbortSignal,
+    actionId: string,
   ): Promise<OperationExecution>;
   currentSessionVersion(): number;
   currentPage(): BoundedPageState;
@@ -966,7 +1640,7 @@ export async function executeCachedAction(
   }
 
   try {
-    candidate = await options.withWriter(async signal => {
+    candidate = await options.withWriter(async (signal) => {
       enteredWriter = true;
       const currentVersion = options.currentSessionVersion();
       if (request.expectedSessionVersion !== currentVersion) {
@@ -987,7 +1661,11 @@ export async function executeCachedAction(
 
       let execution: OperationExecution;
       try {
-        execution = await options.executeOperation(request.operation, signal);
+        execution = await options.executeOperation(
+          request.operation,
+          signal,
+          request.actionId,
+        );
       } catch (error) {
         if (error instanceof OperationNoEffectError) {
           return actionExecutionResultSchema.parse({

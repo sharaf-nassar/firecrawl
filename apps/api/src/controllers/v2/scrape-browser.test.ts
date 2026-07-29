@@ -9,8 +9,6 @@ const mocks = vi.hoisted(() => ({
     stopInteract: vi.fn(),
   },
   getRuntime: vi.fn(),
-  legacyPrompt: vi.fn(),
-  legacyCode: vi.fn(),
   getScrape: vi.fn(),
   logRequest: vi.fn(),
   reserveKeyless: vi.fn(),
@@ -25,10 +23,8 @@ const mocks = vi.hoisted(() => ({
   getSessionFromScrape: vi.fn(),
 }));
 
-vi.mock("../../lib/scrape-interact/browser-agent", () => ({
+vi.mock("../../lib/browser-runtime/public-browser-runtime", () => ({
   getPublicBrowserRuntime: mocks.getRuntime,
-  executePromptViaBrowserAgent: mocks.legacyPrompt,
-  executeCodeViaBrowserSession: mocks.legacyCode,
   PublicBrowserRuntimeError: class PublicBrowserRuntimeError extends Error {
     constructor(public readonly category: string) {
       super(category);
@@ -193,15 +189,24 @@ describe("local scrape Interact compatibility", () => {
     mocks.runtime.loadReplayState.mockResolvedValue(replay());
   });
 
-  it("enforces exact prompt/code XOR and bounded allowed domains", () => {
+  it("accepts only bounded prompt requests and allowed domains", () => {
     expect(browserExecuteRequestSchema.safeParse({}).success).toBe(false);
     expect(
       browserExecuteRequestSchema.safeParse({ prompt: "read", code: "1" })
         .success,
     ).toBe(false);
     expect(
-      browserExecuteRequestSchema.safeParse({ prompt: "read" }).success,
+      browserExecuteRequestSchema.safeParse({
+        prompt: "read",
+        language: "node",
+      }).success,
     ).toBe(true);
+    expect(
+      browserExecuteRequestSchema.safeParse({
+        prompt: "read",
+        language: "python",
+      }).success,
+    ).toBe(false);
     expect(
       browserExecuteRequestSchema.safeParse({
         prompt: "read",
@@ -249,6 +254,7 @@ describe("local scrape Interact compatibility", () => {
       },
     });
     const res = response();
+    const requestStartedAt = Date.now();
 
     await scrapeInteractController(
       request(ownerId, { prompt: "Read the heading" }, jobId),
@@ -258,12 +264,18 @@ describe("local scrape Interact compatibility", () => {
     expect(mocks.runtime.interact).toHaveBeenCalledTimes(1);
     expect(mocks.runtime.interact).toHaveBeenCalledWith(
       expect.objectContaining({
-        mode: "prompt",
         prompt: "Read the heading",
-        timeoutSeconds: 30,
+        deadline: expect.any(Date),
       }),
     );
-    expect(mocks.legacyPrompt).not.toHaveBeenCalled();
+    const submittedDeadline = mocks.runtime.interact.mock.calls[0]![0]
+      .deadline as Date;
+    expect(submittedDeadline.getTime()).toBeGreaterThanOrEqual(
+      requestStartedAt + 30_000,
+    );
+    expect(submittedDeadline.getTime()).toBeLessThanOrEqual(
+      Date.now() + 30_000,
+    );
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({
       output: "done",
@@ -282,7 +294,7 @@ describe("local scrape Interact compatibility", () => {
       options: {},
     });
     mocks.runtime.interact.mockRejectedValue(
-      Object.assign(new Error("missing"), { category: "codex_unavailable" }),
+      Object.assign(new Error("missing"), { category: "adapter_unavailable" }),
     );
     const res = response();
 
@@ -292,8 +304,6 @@ describe("local scrape Interact compatibility", () => {
     );
 
     expect(res.statusCode).toBe(503);
-    expect(mocks.legacyPrompt).not.toHaveBeenCalled();
-    expect(mocks.legacyCode).not.toHaveBeenCalled();
   });
 
   it("maps adapter protocol faults to a sanitized 502", async () => {
@@ -306,7 +316,7 @@ describe("local scrape Interact compatibility", () => {
       options: {},
     });
     mocks.runtime.interact.mockRejectedValue(
-      Object.assign(new Error("/run/private/adapter.sock: leaked bytes"), {
+      Object.assign(new Error("private worker detail: leaked bytes"), {
         category: "adapter_protocol_error",
       }),
     );
@@ -322,9 +332,55 @@ describe("local scrape Interact compatibility", () => {
       success: false,
       error: "Browser execution returned an invalid protocol result.",
     });
-    expect(JSON.stringify(res.body)).not.toContain("/run/private");
-    expect(mocks.legacyPrompt).not.toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain("private worker detail");
   });
+
+  it.each([
+    {
+      category: "model_protocol_error",
+      status: 422,
+      message: "Browser model returned an invalid protocol result.",
+    },
+    {
+      category: "action_limit_exceeded",
+      status: 422,
+      message: "Browser action limit was reached.",
+    },
+    {
+      category: "concurrency_exceeded",
+      status: 429,
+      message: "Browser concurrency limit was reached.",
+    },
+  ])(
+    "maps $category to a sanitized $status",
+    async ({ category, status, message }) => {
+      const ownerId = randomUUID();
+      const jobId = randomUUID();
+      mocks.getScrape.mockResolvedValue({
+        id: jobId,
+        team_id: ownerId,
+        url: "https://fixture.example/start",
+        options: {},
+      });
+      mocks.runtime.interact.mockRejectedValue(
+        Object.assign(new Error("private execution detail"), { category }),
+      );
+      const res = response();
+
+      await scrapeInteractController(
+        request(ownerId, { prompt: "read" }, jobId),
+        res as never,
+      );
+
+      expect(mocks.runtime.interact).toHaveBeenCalledTimes(1);
+      expect(res.statusCode).toBe(status);
+      expect(res.body).toEqual({ success: false, error: message });
+      expect(JSON.stringify(res.body)).not.toContain(
+        "private execution detail",
+      );
+      expect(res.body).not.toHaveProperty("category");
+    },
+  );
 
   it("rejects cross-owner, ZDR, and unavailable replay before execution", async () => {
     const ownerId = randomUUID();
@@ -373,7 +429,7 @@ describe("local scrape Interact compatibility", () => {
     expect(mocks.runtime.interact).not.toHaveBeenCalled();
   });
 
-  it("passes owned session reuse, profile, and domain union to one code job", async () => {
+  it("passes owned session reuse, profile, and domain union to one prompt job", async () => {
     const ownerId = randomUUID();
     const jobId = randomUUID();
     const existingSessionId = randomUUID();
@@ -400,11 +456,16 @@ describe("local scrape Interact compatibility", () => {
           "http://api.example.test/v2/browser/proxy/input/view",
       },
       result: {
-        stdout: "ok",
-        result: "marker",
-        stderr: "",
-        exitCode: 0,
-        killed: false,
+        output: "marker",
+        turnCount: 2,
+        actionCount: 1,
+        usage: { inputTokens: 80, outputTokens: 12 },
+        protocol: {
+          toolEventCount: 1,
+          approvalEventCount: 0,
+          decisionSchemaVersion: 1,
+          observationSchemaVersion: 1,
+        },
       },
     });
     const res = response();
@@ -413,7 +474,7 @@ describe("local scrape Interact compatibility", () => {
       request(
         ownerId,
         {
-          code: "return 1",
+          prompt: "Read the marker",
           existingSessionId,
           allowedDomains: ["assets.example"],
         },
@@ -425,14 +486,17 @@ describe("local scrape Interact compatibility", () => {
     expect(mocks.runtime.interact).toHaveBeenCalledTimes(1);
     expect(mocks.runtime.interact).toHaveBeenCalledWith(
       expect.objectContaining({
-        mode: "code",
-        source: "return 1",
+        prompt: "Read the marker",
         existingSessionId,
         allowedDomains: ["assets.example", "fixture.example"],
         profile: { name: "saved", saveChanges: false },
       }),
     );
-    expect(res.body).toMatchObject({ stdout: "ok", result: "marker" });
+    expect(res.body).toMatchObject({
+      output: "marker",
+      turnCount: 2,
+      actionCount: 1,
+    });
   });
 
   it("stops through one idempotent local runtime operation", async () => {
@@ -511,11 +575,16 @@ describe("local scrape Interact compatibility", () => {
       return {
         session,
         result: {
-          stdout: "ok",
-          result: "done",
-          stderr: "",
-          exitCode: 0,
-          killed: false,
+          output: "done",
+          turnCount: 1,
+          actionCount: 1,
+          usage: { inputTokens: 40, outputTokens: 8 },
+          protocol: {
+            toolEventCount: 1,
+            approvalEventCount: 0,
+            decisionSchemaVersion: 1,
+            observationSchemaVersion: 1,
+          },
         },
       };
     });
@@ -538,7 +607,7 @@ describe("local scrape Interact compatibility", () => {
     });
 
     await scrapeInteractController(
-      request(ownerId, { code: "1" }, jobId),
+      request(ownerId, { prompt: "Read the page" }, jobId),
       response() as never,
     );
     await scrapeStopInteractiveBrowserController(

@@ -17,7 +17,7 @@ export const isLangSmithEnabled = Boolean(
   LANGSMITH_API_KEY && config.LANGSMITH_TRACING === true,
 );
 
-export type InteractTraceMetadata = {
+type InteractTraceMetadata = {
   thread_id: string;
   session_id: string;
   scrape_id: string;

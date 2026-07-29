@@ -131,7 +131,7 @@ describe(
   "held profile publication",
   () => {
     test("persists replay bytes under the reconciled root authority", async () => {
-      const { root, store } = await harness();
+      const { root, stateRoot, store } = await harness();
       const storageState = { cookies: [], origins: [] };
       const persisted = await store.persistReplayCheckpoint({
         ownerId: PROFILE,
@@ -169,6 +169,15 @@ describe(
           checksum: persisted.checksum,
         }),
       ).toBe(true);
+      await rm(join(stateRoot, "replay", PROFILE, SESSION), {
+        recursive: true,
+      });
+      await expect(
+        store.deleteReplayCheckpoint({
+          statePath: persisted.statePath,
+          checksum: persisted.checksum,
+        }),
+      ).resolves.toBe(false);
       await store.close();
       await closeAnchoredProfileRoot(root);
     });

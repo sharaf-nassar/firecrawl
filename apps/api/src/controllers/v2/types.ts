@@ -797,6 +797,20 @@ export type BaseScrapeOptions = z.infer<typeof baseScrapeOptions>;
 
 export type ScrapeOptions = BaseScrapeOptions;
 
+const baseScrapeOptionKeys = Object.keys(
+  baseScrapeOptions.shape,
+) as (keyof BaseScrapeOptions)[];
+
+export function projectBaseScrapeOptions(
+  request: Record<string, unknown>,
+): BaseScrapeOptions {
+  return Object.fromEntries(
+    baseScrapeOptionKeys
+      .filter(key => Object.hasOwn(request, key))
+      .map(key => [key, request[key]]),
+  ) as BaseScrapeOptions;
+}
+
 export type UploadedParseFileKind = "html" | "pdf" | "document";
 
 export type UploadedParseFile = {

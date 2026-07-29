@@ -38,7 +38,7 @@ import {
   getPublicBrowserRuntime,
   PublicBrowserRuntimeError,
   type PublicBrowserSession,
-} from "../../lib/scrape-interact/browser-agent";
+} from "../../lib/browser-runtime/public-browser-runtime";
 
 // ---------------------------------------------------------------------------
 // Zod schemas
@@ -68,7 +68,7 @@ const allowedDomainSchema = z
     }
   });
 
-export const browserCreateRequestSchema = z
+const browserCreateRequestSchema = z
   .strictObject({
     ttl: z.number().int().min(30).max(3600).default(600),
     activityTtl: z.number().int().min(10).max(600).default(300),
@@ -97,26 +97,6 @@ interface BrowserCreateResponse {
   liveViewUrl?: string;
   interactiveLiveViewUrl?: string;
   expiresAt?: string;
-  error?: string;
-}
-
-const browserExecuteRequestSchema = z.strictObject({
-  code: z.string().min(1).max(100_000),
-  language: z.enum(["python", "node", "bash"]).default("node"),
-  timeout: z.number().min(1).max(300).default(30),
-  origin: z.string().optional(),
-  allowedDomains: z.array(allowedDomainSchema).max(8).default([]),
-});
-
-type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
-
-interface BrowserExecuteResponse {
-  success: boolean;
-  stdout?: string;
-  result?: string;
-  stderr?: string;
-  exitCode?: number;
-  killed?: boolean;
   error?: string;
 }
 
@@ -603,164 +583,6 @@ export async function browserCreateController(
     liveViewUrl: svcResponse.iframeUrl,
     interactiveLiveViewUrl: svcResponse.interactiveIframeUrl,
     expiresAt: svcResponse.expiresAt,
-  });
-}
-
-export async function browserExecuteController(
-  req: RequestWithAuth<
-    { sessionId: string },
-    BrowserExecuteResponse,
-    BrowserExecuteRequest
-  >,
-  res: Response<BrowserExecuteResponse>,
-) {
-  // if (!req.acuc?.flags?.browserBeta) {
-  //   return res.status(403).json({
-  //     success: false,
-  //     error:
-  //       "Browser is currently in beta. Please contact support@firecrawl.com to request access.",
-  //   });
-  // }
-
-  req.body = browserExecuteRequestSchema.parse(req.body);
-
-  const id = req.params.sessionId;
-  const { code, language, timeout, origin, allowedDomains } = req.body;
-
-  const logger = _logger.child({
-    sessionId: id,
-    teamId: req.auth.team_id,
-    module: "api/v2",
-    method: "browserExecuteController",
-  });
-
-  if (config.LOCAL_BROWSER_SERVICE_ENABLED === true) {
-    const runtime = getPublicBrowserRuntime();
-    if (!runtime) {
-      return res.status(503).json({
-        success: false,
-        error: "Browser state is temporarily unavailable.",
-      });
-    }
-    try {
-      const requestId = uuidv7();
-      await logRequest({
-        id: requestId,
-        kind: "browser",
-        api_version: "v2",
-        team_id: req.auth.team_id,
-        target_hint: "Browser execution",
-        origin: origin ?? "api",
-        integration: null,
-        zeroDataRetention: false,
-        api_key_id: req.acuc?.api_key_id ?? null,
-      });
-      const execResult = await runtime.executeSession({
-        requestId,
-        ownerId: req.auth.team_id,
-        sessionId: id,
-        language,
-        source: code,
-        timeoutSeconds: timeout,
-        correlationId: uuidv7(),
-        allowedDomains,
-      });
-      const hasError = execResult.exitCode !== 0 || execResult.killed;
-      return res.status(200).json({
-        success: true,
-        stdout: execResult.stdout,
-        result: execResult.result,
-        stderr: execResult.stderr,
-        exitCode: execResult.exitCode,
-        killed: execResult.killed,
-        ...(hasError ? { error: execResult.stderr || "Execution failed" } : {}),
-      });
-    } catch (error) {
-      const mapped = mapLocalBrowserError(error);
-      logger.warn("Local browser execution failed", {
-        category:
-          error && typeof error === "object" && "category" in error
-            ? error.category
-            : "browser_unavailable",
-      });
-      return res
-        .status(mapped.status)
-        .json({ success: false, error: mapped.message });
-    }
-  }
-
-  // Look up session from Supabase
-  const session = await getBrowserSession(id);
-
-  if (!session) {
-    return res.status(404).json({
-      success: false,
-      error: "Browser session not found.",
-    });
-  }
-
-  if (session.team_id !== req.auth.team_id) {
-    return res.status(403).json({
-      success: false,
-      error: "Forbidden.",
-    });
-  }
-
-  if (session.status === "destroyed") {
-    return res.status(410).json({
-      success: false,
-      error: "Browser session has been destroyed.",
-    });
-  }
-
-  // Update activity timestamp (fire-and-forget)
-  updateBrowserSessionActivity(id).catch(() => {});
-
-  logger.info("Executing code in browser session", { language, timeout });
-
-  // Execute code via the browser service
-  let execResult: BrowserServiceExecResponse;
-  try {
-    execResult = await browserServiceRequest<BrowserServiceExecResponse>(
-      "POST",
-      `/browsers/${session.browser_id}/exec`,
-      { code, language, timeout, origin },
-    );
-  } catch (err) {
-    logger.error("Failed to execute code via browser service", { error: err });
-    return res.status(502).json({
-      success: false,
-      error: "Failed to execute code in browser session.",
-    });
-  }
-
-  logger.debug("Execution result", {
-    exitCode: execResult.exitCode,
-    killed: execResult.killed,
-    stdoutLength: execResult.stdout?.length,
-    stderrLength: execResult.stderr?.length,
-  });
-
-  await enqueueBrowserSessionActivity({
-    team_id: req.auth.team_id,
-    session_id: id,
-    source: "browser",
-    language,
-    timeout,
-    exit_code: execResult.exitCode ?? null,
-    killed: execResult.killed ?? false,
-  });
-
-  const hasError = execResult.exitCode !== 0 || execResult.killed;
-
-  return res.status(200).json({
-    success: true,
-    stdout: execResult.stdout,
-    result: execResult.result,
-    stderr: execResult.stderr,
-    exitCode: execResult.exitCode,
-    killed: execResult.killed,
-    ...(hasError ? { error: execResult.stderr || "Execution failed" } : {}),
   });
 }
 

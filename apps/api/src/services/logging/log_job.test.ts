@@ -621,6 +621,58 @@ describe("application persistence", () => {
     );
   });
 
+  it("upserts forced local scrape failures without replacing the row id", async () => {
+    enableLocalPersistence();
+
+    await logScrape(
+      {
+        id: scrapeId,
+        request_id: requestId,
+        url: "https://example.com",
+        is_successful: false,
+        error: "replay_persistence_unavailable",
+        time_taken: 10,
+        team_id: localOwnerId,
+        options: {} as any,
+        credits_cost: 1,
+        skipNuq: false,
+        zeroDataRetention: false,
+      },
+      true,
+    );
+
+    expect(onConflictDoUpdate).toHaveBeenCalledWith({
+      target: schema.scrapes.id,
+      set: expect.objectContaining({
+        request_id: requestId,
+        is_successful: false,
+        error: "replay_persistence_unavailable",
+      }),
+    });
+    expect(onConflictDoUpdate.mock.calls[0]![0].set).not.toHaveProperty("id");
+  });
+
+  it("keeps hosted forced scrape inserts on their existing behavior", async () => {
+    await logScrape(
+      {
+        id: scrapeId,
+        request_id: requestId,
+        url: "https://example.com",
+        is_successful: false,
+        error: "replay_persistence_unavailable",
+        time_taken: 10,
+        team_id: "hosted-team",
+        options: {} as any,
+        credits_cost: 1,
+        skipNuq: false,
+        zeroDataRetention: false,
+      },
+      true,
+    );
+
+    expect(onConflictDoUpdate).not.toHaveBeenCalled();
+  });
+
   it("preserves hosted force insert failure handling", async () => {
     vi.useFakeTimers();
     const error = new Error("database unavailable");

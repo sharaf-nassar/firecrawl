@@ -7,6 +7,7 @@ import {
   batchScrapeRequestSchemaNoURLValidation,
   URL as urlSchema,
   RequestWithAuth,
+  projectBaseScrapeOptions,
   ScrapeOptions,
   BatchScrapeResponse,
 } from "./types";
@@ -221,9 +222,7 @@ export async function batchScrapeController(
   }
   logger.debug("Using job priority " + jobPriority, { jobPriority });
 
-  const scrapeOptions: ScrapeOptions = { ...req.body };
-  delete (scrapeOptions as any).urls;
-  delete (scrapeOptions as any).appendToId;
+  const scrapeOptions: ScrapeOptions = projectBaseScrapeOptions(req.body);
 
   const jobs = urls.map(x => ({
     jobId: uuidv7(),

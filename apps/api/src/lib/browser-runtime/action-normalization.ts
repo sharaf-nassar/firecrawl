@@ -95,9 +95,10 @@ export function normalizeBrowserAction(operation: BrowserOperation): {
     .update(canonicalBrowserActionJson(parsed), "utf8")
     .digest("hex");
   const effect: BrowserOperationEffect = [
-    "snapshot",
-    "get_text",
-    "get_url",
+    "extract",
+    "hover",
+    "hover_batch",
+    "screenshot",
     "wait",
   ].includes(parsed.kind)
     ? "read_only"

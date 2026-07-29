@@ -13,6 +13,7 @@ import { ActionCacheError, SessionActionCache } from "./action-cache.js";
 const ACTION_ID = "aaaaaaaa-1111-4111-8111-111111111111";
 const OTHER_ACTION_ID = "bbbbbbbb-2222-4222-8222-222222222222";
 const RUN_ID = "cccccccc-3333-4333-8333-333333333333";
+const OTHER_RUN_ID = "dddddddd-4444-4444-8444-444444444444";
 const CLICK_OPERATION = { kind: "click", ref: "e1" } as const;
 
 function operationHash(operation: BrowserOperation): string {
@@ -111,18 +112,16 @@ describe("session action cache", () => {
     expect(cache.has(ACTION_ID)).toBe(true);
   });
 
-  test("rejects action-ID and sequence collisions", () => {
+  test("rejects action-ID and same-run sequence collisions", () => {
     const byActionId = new SessionActionCache();
     const first = byActionId.begin(action());
     if (first.kind !== "dispatch") throw new Error("expected dispatch");
     byActionId.succeed(first.pending, succeeded());
 
-    const collidingOperation = { kind: "click", ref: "e2" } as const;
     expectProtocolError(() =>
       byActionId.begin(
         action({
-          normalizedProposalHash: operationHash(collidingOperation),
-          operation: collidingOperation,
+          runId: OTHER_RUN_ID,
         }),
       ),
     );
@@ -139,6 +138,37 @@ describe("session action cache", () => {
         }),
       ),
     );
+  });
+
+  test("scopes sequence identity and replay caching to each run", () => {
+    const cache = new SessionActionCache();
+
+    const firstRun = cache.begin(action());
+    if (firstRun.kind !== "dispatch") throw new Error("expected dispatch");
+    const firstResult = cache.succeed(firstRun.pending, succeeded());
+
+    const secondRequest = action({
+      actionId: OTHER_ACTION_ID,
+      runId: OTHER_RUN_ID,
+    });
+    const secondRun = cache.begin(secondRequest);
+    if (secondRun.kind !== "dispatch") throw new Error("expected dispatch");
+    const secondResult = cache.succeed(
+      secondRun.pending,
+      succeeded({ actionId: OTHER_ACTION_ID }),
+    );
+
+    expect(cache.begin(action())).toEqual({
+      kind: "replay",
+      result: firstResult,
+    });
+    expect(cache.begin(secondRequest)).toEqual({
+      kind: "replay",
+      result: secondResult,
+    });
+    expect(cache.size).toBe(2);
+    expect(cache.has(ACTION_ID)).toBe(true);
+    expect(cache.has(OTHER_ACTION_ID)).toBe(true);
   });
 
   test("keeps pending work outside the terminal cache", () => {
@@ -212,7 +242,11 @@ describe("session action cache", () => {
   test("rejects invalid terminal responses without caching them", () => {
     const invalidCases = [
       succeeded({
-        result: { kind: "get_url", url: "https://example.test/" },
+        result: {
+          kind: "screenshot",
+          byteSize: 0,
+          checksum: "a".repeat(64),
+        },
       }),
       succeeded({ actionId: OTHER_ACTION_ID }),
       succeeded({

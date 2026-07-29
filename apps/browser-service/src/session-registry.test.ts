@@ -93,6 +93,27 @@ function harness(
   let ready = true;
   let id = 1;
   let pageUrl = "about:blank";
+  let context: Record<string, unknown>;
+  const mainFrame = Object.freeze({});
+  const bodyLocator = {
+    innerText: vi.fn(async () => ""),
+    isVisible: vi.fn(async () => true),
+    evaluate: vi.fn(async () => [
+      {
+        connected: true,
+        tag: "BODY",
+        role: "",
+        name: "",
+        text: "",
+      },
+    ]),
+  };
+  const emptyElementsLocator = {
+    count: vi.fn(async () => 0),
+    nth: vi.fn(() => ({
+      elementHandle: vi.fn(async () => null),
+    })),
+  };
   const page = {
     goto: vi.fn(async (url: string) => {
       pageUrl = url;
@@ -100,10 +121,27 @@ function harness(
     url: vi.fn(() => pageUrl),
     title: vi.fn(async () => ""),
     textContent: vi.fn(async () => ""),
+    locator: vi.fn((selector: string) =>
+      selector === "body" ? bodyLocator : emptyElementsLocator,
+    ),
+    waitForTimeout: vi.fn(async () => undefined),
     screenshot: vi.fn(async () => Buffer.from("image")),
+    evaluateHandle: vi.fn(async () => ({
+      evaluate: vi.fn(async () => []),
+      getProperties: vi.fn(async () => new Map()),
+      dispose: vi.fn(async () => undefined),
+    })),
+    on: vi.fn(),
+    off: vi.fn(),
+    mainFrame: vi.fn(() => mainFrame),
+    context: vi.fn(() => context),
   };
   const cdp = {
-    send: vi.fn(async () => ({ ok: true })),
+    send: vi.fn(async (method: string) =>
+      method === "Page.getFrameTree"
+        ? { frameTree: { frame: { id: "main" } } }
+        : { ok: true },
+    ),
     on: vi.fn(),
     off: vi.fn(),
     detach: vi.fn(async () => undefined),
@@ -114,7 +152,7 @@ function harness(
     stopChunk: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
   };
-  const context = {
+  context = {
     pages: vi.fn(() => [page]),
     serviceWorkers: vi.fn(() => []),
     close: vi.fn(async () => undefined),
@@ -283,6 +321,7 @@ function harness(
     registry,
     context,
     page,
+    bodyLocator,
     gate,
     profileStore,
     proxy,
@@ -335,6 +374,188 @@ describe("persistent session registry", () => {
     );
   });
 
+  test("replays captured policy under stricter sandbox egress", async () => {
+    const h = harness();
+    const session = await h.registry.create(
+      request({
+        settings: {
+          ...request().settings,
+          blockAds: true,
+          lockdown: false,
+        },
+      }),
+    );
+
+    expect(session.page.url).toBe("https://example.com/");
+    expect(h.proxyFactory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowedDomains: ["example.com"],
+        blockAds: true,
+      }),
+    );
+  });
+
+  test("completes maximum wait plus bounded observation within timeout margin", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      h.page.waitForTimeout.mockImplementation(
+        (milliseconds: number) =>
+          new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
+      );
+      const session = await h.registry.create(
+        request({ ttlSeconds: 60, activityTtlSeconds: 60 }),
+      );
+      h.page.evaluateHandle.mockImplementationOnce(async () => ({
+        evaluate: vi.fn(
+          () =>
+            new Promise<never[]>((resolve) =>
+              setTimeout(() => resolve([]), 14_000),
+            ),
+        ),
+        getProperties: vi.fn(async () => new Map()),
+        dispose: vi.fn(async () => undefined),
+      }));
+      const operation = { kind: "wait" as const, milliseconds: 30_000 };
+      const execution = h.registry.executeAction(session.runtimeSessionId, {
+        version: 1,
+        actionId: IDS[2]!,
+        runId: IDS[0]!,
+        sequence: 1,
+        normalizedProposalHash: createHash("sha256")
+          .update(canonicalJson(operation))
+          .digest("hex"),
+        effect: "read_only",
+        expectedSessionVersion: 1,
+        allowedDomains: ["example.com"],
+        operation,
+      });
+
+      const completed = expect(execution).resolves.toMatchObject({
+        outcome: "succeeded",
+        result: { kind: "wait", waitedMs: 30_000 },
+        sessionVersion: 2,
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(14_000);
+      await completed;
+      expect(h.context.close).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("fail-stops when post-wait observation exceeds phase deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      h.page.waitForTimeout.mockImplementation(
+        (milliseconds: number) =>
+          new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
+      );
+      const session = await h.registry.create(
+        request({ ttlSeconds: 60, activityTtlSeconds: 60 }),
+      );
+      h.page.evaluateHandle.mockImplementationOnce(async () => ({
+        evaluate: vi.fn(
+          () =>
+            new Promise<never[]>((resolve) =>
+              setTimeout(() => resolve([]), 16_000),
+            ),
+        ),
+        getProperties: vi.fn(async () => new Map()),
+        dispose: vi.fn(async () => undefined),
+      }));
+      const operation = { kind: "wait" as const, milliseconds: 30_000 };
+      const execution = h.registry.executeAction(session.runtimeSessionId, {
+        version: 1,
+        actionId: IDS[2]!,
+        runId: IDS[0]!,
+        sequence: 1,
+        normalizedProposalHash: createHash("sha256")
+          .update(canonicalJson(operation))
+          .digest("hex"),
+        effect: "read_only",
+        expectedSessionVersion: 1,
+        allowedDomains: ["example.com"],
+        operation,
+      });
+      const rejected = expect(execution).rejects.toThrow(
+        "session operation timed out",
+      );
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await rejected;
+      expect(h.context.close).toHaveBeenCalledOnce();
+      expect(h.registry.entries()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("fail-stops an effect that exceeds the default timeout margin", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      const session = await h.registry.create(
+        request({ ttlSeconds: 60, activityTtlSeconds: 60 }),
+      );
+      h.bodyLocator.evaluate.mockImplementationOnce(
+        () =>
+          new Promise<
+            Array<{
+              connected: boolean;
+              tag: string;
+              role: string;
+              name: string;
+              text: string;
+            }>
+          >((resolve) =>
+            setTimeout(
+              () =>
+                resolve([
+                  {
+                    connected: true,
+                    tag: "BODY",
+                    role: "",
+                    name: "",
+                    text: "late body",
+                  },
+                ]),
+              46_000,
+            ),
+          ),
+      );
+      const operation = { kind: "extract" as const };
+      const execution = h.registry.executeAction(session.runtimeSessionId, {
+        version: 1,
+        actionId: IDS[2]!,
+        runId: IDS[0]!,
+        sequence: 1,
+        normalizedProposalHash: createHash("sha256")
+          .update(canonicalJson(operation))
+          .digest("hex"),
+        effect: "read_only",
+        expectedSessionVersion: 1,
+        allowedDomains: ["example.com"],
+        operation,
+      });
+      const rejected = expect(execution).rejects.toThrow(
+        "session operation timed out",
+      );
+
+      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await rejected;
+      expect(h.context.close).toHaveBeenCalledOnce();
+      expect(h.registry.entries()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("creates a direct about:blank session without network bootstrap", async () => {
     const h = harness();
     const session = await h.registry.create(
@@ -351,15 +572,18 @@ describe("persistent session registry", () => {
     [30, 10],
     [600, 600],
     [3_600, 600],
-  ])("accepts exact session TTL boundary %s/%s", async (ttlSeconds, activityTtlSeconds) => {
-    const h = harness();
-    const session = await h.registry.create(
-      request({ ttlSeconds, activityTtlSeconds }),
-    );
-    expect(session.expiresAt).toBe(
-      new Date(1_700_000_000_000 + ttlSeconds * 1_000).toISOString(),
-    );
-  });
+  ])(
+    "accepts exact session TTL boundary %s/%s",
+    async (ttlSeconds, activityTtlSeconds) => {
+      const h = harness();
+      const session = await h.registry.create(
+        request({ ttlSeconds, activityTtlSeconds }),
+      );
+      expect(session.expiresAt).toBe(
+        new Date(1_700_000_000_000 + ttlSeconds * 1_000).toISOString(),
+      );
+    },
+  );
 
   test("passes supported mobile settings without privileged helpers", async () => {
     const h = harness();
@@ -472,9 +696,9 @@ describe("persistent session registry", () => {
           "Runtime.consoleAPICalled",
           expect.any(Function),
         );
-        const subscribed = h.cdp.on.mock.calls[0]![1] as (
-          params: unknown,
-        ) => void;
+        const subscribed = h.cdp.on.mock.calls.find(
+          ([event]) => event === "Runtime.consoleAPICalled",
+        )![1] as (params: unknown) => void;
         subscribed({ type: "log" });
         expect(eventListener).toHaveBeenCalledWith({ type: "log" });
         unsubscribe();
@@ -499,11 +723,7 @@ describe("persistent session registry", () => {
 
     expect(() => sessionRuntimeSignal(retainedLease as never)).toThrow();
     await expect(
-      sendSessionCdpCommand(
-        retainedChannel as never,
-        "Runtime.enable",
-        {},
-      ),
+      sendSessionCdpCommand(retainedChannel as never, "Runtime.enable", {}),
     ).rejects.toBeDefined();
     await h.registry.close(session.runtimeSessionId, "requested");
   });
@@ -537,16 +757,13 @@ describe("persistent session registry", () => {
     );
     const session = await h.registry.create(request());
     await expect(
-      h.registry.withRuntime(
-        session.runtimeSessionId,
-        "passive",
-        (lease) =>
-          captureSessionArtifact(lease, {
-            version: 1,
-            artifactId: IDS[2]!,
-            kind: "trace",
-            preset: "diagnostic-v1",
-          }),
+      h.registry.withRuntime(session.runtimeSessionId, "passive", (lease) =>
+        captureSessionArtifact(lease, {
+          version: 1,
+          artifactId: IDS[2]!,
+          kind: "trace",
+          preset: "diagnostic-v1",
+        }),
       ),
     ).resolves.toEqual({
       contentType: "application/zip",
@@ -568,16 +785,13 @@ describe("persistent session registry", () => {
     );
     const session = await h.registry.create(request());
     await expect(
-      h.registry.withRuntime(
-        session.runtimeSessionId,
-        "passive",
-        (lease) =>
-          captureSessionArtifact(lease, {
-            version: 1,
-            artifactId: IDS[2]!,
-            kind: "trace",
-            preset: "diagnostic-v1",
-          }),
+      h.registry.withRuntime(session.runtimeSessionId, "passive", (lease) =>
+        captureSessionArtifact(lease, {
+          version: 1,
+          artifactId: IDS[2]!,
+          kind: "trace",
+          preset: "diagnostic-v1",
+        }),
       ),
     ).rejects.toMatchObject({ category: "browser_unavailable" });
     expect(h.tracing.startChunk).not.toHaveBeenCalled();
@@ -587,41 +801,41 @@ describe("persistent session registry", () => {
   test.each(["passive", "writer"] as const)(
     "full drain aborts %s runtime leases before closing browser resources",
     async (mode) => {
-    const h = harness();
-    const session = await h.registry.create(request());
-    let observedAbort = false;
-    const runtime = h.registry.withRuntime(
-      session.runtimeSessionId,
-      mode,
-      async (lease) => {
-        const signal = sessionRuntimeSignal(lease);
-        await new Promise<void>((resolve) => {
-          signal.addEventListener(
-            "abort",
-            () => {
-              observedAbort = true;
-              resolve();
-            },
-            { once: true },
-          );
-        });
-      },
-    );
+      const h = harness();
+      const session = await h.registry.create(request());
+      let observedAbort = false;
+      const runtime = h.registry.withRuntime(
+        session.runtimeSessionId,
+        mode,
+        async (lease) => {
+          const signal = sessionRuntimeSignal(lease);
+          await new Promise<void>((resolve) => {
+            signal.addEventListener(
+              "abort",
+              () => {
+                observedAbort = true;
+                resolve();
+              },
+              { once: true },
+            );
+          });
+        },
+      );
 
-    await h.registry.drainAll("shutdown");
-    if (mode === "writer") {
-      await expect(runtime).rejects.toMatchObject({
+      await h.registry.drainAll("shutdown");
+      if (mode === "writer") {
+        await expect(runtime).rejects.toMatchObject({
+          category: "browser_unavailable",
+        });
+      } else {
+        await runtime;
+      }
+      expect(observedAbort).toBe(true);
+      expect(h.recordingProducer.close).toHaveBeenCalledOnce();
+      expect(h.context.close).toHaveBeenCalledOnce();
+      await expect(h.registry.create(request())).rejects.toMatchObject({
         category: "browser_unavailable",
       });
-    } else {
-      await runtime;
-    }
-    expect(observedAbort).toBe(true);
-    expect(h.recordingProducer.close).toHaveBeenCalledOnce();
-    expect(h.context.close).toHaveBeenCalledOnce();
-    await expect(h.registry.create(request())).rejects.toMatchObject({
-      category: "browser_unavailable",
-    });
     },
   );
 
@@ -654,11 +868,11 @@ describe("persistent session registry", () => {
     const h = harness();
     const session = await h.registry.create(request());
     let writerStarted!: () => void;
-    const started = new Promise<void>(resolve => {
+    const started = new Promise<void>((resolve) => {
       writerStarted = resolve;
     });
     let releaseWriter!: () => void;
-    const held = new Promise<void>(resolve => {
+    const held = new Promise<void>((resolve) => {
       releaseWriter = resolve;
     });
     const writer = h.registry.withWriter(session.runtimeSessionId, async () => {
@@ -729,6 +943,7 @@ describe("persistent session registry", () => {
       },
     });
     const session = await h.registry.create(request());
+    const cdpSessionCalls = h.context.newCDPSession.mock.calls.length;
     const close = h.registry.close(session.runtimeSessionId, "requested");
     await reached;
     const runtimeEffect = vi.fn(async () => undefined);
@@ -741,7 +956,7 @@ describe("persistent session registry", () => {
       ),
     ).rejects.toMatchObject({ category: "session_not_found" });
     expect(runtimeEffect).not.toHaveBeenCalled();
-    expect(h.context.newCDPSession).not.toHaveBeenCalled();
+    expect(h.context.newCDPSession).toHaveBeenCalledTimes(cdpSessionCalls);
     expect(h.page.screenshot).not.toHaveBeenCalled();
     expect(h.recordingProducer.snapshot).not.toHaveBeenCalled();
 
@@ -841,7 +1056,9 @@ describe("persistent session registry", () => {
         cleanupTimeoutMs: 25,
         launchTimeoutMs: 25,
       });
-      let resolveLaunch!: (value: Readonly<{ context: typeof h.context }>) => void;
+      let resolveLaunch!: (
+        value: Readonly<{ context: typeof h.context }>,
+      ) => void;
       h.launchPersistentContext.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
@@ -872,7 +1089,9 @@ describe("persistent session registry", () => {
         cleanupTimeoutMs: 100,
         launchTimeoutMs: 25,
       });
-      let resolveLaunch!: (value: Readonly<{ context: typeof h.context }>) => void;
+      let resolveLaunch!: (
+        value: Readonly<{ context: typeof h.context }>,
+      ) => void;
       let resolveProxyClose!: () => void;
       h.launchPersistentContext.mockImplementationOnce(
         () =>
@@ -952,7 +1171,9 @@ describe("persistent session registry", () => {
         cleanupTimeoutMs: 25,
         launchTimeoutMs: 25,
       });
-      let resolveLaunch!: (value: Readonly<{ context: typeof h.context }>) => void;
+      let resolveLaunch!: (
+        value: Readonly<{ context: typeof h.context }>,
+      ) => void;
       h.launchPersistentContext.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
@@ -1046,9 +1267,7 @@ describe("persistent session registry", () => {
     await expect(h.registry.create(request())).rejects.toMatchObject({
       category: "browser_unavailable",
     });
-    expect(h.releaseChromiumSessionAttachment).toHaveBeenCalledWith(
-      attachment,
-    );
+    expect(h.releaseChromiumSessionAttachment).toHaveBeenCalledWith(attachment);
     expect(h.beginDraining).toHaveBeenCalledOnce();
     expect(h.profileStore.discardWorkingCopy).toHaveBeenCalledOnce();
     expect(h.registry.entries()).toEqual([]);
@@ -1208,39 +1427,48 @@ describe("persistent session registry", () => {
     }> = [
       {
         name: "gate-open",
-        inject: (h) => h.gate.open.mockImplementationOnce(() => {
-          throw new Error("gate open failed");
-        }),
+        inject: (h) =>
+          h.gate.open.mockImplementationOnce(() => {
+            throw new Error("gate open failed");
+          }),
       },
       {
         name: "page-acquisition",
-        inject: (h) => h.context.pages.mockImplementationOnce(() => {
-          throw new Error("pages failed");
-        }),
+        inject: (h) =>
+          h.context.pages.mockImplementationOnce(() => {
+            throw new Error("pages failed");
+          }),
       },
       {
         name: "navigation",
-        inject: (h) => h.page.goto.mockRejectedValueOnce(new Error("goto failed")),
+        inject: (h) =>
+          h.page.goto.mockRejectedValueOnce(new Error("goto failed")),
       },
       {
         name: "positive-control",
-        inject: (h) => h.gate.assertPositiveControl.mockImplementationOnce(() => {
-          throw new Error("positive control failed");
-        }),
+        inject: (h) =>
+          h.gate.assertPositiveControl.mockImplementationOnce(() => {
+            throw new Error("positive control failed");
+          }),
       },
       {
         name: "title",
-        inject: (h) => h.page.title.mockRejectedValueOnce(new Error("title failed")),
+        inject: (h) =>
+          h.page.title.mockRejectedValueOnce(new Error("title failed")),
       },
       {
         name: "body",
-        inject: (h) => h.page.textContent.mockRejectedValueOnce(new Error("body failed")),
+        inject: (h) =>
+          h.bodyLocator.innerText.mockRejectedValueOnce(
+            new Error("body failed"),
+          ),
       },
       {
         name: "page-url",
-        inject: (h) => h.page.url.mockImplementationOnce(() => {
-          throw new Error("url failed");
-        }),
+        inject: (h) =>
+          h.page.url.mockImplementationOnce(() => {
+            throw new Error("url failed");
+          }),
       },
     ];
     for (const testCase of cases) {
@@ -1297,11 +1525,10 @@ describe("persistent session registry", () => {
       path: `/proc/${process.pid}/fd/999`,
     };
     h.profileStore.createWorkingCopy.mockRejectedValueOnce(
-      new ProfileStoreError(
-        "profile_prepare_failed",
-        "cleanup unverified",
-        { retainedWork, cleanupUnverified: true },
-      ),
+      new ProfileStoreError("profile_prepare_failed", "cleanup unverified", {
+        retainedWork,
+        cleanupUnverified: true,
+      }),
     );
     await expect(h.registry.create(request())).rejects.toMatchObject({
       category: "browser_unavailable",
@@ -1376,7 +1603,7 @@ describe("persistent session registry", () => {
     ).toEqual(order.map(([label]) => label));
   });
 
-  test("cleans replay restore, export, comparison, and fingerprint failures", async () => {
+  test("cleans replay restore, export, comparison, and navigation failures", async () => {
     const root = await mkdtemp(join(tmpdir(), "session-replay-failures-"));
     roots.push(root);
     const checkpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -1433,17 +1660,6 @@ describe("persistent session registry", () => {
         inject: (h) =>
           h.page.goto.mockRejectedValueOnce(new Error("navigation failed")),
       },
-      {
-        name: "fingerprint",
-        inject: () => undefined,
-        mutate: (value) => ({
-          ...value,
-          fingerprint: {
-            ...value.fingerprint,
-            titleSha256: "f".repeat(64),
-          },
-        }),
-      },
     ];
     for (const testCase of cases) {
       const h = harness(root);
@@ -1452,9 +1668,7 @@ describe("persistent session registry", () => {
         h.registry.create(
           request({
             replay:
-              testCase.mutate === undefined
-                ? replay
-                : testCase.mutate(replay),
+              testCase.mutate === undefined ? replay : testCase.mutate(replay),
           }),
         ),
         testCase.name,
@@ -1474,6 +1688,118 @@ describe("persistent session registry", () => {
         testCase.name,
       ).not.toHaveBeenCalled();
       expect(h.registry.entries(), testCase.name).toEqual([]);
+    }
+  });
+
+  test("normalizes replay body fingerprints without rejecting dynamic DOM changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "session-replay-dynamic-"));
+    roots.push(root);
+    const checkpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const statePath = `replay/owner/scrape/${checkpointId}.json`;
+    const storageState = { cookies: [], origins: [] };
+    const bytes = Buffer.from(canonicalJson(storageState));
+    await mkdir(join(root, "replay", "owner", "scrape"), { recursive: true });
+    await writeFile(join(root, statePath), bytes);
+    const replay = {
+      checkpointId,
+      statePath,
+      checksum: createHash("sha256").update(bytes).digest("hex"),
+      byteSize: bytes.length,
+      storageState,
+      finalUrl: "https://example.com/",
+      fingerprint: {
+        finalUrl: "https://example.com/",
+        titleSha256: createHash("sha256")
+          .update("captured title")
+          .digest("hex"),
+        bodyTextSha256: createHash("sha256")
+          .update("captured body")
+          .digest("hex"),
+      },
+    };
+    const h = harness(root);
+    h.page.title.mockResolvedValue("dynamic title");
+    h.bodyLocator.innerText.mockResolvedValue(" dynamic\n body ");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(h.registry.create(request({ replay }))).resolves.toMatchObject(
+      {
+        page: { url: "https://example.com/" },
+      },
+    );
+    expect(warning).toHaveBeenCalledWith(
+      "firecrawl_replay_fingerprint_changed",
+      expect.objectContaining({
+        titleMatches: false,
+        bodyMatches: false,
+      }),
+    );
+    warning.mockRestore();
+
+    const normalized = harness(root);
+    normalized.page.title.mockResolvedValue("captured title");
+    normalized.bodyLocator.innerText.mockResolvedValue(
+      "  captured \n\t body  ",
+    );
+    const normalizedWarning = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => {});
+    await expect(
+      normalized.registry.create(
+        request({
+          sessionId: IDS[2]!,
+          replay,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      page: { url: "https://example.com/" },
+    });
+    expect(normalizedWarning).not.toHaveBeenCalled();
+    normalizedWarning.mockRestore();
+  });
+
+  test("rejects a replay whose restored final URL differs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "session-replay-url-"));
+    roots.push(root);
+    const checkpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const statePath = `replay/owner/scrape/${checkpointId}.json`;
+    const storageState = { cookies: [], origins: [] };
+    const bytes = Buffer.from(canonicalJson(storageState));
+    await mkdir(join(root, "replay", "owner", "scrape"), { recursive: true });
+    await writeFile(join(root, statePath), bytes);
+    const h = harness(root);
+    h.page.goto.mockResolvedValueOnce(undefined);
+
+    try {
+      await h.registry.create(
+        request({
+          replay: {
+            checkpointId,
+            statePath,
+            checksum: createHash("sha256").update(bytes).digest("hex"),
+            byteSize: bytes.length,
+            storageState,
+            finalUrl: "https://example.com/",
+            fingerprint: {
+              finalUrl: "https://example.com/",
+              titleSha256: createHash("sha256").update("").digest("hex"),
+              bodyTextSha256: createHash("sha256").update("").digest("hex"),
+            },
+          },
+        }),
+      );
+      throw new Error("expected replay URL mismatch");
+    } catch (error) {
+      expect(error).toMatchObject({
+        category: "replay_unavailable",
+        cause: {
+          category: "replay_unavailable",
+          cause: {
+            category: "replay_unavailable",
+            message: "replay final URL differs",
+          },
+        },
+      });
     }
   });
 
@@ -1625,10 +1951,7 @@ describe("persistent session registry", () => {
           }),
       );
       const session = await h.registry.create(request());
-      const closing = h.registry.close(
-        session.runtimeSessionId,
-        "requested",
-      );
+      const closing = h.registry.close(session.runtimeSessionId, "requested");
       const rejected = expect(closing).rejects.toMatchObject({
         cleanupCodes: ["chromium_close_failed"],
       });
@@ -1785,8 +2108,7 @@ describe("persistent session registry", () => {
       session.runtimeSessionId,
       "requested",
     );
-    const prepared =
-      h.profileStore.prepareWorkingCopy.mock.results[0]!.value;
+    const prepared = h.profileStore.prepareWorkingCopy.mock.results[0]!.value;
     expect(closed).toMatchObject({ closed: true });
     expect(closed.preparedProfile).toEqual(await prepared);
     expect(h.profileStore.prepareWorkingCopy).toHaveBeenCalledOnce();

@@ -8,6 +8,7 @@ import { z } from "zod";
 import {
   apiPrivateV1Fingerprint,
   apiPrivateV1Inventory,
+  BROWSER_SERVICE_ERROR_STATUS,
   buildApiPrivateV1Inventory,
   canonicalJson,
   canonicalUuidSchema,
@@ -22,6 +23,15 @@ const fixturePath = path.resolve(
 );
 
 describe("API-owned Browser Service V1 contracts", () => {
+  it("includes session-policy error statuses", () => {
+    expect(BROWSER_SERVICE_ERROR_STATUS).toMatchObject({
+      replay_unavailable: 409,
+      replay_unsupported: 409,
+      concurrency_exceeded: 429,
+      session_not_found: 404,
+    });
+  });
+
   it("matches the canonical V1 inventory without service imports", async () => {
     const source = await readFile(
       path.resolve(

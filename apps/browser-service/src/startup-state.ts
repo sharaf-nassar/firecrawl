@@ -285,6 +285,7 @@ function createStartupStateImpl(
   let currentGeneration: ControlGenerationV1 | null = null;
   let reconciliationCache: ReconciliationCache | null = null;
   let reconciliationFlight: ReconciliationFlight | null = null;
+  let installedAdmissionController: AbortController | null = null;
   let installedAuthority: InstalledAuthorityState | null = null;
   const authorityInstallAttemptedGenerations = new Set<string>();
   let authorityClosePromise: Promise<void> | null = null;
@@ -327,17 +328,32 @@ function createStartupStateImpl(
   function closeInstalledAuthority(): Promise<void> {
     if (authorityClosePromise !== null) return authorityClosePromise;
     const installed = installedAuthority;
-    if (installed === null) return Promise.resolve();
+    const controller = installedAdmissionController;
+    if (installed === null) {
+      controller?.abort();
+      if (installedAdmissionController === controller) {
+        installedAdmissionController = null;
+      }
+      return Promise.resolve();
+    }
     const closePromise = Promise.resolve().then(() => closeAuthority(installed));
     authorityClosePromise = closePromise;
     void closePromise.then(
       () => {
+        controller?.abort();
+        if (installedAdmissionController === controller) {
+          installedAdmissionController = null;
+        }
         if (installedAuthority === installed) installedAuthority = null;
         if (authorityClosePromise === closePromise) {
           authorityClosePromise = null;
         }
       },
       () => {
+        controller?.abort();
+        if (installedAdmissionController === controller) {
+          installedAdmissionController = null;
+        }
         if (authorityClosePromise === closePromise) {
           authorityClosePromise = null;
         }
@@ -797,6 +813,7 @@ function createStartupStateImpl(
           digest: request.snapshotDigest,
           result: immutable,
         };
+        installedAdmissionController = controller;
         status = "ready";
         if (reconciliationFlight === flight) reconciliationFlight = null;
         committedResult = immutable;

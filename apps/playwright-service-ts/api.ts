@@ -351,7 +351,7 @@ interface UrlModel {
   capture_replay_timeout_ms?: number;
 }
 
-type AppliedProxyConfiguration = {
+export type AppliedProxyConfiguration = {
   server: string | null;
   username: string | null;
   password: string | null;
@@ -395,6 +395,44 @@ type ReplayCheckpointCaptureV1 = {
   };
   browserSettings: ReplayBrowserSettingsV1;
 };
+
+export function resolveAppliedProxyConfiguration(
+  proxyConfiguration: AppliedProxyConfiguration,
+): {
+  contextProxy?: {
+    server: string;
+    username?: string;
+    password?: string;
+  };
+  replayProxy: ReplayBrowserSettingsV1["proxy"];
+  appliedCountry?: string;
+} {
+  const { server, username, password } = proxyConfiguration;
+  if (!server) {
+    return {
+      replayProxy: { kind: "auto" },
+    };
+  }
+  const appliedCountry = proxyConfiguration.country?.toLowerCase();
+  const hasCompleteCredentials = username && password;
+  return {
+    contextProxy: hasCompleteCredentials
+      ? {
+          server,
+          username,
+          password,
+        }
+      : { server },
+    replayProxy: {
+      kind: "basic",
+      ...(appliedCountry ? { country: appliedCountry } : {}),
+      ...(hasCompleteCredentials
+        ? { credentialRef: "proxy-credential:playwright-service" }
+        : {}),
+    },
+    ...(appliedCountry ? { appliedCountry } : {}),
+  };
+}
 
 const startBrowserRuntime = async (): Promise<{
   browser: Browser;
@@ -448,6 +486,7 @@ export function resolveAppliedBrowserSettings(
     country: PROXY_COUNTRY,
   },
 ): ReplayBrowserSettingsV1 {
+  const appliedProxy = resolveAppliedProxyConfiguration(proxyConfiguration);
   const mobile = model.mobile === true;
   const viewport = mobile
     ? { width: 390, height: 844 }
@@ -457,7 +496,7 @@ export function resolveAppliedBrowserSettings(
     : ['en-US'];
   const locale = requestedLanguages[0] ?? 'en-US';
   const requestedCountry = model.location?.country?.toLowerCase();
-  const appliedCountry = proxyConfiguration.country?.toLowerCase();
+  const appliedCountry = appliedProxy.appliedCountry;
   if (
     model.capture_replay_checkpoint &&
     ((requestedLanguages.length > 1) ||
@@ -486,17 +525,7 @@ export function resolveAppliedBrowserSettings(
       country: appliedCountry ?? 'us-generic',
       languages: [locale],
     },
-    proxy: {
-      // This service applies one static Playwright proxy. Requested auto,
-      // stealth, and enhanced modes cannot change that runtime truth.
-      kind: 'basic',
-      ...(appliedCountry ? { country: appliedCountry } : {}),
-      ...(proxyConfiguration.server &&
-      proxyConfiguration.username &&
-      proxyConfiguration.password
-        ? { credentialRef: 'proxy-credential:playwright-service' }
-        : {}),
-    },
+    proxy: appliedProxy.replayProxy,
     skipTlsVerification: model.skip_tls_verification === true,
     blockAds: model.block_ads !== false,
     lockdown: false,
@@ -515,7 +544,18 @@ const createContext = async (
     ? Object.entries(model.headers).find(([key]) => key.toLowerCase() === 'user-agent')?.[1]
     : undefined;
   const userAgent = userAgentOverride || new UserAgent().toString();
-  const browserSettings = resolveAppliedBrowserSettings(model, userAgent);
+  const proxyConfiguration = {
+    server: PROXY_SERVER,
+    username: PROXY_USERNAME,
+    password: PROXY_PASSWORD,
+    country: PROXY_COUNTRY,
+  };
+  const appliedProxy = resolveAppliedProxyConfiguration(proxyConfiguration);
+  const browserSettings = resolveAppliedBrowserSettings(
+    model,
+    userAgent,
+    proxyConfiguration,
+  );
   const securityState: ContextSecurityState = {
     blockedNavigationRequestUrl: null,
     storageOrigins: new Set(),
@@ -536,16 +576,8 @@ const createContext = async (
     serviceWorkers: 'block',
   };
 
-  if (PROXY_SERVER && PROXY_USERNAME && PROXY_PASSWORD) {
-    contextOptions.proxy = {
-      server: PROXY_SERVER,
-      username: PROXY_USERNAME,
-      password: PROXY_PASSWORD,
-    };
-  } else if (PROXY_SERVER) {
-    contextOptions.proxy = {
-      server: PROXY_SERVER,
-    };
+  if (appliedProxy.contextProxy) {
+    contextOptions.proxy = appliedProxy.contextProxy;
   }
 
   const newContext = await activeBrowser.newContext(contextOptions);

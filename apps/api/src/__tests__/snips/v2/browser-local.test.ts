@@ -13,7 +13,6 @@ import {
 import {
   browserCreateRaw,
   browserDeleteRaw,
-  browserExecuteRaw,
   browserHarnessRestartRaw,
   browserListRaw,
   Identity,
@@ -226,31 +225,6 @@ describeIf(localBrowserEnabled)("local Browser API", () => {
         profile: { name: profileName, saveChanges: false },
       });
       expect(snapshot.id).not.toBe(writer.id);
-    },
-    scrapeTimeout,
-  );
-
-  it(
-    "returns typed unavailability when the host code adapter is absent",
-    async () => {
-      const created = await create();
-      const response = await browserExecuteRaw(
-        created.id,
-        {
-          code: "console.log('must not start without a host adapter')",
-          language: "node",
-          timeout: 5,
-          origin: "local-browser-snip",
-          allowedDomains: ["fixture.example"],
-        },
-        identity,
-      );
-
-      expect(response.statusCode).toBe(503);
-      expect(response.body).toEqual({
-        success: false,
-        error: "Browser state is temporarily unavailable.",
-      });
     },
     scrapeTimeout,
   );

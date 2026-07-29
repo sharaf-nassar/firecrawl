@@ -21,6 +21,8 @@ services:
     depends_on:
       app-postgres:
         condition: service_healthy
+      browser-interaction-worker:
+        condition: service_healthy
       browser-service:
         condition: service_healthy
       redis:
@@ -38,11 +40,11 @@ services:
       LOCAL_BROWSER_STATE_ROOT: ${LOCAL_BROWSER_STATE_ROOT:-/var/lib/firecrawl-browser-volume/state}
       BROWSER_SERVICE_URL: http://browser-service:3010
       BROWSER_SERVICE_API_KEY: ${BROWSER_SERVICE_API_KEY}
-      BROWSER_EXECUTION_ADAPTER_SOCKET: /run/firecrawl-adapter/adapter.sock
-      BROWSER_ADAPTER_TOKEN_FILE: /run/firecrawl-adapter/adapter.token
+      BROWSER_INTERACTION_WORKER_SOCKET_PATH: /run/firecrawl-interaction/worker.sock
+      BROWSER_INTERACTION_WORKER_TOKEN: ${BROWSER_INTERACTION_WORKER_TOKEN:?set BROWSER_INTERACTION_WORKER_TOKEN in .env}
       BROWSER_REPLAY_INGEST_URL: http://127.0.0.1:${INTERNAL_PORT:-3002}
       BROWSER_REPLAY_INGEST_API_KEY: ${BROWSER_REPLAY_INGEST_API_KEY}
-      BROWSER_SERVICE_REQUEST_TIMEOUT_MS: ${BROWSER_SERVICE_REQUEST_TIMEOUT_MS:-30000}
+      BROWSER_SERVICE_REQUEST_TIMEOUT_MS: ${BROWSER_SERVICE_REQUEST_TIMEOUT_MS:-60000}
       BROWSER_RECONCILIATION_TIMEOUT_MS: ${BROWSER_RECONCILIATION_TIMEOUT_MS:-60000}
       BROWSER_RECONCILIATION_MAX_ATTEMPTS: ${BROWSER_RECONCILIATION_MAX_ATTEMPTS:-4}
       BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS: ${BROWSER_RECONCILIATION_INITIAL_BACKOFF_MS:-250}
@@ -61,11 +63,136 @@ services:
       ARTIFACT_MINIO_SECRET_KEY: ${ARTIFACT_MINIO_SECRET_KEY}
       ARTIFACT_MINIO_BUCKET: ${ARTIFACT_MINIO_BUCKET}
       ARTIFACT_MINIO_REGION: ${ARTIFACT_MINIO_REGION}
+    networks:
+      - backend
+    group_add:
+      - "1000"
+    volumes:
+      - type: volume
+        source: browser-interaction-socket
+        target: /run/firecrawl-interaction
+        read_only: true
+
+  browser-interaction-worker:
+    build:
+      context: apps/browser-interaction-worker
+      dockerfile: Dockerfile
+      target: worker
+    image: firecrawl-local-browser-interaction-worker:local
+    user: "1000:1000"
+    read_only: true
+    init: true
+    environment:
+      BROWSER_INTERACTION_WORKER_SOCKET_PATH: /run/firecrawl-interaction/worker.sock
+      BROWSER_INTERACTION_WORKER_TOKEN: ${BROWSER_INTERACTION_WORKER_TOKEN:?set BROWSER_INTERACTION_WORKER_TOKEN in .env}
+      CODEX_BIN: /opt/codex/bin/codex.js
+      CODEX_HOME: /tmp/codex-home
+      CODEX_AUTH_SEED_FILE: /run/secrets/codex-auth.json
+      CODEX_AUTH_STATE_DIR: /var/lib/firecrawl-codex-auth-state
+      CODEX_CA_CERTIFICATE: /run/certs/host-ca-certificates.crt
+      SSL_CERT_FILE: /run/certs/host-ca-certificates.crt
+      NODE_EXTRA_CA_CERTS: /run/certs/host-ca-certificates.crt
+      MODEL_EGRESS_PROXY_SOCKET_PATH: /run/firecrawl-model-egress/proxy.sock
+      HTTP_PROXY: http://127.0.0.1:3128
+      HTTPS_PROXY: http://127.0.0.1:3128
+      NO_PROXY: ""
+      http_proxy: http://127.0.0.1:3128
+      https_proxy: http://127.0.0.1:3128
+      no_proxy: ""
+    network_mode: none
     volumes:
       - type: bind
-        source: ${LOCAL_FIRECRAWL_HOST_RUNTIME_DIR}
-        target: /run/firecrawl-adapter
+        source: ${LOCAL_CODEX_PACKAGE_DIR:?scripts/local-firecrawl must resolve LOCAL_CODEX_PACKAGE_DIR}
+        target: /opt/codex
         read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LOCAL_CODEX_AUTH_FILE:?scripts/local-firecrawl must resolve LOCAL_CODEX_AUTH_FILE}
+        target: /run/secrets/codex-auth.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LOCAL_CODEX_CA_BUNDLE_FILE:?scripts/local-firecrawl must resolve LOCAL_CODEX_CA_BUNDLE_FILE}
+        target: /run/certs/host-ca-certificates.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: codex-auth-state
+        target: /var/lib/firecrawl-codex-auth-state
+      - type: volume
+        source: browser-interaction-socket
+        target: /run/firecrawl-interaction
+      - type: volume
+        source: browser-interaction-egress-socket
+        target: /run/firecrawl-model-egress
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 1G
+    memswap_limit: 1G
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=256m,mode=1777
+      - /tmp/codex-home:noexec,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const http=require('node:http');const r=http.request({socketPath:'/run/firecrawl-interaction/worker.sock',path:'/health/ready',signal:AbortSignal.timeout(4000)},s=>{s.resume();s.on('end',()=>process.exit(s.statusCode===200?0:1))});r.on('error',()=>process.exit(1));r.end()"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      browser-interaction-egress-proxy:
+        condition: service_healthy
+
+  browser-interaction-egress-proxy:
+    build:
+      context: apps/browser-interaction-worker
+      dockerfile: Dockerfile
+      target: model-egress-proxy
+    image: firecrawl-local-browser-interaction-egress-proxy:local
+    user: "1000:1000"
+    read_only: true
+    init: true
+    environment:
+      MODEL_EGRESS_PROXY_SOCKET_PATH: /run/firecrawl-model-egress/proxy.sock
+    networks:
+      - model-uplink
+    volumes:
+      - type: volume
+        source: browser-interaction-egress-socket
+        target: /run/firecrawl-model-egress
+    restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 64M
+    memswap_limit: 64M
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=16m,mode=1777
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const net=require('node:net');const s=net.createConnection({path:'/run/firecrawl-model-egress/proxy.sock'});s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),4000).unref()"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
   browser-state-init:
     build:
       context: .
@@ -148,6 +275,8 @@ services:
       LOCAL_ARTIFACT_RETENTION_DAYS: ${LOCAL_ARTIFACT_RETENTION_DAYS}
     command: node dist/src/db/migrate.js
     restart: "no"
+    networks:
+      - backend
     depends_on:
       app-postgres:
         condition: service_healthy
@@ -249,3 +378,10 @@ volumes:
   app-postgres-data:
   minio-data:
   browser-state:
+  codex-auth-state:
+  browser-interaction-socket:
+  browser-interaction-egress-socket:
+
+networks:
+  model-uplink:
+    driver: bridge

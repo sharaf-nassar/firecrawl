@@ -99,13 +99,11 @@ describeWithDatabase("durable browser state store", () => {
       scrape_id: scrapeId,
       state: "running",
       mode: "prompt",
-      model: "gpt-5.6-terra",
+      model: "test-model",
       reasoning_effort: "medium",
       deadline_at: new Date(now.getTime() + 120_000).toISOString(),
       correlation_id: correlationId,
       adapter_job_id: fixtureAdapterJobId,
-      adapter_supervisor_id: fixtureAdapterSupervisorId,
-      adapter_process_id: 4242,
     });
     await pool.query(
       "UPDATE browser_sessions SET current_run_id = $1 WHERE id = $2",
@@ -132,9 +130,7 @@ describeWithDatabase("durable browser state store", () => {
       sequence,
       actionId: randomUUID(),
       proposalHash: proposalHash(operation),
-      effect: ["snapshot", "wait", "get_text", "get_url"].includes(
-        operation.kind,
-      )
+      effect: ["extract", "screenshot", "wait"].includes(operation.kind)
         ? "read_only"
         : "side_effecting",
       operation,
@@ -609,26 +605,26 @@ describeWithDatabase("durable browser state store", () => {
       action: { state: "prepared", sequence: 1 },
     });
     await expect(
-      store.prepareBrowserAction(run.id, request(2, { kind: "get_url" })),
+      store.prepareBrowserAction(run.id, request(2, { kind: "extract" })),
     ).rejects.toMatchObject({ name: "ActionInFlightError" });
     await expect(
       store.prepareBrowserAction(run.id, {
-        ...request(2, { kind: "get_url" }),
+        ...request(2, { kind: "extract" }),
         proposalHash: "0".repeat(64),
       }),
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
     await expect(
       store.prepareBrowserAction(run.id, {
-        ...request(2, { kind: "get_url" }),
+        ...request(2, { kind: "extract" }),
         adapterJobId: randomUUID(),
       }),
     ).rejects.toThrow(/adapter job/i);
     await expect(
-      store.prepareBrowserAction(run.id, request(26, { kind: "get_url" })),
+      store.prepareBrowserAction(run.id, request(26, { kind: "extract" })),
     ).rejects.toMatchObject({ name: "ActionLimitExceededError" });
     await expect(
       store.prepareBrowserAction(run.id, {
-        ...request(2, { kind: "get_url" }),
+        ...request(2, { kind: "extract" }),
         unexpected: true,
       } as SubmitBrowserActionV1),
     ).rejects.toThrow();
@@ -637,7 +633,7 @@ describeWithDatabase("durable browser state store", () => {
     await expect(
       store.prepareBrowserAction(
         gapFixture.run.id,
-        request(2, { kind: "get_url" }),
+        request(2, { kind: "extract" }),
       ),
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
 
@@ -645,7 +641,7 @@ describeWithDatabase("durable browser state store", () => {
     await expect(
       store.prepareBrowserAction(
         wrongJobFixture.run.id,
-        request(1, { kind: "get_url" }, { adapterJobId: randomUUID() }),
+        request(1, { kind: "extract" }, { adapterJobId: randomUUID() }),
       ),
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
     const actions = await pool.query(
@@ -665,18 +661,16 @@ describeWithDatabase("durable browser state store", () => {
       scrape_id: fixture.scrapeId,
       state: "running",
       mode: "prompt",
-      model: "gpt-5.6-terra",
+      model: "test-model",
       reasoning_effort: "medium",
       deadline_at: new Date(Date.now() + 120_000).toISOString(),
       correlation_id: randomUUID(),
       adapter_job_id: randomUUID(),
-      adapter_supervisor_id: randomUUID(),
-      adapter_process_id: 4243,
     });
     await expect(
       store.prepareBrowserAction(
         parallelRun.id,
-        request(1, { kind: "get_url" }),
+        request(1, { kind: "extract" }),
       ),
     ).rejects.toThrow(/current run|binding/i);
 
@@ -692,7 +686,7 @@ describeWithDatabase("durable browser state store", () => {
       );
       const pending = store.prepareBrowserAction(
         fixture.run.id,
-        request(1, { kind: "get_url" }),
+        request(1, { kind: "extract" }),
       );
       await blocker.query("COMMIT");
       await expect(pending).rejects.toThrow(/active session|binding/i);
@@ -702,9 +696,25 @@ describeWithDatabase("durable browser state store", () => {
     }
   });
 
+  it("returns the bounded per-operation completion margin", async () => {
+    const fixture = await createFixture({ state: "executing" });
+    const runtimeSessionId = randomUUID();
+    await pool.query(
+      "UPDATE browser_sessions SET browser_id = $1 WHERE id = $2",
+      [runtimeSessionId, fixture.session.id],
+    );
+
+    await expect(
+      store.getActiveBrowserRunAuthority(fixture.run.id),
+    ).resolves.toMatchObject({
+      runtimeSessionId,
+      perOperationTimeoutMs: 45_000,
+    });
+  });
+
   it("returns cached definite observations and rejects changed identities", async () => {
     const { run } = await createFixture({ state: "executing" });
-    const action = request(1, { kind: "get_text", ref: "main" });
+    const action = request(1, { kind: "extract", ref: "main" });
     await store.prepareBrowserAction(run.id, action);
     await store.markBrowserActionExecuting(run.id, action.actionId);
     const observation = await store.completeBrowserAction({
@@ -712,7 +722,7 @@ describeWithDatabase("durable browser state store", () => {
       actionId: action.actionId,
       proposalHash: action.proposalHash,
       outcome: "succeeded",
-      result: { kind: "get_text", text: "hello" },
+      result: { kind: "extract", text: "hello" },
       page: {
         url: "https://example.com/result",
         title: "Result",
@@ -731,54 +741,14 @@ describeWithDatabase("durable browser state store", () => {
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
     await expect(
       store.prepareBrowserAction(run.id, {
-        ...request(1, { kind: "get_url" }),
+        ...request(1, { kind: "extract" }),
         actionId: randomUUID(),
       }),
     ).rejects.toMatchObject({ name: "ActionIdentityMismatchError" });
   });
 
-  it("preserves a successful JSON null value across callback replay", async () => {
-    const { run } = await createFixture({ state: "executing" });
-    const action = request(1, {
-      kind: "evaluate",
-      expression: "null",
-      args: {},
-    });
-    await store.prepareBrowserAction(run.id, action);
-    await store.markBrowserActionExecuting(run.id, action.actionId);
-    const original = await store.completeBrowserAction({
-      runId: run.id,
-      actionId: action.actionId,
-      proposalHash: action.proposalHash,
-      outcome: "succeeded",
-      result: { kind: "evaluate", value: null },
-      page: {
-        url: "https://example.com/empty",
-        title: "Empty",
-        snapshotExcerpt: "",
-      },
-    });
-    const replay = await store.prepareBrowserAction(run.id, action);
-    const terminalRetry = await store.completeBrowserAction({
-      runId: run.id,
-      actionId: action.actionId,
-      proposalHash: action.proposalHash,
-      outcome: "succeeded",
-      result: { kind: "evaluate", value: null },
-      page: {
-        url: "https://example.com/empty",
-        title: "Empty",
-        snapshotExcerpt: "",
-      },
-    });
-    expect(replay).toEqual({ kind: "cached", observation: original });
-    expect(terminalRetry).toEqual(original);
-    expect(terminalRetry).toHaveProperty("result.value", null);
-    expect(original).toHaveProperty("result.value", null);
-  });
-
   it("allows repeated reads but rejects repeated side effects after no-effect", async () => {
-    const read = { kind: "get_url" } as const;
+    const read = { kind: "extract" } as const;
     const readFixture = await createFixture({ state: "executing" });
     const firstRead = request(1, read);
     await store.prepareBrowserAction(readFixture.run.id, firstRead);
@@ -848,32 +818,19 @@ describeWithDatabase("durable browser state store", () => {
 
   it("canonicalizes nested operation keys and validates every operation", async () => {
     const operations: BrowserOperation[] = [
-      { kind: "snapshot" },
-      { kind: "click", ref: "button" },
-      { kind: "fill", ref: "input", value: "value" },
-      { kind: "type", ref: "input", value: "value", delayMs: 10 },
-      { kind: "press", ref: "input", key: "Enter" },
-      { kind: "select", ref: "select", values: ["one"] },
-      { kind: "scroll", deltaX: 0, deltaY: 100 },
-      { kind: "wait", milliseconds: 10 },
-      { kind: "get_text", ref: "main" },
-      { kind: "get_url" },
       { kind: "navigate", url: "https://example.com/next" },
-      {
-        kind: "evaluate",
-        expression: "args",
-        args: { z: 1, a: { y: 2, b: 3 } },
-      },
+      { kind: "click", ref: "button" },
+      { kind: "type", ref: "input", text: "value", clear: true },
+      { kind: "wait", milliseconds: 10 },
+      { kind: "extract", ref: "main" },
+      { kind: "screenshot", fullPage: true },
     ];
     const fixture = await createFixture({ state: "executing" });
     for (const [index, operation] of operations.entries()) {
       const action = request(index + 1, operation);
-      const expectedEffect = [
-        "snapshot",
-        "wait",
-        "get_text",
-        "get_url",
-      ].includes(operation.kind)
+      const expectedEffect = ["extract", "screenshot", "wait"].includes(
+        operation.kind,
+      )
         ? "read_only"
         : "side_effecting";
       expect(action.effect).toBe(expectedEffect);
@@ -906,7 +863,7 @@ describeWithDatabase("durable browser state store", () => {
 
   it("compare-and-sets execution and bounds completion data", async () => {
     const { run } = await createFixture({ state: "executing" });
-    const action = request(1, { kind: "get_text", ref: "button-1" });
+    const action = request(1, { kind: "extract", ref: "button-1" });
     await store.prepareBrowserAction(run.id, action);
     await expect(
       store.markBrowserActionExecuting(run.id, action.actionId),
@@ -920,7 +877,7 @@ describeWithDatabase("durable browser state store", () => {
         actionId: action.actionId,
         proposalHash: action.proposalHash,
         outcome: "succeeded",
-        result: { kind: "get_text", text: "x".repeat(65 * 1024) },
+        result: { kind: "extract", text: "x".repeat(65 * 1024) },
         page: {
           url: "https://example.com",
           title: "Example",
@@ -930,7 +887,7 @@ describeWithDatabase("durable browser state store", () => {
     ).rejects.toThrow(/64 KiB/i);
 
     const mixedFixture = await createFixture({ state: "executing" });
-    const mixed = request(1, { kind: "get_url" });
+    const mixed = request(1, { kind: "extract" });
     await store.prepareBrowserAction(mixedFixture.run.id, mixed);
     await store.markBrowserActionExecuting(mixedFixture.run.id, mixed.actionId);
     await expect(
@@ -939,7 +896,7 @@ describeWithDatabase("durable browser state store", () => {
         actionId: mixed.actionId,
         proposalHash: mixed.proposalHash,
         outcome: "succeeded",
-        result: { kind: "get_url", url: "https://example.com" },
+        result: { kind: "extract", text: "Example" },
         error: { category: "unexpected", message: "must not coexist" },
         page: {
           url: "https://example.com",
@@ -950,7 +907,7 @@ describeWithDatabase("durable browser state store", () => {
     ).rejects.toThrow();
 
     const failureFixture = await createFixture({ state: "executing" });
-    const failure = request(1, { kind: "get_url" });
+    const failure = request(1, { kind: "extract" });
     await store.prepareBrowserAction(failureFixture.run.id, failure);
     await store.markBrowserActionExecuting(
       failureFixture.run.id,

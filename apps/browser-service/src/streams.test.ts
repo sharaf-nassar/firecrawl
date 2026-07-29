@@ -37,26 +37,12 @@ class FakeSocket extends EventEmitter {
   readonly closes: Array<{ code: number; reason: string }> = [];
   pingCount = 0;
   terminated = false;
-  pauseCount = 0;
-  resumeCount = 0;
-  deferSend = false;
-  private sendCallback?: (error?: Error) => void;
 
   send(data: string | Uint8Array, callback?: (error?: Error) => void): void {
     this.sent.push(
       typeof data === "string" ? data : Buffer.from(data).toString("utf8"),
     );
-    if (this.deferSend) {
-      this.sendCallback = callback;
-    } else {
-      callback?.();
-    }
-  }
-
-  flushSend(error?: Error): void {
-    const callback = this.sendCallback;
-    this.sendCallback = undefined;
-    callback?.(error);
+    callback?.();
   }
 
   close(code = 1000, reason = ""): void {
@@ -73,14 +59,6 @@ class FakeSocket extends EventEmitter {
     this.pingCount += 1;
   }
 
-  pause(): void {
-    this.pauseCount += 1;
-  }
-
-  resume(): void {
-    this.resumeCount += 1;
-  }
-
   terminate(): void {
     if (this.readyState === 3) return;
     this.terminated = true;
@@ -89,17 +67,19 @@ class FakeSocket extends EventEmitter {
   }
 }
 
-function harness(options: {
-  now?: number;
-  randomBytes?: () => Uint8Array;
-  heartbeatIntervalMs?: number;
-  heartbeatTimeoutMs?: number;
-  cleanupTimeoutMs?: number;
-  send?: (
-    method: string,
-    params: Record<string, unknown>,
-  ) => Promise<unknown>;
-} = {}) {
+function harness(
+  options: {
+    now?: number;
+    randomBytes?: () => Uint8Array;
+    heartbeatIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
+    send?: (
+      method: string,
+      params: Record<string, unknown>,
+    ) => Promise<unknown>;
+  } = {},
+) {
   let currentNow = options.now ?? NOW;
   const sessionNow = currentNow;
   let randomByte = 9;
@@ -203,11 +183,8 @@ async function settle(): Promise<void> {
 }
 
 test("locks the private stream wire limits", () => {
-  expect(STREAM_LIMITS.cdpFrameBytes).toBe(24 * 1024 * 1024);
-  expect(STREAM_LIMITS.cdpOutstandingIds).toBe(1_024);
-  expect(STREAM_LIMITS.queuedBytes).toBe(32 * 1024 * 1024);
-  expect(STREAM_LIMITS.backpressureBytes).toBe(16 * 1024 * 1024);
-  expect(STREAM_LIMITS.resumeBytes).toBe(8 * 1024 * 1024);
+  expect(STREAM_LIMITS.cdpFrameBytes).toBe(256 * 1024);
+  expect(STREAM_LIMITS.cdpOutstandingIds).toBe(64);
 });
 
 describe("relay grant authority", () => {
@@ -221,7 +198,9 @@ describe("relay grant authority", () => {
       expiresAt: new Date(NOW + 30_000).toISOString(),
       relayToken: Buffer.alloc(32, 9).toString("base64url"),
     });
-    expect(JSON.stringify(h.manager.inventory())).not.toContain(grant.relayToken);
+    expect(JSON.stringify(h.manager.inventory())).not.toContain(
+      grant.relayToken,
+    );
 
     await expect(
       h.manager.open(
@@ -352,9 +331,7 @@ describe("relay grant authority", () => {
     h.withRuntime.mockImplementationOnce(
       async (_runtimeSessionId, _mode, operation) => {
         try {
-          return await operation(
-            Object.freeze({}) as SessionRuntimeLease,
-          );
+          return await operation(Object.freeze({}) as SessionRuntimeLease);
         } finally {
           await writerRelease;
           writerExited = true;
@@ -376,7 +353,7 @@ describe("relay grant authority", () => {
     let acknowledged = false;
     const revoked = h.manager
       .revoke(IDS[0], { version: 1, grantId: grant.grantId })
-      .then(result => {
+      .then((result) => {
         acknowledged = true;
         return result;
       });
@@ -495,7 +472,11 @@ describe("live streams", () => {
       everyNthFrame: 1,
     });
 
-    socket.emit("message", Buffer.from('{"kind":"pointer","x":1,"y":1}'), false);
+    socket.emit(
+      "message",
+      Buffer.from('{"kind":"pointer","x":1,"y":1}'),
+      false,
+    );
     await opened;
     expect(socket.closes.at(-1)?.code).toBe(STREAM_CLOSE_CODES.policyViolation);
   });
@@ -582,7 +563,6 @@ describe("live streams", () => {
     expect(socket.sent.some((value) => value.includes('"kind":"frame"'))).toBe(
       false,
     );
-    expect(socket.pauseCount).toBe(0);
     socket.close();
     await opened;
   });
@@ -594,8 +574,7 @@ describe("live streams", () => {
       rejectInput = reject;
     });
     const h = harness({
-      send: async (method) =>
-        method === "Input.insertText" ? input : {},
+      send: async (method) => (method === "Input.insertText" ? input : {}),
     });
     const grant = h.manager.create(IDS[0], grantInput("interactive"));
     const socket = new FakeSocket();
@@ -738,8 +717,7 @@ describe("live streams", () => {
       const input = new Promise<never>(() => undefined);
       const h = harness({
         cleanupTimeoutMs: 25,
-        send: async (method) =>
-          method === "Input.insertText" ? input : {},
+        send: async (method) => (method === "Input.insertText" ? input : {}),
       });
       const grant = h.manager.create(IDS[0], grantInput("interactive"));
       const socket = new FakeSocket();
@@ -804,7 +782,9 @@ describe("live streams", () => {
         },
         async () => socket as unknown as WebSocket,
       );
-      await vi.waitFor(() => expect(h.runtimeApi.openCdp).toHaveBeenCalledOnce());
+      await vi.waitFor(() =>
+        expect(h.runtimeApi.openCdp).toHaveBeenCalledOnce(),
+      );
       let drained: Promise<void> | undefined;
       let revoked: Promise<unknown> | undefined;
       if (mode === "revoke") {
@@ -913,41 +893,6 @@ describe("live streams", () => {
 });
 
 describe("CDP stream", () => {
-  test("pauses at the high watermark and resumes at the low watermark", async () => {
-    const h = harness();
-    const grant = h.manager.create(IDS[0], grantInput("cdp"));
-    const socket = new FakeSocket();
-    socket.bufferedAmount = STREAM_LIMITS.backpressureBytes - 1;
-    socket.deferSend = true;
-    const opened = h.manager.open(
-      {
-        runtimeSessionId: IDS[0],
-        permission: "cdp",
-        relayToken: grant.relayToken,
-        authority: authority(),
-      },
-      async () => socket as unknown as WebSocket,
-    );
-    await settle();
-    socket.emit(
-      "message",
-      Buffer.from(
-        JSON.stringify({ id: 1, method: "Runtime.enable", params: {} }),
-      ),
-      false,
-    );
-    await settle();
-    expect(socket.pauseCount).toBe(1);
-    expect(socket.closes).toEqual([]);
-
-    socket.bufferedAmount = STREAM_LIMITS.resumeBytes;
-    socket.flushSend();
-    await settle();
-    expect(socket.resumeCount).toBe(1);
-    socket.close();
-    await opened;
-  });
-
   test("does not complete upgrade until writer acquisition and enforces policy", async () => {
     let releaseWriter!: () => void;
     const writerGate = new Promise<void>((resolve) => {
@@ -1008,7 +953,7 @@ describe("CDP stream", () => {
     });
     const h = harness({
       send: async (method) =>
-        method === "Runtime.evaluate" ? command : {},
+        method === "Runtime.getProperties" ? command : {},
     });
     const grant = h.manager.create(IDS[0], grantInput("cdp"));
     const socket = new FakeSocket();
@@ -1025,8 +970,8 @@ describe("CDP stream", () => {
     const request = Buffer.from(
       JSON.stringify({
         id: 9,
-        method: "Runtime.evaluate",
-        params: { expression: "document.title", returnByValue: true },
+        method: "Runtime.getProperties",
+        params: { objectId: "remote-object-1", ownProperties: true },
       }),
     );
     socket.emit("message", request, false);
@@ -1037,7 +982,7 @@ describe("CDP stream", () => {
     await opened;
   });
 
-  test("caps outstanding IDs and rejects malformed response values", async () => {
+  test("caps outstanding IDs at 64 and rejects malformed response values", async () => {
     let resolveCommands!: (value: unknown) => void;
     const commands = new Promise<unknown>((resolve) => {
       resolveCommands = resolve;
@@ -1225,30 +1170,27 @@ test("drain revokes unused grants, aborts active streams, and leaves no inventor
   expect(h.manager.inventory()).toEqual({ grants: 0, streams: 0 });
 });
 
-test(
-  "revoke closes an active stream with policy code before generic abort cleanup",
-  async () => {
-    const h = harness();
-    const grant = h.manager.create(IDS[0], grantInput("passive"));
-    const socket = new FakeSocket();
-    const opened = h.manager.open(
-      {
-        runtimeSessionId: IDS[0],
-        permission: "passive",
-        relayToken: grant.relayToken,
-        authority: authority(),
-      },
-      async () => socket as unknown as WebSocket,
-    );
-    await settle();
-    await h.manager.revoke(IDS[0], {
-      version: 1,
-      grantId: grant.grantId,
-    });
-    await opened;
-    expect(socket.closes[0]?.code).toBe(STREAM_CLOSE_CODES.policyViolation);
-  },
-);
+test("revoke closes an active stream with policy code before generic abort cleanup", async () => {
+  const h = harness();
+  const grant = h.manager.create(IDS[0], grantInput("passive"));
+  const socket = new FakeSocket();
+  const opened = h.manager.open(
+    {
+      runtimeSessionId: IDS[0],
+      permission: "passive",
+      relayToken: grant.relayToken,
+      authority: authority(),
+    },
+    async () => socket as unknown as WebSocket,
+  );
+  await settle();
+  await h.manager.revoke(IDS[0], {
+    version: 1,
+    grantId: grant.grantId,
+  });
+  await opened;
+  expect(socket.closes[0]?.code).toBe(STREAM_CLOSE_CODES.policyViolation);
+});
 
 test("grant expiry bounds redemption but not an already active stream", async () => {
   const h = harness();
@@ -1304,13 +1246,15 @@ test("post-upgrade setup failure closes the socket and retains inventory until c
   expect(h.manager.inventory()).toEqual({ grants: 0, streams: 0 });
 });
 
-async function realUpgradeHarness(options: {
-  permission?: "passive" | "interactive" | "cdp";
-  heartbeatIntervalMs?: number;
-  heartbeatTimeoutMs?: number;
-  failSetup?: boolean;
-  configureServerSocket?: (socket: WebSocket) => void;
-} = {}) {
+async function realUpgradeHarness(
+  options: {
+    permission?: "passive" | "interactive" | "cdp";
+    heartbeatIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
+    failSetup?: boolean;
+    configureServerSocket?: (socket: WebSocket) => void;
+  } = {},
+) {
   const permission = options.permission ?? "cdp";
   const h = harness({
     heartbeatIntervalMs: options.heartbeatIntervalMs,
@@ -1330,9 +1274,7 @@ async function realUpgradeHarness(options: {
     response.writeHead(404).end();
   });
   let serverSocket: WebSocket | undefined;
-  let openResult:
-    | Promise<Readonly<{ error: unknown | undefined }>>
-    | undefined;
+  let openResult: Promise<Readonly<{ error: unknown | undefined }>> | undefined;
   server.on("upgrade", (request, socket, head) => {
     const opened = h.manager.open(
       {
@@ -1356,7 +1298,7 @@ async function realUpgradeHarness(options: {
     );
     openResult = opened.then(
       () => Object.freeze({ error: undefined }),
-      error => Object.freeze({ error }),
+      (error) => Object.freeze({ error }),
     );
   });
   await new Promise<void>((resolve, reject) => {
@@ -1399,7 +1341,7 @@ async function realUpgradeHarness(options: {
         wss.close(() => resolve());
       });
       await new Promise<void>((resolve, reject) => {
-        server.close(error => {
+        server.close((error) => {
           if (error === undefined) resolve();
           else reject(error);
         });
@@ -1412,16 +1354,13 @@ describe("real ws no-server upgrade boundary", () => {
   test("uses maxPayload to reject an oversized inbound frame before dispatch", async () => {
     const real = await realUpgradeHarness();
     try {
-      expect(real.wss.options.maxPayload).toBe(
-        STREAM_LIMITS.cdpFrameBytes,
-      );
+      expect(real.wss.options.maxPayload).toBe(256 * 1024);
       const closed = new Promise<number>((resolve) => {
-        real.client.once("close", code => resolve(code));
+        real.client.once("close", (code) => resolve(code));
       });
-      real.client.send(
-        Buffer.alloc(STREAM_LIMITS.cdpFrameBytes + 1),
-        { binary: false },
-      );
+      real.client.send(Buffer.alloc(STREAM_LIMITS.cdpFrameBytes + 1), {
+        binary: false,
+      });
       await expect(closed).resolves.toBe(STREAM_CLOSE_CODES.messageTooBig);
       expect(real.h.send).not.toHaveBeenCalled();
       await real.opened();
@@ -1437,7 +1376,7 @@ describe("real ws no-server upgrade boundary", () => {
     });
     try {
       const closed = new Promise<number>((resolve) => {
-        real.client.once("close", code => resolve(code));
+        real.client.once("close", (code) => resolve(code));
       });
       await expect(closed).resolves.toBe(1006);
       await real.opened();
@@ -1450,7 +1389,7 @@ describe("real ws no-server upgrade boundary", () => {
     const real = await realUpgradeHarness({ failSetup: true });
     try {
       const closed = new Promise<number>((resolve) => {
-        real.client.once("close", code => resolve(code));
+        real.client.once("close", (code) => resolve(code));
       });
       await expect(closed).resolves.toBe(STREAM_CLOSE_CODES.internalError);
       await expect(real.opened()).resolves.toMatchObject({
@@ -1479,7 +1418,7 @@ describe("real ws no-server upgrade boundary", () => {
       });
       try {
         const closed = new Promise<number>((resolve) => {
-          real.client.once("close", code => resolve(code));
+          real.client.once("close", (code) => resolve(code));
         });
         const revoked = real.h.manager.revoke(IDS[0], {
           version: 1,

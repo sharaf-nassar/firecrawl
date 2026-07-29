@@ -5,6 +5,7 @@ import {
   captureReplayCheckpoint,
   captureWithDeadline,
   resolveAppliedBrowserSettings,
+  resolveAppliedProxyConfiguration,
   settleScrapeResources,
   SharedBrowserLifecycle,
 } from './api';
@@ -129,6 +130,29 @@ function createPostStorageCaptureHarness(options: {
   };
 }
 
+test('records automatic proxy truth when no static proxy is applied', () => {
+  const settings = resolveAppliedBrowserSettings(
+    {
+      url: 'https://example.com',
+      capture_replay_checkpoint: true,
+      proxy_kind: 'basic',
+      location: { languages: ['en-US'] },
+    },
+    'actual-user-agent',
+    {
+      server: null,
+      username: null,
+      password: null,
+      country: 'de',
+    },
+  );
+  assert.deepEqual(settings.proxy, { kind: 'auto' });
+  assert.deepEqual(settings.location, {
+    country: 'us-generic',
+    languages: ['en-US'],
+  });
+});
+
 test('records applied static proxy truth instead of requested proxy metadata', () => {
   const settings = resolveAppliedBrowserSettings(
     {
@@ -142,16 +166,36 @@ test('records applied static proxy truth instead of requested proxy metadata', (
       server: 'http://proxy.internal:8080',
       username: 'server-user',
       password: 'server-password',
+      country: 'DE',
     },
   );
   assert.deepEqual(settings.proxy, {
     kind: 'basic',
+    country: 'de',
     credentialRef: 'proxy-credential:playwright-service',
   });
   assert.deepEqual(settings.location, {
-    country: 'us-generic',
+    country: 'de',
     languages: ['en-US'],
   });
+});
+
+test('applies an incomplete proxy credential tuple as server-only', () => {
+  const appliedProxy = resolveAppliedProxyConfiguration({
+    server: 'http://proxy.internal:8080',
+    username: 'server-user',
+    password: null,
+    country: 'DE',
+  });
+
+  assert.deepEqual(appliedProxy.contextProxy, {
+    server: 'http://proxy.internal:8080',
+  });
+  assert.deepEqual(appliedProxy.replayProxy, {
+    kind: 'basic',
+    country: 'de',
+  });
+  assert.equal(appliedProxy.appliedCountry, 'de');
 });
 
 test('fails checkpoint capture when requested location is not applied exactly', () => {

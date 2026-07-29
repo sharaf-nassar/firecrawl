@@ -6,13 +6,45 @@ import {
   API_INSTANCE_ID,
   BrowserServiceClientError,
 } from "../scrape-interact/browser-service-client";
-import { createBrowserReconciliationCoordinator } from "./reconciliation-coordinator";
+import {
+  browserReconciliationFailureDiagnostic,
+  BrowserReconciliationCoordinatorError,
+  createBrowserReconciliationCoordinator,
+} from "./reconciliation-coordinator";
+import { createBrowserStartupGate } from "./startup-gate";
 
 const processNonce = Buffer.alloc(32, 1).toString("base64url");
 const controlGenerationNonce = Buffer.alloc(32, 2).toString("base64url");
 const snapshotDigest = "a".repeat(64);
 
 describe("BrowserReconciliationCoordinator", () => {
+  it("reports startup failure categories without payload text", () => {
+    const failure = new BrowserServiceClientError(
+      "reconciliation_reference_missing",
+      "secret /var/lib/firecrawl-browser/replay/owner/scrape/file.json",
+      409,
+    );
+    const wrapped = new BrowserReconciliationCoordinatorError(failure);
+
+    const diagnostic = browserReconciliationFailureDiagnostic(wrapped);
+
+    expect(diagnostic).toEqual({
+      category: "browser_state_unavailable",
+      causes: [
+        {
+          name: "BrowserReconciliationCoordinatorError",
+          category: "browser_state_unavailable",
+        },
+        {
+          name: "BrowserServiceClientError",
+          category: "reconciliation_reference_missing",
+        },
+      ],
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("secret");
+    expect(JSON.stringify(diagnostic)).not.toContain("/var/lib");
+  });
+
   it("abandons a handoff when scoped live moves to a new process", async () => {
     const nextProcessNonce = Buffer.alloc(32, 3).toString("base64url");
     const nextControlNonce = Buffer.alloc(32, 4).toString("base64url");
@@ -263,13 +295,179 @@ describe("BrowserReconciliationCoordinator", () => {
     await coordinator.stop();
   });
 
-  it("passes explicit fenced dependencies through recovery and snapshot", async () => {
+  it("uses the real startup gate recovery lease exactly once", async () => {
+    const order: string[] = [];
+    let connectionNumber = 0;
+    const pool = {
+      connect: vi.fn(async () => {
+        connectionNumber += 1;
+        const currentConnection = connectionNumber;
+        return {
+          query: vi.fn(async (text: string) => {
+            if (text.includes("FROM browser_control_generation")) {
+              return {
+                rows: [
+                  {
+                    database_control_epoch: "1",
+                    api_instance_id: API_INSTANCE_ID,
+                    process_nonce: processNonce,
+                    control_generation_nonce: controlGenerationNonce,
+                  },
+                ],
+                command: "SELECT",
+              };
+            }
+            if (text === "COMMIT") {
+              order.push(
+                currentConnection === 1
+                  ? "activation.commit"
+                  : "recovery.commit",
+              );
+            }
+            return { rows: [], command: text };
+          }),
+          release: vi.fn(),
+        };
+      }),
+    };
+    const gate = createBrowserStartupGate({ pool: pool as never });
+    const serviceClient = {
+      discoverLive: vi.fn(async () => ({
+        version: 1 as const,
+        status: "live_unreconciled" as const,
+        processNonce,
+      })),
+      createControlGeneration: vi.fn(async request => ({
+        version: 1 as const,
+        processNonce,
+        controlGenerationNonce,
+        apiInstanceId: request.apiInstanceId,
+      })),
+      getLive: vi.fn(async () => ({
+        version: 1 as const,
+        status: "live_unreconciled" as const,
+        processNonce,
+        controlGenerationNonce,
+      })),
+      reconcile: vi.fn(async body => {
+        order.push("reconcile");
+        const request = JSON.parse(body);
+        return {
+          version: 1 as const,
+          processNonce,
+          controlGenerationNonce,
+          snapshotDigest: request.snapshotDigest,
+          retained: 0,
+          removed: 0,
+          missing: 0 as const,
+          corrupt: 0 as const,
+          ready: true as const,
+        };
+      }),
+      getReady: vi.fn(async () => {
+        order.push("getReady");
+        return {
+          version: 1 as const,
+          status: "ready" as const,
+          processNonce,
+          controlGenerationNonce,
+          snapshotDigest,
+        };
+      }),
+    };
+    const coordinator = createBrowserReconciliationCoordinator({
+      gate,
+      pool: pool as never,
+      filesystem: { delete: vi.fn() } as never,
+      inspectProcessIdentity: vi.fn() as never,
+      serviceClient,
+      loadSnapshot: vi.fn(async transaction => {
+        order.push("snapshot");
+        expect(transaction.databaseControlEpoch).toBe(1);
+        await transaction.query("SELECT snapshot");
+        return { snapshotDigest, references: [] };
+      }),
+      interruptUnfinishedBrowserWork: vi.fn(async () => {
+        order.push("interrupt");
+        return {
+          preparedActionsCancelled: 0,
+          executingActionsUnknown: 0,
+          runsInterrupted: 0,
+          sessionsInterrupted: 0,
+          capabilitiesRevoked: 0,
+          grantsRevoked: 0,
+          writerLeasesCleared: 0,
+        };
+      }),
+      recoverBrowserCleanupIntentsBeforeSnapshot: vi.fn(async input => {
+        order.push("recovery");
+        const client = await input.pool.connect();
+        await client.query("SELECT recovery");
+        client.release();
+        return {
+          liveRetained: 0,
+          unknownRetained: 0,
+          deadRecovered: 0,
+          missingConverged: 0,
+        };
+      }),
+      pauseBrowserRetention: vi.fn(async () => undefined),
+      startBrowserRetention: vi.fn(async () => {
+        gate.assertOpen();
+        order.push("admission.open");
+      }),
+      retry: {
+        maxAttempts: 4,
+        initialBackoffMs: 250,
+        maxBackoffMs: 1_000,
+        startupBudgetMs: 60_000,
+        monitorIntervalMs: 60_000,
+        retryCooldownMs: 30_000,
+      },
+      now: () => Date.now(),
+      sleep: vi.fn(async () => undefined),
+      logger: { info: vi.fn(), error: vi.fn() } as never,
+    });
+
+    const handoff = await coordinator.acquireControlGeneration();
+    await expect(
+      coordinator.initializeAfterMigrations(handoff),
+    ).resolves.toMatchObject({
+      databaseControlEpoch: 1,
+      processNonce,
+      controlGenerationNonce,
+      snapshotDigest,
+    });
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    expect(order).toEqual([
+      "activation.commit",
+      "interrupt",
+      "snapshot",
+      "reconcile",
+      "recovery",
+      "recovery.commit",
+      "getReady",
+      "admission.open",
+    ]);
+    expect(gate.assertOpen()).toMatchObject({
+      databaseControlEpoch: 1,
+      processNonce,
+      controlGenerationNonce,
+      snapshotDigest,
+    });
+    await coordinator.stop();
+  });
+
+  it("recovers cleanup after reconcile and before opening admission", async () => {
+    const order: string[] = [];
     const transactionQuery = vi.fn(async () => ({ rows: [] }));
     const drain = { epoch: 1, drained: Promise.resolve() };
     const gate = {
       assertOpen: vi.fn(),
       close: vi.fn(() => drain),
-      open: vi.fn(),
+      open: vi.fn(() => {
+        order.push("gate.open");
+      }),
       waitUntilOpen: vi.fn(),
       withBrowserStateMutationLease: vi.fn(),
       withDrainedBrowserStateMutation: vi.fn(async (_drain, callback) =>
@@ -299,14 +497,17 @@ describe("BrowserReconciliationCoordinator", () => {
       release: vi.fn(),
     };
     const pool = { connect: vi.fn(async () => databaseClient) };
-    const filesystem = { delete: vi.fn() };
     const inspectProcessIdentity = vi.fn();
-    const loadSnapshot = vi.fn(async receivedPool => {
-      expect(receivedPool).toBe(pool);
+    const deleteReplayCheckpoint = vi.fn(async () => {
+      order.push("delete");
+    });
+    const loadSnapshot = vi.fn(async receivedTransaction => {
+      order.push("snapshot");
+      expect(receivedTransaction.databaseControlEpoch).toBe(1);
       return { snapshotDigest, references: [] };
     });
     const recover = vi.fn(async input => {
-      expect(input.filesystem).toBe(filesystem);
+      order.push("recovery");
       expect(input.inspectProcessIdentity).toBe(inspectProcessIdentity);
       expect(input.signal).toBeInstanceOf(AbortSignal);
       const recoveryClient = await input.pool.connect();
@@ -316,6 +517,10 @@ describe("BrowserReconciliationCoordinator", () => {
         expect.any(Array),
       );
       expect(transactionQuery).toHaveBeenLastCalledWith("SELECT 1", undefined);
+      await input.filesystem.deleteWithChecksum?.(
+        "replay/owner/scrape/11111111-1111-4111-8111-111111111111.json",
+        "b".repeat(64),
+      );
       return {
         liveRetained: 0,
         unknownRetained: 0,
@@ -349,6 +554,7 @@ describe("BrowserReconciliationCoordinator", () => {
         .fn()
         .mockRejectedValueOnce(new Error("transport closed"))
         .mockImplementation(async body => {
+          order.push("reconcile");
           reconcileBodies.push(body);
           return {
             version: 1 as const,
@@ -362,19 +568,22 @@ describe("BrowserReconciliationCoordinator", () => {
             ready: true as const,
           };
         }),
-      getReady: vi.fn(async () => ({
-        version: 1 as const,
-        status: "ready" as const,
-        processNonce,
-        controlGenerationNonce,
-        snapshotDigest,
-      })),
+      getReady: vi.fn(async () => {
+        order.push("getReady");
+        return {
+          version: 1 as const,
+          status: "ready" as const,
+          processNonce,
+          controlGenerationNonce,
+          snapshotDigest,
+        };
+      }),
     };
     const sleeps: number[] = [];
     const coordinator = createBrowserReconciliationCoordinator({
       gate: gate as never,
       pool: pool as never,
-      filesystem: filesystem as never,
+      deleteReplayCheckpoint,
       inspectProcessIdentity: inspectProcessIdentity as never,
       serviceClient,
       loadSnapshot,
@@ -414,16 +623,28 @@ describe("BrowserReconciliationCoordinator", () => {
       snapshotDigest,
     });
     expect(recover).toHaveBeenCalledOnce();
+    expect(deleteReplayCheckpoint).toHaveBeenCalledOnce();
     expect(loadSnapshot).toHaveBeenCalledOnce();
     expect(serviceClient.reconcile).toHaveBeenCalledTimes(2);
-    expect(serviceClient.reconcile.mock.calls[0]?.[0]).toBe(
+    expect(serviceClient.reconcile.mock.calls[0]?.[0]).toEqual(
       serviceClient.reconcile.mock.calls[1]?.[0],
     );
     expect(reconcileBodies).toHaveLength(1);
     expect(sleeps).toEqual([250, 250]);
+    expect(serviceClient.createControlGeneration).toHaveBeenCalledTimes(2);
     expect(serviceClient.createControlGeneration.mock.calls[0]?.[0]).toEqual(
       serviceClient.createControlGeneration.mock.calls[1]?.[0],
     );
+    expect(order.indexOf("snapshot")).toBeLessThan(order.indexOf("reconcile"));
+    expect(order.lastIndexOf("reconcile")).toBeLessThan(
+      order.lastIndexOf("recovery"),
+    );
+    expect(order.lastIndexOf("recovery")).toBeLessThan(
+      order.indexOf("getReady"),
+    );
+    expect(order.lastIndexOf("recovery")).toBeLessThan(order.indexOf("delete"));
+    expect(order.indexOf("delete")).toBeLessThan(order.indexOf("getReady"));
+    expect(order.indexOf("getReady")).toBeLessThan(order.indexOf("gate.open"));
     expect(gate.open).toHaveBeenCalledWith(drain, binding);
     serviceClient.getReady.mockResolvedValueOnce({
       version: 1 as const,
@@ -619,10 +840,11 @@ describe("BrowserReconciliationCoordinator", () => {
       controlGenerationNonce,
       snapshotDigest,
     });
+    const retryHandoff = await coordinator.acquireControlGeneration();
     await expect(
-      coordinator.initializeAfterMigrations(handoff),
+      coordinator.initializeAfterMigrations(retryHandoff),
     ).resolves.toMatchObject({ snapshotDigest });
-    expect(gate.withDrainedBrowserStateMutation).toHaveBeenCalledTimes(1);
+    expect(gate.withDrainedBrowserStateMutation).toHaveBeenCalledTimes(2);
     expect(startBrowserRetention).toHaveBeenCalledOnce();
     serviceClient.getReady.mockResolvedValueOnce({
       version: 1 as const,

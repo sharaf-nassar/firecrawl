@@ -28,6 +28,21 @@ export const MAX_CONNECT_DIRECTION_BYTES = 128 * 1024 * 1024;
 export const MAX_CONNECT_TUNNELS = 32;
 export const PROXY_IDLE_TIMEOUT_MS = 60_000;
 export const PROXY_MAX_LIFETIME_MS = 3_600_000;
+export const AD_SERVING_DOMAINS = Object.freeze([
+  "doubleclick.net",
+  "adservice.google.com",
+  "googlesyndication.com",
+  "googletagservices.com",
+  "googletagmanager.com",
+  "google-analytics.com",
+  "adsystem.com",
+  "adservice.com",
+  "adnxs.com",
+  "ads-twitter.com",
+  "facebook.net",
+  "fbcdn.net",
+  "amazon-adsystem.com",
+]);
 
 export type EgressDial = (options: {
   address: string;
@@ -60,6 +75,7 @@ export type EgressProxyOptions = {
   onDecision?: (decision: EgressDecision) => void;
   restoreGate?: RestoreGate;
   allowedDomains?: readonly string[];
+  blockAds?: boolean;
 };
 
 export type EgressProxy = {
@@ -452,6 +468,7 @@ export async function createEgressProxy(
     restoreGate: options.restoreGate,
     restoreAttempt,
     allowedDomains: options.allowedDomains,
+    blockAds: options.blockAds === true,
     limits,
     tlsCa: options.tlsCa,
   });
@@ -638,6 +655,7 @@ type ForwardOptions = {
   restoreGate: RestoreGate | undefined;
   restoreAttempt: RestoreIngressToken | undefined;
   allowedDomains: readonly string[] | undefined;
+  blockAds: boolean;
   limits: EffectiveLimits;
   tlsCa: string | Buffer | undefined;
 };
@@ -720,10 +738,10 @@ function reportDecision(
   options.onDecision?.(decision);
 }
 
-function assertAllowedDomain(options: ForwardOptions, hostname: string): void {
-  if (options.allowedDomains === undefined) return;
+function assertEgressPolicy(options: ForwardOptions, hostname: string): void {
   const normalized = hostname.toLowerCase();
   if (
+    options.allowedDomains !== undefined &&
     !options.allowedDomains.some((allowed) => {
       const domain = allowed.toLowerCase();
       return normalized === domain || normalized.endsWith(`.${domain}`);
@@ -732,6 +750,16 @@ function assertAllowedDomain(options: ForwardOptions, hostname: string): void {
     throw new NetworkPolicyError(
       "target_blocked",
       "target domain is not allowed",
+      normalized,
+    );
+  }
+  if (
+    options.blockAds &&
+    AD_SERVING_DOMAINS.some((domain) => normalized.includes(domain))
+  ) {
+    throw new NetworkPolicyError(
+      "target_blocked",
+      "ad-serving target is blocked",
       normalized,
     );
   }
@@ -826,7 +854,7 @@ async function forwardHttpRequest(
       resolvePlainRequestTarget(request.url, options.lookup),
       controller.signal,
     );
-    assertAllowedDomain(options, target.hostname);
+    assertEgressPolicy(options, target.hostname);
     reportDecision(options, { outcome: "allowed", hostname: target.hostname });
   } catch (error) {
     reportBlockedDecision(error, request.url, options);
@@ -947,7 +975,7 @@ async function forwardConnect(
     return;
   }
   try {
-    assertAllowedDomain(options, target.hostname);
+    assertEgressPolicy(options, target.hostname);
     reportDecision(options, { outcome: "allowed", hostname: target.hostname });
   } catch (error) {
     reportBlockedDecision(error, target.hostname, options);
@@ -1063,7 +1091,7 @@ async function forwardUpgrade(
         controller.abort();
         return;
       }
-      assertAllowedDomain(options, target.hostname);
+      assertEgressPolicy(options, target.hostname);
       reportDecision(options, {
         outcome: "allowed",
         hostname: target.hostname,

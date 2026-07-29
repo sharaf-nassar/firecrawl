@@ -1,12 +1,11 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
-import {
-  CapabilityDeniedError,
-  createCapabilityStore,
-  type AuthorizePersistedCapabilityInput,
-} from "../browser-state/capability-store";
+import type { ArtifactStore } from "../artifacts";
+import { persistBrowserArtifactManifestWithLease } from "../artifacts/local-manifest";
+import { putArtifactWithManifest } from "../artifacts/manifest";
 import {
   ActionIdentityMismatchError,
   ActionLimitExceededError,
@@ -15,6 +14,7 @@ import {
   type ActiveBrowserRunAuthority,
   type CompleteBrowserActionInput,
 } from "../browser-state/store";
+import { logger as rootLogger } from "../logger";
 import type {
   ObservationV1,
   SubmitBrowserActionV1,
@@ -22,6 +22,7 @@ import type {
 import {
   actionExecutionRequestSchema,
   actionExecutionResultSchema,
+  artifactMetadataV1Schema,
   type BrowserActionExecutionV1,
   type BrowserActionExecutionResultV1,
 } from "../scrape-interact/browser-service-contracts";
@@ -58,11 +59,7 @@ export class BrowserActionCoordinatorError extends Error {
 }
 
 type ActionStore = ReturnType<typeof createBrowserActionStore>;
-type CapabilityStore = ReturnType<typeof createCapabilityStore>;
-
 type CoordinatorContext = {
-  adapterSupervisorId: string;
-  adapterProcessId: number;
   correlationId: string;
   deadline: Date;
   signal?: AbortSignal;
@@ -70,10 +67,17 @@ type CoordinatorContext = {
 
 type ActionCoordinatorDependencies = {
   gate: BrowserStartupGate;
-  browserClient: Pick<BrowserServiceClient, "executeAction">;
+  browserClient: Pick<BrowserServiceClient, "executeAction" | "fetchArtifact">;
+  artifactStore: ArtifactStore | null;
   actions?: ActionStore;
-  capabilities?: CapabilityStore;
 };
+
+function screenshotObjectKey(
+  run: ActiveBrowserRunAuthority,
+  artifactId: string,
+): string {
+  return `browser-interact/${run.ownerId}/${run.runId}/${artifactId}.png`;
+}
 
 function byteLength(value: unknown): number {
   let encoded: string;
@@ -112,30 +116,11 @@ function cancelled(): BrowserActionCoordinatorError {
   );
 }
 
-function bindingInput(
-  run: ActiveBrowserRunAuthority,
-  context: CoordinatorContext,
-): AuthorizePersistedCapabilityInput {
-  return {
-    ownerId: run.ownerId,
-    sessionId: run.sessionId,
-    runId: run.runId,
-    adapterJobId: run.adapterJobId,
-    adapterSupervisorId: context.adapterSupervisorId,
-    adapterProcessId: context.adapterProcessId,
-  };
-}
-
 function assertAuthority(
   run: ActiveBrowserRunAuthority,
   proposal: SubmitBrowserActionV1,
-  context: CoordinatorContext,
 ): void {
-  if (
-    proposal.adapterJobId !== run.adapterJobId ||
-    context.adapterSupervisorId !== run.adapterSupervisorId ||
-    context.adapterProcessId !== run.adapterProcessId
-  ) {
+  if (proposal.adapterJobId !== run.adapterJobId) {
     throw new BrowserActionCoordinatorError(
       "capability_denied",
       "Browser capability was denied",
@@ -208,8 +193,6 @@ export function createBrowserActionCoordinator(
   deps: ActionCoordinatorDependencies,
 ) {
   const actions = deps.actions ?? createBrowserActionStore({ gate: deps.gate });
-  const capabilities =
-    deps.capabilities ?? createCapabilityStore({ gate: deps.gate });
 
   const terminalUnknown = async (
     lease: BrowserStateMutationLease,
@@ -241,6 +224,52 @@ export function createBrowserActionCoordinator(
   };
 
   return {
+    async loadScreenshot(
+      activeRun: ActiveBrowserRunAuthority,
+      observation: ObservationV1,
+    ): Promise<
+      Readonly<{
+        metadata: Readonly<{
+          artifactId: string;
+          contentType: "image/png";
+          byteSize: number;
+          checksum: string;
+        }>;
+        bytes: Uint8Array;
+      }>
+    > {
+      if (
+        observation.type !== "action_result" ||
+        observation.outcome !== "succeeded" ||
+        observation.actionKind !== "screenshot" ||
+        observation.result?.kind !== "screenshot" ||
+        observation.actionId !== observation.result.artifactId ||
+        deps.artifactStore === null
+      ) {
+        throw protocol("Screenshot authority is invalid");
+      }
+      const metadata = observation.result;
+      const bytes = await deps.artifactStore.get(
+        screenshotObjectKey(activeRun, metadata.artifactId),
+      );
+      if (
+        bytes === null ||
+        bytes.byteLength !== metadata.byteSize ||
+        createHash("sha256").update(bytes).digest("hex") !== metadata.checksum
+      ) {
+        throw unknown();
+      }
+      return {
+        metadata: {
+          artifactId: metadata.artifactId,
+          contentType: metadata.contentType,
+          byteSize: metadata.byteSize,
+          checksum: metadata.checksum,
+        },
+        bytes: Uint8Array.from(bytes),
+      };
+    },
+
     async handleProposal(
       activeRun: ActiveBrowserRunAuthority,
       untrustedProposal: unknown,
@@ -273,36 +302,13 @@ export function createBrowserActionCoordinator(
         }
         throw error;
       }
-      assertAuthority(activeRun, proposal, context);
+      assertAuthority(activeRun, proposal);
 
       let prepared: Awaited<ReturnType<ActionStore["prepare"]>>;
       try {
         prepared = await deps.gate.withBrowserStateMutationLease(
           "filesystem_and_database",
-          async lease => {
-            const staged = await actions.prepareWithLease(
-              lease,
-              activeRun.runId,
-              proposal,
-            );
-            if (staged.kind === "cached") return staged;
-            try {
-              await capabilities.redeemActionWithLease(lease, {
-                ...bindingInput(activeRun, context),
-                operation: proposal.operation.kind,
-                byteCount: byteLength(proposal.operation),
-              });
-              return staged;
-            } catch (error) {
-              if (!(error instanceof CapabilityDeniedError)) throw error;
-              await actions.cancelPreparedWithLease(
-                lease,
-                activeRun.runId,
-                proposal.actionId,
-              );
-              throw error;
-            }
-          },
+          lease => actions.prepareWithLease(lease, activeRun.runId, proposal),
         );
       } catch (error) {
         if (error instanceof ActionIdentityMismatchError) {
@@ -320,17 +326,12 @@ export function createBrowserActionCoordinator(
       try {
         await deps.gate.withBrowserStateMutationLease(
           "filesystem_and_database",
-          async lease => {
-            await capabilities.inspectBindingWithLease(
-              lease,
-              bindingInput(activeRun, context),
-            );
-            await actions.markExecutingWithLease(
+          lease =>
+            actions.markExecutingWithLease(
               lease,
               activeRun.runId,
               proposal.actionId,
-            );
-          },
+            ),
         );
       } catch {
         return terminalizeAfterLeaseFailure(activeRun.runId, proposal.actionId);
@@ -355,11 +356,16 @@ export function createBrowserActionCoordinator(
           "filesystem_and_database",
           async lease => {
             try {
-              const capability = await capabilities.inspectBindingWithLease(
-                lease,
-                bindingInput(activeRun, context),
-              );
               if (context.signal?.aborted) {
+                rootLogger.warn("Browser action phase had no dispatch budget", {
+                  correlationId: context.correlationId,
+                  runId: activeRun.runId,
+                  actionId: proposal.actionId,
+                  sequence: proposal.sequence,
+                  operationKind: proposal.operation.kind,
+                  deadlineSource: "request_signal",
+                  phaseBudgetMs: 0,
+                });
                 return terminalUnknown(
                   lease,
                   activeRun.runId,
@@ -367,14 +373,35 @@ export function createBrowserActionCoordinator(
                 );
               }
               const now = Date.now();
-              const operationDeadline = Math.min(
-                context.deadline.getTime(),
-                activeRun.deadline.getTime(),
-                capability.wallDeadlineAt.getTime(),
-                capability.expiresAt.getTime(),
-                now + capability.perOperationTimeoutMs,
+              const deadlineCandidates = [
+                {
+                  source: "request" as const,
+                  at: context.deadline.getTime(),
+                },
+                {
+                  source: "run" as const,
+                  at: activeRun.deadline.getTime(),
+                },
+                {
+                  source: "operation" as const,
+                  at: now + activeRun.perOperationTimeoutMs,
+                },
+              ];
+              const selectedDeadline = deadlineCandidates.reduce(
+                (selected, candidate) =>
+                  candidate.at < selected.at ? candidate : selected,
               );
+              const operationDeadline = selectedDeadline.at;
               if (operationDeadline <= now) {
+                rootLogger.warn("Browser action phase had no dispatch budget", {
+                  correlationId: context.correlationId,
+                  runId: activeRun.runId,
+                  actionId: proposal.actionId,
+                  sequence: proposal.sequence,
+                  operationKind: proposal.operation.kind,
+                  deadlineSource: selectedDeadline.source,
+                  phaseBudgetMs: 0,
+                });
                 return terminalUnknown(
                   lease,
                   activeRun.runId,
@@ -394,6 +421,20 @@ export function createBrowserActionCoordinator(
                 processNonce: lease.binding.processNonce,
                 controlGenerationNonce: lease.binding.controlGenerationNonce,
               };
+              const actionStartedAt = Date.now();
+              const diagnostic = {
+                correlationId: context.correlationId,
+                runId: activeRun.runId,
+                actionId: proposal.actionId,
+                sequence: proposal.sequence,
+                operationKind: proposal.operation.kind,
+                deadlineSource: selectedDeadline.source,
+                phaseBudgetMs: Math.max(0, operationDeadline - actionStartedAt),
+              };
+              rootLogger.info("Browser action phase started", {
+                ...diagnostic,
+                phase: "browser_service_execute",
+              });
               let rawResult: unknown;
               try {
                 rawResult = await Promise.race([
@@ -415,12 +456,24 @@ export function createBrowserActionCoordinator(
                   }),
                 ]);
               } catch {
+                rootLogger.warn("Browser action phase outcome is unknown", {
+                  ...diagnostic,
+                  phase: "browser_service_execute",
+                  durationMs: Date.now() - actionStartedAt,
+                  deadlineReached:
+                    operationSignal.aborted || Date.now() >= operationDeadline,
+                });
                 return terminalUnknown(
                   lease,
                   activeRun.runId,
                   proposal.actionId,
                 );
               }
+              rootLogger.info("Browser action phase completed", {
+                ...diagnostic,
+                phase: "browser_service_execute",
+                durationMs: Date.now() - actionStartedAt,
+              });
               let result: BrowserActionExecutionResultV1;
               try {
                 result = validateServiceResult(
@@ -429,11 +482,99 @@ export function createBrowserActionCoordinator(
                   activeRun.expectedSessionVersion,
                 );
               } catch {
+                rootLogger.warn("Browser action response validation failed", {
+                  ...diagnostic,
+                  phase: "validate_service_result",
+                  durationMs: Date.now() - actionStartedAt,
+                });
                 return terminalUnknown(
                   lease,
                   activeRun.runId,
                   proposal.actionId,
                 );
+              }
+              if (
+                result.outcome === "succeeded" &&
+                result.result.kind === "screenshot"
+              ) {
+                if (
+                  deps.artifactStore === null ||
+                  result.result.artifactId !== proposal.actionId
+                ) {
+                  return terminalUnknown(
+                    lease,
+                    activeRun.runId,
+                    proposal.actionId,
+                  );
+                }
+                try {
+                  const artifact = await deps.browserClient.fetchArtifact(
+                    activeRun.runtimeSessionId,
+                    {
+                      version: 1,
+                      artifactId: result.result.artifactId,
+                      kind: "screenshot",
+                      format: "png",
+                      fullPage:
+                        proposal.operation.kind === "screenshot"
+                          ? (proposal.operation.fullPage ?? false)
+                          : false,
+                    },
+                    serviceContext,
+                  );
+                  const metadata = artifactMetadataV1Schema.parse(
+                    artifact.metadata,
+                  );
+                  if (
+                    metadata.kind !== "screenshot" ||
+                    metadata.contentType !== result.result.contentType ||
+                    metadata.byteSize !== result.result.byteSize ||
+                    metadata.checksum !== result.result.checksum
+                  ) {
+                    return terminalUnknown(
+                      lease,
+                      activeRun.runId,
+                      proposal.actionId,
+                    );
+                  }
+                  const objectKey = screenshotObjectKey(
+                    activeRun,
+                    metadata.artifactId,
+                  );
+                  await putArtifactWithManifest(
+                    deps.artifactStore,
+                    {
+                      key: objectKey,
+                      body: Buffer.from(artifact.bytes),
+                      contentType: metadata.contentType,
+                      metadata: {
+                        artifactId: metadata.artifactId,
+                        checksum: metadata.checksum,
+                      },
+                      ownerId: activeRun.ownerId,
+                      requestId: activeRun.requestId,
+                      jobId: activeRun.runId,
+                      kind: "browser-screenshot",
+                      checksum: metadata.checksum,
+                      deleteAfter: activeRun.deleteAfter,
+                    },
+                    async (_key, work) =>
+                      work({
+                        existed: false,
+                        persist: record =>
+                          persistBrowserArtifactManifestWithLease(
+                            lease,
+                            record,
+                          ),
+                      }),
+                  );
+                } catch {
+                  return terminalUnknown(
+                    lease,
+                    activeRun.runId,
+                    proposal.actionId,
+                  );
+                }
               }
               let observation: ObservationV1;
               try {
@@ -461,15 +602,8 @@ export function createBrowserActionCoordinator(
                 );
               }
               return observation;
-            } catch (error) {
-              if (error instanceof CapabilityDeniedError) {
-                return terminalUnknown(
-                  lease,
-                  activeRun.runId,
-                  proposal.actionId,
-                );
-              }
-              throw error;
+            } catch {
+              return terminalUnknown(lease, activeRun.runId, proposal.actionId);
             }
           },
         );

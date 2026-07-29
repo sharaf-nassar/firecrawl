@@ -55,7 +55,6 @@ import { agentStatusController } from "../controllers/v2/agent-status";
 import { agentCancelController } from "../controllers/v2/agent-cancel";
 import {
   browserCreateController,
-  browserExecuteController,
   browserDeleteController,
   browserListController,
   browserWebhookDestroyedController,
@@ -564,12 +563,6 @@ v2Router.get(
   ["/browser", "/interact"],
   authMiddleware(RateLimiterMode.BrowserExecute),
   wrap(browserListController),
-);
-
-v2Router.post(
-  ["/browser/:sessionId/execute", "/interact/:sessionId/execute"],
-  authMiddleware(RateLimiterMode.BrowserExecute),
-  wrap(browserExecuteController),
 );
 
 v2Router.delete(

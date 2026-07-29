@@ -253,6 +253,31 @@ describe("replay ingest authority boundary", () => {
     expect(unauthorizedFetch).toHaveBeenCalledOnce();
   });
 
+  it("rejects unknown replay options before transport", async () => {
+    const fetch = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response('{"persisted":true}', { status: 200 }),
+    );
+    const persist = createReplayIngestClientForTesting({
+      enabled: true,
+      fetch,
+      baseUrl: "http://127.0.0.1:3002",
+      apiKey,
+    });
+
+    await expect(
+      persist({
+        ...input,
+        options: {
+          futureBrowserOption: true,
+        },
+      }),
+    ).rejects.toMatchObject({
+      category: "replay_persistence_unavailable",
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("rejects an oversized streamed authority response", async () => {
     const fetch = vi.fn(
       async () =>

@@ -33,14 +33,13 @@ import {
 import type { ControlGenerationBinding } from "./startup-state.js";
 
 export const STREAM_LIMITS = Object.freeze({
-  frameBytes: 24 * 1024 * 1024,
+  frameBytes: 1024 * 1024,
   interactiveInputBytes: 4 * 1024,
-  cdpFrameBytes: 24 * 1024 * 1024,
-  cdpOutstandingIds: 1_024,
-  queuedMessages: 1_024,
-  queuedBytes: 32 * 1024 * 1024,
-  backpressureBytes: 16 * 1024 * 1024,
-  resumeBytes: 8 * 1024 * 1024,
+  cdpFrameBytes: 256 * 1024,
+  cdpOutstandingIds: 64,
+  queuedMessages: 64,
+  queuedBytes: 4 * 1024 * 1024,
+  backpressureBytes: 1024 * 1024,
   closeTimeoutMs: 5_000,
   jsonDepth: 16,
   jsonArrayEntries: 1_000,
@@ -67,7 +66,14 @@ const MAX_AUTH_BINDING_BYTES = 4_096;
 const finiteNumberSchema = z.number().finite();
 const nonnegativeIntegerSchema = z.number().int().min(0);
 const modifiersSchema = z.number().int().min(0).max(15);
-const mouseButtonSchema = z.enum(["none", "left", "middle", "right", "back", "forward"]);
+const mouseButtonSchema = z.enum([
+  "none",
+  "left",
+  "middle",
+  "right",
+  "back",
+  "forward",
+]);
 
 const interactiveInputSchema = z.discriminatedUnion("kind", [
   z.strictObject({
@@ -112,14 +118,17 @@ const interactiveInputSchema = z.discriminatedUnion("kind", [
 const authoritySchema = z.strictObject({
   processNonce: tokenSchema,
   controlGenerationNonce: tokenSchema,
-  authBinding: z.string().min(1).superRefine((value, context) => {
-    if (Buffer.byteLength(value, "utf8") > MAX_AUTH_BINDING_BYTES) {
-      context.addIssue({
-        code: "custom",
-        message: "authentication binding is too large",
-      });
-    }
-  }),
+  authBinding: z
+    .string()
+    .min(1)
+    .superRefine((value, context) => {
+      if (Buffer.byteLength(value, "utf8") > MAX_AUTH_BINDING_BYTES) {
+        context.addIssue({
+          code: "custom",
+          message: "authentication binding is too large",
+        });
+      }
+    }),
 });
 
 const openRelaySchema = z.strictObject({
@@ -153,34 +162,6 @@ const emptyParamsSchema = z.strictObject({});
 const cdpParamsByMethod = {
   "Runtime.enable": emptyParamsSchema,
   "Runtime.disable": emptyParamsSchema,
-  "Runtime.evaluate": z.strictObject({
-    expression: z.string().max(64 * 1024),
-    objectGroup: z.string().max(256).optional(),
-    includeCommandLineAPI: z.boolean().optional(),
-    silent: z.boolean().optional(),
-    returnByValue: z.boolean().optional(),
-    generatePreview: z.boolean().optional(),
-    userGesture: z.boolean().optional(),
-    awaitPromise: z.boolean().optional(),
-    throwOnSideEffect: z.boolean().optional(),
-    timeout: z.number().finite().positive().max(30_000).optional(),
-    disableBreaks: z.boolean().optional(),
-    replMode: z.boolean().optional(),
-    allowUnsafeEvalBlockedByCSP: z.boolean().optional(),
-  }),
-  "Runtime.callFunctionOn": z.strictObject({
-    functionDeclaration: z.string().max(64 * 1024),
-    objectId: z.string().min(1).max(4_096).optional(),
-    arguments: z.array(z.unknown()).max(256).optional(),
-    silent: z.boolean().optional(),
-    returnByValue: z.boolean().optional(),
-    generatePreview: z.boolean().optional(),
-    userGesture: z.boolean().optional(),
-    awaitPromise: z.boolean().optional(),
-    executionContextId: nonnegativeIntegerSchema.optional(),
-    objectGroup: z.string().max(256).optional(),
-    throwOnSideEffect: z.boolean().optional(),
-  }),
   "Runtime.getProperties": z.strictObject({
     objectId: z.string().min(1).max(4_096),
     ownProperties: z.boolean().optional(),
@@ -204,29 +185,37 @@ const cdpParamsByMethod = {
   }),
   "DOM.querySelector": z.strictObject({
     nodeId: nonnegativeIntegerSchema,
-    selector: z.string().min(1).max(16 * 1024),
+    selector: z
+      .string()
+      .min(1)
+      .max(16 * 1024),
   }),
   "DOM.querySelectorAll": z.strictObject({
     nodeId: nonnegativeIntegerSchema,
-    selector: z.string().min(1).max(16 * 1024),
+    selector: z
+      .string()
+      .min(1)
+      .max(16 * 1024),
   }),
-  "DOM.getOuterHTML": z.strictObject({
-    nodeId: nonnegativeIntegerSchema.optional(),
-    backendNodeId: nonnegativeIntegerSchema.optional(),
-    objectId: z.string().min(1).max(4_096).optional(),
-    includeShadowDOM: z.boolean().optional(),
-  }).superRefine((value, context) => {
-    const count =
-      Number(value.nodeId !== undefined) +
-      Number(value.backendNodeId !== undefined) +
-      Number(value.objectId !== undefined);
-    if (count !== 1) {
-      context.addIssue({
-        code: "custom",
-        message: "exactly one node identity is required",
-      });
-    }
-  }),
+  "DOM.getOuterHTML": z
+    .strictObject({
+      nodeId: nonnegativeIntegerSchema.optional(),
+      backendNodeId: nonnegativeIntegerSchema.optional(),
+      objectId: z.string().min(1).max(4_096).optional(),
+      includeShadowDOM: z.boolean().optional(),
+    })
+    .superRefine((value, context) => {
+      const count =
+        Number(value.nodeId !== undefined) +
+        Number(value.backendNodeId !== undefined) +
+        Number(value.objectId !== undefined);
+      if (count !== 1) {
+        context.addIssue({
+          code: "custom",
+          message: "exactly one node identity is required",
+        });
+      }
+    }),
   "DOM.describeNode": z.strictObject({
     nodeId: nonnegativeIntegerSchema.optional(),
     backendNodeId: nonnegativeIntegerSchema.optional(),
@@ -252,7 +241,10 @@ const cdpParamsByMethod = {
   }),
   "Page.reload": z.strictObject({
     ignoreCache: z.boolean().optional(),
-    scriptToEvaluateOnLoad: z.string().max(64 * 1024).optional(),
+    scriptToEvaluateOnLoad: z
+      .string()
+      .max(64 * 1024)
+      .optional(),
     loaderId: z.string().min(1).max(4_096).optional(),
   }),
   "Page.stopLoading": emptyParamsSchema,
@@ -271,8 +263,12 @@ const cdpParamsByMethod = {
     optimizeForSpeed: z.boolean().optional(),
   }),
   "Network.enable": z.strictObject({
-    maxTotalBufferSize: nonnegativeIntegerSchema.max(16 * 1024 * 1024).optional(),
-    maxResourceBufferSize: nonnegativeIntegerSchema.max(16 * 1024 * 1024).optional(),
+    maxTotalBufferSize: nonnegativeIntegerSchema
+      .max(16 * 1024 * 1024)
+      .optional(),
+    maxResourceBufferSize: nonnegativeIntegerSchema
+      .max(16 * 1024 * 1024)
+      .optional(),
     maxPostDataSize: nonnegativeIntegerSchema.max(1024 * 1024).optional(),
     reportDirectSocketTraffic: z.boolean().optional(),
     enableDurableMessages: z.boolean().optional(),
@@ -432,10 +428,7 @@ export type RelayGrantManager = Readonly<{
     runtimeSessionId: string,
     input: unknown,
   ): Promise<RevokedRelayGrantV1>;
-  open(
-    input: unknown,
-    upgrade: () => Promise<WebSocket>,
-  ): Promise<void>;
+  open(input: unknown, upgrade: () => Promise<WebSocket>): Promise<void>;
   sweepExpired(): number;
   drain(): Promise<void>;
   inventory(): RelayGrantInventory;
@@ -541,13 +534,8 @@ async function openStreamCdpChannel(options: {
     runtimeSignal: AbortSignal;
   }>
 > {
-  const {
-    socket,
-    lease,
-    runtimeApi,
-    externalAbort,
-    cleanupTimeoutMs,
-  } = options;
+  const { socket, lease, runtimeApi, externalAbort, cleanupTimeoutMs } =
+    options;
   const lifecycle = createStreamLifecycle(cleanupTimeoutMs);
   const runtimeSignal = runtimeApi.signal(lease);
   const onAbort = (): void => {
@@ -665,7 +653,10 @@ function assertJsonSafe(value: unknown, depth = 0): void {
   const symbols = Object.getOwnPropertySymbols(value);
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const entries = Object.entries(descriptors);
-  if (symbols.length !== 0 || entries.length > STREAM_LIMITS.jsonObjectEntries) {
+  if (
+    symbols.length !== 0 ||
+    entries.length > STREAM_LIMITS.jsonObjectEntries
+  ) {
     throw invalidRequest("CDP JSON object exceeds its limit");
   }
   for (const [key, descriptor] of entries) {
@@ -742,26 +733,11 @@ function createSocketSender(
   let queuedBytes = 0;
   let sending = false;
   let closed = false;
-  let paused = false;
-
-  const updateFlowControl = (): void => {
-    const bufferedBytes = socket.bufferedAmount + queuedBytes;
-    if (!paused && bufferedBytes >= STREAM_LIMITS.backpressureBytes) {
-      socket.pause();
-      paused = true;
-    } else if (paused && bufferedBytes <= STREAM_LIMITS.resumeBytes) {
-      socket.resume();
-      paused = false;
-    }
-  };
 
   const pump = (): void => {
     if (closed || sending || socket.readyState !== SOCKET_OPEN) return;
     const next = queue.shift();
-    if (next === undefined) {
-      updateFlowControl();
-      return;
-    }
+    if (next === undefined) return;
     queuedBytes -= next.bytes;
     sending = true;
     socket.send(next.data, (error) => {
@@ -770,7 +746,6 @@ function createSocketSender(
         onFailure(STREAM_CLOSE_CODES.internalError, "stream send failed");
         return;
       }
-      updateFlowControl();
       pump();
     });
   };
@@ -788,27 +763,26 @@ function createSocketSender(
       }
       const bytes = Buffer.byteLength(data, "utf8");
       if (bytes > STREAM_LIMITS.frameBytes) {
-        onFailure(STREAM_CLOSE_CODES.messageTooBig, "stream output is too large");
+        onFailure(
+          STREAM_CLOSE_CODES.messageTooBig,
+          "stream output is too large",
+        );
         return false;
       }
-      const bufferedBytes = socket.bufferedAmount + queuedBytes + bytes;
       if (
+        socket.bufferedAmount > STREAM_LIMITS.backpressureBytes ||
         queue.length >= STREAM_LIMITS.queuedMessages ||
-        bufferedBytes > STREAM_LIMITS.queuedBytes
+        queuedBytes + bytes > STREAM_LIMITS.queuedBytes
       ) {
         if (mode === "droppable") return false;
-        onFailure(STREAM_CLOSE_CODES.tryAgainLater, "stream backpressure limit");
-        return false;
-      }
-      if (
-        mode === "droppable" &&
-        bufferedBytes >= STREAM_LIMITS.backpressureBytes
-      ) {
+        onFailure(
+          STREAM_CLOSE_CODES.tryAgainLater,
+          "stream backpressure limit",
+        );
         return false;
       }
       queue.push({ bytes, data });
       queuedBytes += bytes;
-      updateFlowControl();
       pump();
       return true;
     },
@@ -816,8 +790,6 @@ function createSocketSender(
       closed = true;
       queue.length = 0;
       queuedBytes = 0;
-      if (paused) socket.resume();
-      paused = false;
     },
   });
 }
@@ -864,7 +836,8 @@ function installHeartbeat(
     pongReceived = false;
     socket.ping();
     timeout = setTimeout(() => {
-      if (!pongReceived && socket.readyState === SOCKET_OPEN) socket.terminate();
+      if (!pongReceived && socket.readyState === SOCKET_OPEN)
+        socket.terminate();
     }, timeoutMs);
     timeout.unref();
   }, intervalMs);
@@ -956,18 +929,8 @@ async function serveLiveStream(options: {
   cleanupTimeoutMs: number;
   externalAbort: AbortSignal;
 }): Promise<void> {
-  const {
-    socket,
-    lease,
-    permission,
-    runtimeApi,
-    externalAbort,
-  } = options;
-  const {
-    channel,
-    lifecycle,
-    runtimeSignal,
-  } = await openStreamCdpChannel({
+  const { socket, lease, permission, runtimeApi, externalAbort } = options;
+  const { channel, lifecycle, runtimeSignal } = await openStreamCdpChannel({
     socket,
     lease,
     runtimeApi,
@@ -989,10 +952,7 @@ async function serveLiveStream(options: {
   sender = createSocketSender(socket, fail);
 
   const onFrame = (raw: unknown): void => {
-    if (
-      lifecycle.isClosing() ||
-      socket.readyState !== SOCKET_OPEN
-    ) {
+    if (lifecycle.isClosing() || socket.readyState !== SOCKET_OPEN) {
       lifecycle.beginClosing();
       return;
     }
@@ -1045,10 +1005,7 @@ async function serveLiveStream(options: {
   };
 
   const onMessage = (data: WebSocket.RawData, isBinary: boolean): void => {
-    if (
-      lifecycle.isClosing() ||
-      socket.readyState !== SOCKET_OPEN
-    ) {
+    if (lifecycle.isClosing() || socket.readyState !== SOCKET_OPEN) {
       lifecycle.beginClosing();
       return;
     }
@@ -1089,10 +1046,7 @@ async function serveLiveStream(options: {
     queuedInputBytes += bytes;
     commandQueue = commandQueue
       .then(() => {
-        if (
-          lifecycle.isClosing() ||
-          socket.readyState !== SOCKET_OPEN
-        ) {
+        if (lifecycle.isClosing() || socket.readyState !== SOCKET_OPEN) {
           lifecycle.beginClosing();
           return;
         }
@@ -1100,7 +1054,8 @@ async function serveLiveStream(options: {
       })
       .then(
         () => undefined,
-        () => fail(STREAM_CLOSE_CODES.internalError, "interactive input failed"),
+        () =>
+          fail(STREAM_CLOSE_CODES.internalError, "interactive input failed"),
       )
       .finally(() => {
         queuedInputs -= 1;
@@ -1152,10 +1107,7 @@ async function serveLiveStream(options: {
         lifecycle.whenClosing.then(() => "closing" as const),
       ]);
       if (outcome === "started" && !lifecycle.isClosing()) {
-        await Promise.race([
-          onceSocketClosed(socket),
-          lifecycle.whenClosing,
-        ]);
+        await Promise.race([onceSocketClosed(socket), lifecycle.whenClosing]);
       }
     }
   } finally {
@@ -1182,11 +1134,7 @@ async function serveCdpStream(options: {
   externalAbort: AbortSignal;
 }): Promise<void> {
   const { socket, lease, runtimeApi, externalAbort } = options;
-  const {
-    channel,
-    lifecycle,
-    runtimeSignal,
-  } = await openStreamCdpChannel({
+  const { channel, lifecycle, runtimeSignal } = await openStreamCdpChannel({
     socket,
     lease,
     runtimeApi,
@@ -1205,10 +1153,7 @@ async function serveCdpStream(options: {
   sender = createSocketSender(socket, fail);
 
   const onMessage = (data: WebSocket.RawData, isBinary: boolean): void => {
-    if (
-      lifecycle.isClosing() ||
-      socket.readyState !== SOCKET_OPEN
-    ) {
+    if (lifecycle.isClosing() || socket.readyState !== SOCKET_OPEN) {
       lifecycle.beginClosing();
       return;
     }
@@ -1317,10 +1262,7 @@ async function serveCdpStream(options: {
       onAbort();
     }
     if (!lifecycle.isClosing()) {
-      await Promise.race([
-        onceSocketClosed(socket),
-        lifecycle.whenClosing,
-      ]);
+      await Promise.race([onceSocketClosed(socket), lifecycle.whenClosing]);
     }
   } finally {
     lifecycle.beginClosing();
@@ -1407,14 +1349,14 @@ export function createRelayGrantManager(options: {
         throw browserUnavailable("relay grant history is exhausted");
       }
       const session = options.registry.get(runtimeSessionId);
-      if (session === undefined || session.runtimeSessionId !== runtimeSessionId) {
+      if (
+        session === undefined ||
+        session.runtimeSessionId !== runtimeSessionId
+      ) {
         throw invalidRequest("relay grant session is unavailable");
       }
       const expiresAtMs = Date.parse(request.expiresAt);
-      if (
-        expiresAtMs <= now() ||
-        expiresAtMs > Date.parse(session.expiresAt)
-      ) {
+      if (expiresAtMs <= now() || expiresAtMs > Date.parse(session.expiresAt)) {
         throw invalidRequest("relay grant expiry is invalid");
       }
       const tokenBytes = Buffer.from(randomBytes(32));
@@ -1455,7 +1397,10 @@ export function createRelayGrantManager(options: {
       canonicalUuidSchema.parse(runtimeSessionId);
       const request = revokeRelayGrantV1Schema.parse(input);
       const record = grantsById.get(request.grantId);
-      if (record !== undefined && record.runtimeSessionId !== runtimeSessionId) {
+      if (
+        record !== undefined &&
+        record.runtimeSessionId !== runtimeSessionId
+      ) {
         throw invalidRequest("relay grant is unavailable");
       }
       if (record === undefined) {

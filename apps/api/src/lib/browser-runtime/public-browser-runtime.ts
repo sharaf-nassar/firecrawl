@@ -6,7 +6,8 @@ import {
   createBrowserSessionOrchestrator,
   type BrowserSessionLifetime,
 } from "./orchestrator";
-import type { CodeRunResult, PromptRunResult } from "./protocol";
+import { createBrowserActionCoordinator } from "./action-coordinator";
+import type { PromptRunResult } from "./protocol";
 import { runtimeUuidSchema } from "./protocol";
 import { createBrowserProxyUrls } from "./proxy-urls";
 import type {
@@ -39,6 +40,7 @@ import {
   type BrowserAdmissionCleanupClaim,
   type BrowserSessionBillingClaim,
 } from "../browser-state/store";
+import { getArtifactStore } from "../artifacts";
 
 type PublicOrigins = { publicBase: string; publicWsBase: string };
 
@@ -83,28 +85,15 @@ type CreatePublicSessionInput = PublicOrigins & {
   billingApiKeyId?: number | null;
   admitSession?: () => Promise<BrowserBillingReservation | void>;
   rollbackKeylessReservation?: () => Promise<void>;
-};
-
-type ExecutePublicSessionInput = {
-  requestId: string;
-  ownerId: string;
-  sessionId: string;
-  language: "node" | "python" | "bash";
-  source: string;
-  timeoutSeconds: number;
-  correlationId: string;
-  allowedDomains: string[];
+  requestDeadline?: Date;
 };
 
 type InteractInput = PublicOrigins & {
   requestId: string;
   ownerId: string;
   scrapeId: string;
-  mode: "prompt" | "code";
-  prompt?: string;
-  source?: string;
-  language: "node" | "python" | "bash";
-  timeoutSeconds: number;
+  prompt: string;
+  deadline: Date;
   correlationId: string;
   existingSessionId?: string;
   allowedDomains: string[];
@@ -143,7 +132,6 @@ interface PublicBrowserRuntime {
     status: "active" | "destroyed" | undefined,
     origins: PublicOrigins,
   ): Promise<PublicBrowserSession[]>;
-  executeSession(input: ExecutePublicSessionInput): Promise<CodeRunResult>;
   stopSession(
     ownerId: string,
     sessionId: string,
@@ -157,7 +145,7 @@ interface PublicBrowserRuntime {
   }>;
   interact(input: InteractInput): Promise<{
     session: PublicBrowserSession;
-    result: PromptRunResult | CodeRunResult;
+    result: PromptRunResult;
   }>;
   stopInteract(
     ownerId: string,
@@ -353,6 +341,11 @@ export function createPublicBrowserRuntime(deps: {
 
   const grants = createBrowserProxyGrantStore({ gate: deps.gate });
   const adapter = deps.adapter ?? unavailableExecutionAdapter;
+  const actionCoordinator = createBrowserActionCoordinator({
+    gate: deps.gate,
+    browserClient: deps.browserClient,
+    artifactStore: getArtifactStore(),
+  });
   const closeSession = async (
     claim: {
       browserId: string | null;
@@ -386,6 +379,7 @@ export function createPublicBrowserRuntime(deps: {
   const orchestrator = createBrowserSessionOrchestrator({
     gate: deps.gate,
     adapter,
+    actionCoordinator,
     closeSession,
     finalizeProfile: prepared =>
       deps.gate.withBrowserStateMutationLease(
@@ -638,7 +632,11 @@ export function createPublicBrowserRuntime(deps: {
           ),
         createRuntime: async (lease, lifetime) => {
           const deadline = new Date(
-            Math.min(lifetime.absoluteDeadline.getTime(), Date.now() + 60_000),
+            Math.min(
+              lifetime.absoluteDeadline.getTime(),
+              input.requestDeadline?.getTime() ?? Number.POSITIVE_INFINITY,
+              Date.now() + 60_000,
+            ),
           );
           runtimeSession = await deps.browserClient.createSession(
             {
@@ -788,9 +786,7 @@ export function createPublicBrowserRuntime(deps: {
   const beginRun = async (
     ownerId: string,
     sessionId: string,
-    mode: "prompt" | "code",
-    language: string | null,
-    timeoutSeconds: number,
+    deadline: Date,
     correlationId: string,
     requestId: string,
     allowedDomains?: string[],
@@ -801,9 +797,6 @@ export function createPublicBrowserRuntime(deps: {
     allowedDomains: string[];
   }> => {
     const runId = randomUUID();
-    const deadline = new Date(
-      Date.now() + Math.min(300, timeoutSeconds) * 1_000,
-    );
     const runtime = await deps.gate.withBrowserStateMutationLease(
       "filesystem_and_database",
       async lease => {
@@ -849,14 +842,14 @@ export function createPublicBrowserRuntime(deps: {
              language, model, reasoning_effort, deadline_at, correlation_id
            )
            SELECT $1, $2, owner_id, id, scrape_id, $3, 'queued',
-                  $4, 'gpt-5.6-terra', 'medium', $5, $6
+                  $4, 'local', 'configured', $5, $6
              FROM browser_sessions
             WHERE id = $7 AND owner_id = $8`,
           [
             runId,
             runtimeUuidSchema.parse(requestId),
-            mode,
-            language,
+            "prompt",
+            null,
             deadline.toISOString(),
             correlationId,
             row.id,
@@ -875,7 +868,7 @@ export function createPublicBrowserRuntime(deps: {
                   updated_at = now()
             WHERE id = $1 AND state = 'ready'
             RETURNING id`,
-          [row.id, runId, requestId, mode === "prompt"],
+          [row.id, runId, requestId, true],
         );
         if (transitioned.rows.length !== 1)
           throw runtimeError("browser_state_unavailable");
@@ -888,28 +881,6 @@ export function createPublicBrowserRuntime(deps: {
       runtime: runtime.service,
       allowedDomains: runtime.allowedDomains,
     };
-  };
-
-  const executeSession = async (
-    input: ExecutePublicSessionInput,
-  ): Promise<CodeRunResult> => {
-    const started = await beginRun(
-      input.ownerId,
-      input.sessionId,
-      "code",
-      input.language,
-      input.timeoutSeconds,
-      input.correlationId,
-      input.requestId,
-      input.allowedDomains,
-    );
-    return orchestrator.executeCode({
-      runId: started.runId,
-      language: input.language,
-      source: input.source,
-      deadline: new Date(Date.now() + input.timeoutSeconds * 1_000),
-      correlationId: input.correlationId,
-    });
   };
 
   const waitForAdmissionCleanup = async (
@@ -1106,8 +1077,6 @@ export function createPublicBrowserRuntime(deps: {
       return Promise.all(rows.map(row => issuePublicSession(row, origins)));
     },
 
-    executeSession,
-
     stopSession,
 
     async interact(input) {
@@ -1153,6 +1122,7 @@ export function createPublicBrowserRuntime(deps: {
           session = await createSession(
             {
               ...input,
+              requestDeadline: input.deadline,
               ttlSeconds: 3_600,
               activityTtlSeconds: 600,
               streamWebView: true,
@@ -1165,36 +1135,22 @@ export function createPublicBrowserRuntime(deps: {
       const started = await beginRun(
         input.ownerId,
         session.id,
-        input.mode,
-        input.mode === "code" ? input.language : null,
-        input.timeoutSeconds,
+        input.deadline,
         input.correlationId,
         input.requestId,
       );
-      const deadline = new Date(
-        Date.now() + Math.min(300, input.timeoutSeconds) * 1_000,
-      );
-      const result =
-        input.mode === "prompt"
-          ? await orchestrator.executePrompt({
-              runId: started.runId,
-              prompt: input.prompt ?? "",
-              initialObservation: {
-                version: 1,
-                type: "initial",
-                sequence: 0,
-                page: started.runtime.page,
-              },
-              deadline,
-              correlationId: input.correlationId,
-            })
-          : await orchestrator.executeCode({
-              runId: started.runId,
-              language: input.language,
-              source: input.source ?? "",
-              deadline,
-              correlationId: input.correlationId,
-            });
+      const result = await orchestrator.executePrompt({
+        runId: started.runId,
+        prompt: input.prompt,
+        initialObservation: {
+          version: 1,
+          type: "initial",
+          sequence: 0,
+          page: started.runtime.page,
+        },
+        deadline: input.deadline,
+        correlationId: input.correlationId,
+      });
       return { session, result };
     },
 

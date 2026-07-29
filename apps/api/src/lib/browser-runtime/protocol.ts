@@ -2,11 +2,7 @@ import { Buffer } from "node:buffer";
 
 import { z } from "zod";
 
-import {
-  adapterAuthorizationBindingSchema,
-  type AdapterPendingAuthorizationInput,
-  type BrowserOperation,
-} from "../browser-state/types";
+import type { BrowserOperation } from "../browser-state/types";
 import {
   browserOperationResultSchema,
   canonicalUuidSchema,
@@ -88,48 +84,41 @@ const internalJsonValueSchema = z.unknown().superRefine((root, context) => {
 
 export const browserOperationSchema: z.ZodType<BrowserOperation> =
   z.discriminatedUnion("kind", [
-    z.strictObject({ kind: z.literal("snapshot") }),
+    z.strictObject({ kind: z.literal("navigate"), url: httpUrlSchema }),
     z.strictObject({ kind: z.literal("click"), ref: internalRefSchema }),
+    z.strictObject({ kind: z.literal("hover"), ref: internalRefSchema }),
     z.strictObject({
-      kind: z.literal("fill"),
-      ref: internalRefSchema,
-      value: internalTextSchema,
+      kind: z.literal("hover_batch"),
+      refs: z
+        .array(internalRefSchema)
+        .min(1)
+        .max(16)
+        .superRefine((refs, context) => {
+          if (new Set(refs).size !== refs.length) {
+            context.addIssue({
+              code: "custom",
+              message: "duplicate locator ref",
+            });
+          }
+        }),
     }),
     z.strictObject({
       kind: z.literal("type"),
       ref: internalRefSchema,
-      value: internalTextSchema,
-      delayMs: z.number().int().min(0).max(250),
-    }),
-    z.strictObject({
-      kind: z.literal("press"),
-      ref: internalRefSchema,
-      key: z.string().min(1).max(64),
-    }),
-    z.strictObject({
-      kind: z.literal("select"),
-      ref: internalRefSchema,
-      values: z.array(z.string().max(512)).max(20),
-    }),
-    z.strictObject({
-      kind: z.literal("scroll"),
-      deltaX: z.number().int().min(-10_000).max(10_000),
-      deltaY: z.number().int().min(-10_000).max(10_000),
+      text: internalTextSchema,
+      clear: z.boolean().optional(),
     }),
     z.strictObject({
       kind: z.literal("wait"),
       milliseconds: z.number().int().min(0).max(30_000),
     }),
     z.strictObject({
-      kind: z.literal("get_text"),
+      kind: z.literal("extract"),
       ref: internalRefSchema.optional(),
     }),
-    z.strictObject({ kind: z.literal("get_url") }),
-    z.strictObject({ kind: z.literal("navigate"), url: httpUrlSchema }),
     z.strictObject({
-      kind: z.literal("evaluate"),
-      expression: internalTextSchema,
-      args: z.record(z.string(), internalJsonValueSchema),
+      kind: z.literal("screenshot"),
+      fullPage: z.boolean().optional(),
     }),
   ]);
 
@@ -157,18 +146,14 @@ export const observationV1Schema = z
       sequence: z.number().int().min(1).max(25),
       actionId: runtimeUuidSchema,
       actionKind: z.enum([
-        "snapshot",
-        "click",
-        "fill",
-        "type",
-        "press",
-        "select",
-        "scroll",
-        "wait",
-        "get_text",
-        "get_url",
         "navigate",
-        "evaluate",
+        "click",
+        "hover",
+        "hover_batch",
+        "type",
+        "wait",
+        "extract",
+        "screenshot",
       ]),
       outcome: z.enum(["succeeded", "rejected_no_effect", "failed_no_effect"]),
       result: browserOperationResultSchema.optional(),
@@ -220,6 +205,56 @@ export const observationV1Schema = z
 export type BoundedPageState = z.infer<typeof boundedPageStateSchema>;
 export type ObservationV1 = z.infer<typeof observationV1Schema>;
 
+const decisionHistoryEntryV1Schema = z
+  .strictObject({
+    turn: z.number().int().min(0).max(24),
+    action: browserOperationSchema,
+    observation: observationV1Schema,
+  })
+  .superRefine((entry, context) => {
+    if (
+      entry.observation.type !== "action_result" ||
+      entry.observation.sequence !== entry.turn + 1 ||
+      entry.observation.actionKind !== entry.action.kind
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "decision history entry does not match its turn and action",
+      });
+    }
+  });
+
+export const decisionHistoryV1Schema = z
+  .array(decisionHistoryEntryV1Schema)
+  .max(25)
+  .superRefine((history, context) => {
+    for (const [index, entry] of history.entries()) {
+      if (entry.turn !== index) {
+        context.addIssue({
+          code: "custom",
+          message: "decision history must be contiguous and ordered",
+        });
+        return;
+      }
+    }
+    const observationBytes = history.reduce(
+      (total, entry) =>
+        total + Buffer.byteLength(JSON.stringify(entry.observation), "utf8"),
+      0,
+    );
+    if (observationBytes > 1024 * 1024) {
+      context.addIssue({
+        code: "custom",
+        message: "decision history observations exceed 1 MiB",
+      });
+    }
+  });
+
+/** @public */
+export type DecisionHistoryEntryV1 = z.infer<
+  typeof decisionHistoryEntryV1Schema
+>;
+
 /** @public */
 export type ModelDecisionV1 =
   | { version: 1; type: "action"; action: BrowserOperation }
@@ -227,22 +262,14 @@ export type ModelDecisionV1 =
 
 /** @public */
 export type ModelWireBrowserOperationV1 =
-  | { kind: "snapshot" }
-  | { kind: "click"; ref: string }
-  | { kind: "fill"; ref: string; value: string }
-  | { kind: "type"; ref: string; value: string; delayMs: number }
-  | { kind: "press"; ref: string; key: string }
-  | { kind: "select"; ref: string; values: string[] }
-  | { kind: "scroll"; deltaX: number; deltaY: number }
-  | { kind: "wait"; milliseconds: number }
-  | { kind: "get_text"; ref: string | null }
-  | { kind: "get_url" }
   | { kind: "navigate"; url: string }
-  | {
-      kind: "evaluate";
-      expression: string;
-      args: Record<string, never>;
-    };
+  | { kind: "click"; ref: string }
+  | { kind: "hover"; ref: string }
+  | { kind: "hover_batch"; refs: string[] }
+  | { kind: "type"; ref: string; text: string; clear?: boolean | null }
+  | { kind: "wait"; milliseconds: number }
+  | { kind: "extract"; ref?: string | null }
+  | { kind: "screenshot"; fullPage?: boolean | null };
 
 /** @public */
 export type ModelWireDecisionV1 =
@@ -272,54 +299,43 @@ export const modelDecisionV1Schema = z.discriminatedUnion("type", [
   }),
 ]);
 
-const emptyModelWireArgsSchema = z
-  .strictObject({})
-  .transform((): Record<string, never> => ({}));
-
 /** @public */
 export const modelWireBrowserOperationV1Schema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("snapshot") }),
+  z.strictObject({ kind: z.literal("navigate"), url: httpUrlSchema }),
   z.strictObject({ kind: z.literal("click"), ref: internalRefSchema }),
+  z.strictObject({ kind: z.literal("hover"), ref: internalRefSchema }),
   z.strictObject({
-    kind: z.literal("fill"),
-    ref: internalRefSchema,
-    value: internalTextSchema,
+    kind: z.literal("hover_batch"),
+    refs: z
+      .array(internalRefSchema)
+      .min(1)
+      .max(16)
+      .superRefine((refs, context) => {
+        if (new Set(refs).size !== refs.length) {
+          context.addIssue({
+            code: "custom",
+            message: "duplicate locator ref",
+          });
+        }
+      }),
   }),
   z.strictObject({
     kind: z.literal("type"),
     ref: internalRefSchema,
-    value: internalTextSchema,
-    delayMs: z.number().int().min(0).max(250),
-  }),
-  z.strictObject({
-    kind: z.literal("press"),
-    ref: internalRefSchema,
-    key: z.string().min(1).max(64),
-  }),
-  z.strictObject({
-    kind: z.literal("select"),
-    ref: internalRefSchema,
-    values: z.array(z.string().max(512)).max(20),
-  }),
-  z.strictObject({
-    kind: z.literal("scroll"),
-    deltaX: z.number().int().min(-10_000).max(10_000),
-    deltaY: z.number().int().min(-10_000).max(10_000),
+    text: internalTextSchema,
+    clear: z.boolean().nullable().optional(),
   }),
   z.strictObject({
     kind: z.literal("wait"),
     milliseconds: z.number().int().min(0).max(30_000),
   }),
   z.strictObject({
-    kind: z.literal("get_text"),
-    ref: internalRefSchema.nullable(),
+    kind: z.literal("extract"),
+    ref: internalRefSchema.nullable().optional(),
   }),
-  z.strictObject({ kind: z.literal("get_url") }),
-  z.strictObject({ kind: z.literal("navigate"), url: httpUrlSchema }),
   z.strictObject({
-    kind: z.literal("evaluate"),
-    expression: internalTextSchema,
-    args: emptyModelWireArgsSchema,
+    kind: z.literal("screenshot"),
+    fullPage: z.boolean().nullable().optional(),
   }),
 ]);
 
@@ -341,7 +357,7 @@ export const modelWireDecisionV1Schema = z.discriminatedUnion("type", [
   }),
 ]);
 
-export const modelDecisionEnvelopeV1Schema = z.strictObject({
+const modelDecisionEnvelopeV1Schema = z.strictObject({
   decision: modelWireDecisionV1Schema,
 });
 
@@ -363,24 +379,39 @@ export function normalizeModelDecisionEnvelopeV1(
   const decision = parsed.data.decision;
   if (decision.type === "final") return decision;
   const operation = decision.action;
-  if (operation.kind === "get_text") {
+  if (operation.kind === "extract") {
     return {
       version: 1,
       type: "action",
       action:
-        operation.ref === null
-          ? { kind: "get_text" }
-          : { kind: "get_text", ref: operation.ref },
+        operation.ref == null
+          ? { kind: "extract" }
+          : { kind: "extract", ref: operation.ref },
     };
   }
-  return {
-    version: 1,
-    type: "action",
-    action:
-      operation.kind === "evaluate"
-        ? { ...operation, args: {} }
-        : (operation as BrowserOperation),
-  };
+  if (operation.kind === "type") {
+    return {
+      version: 1,
+      type: "action",
+      action: {
+        kind: "type",
+        ref: operation.ref,
+        text: operation.text,
+        ...(operation.clear == null ? {} : { clear: operation.clear }),
+      },
+    };
+  }
+  if (operation.kind === "screenshot") {
+    return {
+      version: 1,
+      type: "action",
+      action:
+        operation.fullPage == null
+          ? { kind: "screenshot" }
+          : { kind: "screenshot", fullPage: operation.fullPage },
+    };
+  }
+  return { version: 1, type: "action", action: operation };
 }
 
 export const PROMPT_LOOP_POLICY_V1 = {
@@ -393,16 +424,6 @@ export const PROMPT_LOOP_POLICY_V1 = {
   maxTurns: 26,
   maxRuntimeMs: 300_000,
 } as const;
-
-const adapterPendingSchema = {
-  adapterJobId: adapterAuthorizationBindingSchema.shape.adapterJobId,
-  adapterSupervisorId:
-    adapterAuthorizationBindingSchema.shape.adapterSupervisorId,
-  capabilityToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-  onAccepted: z.custom<AdapterPendingAuthorizationInput["onAccepted"]>(
-    value => typeof value === "function",
-  ),
-};
 
 const promptLoopPolicySchema = z.strictObject({
   maxPromptCharacters: z.literal(10_000),
@@ -426,22 +447,17 @@ const boundedDeadlineSchema = z.date().superRefine((deadline, context) => {
 });
 
 export const promptRunInputSchema = z.strictObject({
-  ...adapterPendingSchema,
   runId: runtimeUuidSchema,
   prompt: z.string().max(10_000),
   initialObservation: observationV1Schema.refine(
     value => value.type === "initial" && value.sequence === 0,
   ),
-  model: z.literal("gpt-5.6-terra"),
-  reasoningEffort: z.literal("medium"),
   decisionSchemaVersion: z.literal(1),
   observationSchemaVersion: z.literal(1),
   loopPolicy: promptLoopPolicySchema,
   deadline: boundedDeadlineSchema,
   correlationId: runtimeUuidSchema,
 });
-
-export type PromptRunInput = z.infer<typeof promptRunInputSchema>;
 
 export const promptRunResultSchema = z.strictObject({
   output: z.string().superRefine((value, context) => {
@@ -463,41 +479,3 @@ export const promptRunResultSchema = z.strictObject({
   }),
 });
 export type PromptRunResult = z.infer<typeof promptRunResultSchema>;
-
-export const codeRunInputSchema = z.strictObject({
-  ...adapterPendingSchema,
-  runId: runtimeUuidSchema,
-  language: z.enum(["node", "python", "bash"]),
-  source: z.string().max(100_000),
-  deadline: boundedDeadlineSchema,
-  correlationId: runtimeUuidSchema,
-});
-export type CodeRunInput = z.infer<typeof codeRunInputSchema>;
-
-const boundedCodeTextSchema = z.string().superRefine((value, context) => {
-  if (Buffer.byteLength(value, "utf8") > 256 * 1024) {
-    context.addIssue({ code: "custom", message: "code output exceeds bound" });
-  }
-});
-
-export const codeRunResultSchema = z
-  .strictObject({
-    stdout: boundedCodeTextSchema,
-    result: boundedCodeTextSchema,
-    stderr: boundedCodeTextSchema,
-    exitCode: z.number().int().min(0).max(255),
-    killed: z.boolean(),
-  })
-  .superRefine((value, context) => {
-    const total =
-      Buffer.byteLength(value.stdout, "utf8") +
-      Buffer.byteLength(value.result, "utf8") +
-      Buffer.byteLength(value.stderr, "utf8");
-    if (total > 512 * 1024) {
-      context.addIssue({
-        code: "custom",
-        message: "code result exceeds bound",
-      });
-    }
-  });
-export type CodeRunResult = z.infer<typeof codeRunResultSchema>;

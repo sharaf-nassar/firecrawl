@@ -384,79 +384,91 @@ const semanticRuleImplementations: Record<string, () => void> = {
     expect(jsonSafeSchema.safeParse(proxy).success).toBe(false);
   },
   operation_request_v1: () => {
-    const cap = PRIVATE_V1_CUSTOM_CONSTANTS.operationMaxBytes;
-    const boundary = findEncodedBoundary(20_000, cap, (count) => ({
-      kind: "evaluate" as const,
-      expression: "",
-      args: { x: "💥".repeat(count) },
-    }));
-    expect(boundary.withinBytes).toBeLessThanOrEqual(cap);
-    expect(boundary.overflowBytes).toBeGreaterThan(cap);
-    expect(browserOperationSchema.safeParse(boundary.within).success).toBe(
-      true,
-    );
-    expect(browserOperationSchema.safeParse(boundary.overflow).success).toBe(
-      false,
-    );
     expect(
       browserOperationSchema.safeParse({
-        kind: "evaluate",
-        expression: "x".repeat(20_000),
-        args: { x: "界".repeat(20_000) },
+        kind: "type",
+        ref: "e1",
+        text: "x".repeat(20_000),
+      }).success,
+    ).toBe(true);
+    expect(
+      browserOperationSchema.safeParse({
+        kind: "type",
+        ref: "e1",
+        text: "x".repeat(20_001),
+      }).success,
+    ).toBe(false);
+    expect(
+      browserOperationSchema.safeParse({
+        kind: "hover_batch",
+        refs: Array.from(
+          { length: PRIVATE_V1_CUSTOM_CONSTANTS.hoverBatchMaxRefs },
+          (_, index) => `e${index}`,
+        ),
+      }).success,
+    ).toBe(true);
+    expect(
+      browserOperationSchema.safeParse({
+        kind: "hover_batch",
+        refs: ["e1", "e1"],
       }).success,
     ).toBe(false);
   },
   operation_result_v1: () => {
     const c = PRIVATE_V1_CUSTOM_CONSTANTS;
-    const evaluateAtCap = "x".repeat(c.evaluateResultMaxBytes - 2);
-    const evaluateOverflow = "x".repeat(c.evaluateResultMaxBytes - 1);
     const base = {
-      version: 1,
+      version: 1 as const,
       actionId: VALID_ID,
       sequence: 1,
       normalizedProposalHash: "a".repeat(64),
-      outcome: "succeeded",
-      page: { url: "https://example.test/", title: "", snapshotExcerpt: "" },
-      sessionVersion: 0,
+      outcome: "succeeded" as const,
+      result: { kind: "extract" as const, text: "ok" },
+      page: {
+        url: "https://example.test/",
+        title: "ok",
+        snapshotExcerpt: "ok",
+      },
+      sessionVersion: 1,
     };
     expect(
-      actionExecutionResultSchema.safeParse({
-        ...base,
-        result: {
-          kind: "evaluate",
-          value: evaluateAtCap,
-        },
+      browserOperationResultSchema.safeParse({
+        kind: "extract",
+        text: "x".repeat(40_000),
       }).success,
     ).toBe(true);
     expect(
-      actionExecutionResultSchema.safeParse({
-        ...base,
-        result: {
-          kind: "evaluate",
-          value: evaluateOverflow,
-        },
+      browserOperationResultSchema.safeParse({
+        kind: "extract",
+        text: "x".repeat(40_001),
       }).success,
     ).toBe(false);
-    expect(encodedBytes(evaluateAtCap)).toBe(c.evaluateResultMaxBytes);
-    expect(encodedBytes(evaluateOverflow)).toBe(c.evaluateResultMaxBytes + 1);
-
-    const operationBoundary = findEncodedBoundary(
-      40_000,
-      c.operationResultMaxBytes,
-      (count) => ({ kind: "get_text" as const, text: "💥".repeat(count) }),
-    );
-    expect(operationBoundary.withinBytes).toBeLessThanOrEqual(
-      c.operationResultMaxBytes,
-    );
-    expect(operationBoundary.overflowBytes).toBeGreaterThan(
-      c.operationResultMaxBytes,
-    );
     expect(
-      browserOperationResultSchema.safeParse(operationBoundary.within).success,
+      browserOperationResultSchema.safeParse({
+        kind: "hover_batch",
+        items: [
+          {
+            ref: "e1",
+            outcome: "succeeded",
+            text: "😀".repeat(
+              PRIVATE_V1_CUSTOM_CONSTANTS.hoverBatchMaxTextBytes / 4,
+            ),
+          },
+        ],
+      }).success,
     ).toBe(true);
     expect(
-      browserOperationResultSchema.safeParse(operationBoundary.overflow)
-        .success,
+      browserOperationResultSchema.safeParse({
+        kind: "hover_batch",
+        items: [
+          {
+            ref: "e1",
+            outcome: "succeeded",
+            text: `x${"😀".repeat(
+              PRIVATE_V1_CUSTOM_CONSTANTS.hoverBatchMaxTextBytes / 4,
+            )}`,
+          },
+        ],
+      }).success,
     ).toBe(false);
 
     const actionBoundary = findEncodedBoundary(
@@ -464,7 +476,7 @@ const semanticRuleImplementations: Record<string, () => void> = {
       c.actionResponseMaxBytes,
       (count) => ({
         ...base,
-        result: { kind: "get_url" as const, url: "https://example.test/" },
+        result: { kind: "extract" as const, text: "ok" },
         page: {
           ...base.page,
           title: "界".repeat(4_096),
@@ -1133,16 +1145,16 @@ const semanticRuleCaseCoverage: Record<
     ],
   },
   operation_request_v1: {
-    coveredConstantKeys: ["operationMaxBytes"],
-    coveredBehaviorKeys: [],
+    coveredConstantKeys: ["operationMaxBytes", "hoverBatchMaxRefs"],
+    coveredBehaviorKeys: ["hover_batch_unique_refs"],
   },
   operation_result_v1: {
     coveredConstantKeys: [
-      "evaluateResultMaxBytes",
       "operationResultMaxBytes",
       "actionResponseMaxBytes",
+      "hoverBatchMaxTextBytes",
     ],
-    coveredBehaviorKeys: [],
+    coveredBehaviorKeys: ["hover_batch_utf8_item_text_bound"],
   },
   indexeddb_v1: {
     coveredConstantKeys: [],
@@ -1300,6 +1312,85 @@ describe("private V1 contracts", () => {
     expect(
       browserOperationSchema.safeParse({ kind: "shell", command: "id" })
         .success,
+    ).toBe(false);
+  });
+
+  test("hover requires one bounded locator ref", () => {
+    expect(
+      browserOperationSchema.safeParse({ kind: "hover", ref: "e1" }).success,
+    ).toBe(true);
+    expect(browserOperationSchema.safeParse({ kind: "hover" }).success).toBe(
+      false,
+    );
+    expect(
+      browserOperationSchema.safeParse({ kind: "hover", ref: "" }).success,
+    ).toBe(false);
+    expect(
+      browserOperationSchema.safeParse({
+        kind: "hover",
+        ref: "e".repeat(129),
+      }).success,
+    ).toBe(false);
+  });
+
+  test("hover_batch requires 1 to 16 unique exact locator refs", () => {
+    expect(
+      browserOperationSchema.safeParse({
+        kind: "hover_batch",
+        refs: ["e1", "e2"],
+      }).success,
+    ).toBe(true);
+    for (const operation of [
+      { kind: "hover_batch", refs: [] },
+      {
+        kind: "hover_batch",
+        refs: Array.from({ length: 17 }, (_, index) => `e${index}`),
+      },
+      { kind: "hover_batch", refs: ["e1", "e1"] },
+      { kind: "hover_batch", refs: [""] },
+      { kind: "hover_batch", refs: ["e1"], selector: "button" },
+    ]) {
+      expect(browserOperationSchema.safeParse(operation).success).toBe(false);
+    }
+  });
+
+  test("hover_batch result enforces exact outcomes and UTF-8 item bounds", () => {
+    expect(
+      browserOperationResultSchema.safeParse({
+        kind: "hover_batch",
+        items: [
+          { ref: "e1", outcome: "succeeded", text: "tooltip" },
+          {
+            ref: "e2",
+            outcome: "failed_no_effect",
+            error: { category: "stale_ref", message: "detached" },
+          },
+        ],
+      }).success,
+    ).toBe(true);
+    expect(
+      browserOperationResultSchema.safeParse({
+        kind: "hover_batch",
+        items: [
+          {
+            ref: "e1",
+            outcome: "succeeded",
+            text: "😀".repeat(257),
+          },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      browserOperationResultSchema.safeParse({
+        kind: "hover_batch",
+        items: [
+          {
+            ref: "e1",
+            outcome: "failed_no_effect",
+            error: { category: "other", message: "no" },
+          },
+        ],
+      }).success,
     ).toBe(false);
   });
 
@@ -1584,27 +1675,7 @@ describe("private V1 contracts", () => {
     ).toThrow(/extra_behavior/);
   });
 
-  test("action results reject unsafe JSON and encoded overflow", () => {
-    const cyclic: Record<string, unknown> = {};
-    cyclic.self = cyclic;
-    for (const value of [undefined, Symbol("x"), 1n, Number.NaN, cyclic]) {
-      expect(
-        actionExecutionResultSchema.safeParse({
-          version: 1,
-          actionId: VALID_ID,
-          sequence: 1,
-          normalizedProposalHash: "a".repeat(64),
-          outcome: "succeeded",
-          result: { kind: "evaluate", value },
-          page: {
-            url: "https://example.test/",
-            title: "ok",
-            snapshotExcerpt: "ok",
-          },
-          sessionVersion: 1,
-        }).success,
-      ).toBe(false);
-    }
+  test("action results reject encoded overflow", () => {
     expect(
       actionExecutionResultSchema.safeParse({
         version: 1,
@@ -1612,7 +1683,7 @@ describe("private V1 contracts", () => {
         sequence: 1,
         normalizedProposalHash: "a".repeat(64),
         outcome: "succeeded",
-        result: { kind: "get_text", text: "x".repeat(40_001) },
+        result: { kind: "extract", text: "x".repeat(40_001) },
         page: {
           url: "https://example.test/",
           title: "ok",
@@ -1621,30 +1692,13 @@ describe("private V1 contracts", () => {
         sessionVersion: 1,
       }).success,
     ).toBe(false);
-    expect(
-      actionExecutionResultSchema.safeParse({
-        version: 1,
-        actionId: VALID_ID,
-        sequence: 1,
-        normalizedProposalHash: "a".repeat(64),
-        outcome: "succeeded",
-        result: { kind: "evaluate", value: "x".repeat(32 * 1024 + 1) },
-        page: {
-          url: "https://example.test/",
-          title: "ok",
-          snapshotExcerpt: "ok",
-        },
-        sessionVersion: 1,
-      }).success,
-    ).toBe(false);
-
     const maximalValidActionResponse = {
       version: 1,
       actionId: VALID_ID,
       sequence: 25,
       normalizedProposalHash: "a".repeat(64),
       outcome: "succeeded",
-      result: { kind: "evaluate", value: "x".repeat(32 * 1024 - 2) },
+      result: { kind: "extract", text: "x".repeat(40_000) },
       page: {
         url: "https://example.test/",
         title: "x".repeat(4_096),
@@ -1983,10 +2037,14 @@ describe("private V1 contracts", () => {
     ).toBe(false);
   });
 
-  test("error taxonomy includes every reconciliation failure status", () => {
+  test("error taxonomy includes session-policy and reconciliation statuses", () => {
     expect(BROWSER_SERVICE_ERROR_STATUS).toMatchObject({
       browser_service_runtime_mismatch: 503,
       browser_unavailable: 503,
+      concurrency_exceeded: 429,
+      session_not_found: 404,
+      replay_unavailable: 409,
+      replay_unsupported: 409,
       reconciliation_snapshot_invalid: 400,
       reconciliation_snapshot_too_large: 413,
       reconciliation_reference_missing: 409,
@@ -1999,9 +2057,9 @@ describe("private V1 contracts", () => {
   test("operation and storage-state encoded caps reject multibyte overflow", () => {
     expect(
       browserOperationSchema.safeParse({
-        kind: "evaluate",
-        expression: "x".repeat(20_000),
-        args: { value: "界".repeat(20_000) },
+        kind: "fill",
+        ref: "e1",
+        value: "界".repeat(20_001),
       }).success,
     ).toBe(false);
     const validState = {

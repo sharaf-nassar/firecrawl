@@ -42,7 +42,6 @@ import {
   createSessionRegistry,
   type SessionRegistry,
 } from "./session-registry.js";
-import { STREAM_LIMITS } from "./streams.js";
 
 const PROCESS_NONCE = Buffer.alloc(32, 1).toString("base64url");
 const GENERATION_NONCE = Buffer.alloc(32, 2).toString("base64url");
@@ -52,6 +51,8 @@ const IDS = [
   "11111111-1111-4111-8111-111111111111",
   "22222222-2222-4222-8222-222222222222",
   "33333333-3333-4333-8333-333333333333",
+  "44444444-4444-4444-8444-444444444444",
+  "55555555-5555-4555-8555-555555555555",
 ] as const;
 
 const binding = Object.freeze({
@@ -92,23 +93,28 @@ function validActionBody(): string {
     effect: "read_only",
     expectedSessionVersion: 0,
     allowedDomains: ["example.com"],
-    operation: { kind: "get_url" },
+    operation: { kind: "extract" },
   });
 }
 
 function realActionBody(
   operation: Parameters<typeof normalizedProposalHashForOperation>[0] = {
-    kind: "get_url",
+    kind: "extract",
   },
+  identity: {
+    actionId?: string;
+    runId?: string;
+    expectedSessionVersion?: number;
+  } = {},
 ): string {
   return JSON.stringify({
     version: 1,
-    actionId: IDS[1],
-    runId: IDS[2],
+    actionId: identity.actionId ?? IDS[1],
+    runId: identity.runId ?? IDS[2],
     sequence: 1,
     normalizedProposalHash: normalizedProposalHashForOperation(operation),
     effect: "read_only",
-    expectedSessionVersion: 1,
+    expectedSessionVersion: identity.expectedSessionVersion ?? 1,
     allowedDomains: ["example.com"],
     operation,
   });
@@ -195,6 +201,39 @@ function realRegistryFixture(): {
     stop: vi.fn(async () => undefined),
   };
   let context: Record<string, unknown>;
+  const bodyLocator = {
+    innerText: vi.fn(async () => {
+      const held = heldPageText;
+      if (held !== undefined) {
+        held.markReached();
+        await held.released;
+      }
+      return "Example";
+    }),
+    isVisible: vi.fn(async () => true),
+    evaluate: vi.fn(async () => {
+      const held = heldPageText;
+      if (held !== undefined) {
+        held.markReached();
+        await held.released;
+      }
+      return [
+        {
+          connected: true,
+          tag: "BODY",
+          role: "",
+          name: "",
+          text: "Example",
+        },
+      ];
+    }),
+  };
+  const emptyElementsLocator = {
+    count: vi.fn(async () => 0),
+    nth: vi.fn(() => ({
+      elementHandle: vi.fn(async () => null),
+    })),
+  };
   const page = {
     goto: vi.fn(async (url: string) => {
       pageUrl = url;
@@ -215,12 +254,20 @@ function realRegistryFixture(): {
       }
       return "Example";
     }),
+    locator: vi.fn((selector: string) =>
+      selector === "body" ? bodyLocator : emptyElementsLocator,
+    ),
     waitForTimeout: vi.fn(async () => {
       if (waitNeverSettles) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }),
     screenshot: vi.fn(async () => Buffer.from("image")),
+    evaluateHandle: vi.fn(async () => ({
+      evaluate: vi.fn(async () => []),
+      getProperties: vi.fn(async () => new Map()),
+      dispose: vi.fn(async () => undefined),
+    })),
     on: vi.fn(),
     off: vi.fn(),
     mainFrame: vi.fn(() => Object.freeze({})),
@@ -407,7 +454,7 @@ function harness(registryOverride?: SessionRegistry) {
       sequence: 1,
       normalizedProposalHash: "a".repeat(64),
       outcome: "succeeded",
-      result: { kind: "get_url", url: "https://example.com/" },
+      result: { kind: "extract", text: "Example" },
       page: session.page,
       sessionVersion: 0,
     })),
@@ -810,7 +857,7 @@ describe("private browser server", () => {
         effect: "read_only",
         expectedSessionVersion: 0,
         allowedDomains: ["example.com"],
-        operation: { kind: "get_url" },
+        operation: { kind: "extract" },
       }),
     });
     expect(action.status).toBe(200);
@@ -1082,9 +1129,7 @@ describe("private browser server", () => {
     );
     const closed = new Promise<number>((resolve, reject) => {
       client.once("open", () => {
-        client.send(Buffer.alloc(STREAM_LIMITS.cdpFrameBytes + 1), {
-          binary: false,
-        });
+        client.send(Buffer.alloc(256 * 1024 + 1), { binary: false });
       });
       client.once("close", (code) => resolve(code));
       client.once("error", reject);
@@ -1138,7 +1183,7 @@ describe("private browser server", () => {
         effect: "read_only",
         expectedSessionVersion: 0,
         allowedDomains: ["example.com"],
-        operation: { kind: "get_url" },
+        operation: { kind: "extract" },
       }),
     });
 
@@ -1172,6 +1217,68 @@ describe("private browser server", () => {
       expect(h.internalErrors).toEqual([rejection]);
     },
   );
+
+  test("executes sequence one independently for sequential action runs", async () => {
+    const real = realRegistryFixture();
+    const created = await real.registry.create(validSessionCreateRequest());
+    const h = harness(real.registry);
+    const base = await start(h);
+    const endpoint = `${base}/v1/sessions/${created.runtimeSessionId}/actions`;
+    const firstBody = realActionBody();
+
+    const first = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: firstBody,
+    });
+    expect(first.status).toBe(200);
+    const firstResult = await first.json();
+    expect(firstResult).toMatchObject({
+      actionId: IDS[1],
+      sequence: 1,
+      outcome: "succeeded",
+      sessionVersion: 2,
+    });
+
+    const firstReplay = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: firstBody,
+    });
+    expect(firstReplay.status).toBe(200);
+    expect(await firstReplay.json()).toEqual(firstResult);
+
+    const secondBody = realActionBody(
+      { kind: "extract" },
+      {
+        actionId: IDS[3],
+        runId: IDS[4],
+        expectedSessionVersion: 2,
+      },
+    );
+    const second = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: secondBody,
+    });
+    expect(second.status).toBe(200);
+    const secondResult = await second.json();
+    expect(secondResult).toMatchObject({
+      actionId: IDS[3],
+      sequence: 1,
+      outcome: "succeeded",
+      sessionVersion: 3,
+    });
+
+    const secondReplay = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: secondBody,
+    });
+    expect(secondReplay.status).toBe(200);
+    expect(await secondReplay.json()).toEqual(secondResult);
+    expect(real.registry.entries()).toHaveLength(1);
+  });
 
   test("fail-stops a real registry Chromium rejection with no usable cache", async () => {
     const real = realRegistryFixture();
@@ -1358,7 +1465,7 @@ describe("private browser server", () => {
       sequence: 1,
       normalizedProposalHash: "a".repeat(64),
       outcome: "succeeded",
-      result: { kind: "get_url", url: "https://example.com/" },
+      result: { kind: "extract", text: "Example" },
       page: session.page,
       sessionVersion: 0,
     });
@@ -1456,48 +1563,26 @@ describe("private browser server", () => {
     await vi.waitFor(() => expect(signal.aborted).toBe(true));
   });
 
-  test("maps registry invalid_request to canonical 400", async () => {
+  test.each([
+    ["invalid_request", 400],
+    ["replay_unavailable", 409],
+    ["replay_unsupported", 409],
+    ["concurrency_exceeded", 429],
+    ["session_not_found", 404],
+  ] as const)("maps registry %s to canonical %i", async (category, status) => {
     const h = harness();
     h.registry.create.mockRejectedValueOnce(
-      new SessionRegistryError("invalid_request", "invalid session"),
+      new SessionRegistryError(category, "session policy rejected"),
     );
     const base = await start(h);
     const response = await fetch(`${base}/v1/sessions`, {
       method: "POST",
       headers: requestHeaders(),
-      body: JSON.stringify({
-        version: 1,
-        sessionId: IDS[0],
-        initialUrl: "https://example.com/",
-        allowedDomains: ["example.com"],
-        ttlSeconds: 60,
-        activityTtlSeconds: 30,
-        profile: null,
-        replay: null,
-        settings: {
-          headers: {},
-          cookies: [],
-          viewport: {
-            width: 1280,
-            height: 720,
-            deviceScaleFactor: 1,
-            isMobile: false,
-            hasTouch: false,
-          },
-          userAgent: "server-test",
-          locale: "en-US",
-          timezoneId: "UTC",
-          location: { country: "us", languages: ["en-US"] },
-          proxy: { kind: "basic" },
-          skipTlsVerification: false,
-          blockAds: false,
-          lockdown: true,
-        },
-      }),
+      body: JSON.stringify(validSessionCreateRequest()),
     });
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(status);
     expect(await response.json()).toMatchObject({
-      category: "invalid_request",
+      category,
     });
   });
 
@@ -1586,7 +1671,7 @@ describe("private browser server", () => {
       {
         method: "POST",
         headers: requestHeaders(),
-        body: realActionBody({ kind: "get_text" }),
+        body: realActionBody({ kind: "extract" }),
       },
     );
     const writerRejected = expect(writer).rejects.toThrow();
@@ -1854,9 +1939,18 @@ describe("private browser server", () => {
     });
     expect(handedOff.status).toBe(201);
     const generation = (await handedOff.json()) as ControlGenerationV1;
-    const snapshotDigest = canonicalizeReconciliationSnapshot(
-      [],
-    ).snapshotDigest;
+    const staleCleanupPath = `replay/${IDS[0]}/${IDS[1]}/${IDS[0]}.json`;
+    const staleCleanupChecksum = "d".repeat(64);
+    const references = [
+      {
+        kind: "replay_checkpoint_cleanup_intent" as const,
+        id: IDS[0],
+        path: staleCleanupPath,
+        checksum: staleCleanupChecksum,
+      },
+    ];
+    const snapshotDigest =
+      canonicalizeReconciliationSnapshot(references).snapshotDigest;
     const reconciled = await fetch(`${base}/v1/reconciliation`, {
       method: "POST",
       headers: {
@@ -1870,7 +1964,7 @@ describe("private browser server", () => {
         processNonce: generation.processNonce,
         controlGenerationNonce: generation.controlGenerationNonce,
         snapshotDigest,
-        references: [],
+        references,
       }),
     });
     const reconciledBody = await reconciled.json();
@@ -1883,6 +1977,53 @@ describe("private browser server", () => {
       processNonce: generation.processNonce,
       controlGenerationNonce: generation.controlGenerationNonce,
     });
+    const generationHeaders = {
+      ...requestHeaders(),
+      "x-firecrawl-process-nonce": generation.processNonce,
+      "x-firecrawl-control-generation-nonce":
+        generation.controlGenerationNonce,
+    };
+    const convergedCleanup = await fetch(
+      `${base}/v1/replay-checkpoints`,
+      {
+        method: "DELETE",
+        headers: generationHeaders,
+        body: JSON.stringify({
+          version: 1,
+          statePath: staleCleanupPath,
+          checksum: staleCleanupChecksum,
+        }),
+      },
+    );
+    expect(convergedCleanup.status, await convergedCleanup.text()).toBe(200);
+    const storageState = { cookies: [], origins: [] };
+    const checkpointBytes = Buffer.from(canonicalJson(storageState), "utf8");
+    const checkpointChecksum = createHash("sha256")
+      .update(checkpointBytes)
+      .digest("hex");
+    const checkpointPath = `replay/${IDS[0]}/${IDS[1]}/${IDS[2]}.json`;
+    const persisted = await fetch(`${base}/v1/replay-checkpoints`, {
+      method: "POST",
+      headers: generationHeaders,
+      body: JSON.stringify({
+        version: 1,
+        ownerId: IDS[0],
+        scrapeId: IDS[1],
+        checkpointId: IDS[2],
+        storageState,
+      }),
+    });
+    expect(persisted.status, await persisted.text()).toBe(201);
+    const deleted = await fetch(`${base}/v1/replay-checkpoints`, {
+      method: "DELETE",
+      headers: generationHeaders,
+      body: JSON.stringify({
+        version: 1,
+        statePath: checkpointPath,
+        checksum: checkpointChecksum,
+      }),
+    });
+    expect(deleted.status, await deleted.text()).toBe(200);
 
     const replacement = await fetch(`${base}/v1/control-generations`, {
       method: "POST",
@@ -1896,6 +2037,18 @@ describe("private browser server", () => {
     });
     expect(replacement.status).toBe(201);
     expect(application.currentRuntime()).toBeNull();
+    const stalePersist = await fetch(`${base}/v1/replay-checkpoints`, {
+      method: "POST",
+      headers: generationHeaders,
+      body: JSON.stringify({
+        version: 1,
+        ownerId: IDS[0],
+        scrapeId: IDS[1],
+        checkpointId: IDS[2],
+        storageState,
+      }),
+    });
+    expect(stalePersist.status).toBe(409);
     const staleReady = await fetch(`${base}/health/ready`, {
       headers: {
         ...bootstrapHeaders(),

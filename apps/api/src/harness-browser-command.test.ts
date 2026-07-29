@@ -5,7 +5,6 @@ import {
   createHarnessBrowserCommandEnvironment,
   isHarnessControlledBrowserEnvironment,
   localPersistenceHarnessMode,
-  shouldRunRealCodexBrowserSmoke,
 } from "./harness-browser-command";
 
 const token = Buffer.alloc(32, 7).toString("base64url");
@@ -22,7 +21,6 @@ describe("localPersistenceHarnessMode", () => {
   it.each([
     ["test:snips:local-persistence", "persistence"],
     ["test:snips:local-browser", "browser"],
-    ["test:snips:real-codex-browser", "real-codex-browser"],
   ] as const)("recognizes pnpm %s", (script, mode) => {
     expect(localPersistenceHarnessMode(["pnpm", script])).toBe(mode);
   });
@@ -33,7 +31,7 @@ describe("localPersistenceHarnessMode", () => {
         "pnpm",
         "vitest",
         "run",
-        "browser-real-codex.test.ts",
+        "browser-local.test.ts",
       ]),
     ).toBeNull();
     expect(localPersistenceHarnessMode(["pnpm", "test:snips"])).toBeNull();
@@ -79,20 +77,5 @@ describe("Browser harness environment gating", () => {
     ]) {
       expect(isHarnessControlledBrowserEnvironment(environment)).toBe(false);
     }
-  });
-
-  it("requires both explicit smoke opt-in and harness control", () => {
-    expect(
-      shouldRunRealCodexBrowserSmoke({
-        ...controlledEnvironment(),
-        RUN_REAL_CODEX_BROWSER_SMOKE: "1",
-      }),
-    ).toBe(true);
-    expect(shouldRunRealCodexBrowserSmoke(controlledEnvironment())).toBe(false);
-    expect(
-      shouldRunRealCodexBrowserSmoke({
-        RUN_REAL_CODEX_BROWSER_SMOKE: "1",
-      }),
-    ).toBe(false);
   });
 });

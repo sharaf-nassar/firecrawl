@@ -60,6 +60,11 @@ import {
 } from "./operations.js";
 
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
+/**
+ * Leaves a 15-second completion margin over the largest valid 30-second wait.
+ * Session and caller deadlines remain hard upper bounds.
+ */
+export const BROWSER_OPERATION_TIMEOUT_MS = 45_000;
 
 type CdpChannelLike = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
@@ -203,6 +208,14 @@ type RegistryEntry = {
   traceStarted: boolean;
   actionCache: SessionActionCache;
   operationSession: BrowserOperationSession | undefined;
+  actionArtifacts: Map<
+    string,
+    Readonly<{
+      contentType: "image/png";
+      bytes: Uint8Array;
+      fullPage: boolean;
+    }>
+  >;
   work: WorkingProfile | undefined;
   proxy: EgressProxy | undefined;
   context: ContextLike | undefined;
@@ -523,14 +536,20 @@ export async function captureSessionArtifact(
     let contentType: string;
     let bytes: Uint8Array;
     if (request.kind === "screenshot") {
-      if (entry.page === undefined) {
-        throw asError("browser_unavailable", "session page is unavailable");
+      const captured = entry.actionArtifacts.get(request.artifactId);
+      if (
+        captured === undefined ||
+        request.format !== "png" ||
+        request.fullPage !== captured.fullPage
+      ) {
+        throw asError(
+          "browser_unavailable",
+          "action screenshot is unavailable",
+        );
       }
-      contentType = request.format === "png" ? "image/png" : "image/jpeg";
-      bytes = await entry.page.screenshot({
-        type: request.format,
-        fullPage: request.fullPage,
-      });
+      entry.actionArtifacts.delete(request.artifactId);
+      contentType = captured.contentType;
+      bytes = Uint8Array.from(captured.bytes);
     } else if (request.kind === "recording") {
       if (entry.recordingProducer === undefined) {
         throw asError(
@@ -641,12 +660,9 @@ function validateSupportedSettings(request: CreateSessionV1): void {
       "upstream proxy setting is unavailable",
     );
   }
-  if (request.settings.blockAds || !request.settings.lockdown) {
-    throw asError(
-      "replay_unsupported",
-      "requested browser policy is unavailable",
-    );
-  }
+  // Captured policy flags describe the source scrape. Replay always keeps
+  // allowed-domain egress confinement, which is stricter than lockdown=false,
+  // and the egress proxy reproduces blockAds=true before any outbound dial.
 }
 
 function validateSessionTargets(request: CreateSessionV1): void {
@@ -811,7 +827,8 @@ export function createSessionRegistry(options: {
   const pendingSessionIds = new Set<string>();
   const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 5_000;
   const launchTimeoutMs = options.launchTimeoutMs ?? 30_000;
-  const operationTimeoutMs = options.operationTimeoutMs ?? 30_000;
+  const operationTimeoutMs =
+    options.operationTimeoutMs ?? BROWSER_OPERATION_TIMEOUT_MS;
   const createRecordingProducer =
     options.createRecordingProducer ?? createChromiumRecordingProducer;
   let registryAdmissionOpen = true;
@@ -928,7 +945,7 @@ export function createSessionRegistry(options: {
           () => true,
           () => false,
         ),
-        new Promise<false>(resolve => {
+        new Promise<false>((resolve) => {
           timer = setTimeout(resolve, timeoutMs, false);
         }),
       ]);
@@ -1078,6 +1095,7 @@ export function createSessionRegistry(options: {
         cleanupCodes.push("operation_session_dispose_failed");
       }
     }
+    entry.actionArtifacts.clear();
     let contextClosed = false;
     try {
       contextClosed = await closeContext(entry);
@@ -1344,6 +1362,7 @@ export function createSessionRegistry(options: {
         traceStarted: false,
         actionCache: new SessionActionCache(),
         operationSession: undefined,
+        actionArtifacts: new Map(),
         writerHeld: false,
         writerAbort: undefined,
         writerSettlement: undefined,
@@ -1424,6 +1443,7 @@ export function createSessionRegistry(options: {
         entry.proxy = await createProxy({
           restoreGate: createRestoreGate(),
           allowedDomains: entry.allowedDomains,
+          blockAds: request.settings.blockAds,
           deadlineAtMs: () =>
             Math.min(entry.expiresAtMs, entry.idleExpiresAtMs),
         });
@@ -1585,29 +1605,44 @@ export function createSessionRegistry(options: {
             );
           }
           const title = await runWithinDeadline(entry, () => page.title());
-          const body =
-            (await runWithinDeadline(entry, () => page.textContent("body"))) ??
-            "";
+          const body = (
+            await runWithinDeadline(entry, () =>
+              page.locator("body").innerText(),
+            )
+          )
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 65_536);
           const pageUrl = runAdmitted(entry, () => page.url());
           if (replayState !== null) {
-            if (
-              pageUrl !== replayState.checkpoint.fingerprint.finalUrl ||
-              sha256(title) !==
-                replayState.checkpoint.fingerprint.titleSha256 ||
-              sha256(body) !== replayState.checkpoint.fingerprint.bodyTextSha256
-            ) {
+            if (pageUrl !== replayState.checkpoint.fingerprint.finalUrl) {
               throw new ReplayRestoreError(
                 "replay_unavailable",
-                "replay fingerprint differs",
+                "replay final URL differs",
               );
+            }
+            const titleMatches =
+              sha256(title) === replayState.checkpoint.fingerprint.titleSha256;
+            const bodyMatches =
+              sha256(body) ===
+              replayState.checkpoint.fingerprint.bodyTextSha256;
+            if (!titleMatches || !bodyMatches) {
+              console.warn("firecrawl_replay_fingerprint_changed", {
+                runtimeSessionId: entry.runtimeSessionId,
+                titleMatches,
+                bodyMatches,
+              });
             }
           }
           entry.page = page;
-          entry.pageState = {
-            url: pageUrl,
-            title: Array.from(title).slice(0, 4_096).join(""),
-            snapshotExcerpt: Array.from(body).slice(0, 40_000).join(""),
-          };
+          entry.operationSession = createBrowserOperationSession({
+            page,
+            allowedDomains: entry.allowedDomains,
+            initialOrigin: entry.initialOrigin,
+          });
+          entry.pageState = await runWithinDeadline(entry, () =>
+            entry.operationSession!.observe(),
+          );
           if (context.tracing === undefined) {
             throw asError(
               "browser_unavailable",
@@ -1721,7 +1756,7 @@ export function createSessionRegistry(options: {
       const writerAbort = new AbortController();
       entry.writerAbort = writerAbort;
       let settleWriter!: () => void;
-      const writerSettlement = new Promise<void>(resolve => {
+      const writerSettlement = new Promise<void>((resolve) => {
         settleWriter = resolve;
       });
       entry.writerSettlement = writerSettlement;
@@ -1784,8 +1819,8 @@ export function createSessionRegistry(options: {
       return executeCachedAction({
         cache: entry.actionCache,
         request,
-        withWriter: operation =>
-          registry.withWriter(runtimeSessionId, async signal => {
+        withWriter: (operation) =>
+          registry.withWriter(runtimeSessionId, async (signal) => {
             await applyAuthority(
               entry,
               request.expectedSessionVersion,
@@ -1793,7 +1828,7 @@ export function createSessionRegistry(options: {
             );
             return operation(signal);
           }),
-        executeOperation: (operation, signal) =>
+        executeOperation: (operation, signal, actionId) =>
           runWithinDeadline(
             entry,
             async () => {
@@ -1810,7 +1845,13 @@ export function createSessionRegistry(options: {
                   initialOrigin: entry.initialOrigin,
                 });
               }
-              return entry.operationSession.execute(operation);
+              return entry.operationSession.execute(operation, actionId, {
+                signal,
+                deadlineAtMs: Math.min(
+                  entry.deadlineAtMs,
+                  now() + operationTimeoutMs,
+                ),
+              });
             },
             signal,
           ),
@@ -1825,6 +1866,29 @@ export function createSessionRegistry(options: {
           return { ...entry.pageState };
         },
         commitSuccess: (execution) => {
+          if (execution.artifact !== undefined) {
+            if (
+              request.operation.kind !== "screenshot" ||
+              execution.result.kind !== "screenshot" ||
+              execution.result.artifactId !== request.actionId ||
+              execution.result.contentType !== execution.artifact.contentType ||
+              execution.result.byteSize !==
+                execution.artifact.bytes.byteLength ||
+              createHash("sha256")
+                .update(execution.artifact.bytes)
+                .digest("hex") !== execution.result.checksum
+            ) {
+              throw new Error("action artifact metadata is inconsistent");
+            }
+            entry.actionArtifacts.set(
+              request.actionId,
+              Object.freeze({
+                contentType: execution.artifact.contentType,
+                bytes: Uint8Array.from(execution.artifact.bytes),
+                fullPage: request.operation.fullPage ?? false,
+              }),
+            );
+          }
           entry.pageState = { ...execution.page };
           entry.sessionVersion += 1;
           entry.idleExpiresAtMs = Math.min(

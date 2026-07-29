@@ -689,7 +689,7 @@ describeWithDatabase("application migrations", () => {
             model, reasoning_effort, deadline_at, correlation_id,
             adapter_job_id, adapter_supervisor_id, adapter_process_id)
          VALUES ($1, $2, $3, $4, $5, 'prompt', 'running',
-                 'gpt-5.6-terra', 'medium', now() + interval '1 minute', $6,
+                 'test-model', 'medium', now() + interval '1 minute', $6,
                  $7, $8, 42)`,
         [
           fixture.runId,
@@ -866,7 +866,7 @@ describeWithDatabase("application migrations", () => {
          (id, request_id, owner_id, session_id, scrape_id, mode, state,
           model, reasoning_effort, deadline_at, correlation_id,
           adapter_job_id, adapter_supervisor_id, adapter_process_id)
-       VALUES ($1, $2, $3, $4, $5, 'prompt', 'running', 'gpt-5.6-terra',
+       VALUES ($1, $2, $3, $4, $5, 'prompt', 'running', 'test-model',
                'medium', now() + interval '1 minute', $6, $7, $8, 42)`,
       [
         fixture.runId,
@@ -1679,7 +1679,7 @@ describeWithDatabase("application migrations", () => {
            (id, request_id, owner_id, session_id, mode, state, model,
             reasoning_effort, deadline_at, correlation_id,
             adapter_process_id)
-         VALUES ($1, $2, $3, $4, 'prompt', 'running', 'gpt-5.6-terra',
+         VALUES ($1, $2, $3, $4, 'prompt', 'running', 'test-model',
                  'medium', now() + interval '1 minute', $5, 4242)`,
         [legacyRunId, legacyRequestId, ownerId, legacySessionId, randomUUID()],
       );
@@ -1841,7 +1841,7 @@ describeWithDatabase("application migrations", () => {
          (id, request_id, owner_id, session_id, mode, state, model,
           reasoning_effort, deadline_at, correlation_id, adapter_job_id,
           adapter_supervisor_id)
-       VALUES ($1, $2, $3, $4, 'prompt', 'starting', 'gpt-5.6-terra',
+       VALUES ($1, $2, $3, $4, 'prompt', 'starting', 'test-model',
                'medium', now() + interval '1 minute', $5, $6, $7)`,
       [
         runId,
@@ -1892,7 +1892,7 @@ describeWithDatabase("application migrations", () => {
           reasoning_effort, deadline_at, correlation_id, adapter_job_id,
           adapter_supervisor_id)
        VALUES (gen_random_uuid(), $1, $2, $3, 'prompt', 'running',
-               'gpt-5.6-terra', 'medium', now() + interval '1 minute',
+               'test-model', 'medium', now() + interval '1 minute',
                gen_random_uuid(), gen_random_uuid(), gen_random_uuid())`,
       [requestId, ownerId, sessionId],
       /^23514$/,
@@ -1910,7 +1910,7 @@ describeWithDatabase("application migrations", () => {
           reasoning_effort, deadline_at, correlation_id, adapter_job_id,
           adapter_supervisor_id)
        VALUES (gen_random_uuid(), $1, $2, $3, 'prompt', 'starting',
-               'gpt-5.6-terra', 'medium', now() + interval '1 minute',
+               'test-model', 'medium', now() + interval '1 minute',
                gen_random_uuid(),
                '00000000-0000-0000-0000-000000000000',
                '00000000-0000-0000-0000-000000000000')`,

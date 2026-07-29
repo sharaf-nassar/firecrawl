@@ -42,7 +42,7 @@ const action = {
   effect: "read_only" as const,
   expectedSessionVersion: 0,
   allowedDomains: ["example.test"],
-  operation: { kind: "get_url" as const },
+  operation: { kind: "extract" as const },
 };
 const actionResult = {
   version: 1 as const,
@@ -56,7 +56,7 @@ const actionResult = {
   },
   sessionVersion: 1,
   outcome: "succeeded" as const,
-  result: { kind: "get_url" as const, url: "https://example.test/" },
+  result: { kind: "extract" as const, text: "Example" },
 };
 const controlGeneration = {
   version: 1 as const,
@@ -218,6 +218,61 @@ describe("BrowserServiceClient", () => {
     );
   });
 
+  it("permits an action response after 30 seconds within its context deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-29T12:00:00.000Z"));
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation((delay: number) => {
+        const controller = new AbortController();
+        setTimeout(
+          () => controller.abort(new Error("request deadline elapsed")),
+          delay,
+        );
+        return controller.signal;
+      });
+    try {
+      fetchMock.mockImplementationOnce(
+        (_input, init) =>
+          new Promise<Response>((resolve, reject) => {
+            const responseTimer = setTimeout(
+              () => resolve(jsonResponse(200, actionResult)),
+              30_001,
+            );
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(responseTimer);
+                reject(init.signal?.reason);
+              },
+              { once: true },
+            );
+          }),
+      );
+      const c = new BrowserServiceClient({
+        baseUrl: "http://browser-service:3010",
+        apiKey: "secret".repeat(6),
+        requestTimeoutMs: 60_000,
+        reconciliationTimeoutMs: 60_000,
+        fetch: fetchMock,
+        onControlGenerationMismatch,
+      });
+      const context = {
+        ...scopedContext(),
+        deadline: new Date(Date.now() + 45_000),
+      };
+
+      const pending = c.executeAction(ID, action, context);
+      await vi.advanceTimersByTimeAsync(30_001);
+
+      await expect(pending).resolves.toEqual(actionResult);
+      expect(timeout).toHaveBeenCalledWith(45_000);
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("binds handoff and reconciliation to current process and generation", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, liveDiscovery))
@@ -283,6 +338,52 @@ describe("BrowserServiceClient", () => {
     ).rejects.toMatchObject({ category });
     expect(onControlGenerationMismatch).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["replay_unavailable", 409],
+    ["replay_unsupported", 409],
+    ["concurrency_exceeded", 429],
+    ["session_not_found", 404],
+  ] as const)(
+    "preserves typed session-policy category %s at status %i",
+    async (category, status) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(status, {
+          version: 1,
+          category,
+          message: "session policy rejected",
+        }),
+      );
+      await expect(
+        client().getSession(ID, scopedContext()),
+      ).rejects.toMatchObject({ category, status });
+      expect(onControlGenerationMismatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["replay_unavailable", 409],
+    ["replay_unsupported", 409],
+    ["concurrency_exceeded", 429],
+    ["session_not_found", 404],
+  ] as const)(
+    "rejects a mismatched HTTP status for session-policy category %s",
+    async (category, _status) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(400, {
+          version: 1,
+          category,
+          message: "session policy rejected",
+        }),
+      );
+      await expect(
+        client().getSession(ID, scopedContext()),
+      ).rejects.toMatchObject({
+        category: "browser_service_protocol_error",
+      });
+      expect(onControlGenerationMismatch).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects redirects and bounded malformed action responses", async () => {
     const responses = [

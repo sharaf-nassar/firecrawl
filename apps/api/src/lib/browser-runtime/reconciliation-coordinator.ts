@@ -18,7 +18,7 @@ import {
 import { interruptUnfinishedBrowserWork } from "../browser-state/store";
 import { recoverBrowserCleanupIntentsBeforeSnapshot } from "../../services/local-retention-worker";
 import type { BrowserStateFileDeleter } from "../../services/local-retention-worker";
-import { loadBrowserReconciliationSnapshot } from "./reconciliation-snapshot";
+import { loadBrowserReconciliationSnapshotFromTransaction } from "./reconciliation-snapshot";
 import {
   type BrowserMutationDrain,
   type BrowserControlFenceTransaction,
@@ -57,7 +57,7 @@ export type BrowserReconciliationCoordinatorDependencies = {
     | "getReady"
     | "reconcile"
   >;
-  loadSnapshot: typeof loadBrowserReconciliationSnapshot;
+  loadSnapshot: typeof loadBrowserReconciliationSnapshotFromTransaction;
   interruptUnfinishedBrowserWork: typeof interruptUnfinishedBrowserWork;
   recoverBrowserCleanupIntentsBeforeSnapshot: typeof recoverBrowserCleanupIntentsBeforeSnapshot;
   pauseBrowserRetention: () => Promise<void>;
@@ -100,6 +100,44 @@ export class BrowserReconciliationCoordinatorError extends Error {
     super("Browser state is unavailable", { cause });
     this.name = "BrowserReconciliationCoordinatorError";
   }
+}
+
+/** @public */
+export function browserReconciliationFailureDiagnostic(error: unknown): {
+  category: "browser_state_unavailable";
+  causes: ReadonlyArray<Readonly<{ name: string; category?: string }>>;
+} {
+  const causes: Array<{ name: string; category?: string }> = [];
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (pending.length > 0 && causes.length < 8) {
+    const current = pending.shift();
+    if (
+      current === null ||
+      (typeof current !== "object" && typeof current !== "function") ||
+      seen.has(current)
+    ) {
+      continue;
+    }
+    seen.add(current);
+    const rawName = current instanceof Error ? current.name : "Error";
+    const name = /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(rawName)
+      ? rawName
+      : "Error";
+    let category: string | undefined;
+    if ("category" in current) {
+      const value = current.category;
+      if (typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value)) {
+        category = value;
+      }
+    }
+    causes.push(category === undefined ? { name } : { name, category });
+    if (current instanceof AggregateError) {
+      pending.push(...current.errors);
+    }
+    if ("cause" in current) pending.push(current.cause);
+  }
+  return { category: "browser_state_unavailable", causes };
 }
 
 class ServiceProcessChangedError extends Error {}
@@ -222,7 +260,6 @@ export function createBrowserReconciliationCoordinator(
   let authorityBinding: BrowserStartupBinding | undefined;
   let currentHandoff: BrowserControlGenerationHandoff | undefined;
   const handoffTuples = new Map<string, HandoffTuple>();
-  const frozenCycles = new Map<string, FrozenReconciliationCycle>();
   const handoffBudgetStarts = new WeakMap<
     BrowserControlGenerationHandoff,
     number
@@ -518,18 +555,12 @@ export function createBrowserReconciliationCoordinator(
     return handoff;
   };
 
-  const prepareReconciliationCycle = async (
+  const reconcileGeneration = async (
     handoff: BrowserControlGenerationHandoff,
-    signal: AbortSignal,
-    startedAt: number,
-  ): Promise<FrozenReconciliationCycle> => {
-    const existing = frozenCycles.get(handoff.controlGenerationNonce);
-    if (
-      existing?.processNonce === handoff.processNonce &&
-      existing.controlGenerationNonce === handoff.controlGenerationNonce
-    ) {
-      return existing;
-    }
+    outerSignal?: AbortSignal,
+  ): Promise<BrowserStartupBinding> => {
+    const startedAt = handoffBudgetStarts.get(handoff) ?? deps.now();
+    const signal = budgetSignalFor(startedAt, outerSignal);
     assertRunning(signal, deadlineFor(startedAt));
     const databaseControlEpoch = await activateDatabaseControl(
       handoff,
@@ -538,7 +569,7 @@ export function createBrowserReconciliationCoordinator(
     );
     await awaitWithinBudget(handoff.drain.drained, signal);
     assertRunning(signal, deadlineFor(startedAt));
-    await awaitWithinBudget(
+    const cycle = await awaitWithinBudget(
       deps.gate.withDrainedBrowserStateMutation(handoff.drain, async lease => {
         const deadline = deadlineFor(startedAt);
         assertRunning(signal, deadline);
@@ -562,6 +593,48 @@ export function createBrowserReconciliationCoordinator(
           transaction,
         );
         assertRunning(signal, deadlineFor(startedAt));
+        const snapshot = await deps.loadSnapshot(transaction, signal);
+        assertRunning(signal, deadlineFor(startedAt));
+        const request = reconciliationRequestV1Schema.parse({
+          version: 1,
+          processNonce: handoff.processNonce,
+          controlGenerationNonce: handoff.controlGenerationNonce,
+          snapshotDigest: snapshot.snapshotDigest,
+          references: snapshot.references,
+        });
+        const cycle: FrozenReconciliationCycle = {
+          databaseControlEpoch,
+          processNonce: handoff.processNonce,
+          controlGenerationNonce: handoff.controlGenerationNonce,
+          snapshotDigest: snapshot.snapshotDigest,
+          canonicalRequestBody: JSON.stringify(request),
+        };
+        const serviceBinding = {
+          processNonce: cycle.processNonce,
+          controlGenerationNonce: cycle.controlGenerationNonce,
+        };
+        await retry(startedAt, signal, async attemptDeadline => {
+          const live = await requireScopedLive(
+            cycle.processNonce,
+            cycle.controlGenerationNonce,
+            signal,
+            attemptDeadline,
+          );
+          if (live.processNonce !== cycle.processNonce) {
+            throw new ServiceProcessChangedError();
+          }
+          if (live.controlGenerationNonce !== cycle.controlGenerationNonce) {
+            throw new ServiceControlLostError();
+          }
+          const result = await deps.serviceClient.reconcile(
+            cycle.canonicalRequestBody,
+            requestContext(signal, attemptDeadline, serviceBinding),
+          );
+          if (result.snapshotDigest !== cycle.snapshotDigest || !result.ready) {
+            throw new BrowserReconciliationCoordinatorError();
+          }
+          return result;
+        });
         await deps.recoverBrowserCleanupIntentsBeforeSnapshot({
           pool: transactionPool(transaction),
           filesystem:
@@ -585,67 +658,14 @@ export function createBrowserReconciliationCoordinator(
           signal,
         });
         assertRunning(signal, deadlineFor(startedAt));
+        return cycle;
       }),
       signal,
     );
-    assertRunning(signal, deadlineFor(startedAt));
-    const snapshot = await awaitWithinBudget(
-      deps.loadSnapshot(deps.pool, signal),
-      signal,
-    );
-    assertRunning(signal, deadlineFor(startedAt));
-    const request = reconciliationRequestV1Schema.parse({
-      version: 1,
-      processNonce: handoff.processNonce,
-      controlGenerationNonce: handoff.controlGenerationNonce,
-      snapshotDigest: snapshot.snapshotDigest,
-      references: snapshot.references,
-    });
-    const canonicalRequestBody = JSON.stringify(request);
-    const cycle = {
-      databaseControlEpoch,
-      processNonce: handoff.processNonce,
-      controlGenerationNonce: handoff.controlGenerationNonce,
-      snapshotDigest: snapshot.snapshotDigest,
-      canonicalRequestBody,
-    };
-    frozenCycles.set(handoff.controlGenerationNonce, cycle);
-    return cycle;
-  };
-
-  const reconcileGeneration = async (
-    handoff: BrowserControlGenerationHandoff,
-    outerSignal?: AbortSignal,
-  ): Promise<BrowserStartupBinding> => {
-    const startedAt = handoffBudgetStarts.get(handoff) ?? deps.now();
-    const signal = budgetSignalFor(startedAt, outerSignal);
-    const cycle = await prepareReconciliationCycle(handoff, signal, startedAt);
     const serviceBinding = {
       processNonce: cycle.processNonce,
       controlGenerationNonce: cycle.controlGenerationNonce,
     };
-    await retry(startedAt, signal, async deadline => {
-      const live = await requireScopedLive(
-        cycle.processNonce,
-        cycle.controlGenerationNonce,
-        signal,
-        deadline,
-      );
-      if (live.processNonce !== cycle.processNonce) {
-        throw new ServiceProcessChangedError();
-      }
-      if (live.controlGenerationNonce !== cycle.controlGenerationNonce) {
-        throw new ServiceControlLostError();
-      }
-      const result = await deps.serviceClient.reconcile(
-        cycle.canonicalRequestBody,
-        requestContext(signal, deadline, serviceBinding),
-      );
-      if (result.snapshotDigest !== cycle.snapshotDigest || !result.ready) {
-        throw new BrowserReconciliationCoordinatorError();
-      }
-      return result;
-    });
     const deadline = deadlineFor(startedAt);
     let ready: Awaited<ReturnType<typeof deps.serviceClient.getReady>>;
     try {
@@ -688,7 +708,6 @@ export function createBrowserReconciliationCoordinator(
     authorityBinding = binding;
     failedBinding = undefined;
     handoffTuples.delete(cycle.processNonce);
-    frozenCycles.delete(cycle.controlGenerationNonce);
     return binding;
   };
 
@@ -702,7 +721,6 @@ export function createBrowserReconciliationCoordinator(
         return await reconcileGeneration(next, signal);
       } catch (error) {
         if (!(error instanceof ServiceProcessChangedError)) throw error;
-        frozenCycles.delete(next.controlGenerationNonce);
         handoffTuples.delete(next.processNonce);
         next = await acquire(
           signal,
@@ -859,6 +877,10 @@ export function createBrowserReconciliationCoordinator(
           scheduleMonitor();
           return binding;
         } catch (error) {
+          deps.logger.error(
+            "Browser reconciliation startup failed",
+            browserReconciliationFailureDiagnostic(error),
+          );
           await deps.pauseBrowserRetention();
           throw error instanceof BrowserReconciliationCoordinatorError
             ? error
