@@ -1,0 +1,173 @@
+# Local Runtime Operations
+
+The supported local environment is a layered Docker Compose application managed through `scripts/local-firecrawl`.
+
+`compose.yaml` includes the shared `docker-compose.yaml` stack and the hardened `compose.local.yaml` overlay. Direct Compose use can bypass ordering, provenance, rollback, port, and health invariants enforced by the wrapper.
+
+## Deployment topology
+
+The stack divides public ingress, backend services, model egress, persistent volumes, and initialization jobs.
+
+Only API publishes a host port, bound to `127.0.0.1:${PORT:-3002}`. API, Browser Service, Playwright, databases, Redis, RabbitMQ, MinIO, and NuQ share the private `backend` bridge.
+
+Browser Interaction Worker has no network namespace connectivity. Browser Interaction Egress Proxy alone joins `model-uplink`; shared Unix-socket volumes connect API to worker and worker to proxy.
+
+## Long-running services
+
+The wrapper treats API, browser services, stores, queues, and object storage as one health domain.
+
+Long-running services are:
+
+- `api`, the public HTTP entrypoint and internal worker harness;
+- `browser-service`, the persistent replay/profile browser runtime;
+- `browser-interaction-worker`, constrained model decisions over Unix socket;
+- `browser-interaction-egress-proxy`, allowlisted model HTTPS uplink;
+- `playwright-service`, stateless scrape browser;
+- `redis`, `rabbitmq`, and `nuq-postgres`, queue and coordination infrastructure;
+- `app-postgres`, durable application records;
+- `minio`, durable artifact objects.
+
+FoundationDB services are optional and profile-gated.
+
+## Initialization jobs
+
+Three one-shot containers establish state before request-serving containers start.
+
+`browser-state-init` creates and validates the browser volume marker, ownership, modes, profile namespaces, staging metadata roots, and optional replay/quarantine directories.
+
+`app-db-migrate` runs checked-in application migrations after application Postgres is healthy. `minio-init` creates the artifact bucket, restricted policy, and application credential after MinIO is healthy.
+
+One-shots are profiles or explicitly invoked services, have bounded runtime, and must exit zero. Stale or failed one-shot containers are inspected and cleaned deliberately before rerun.
+
+## Persistent volumes
+
+Durability is separated by responsibility to prevent one service from gaining unnecessary authority.
+
+- `browser-state` holds Browser Service profiles, replay checkpoints, quarantine, and atomic publication metadata.
+- `codex-auth-state` holds worker-owned refreshed Codex authentication.
+- `app-postgres-data` stores application records and migration ledger.
+- `nuq-postgres-data` stores durable queue state and pg_cron history.
+- `redis-data`, `rabbitmq-data`, and `minio-data` hold coordination, messaging, and artifacts.
+- two socket volumes carry API-to-worker and worker-to-egress-proxy Unix sockets.
+
+The browser state volume is writable by the initialization job and Browser Service, not API. API receives browser state through authenticated private protocols.
+
+## API dependency ordering
+
+API readiness is downstream of all required local capabilities.
+
+Compose requires healthy application Postgres, Browser Interaction Worker, Browser Service, Redis, Playwright, RabbitMQ, and NuQ Postgres before API. The wrapper additionally completes migrations and MinIO initialization before starting browser and API layers.
+
+`start_runtime` orders durable dependencies, one-shots, Browser Service, egress proxy, interaction worker, and API. This ordering ensures the model worker's canary has egress and the API does not reconcile browser state before its volume is initialized.
+
+## Environment bootstrap
+
+`scripts/init-local-env.sh` creates a new mode-`0600` `.env` and refuses to overwrite any existing file or symlink.
+
+It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO root, and MinIO application access. It also generates a stable local owner UUID and writes explicit retention and service defaults.
+
+`scripts/upgrade-local-env-phase1` upgrades earlier environment files under an exclusive mode-`0600` lock. It validates file type, ownership, duplicate keys, secret distinctness, and phase values, then replaces through a bounded temporary file only if the source did not change.
+
+Secrets from `.env` must not be copied into documentation or logs. The wrapper's log path performs pattern-based redaction, but operators should still treat diagnostic output as sensitive.
+
+## Codex host inputs
+
+Starting the local stack resolves but does not install the host Codex runtime.
+
+The wrapper requires exactly one external `codex` executable on `PATH`, proves it is the `@openai/codex` package entrypoint, and bind-mounts that package read-only.
+
+It also requires a single-link regular `~/.codex/auth.json` owned by the current user with mode `0400` or `0600`, plus a readable absolute CA bundle. Missing or ambiguous host inputs stop startup.
+
+The host auth seed is mounted read-only. Refreshed state lives only in `codex-auth-state`, so the container cannot rewrite the user's host credential file.
+
+## Lifecycle lock
+
+All lifecycle and diagnostic commands coordinate through a per-user, per-project advisory lock.
+
+The wrapper creates a regular, single-link, user-owned mode-`0600` lock under a private runtime directory, revalidates its identity before and after open, and uses `flock` with a configurable default 30-second wait.
+
+Start, stop, restart, and egress probe take an exclusive lock. Status, health, and logs take a shared lock. This prevents diagnostics from observing half-completed maintenance while permitting concurrent read-only checks.
+
+## Start and restart
+
+Start and restart validate configuration and rebuild local runtime images before changing running state.
+
+They prove Compose schema, network separation, mount direction, fixed worker paths, resource hardening, loopback port publication, and image/container provenance. Legacy containers are recognized only through bounded known configuration paths.
+
+Writers are quiesced before dependencies stop. Browser rollback validation, when explicitly enabled, runs from the current immutable image against a read-only view of the state volume before the replacement starts.
+
+One-shot timeout defaults to 300 seconds and service health wait to 180 seconds. Timeouts are configuration errors when nonpositive and operational failures when exceeded.
+
+## Browser rollback
+
+Browser Service downgrade is opt-in because older code may not understand newer durable atomic-publication records.
+
+`LOCAL_FIRECRAWL_BROWSER_DOWNGRADE=true` also requires `FIRECRAWL_BROWSER_SERVICE_IMAGE` pinned by SHA-256 digest and a currently running Browser Service.
+
+The wrapper stops API, interaction worker, Browser Service, and egress proxy, then runs the current Browser Service image read-only and networkless against its own state volume to check rollback compatibility. Only a proven-safe state proceeds.
+
+## Stop
+
+Stop validates recoverable Compose provenance and shuts down writers before dependencies.
+
+API, interaction worker, and Browser Service stop first, then the egress proxy, then storage and queue dependencies. Volumes are not deleted, and one-shot records remain available for diagnosis.
+
+## Status
+
+`scripts/local-firecrawl status` reports both long-running and one-shot containers under a shared lifecycle lock.
+
+`--json` returns Compose state sorted by service. Status validates known project provenance but does not claim functional health.
+
+## Health
+
+`scripts/local-firecrawl health` verifies application-level invariants beyond container health status.
+
+Checks include Redis `PONG`, RabbitMQ diagnostics, both Postgres servers, latest migration filename and checksum, successful one-shots, MinIO liveness and restricted application artifact access, Playwright health, Browser Service authenticated liveness, egress socket, worker readiness, public API, and loopback-only port policy.
+
+`--json` returns endpoint, migration, artifact provider, and browser component status. A healthy container with a stale migration, wrong checksum, failed canary, inaccessible artifact policy, or unexpected port still fails overall health.
+
+## Egress probe
+
+`scripts/local-firecrawl probe-egress` tests the worker-to-proxy boundary from inside the networkless worker.
+
+The probe sends CONNECT requests through loopback and verifies policy outcomes. It requires the exclusive lifecycle lock because proxy/container changes during the probe would make results ambiguous.
+
+## Logs
+
+`scripts/local-firecrawl logs` provides bounded, redacted diagnostics for all services or selected browser/API components.
+
+It reads at most 200 recent lines, optionally filters by canonical UUID correlation ID, and redacts common authorization, bearer, token, secret, password, capability, prompt, source, and page-value fields.
+
+Use `logs browser-service`, `logs browser-interaction-worker`, or `logs browser-interaction-egress-proxy` to isolate the corresponding trust boundary. Remaining failure after wrapper recovery should be surfaced instead of hidden by repeated restarts.
+
+## Local recovery procedure
+
+Recovery uses the wrapper so ordering and evidence remain intact.
+
+1. Run `scripts/local-firecrawl status` to inspect containers and one-shots.
+2. Run `scripts/local-firecrawl health` for the first failing invariant.
+3. Run bounded component logs, optionally with a correlation UUID.
+4. Use `scripts/local-firecrawl start` when stopped or `restart` when a full ordered rebuild is required.
+5. Re-run health once; if unhealthy, preserve the reported category and logs for investigation.
+
+Do not remove volumes to resolve ordinary startup, migration, browser reconciliation, or queue failures. Volume deletion discards the evidence and durable state those recovery protocols are designed to validate.
+
+## Basic self-host stack
+
+`docker-compose.yaml` remains the simpler general self-host configuration.
+
+It runs API, Playwright, Redis, RabbitMQ, NuQ Postgres, and optional FoundationDB. It does not include local application persistence, MinIO, Browser Service, or Browser Interaction Worker unless combined through `compose.yaml`.
+
+The basic file publishes API on all host interfaces by default, while the local overlay replaces that binding with loopback-only ingress and persistent volumes. Operators must not assume the local hardening or recovery wrapper applies to a standalone self-host deployment.
+
+## Browser integration test database
+
+`compose.browser-test.yaml` is an isolated PostgreSQL service for Browser Service integration tests.
+
+It publishes PostgreSQL only on `127.0.0.1:55432`, uses test credentials, and has its own health check. It is not part of the runtime Compose include.
+
+## Host directory
+
+The repository's `host/` directory currently contains no tracked runtime configuration.
+
+Host integration is expressed through Compose bind mounts and `scripts/local-firecrawl` validation. New host-side units or configuration should define their ownership, secret, lifecycle, and rollback contracts here when introduced.

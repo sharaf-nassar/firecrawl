@@ -526,10 +526,7 @@ describe("browser operation session", () => {
       await page.evaluate(() => {
         const target = document.querySelector("#target")!;
         target.setAttribute("data-tooltip-trigger", "true");
-        target.setAttribute(
-          "data-tooltip-id",
-          `item"\n\\${"😀".repeat(100)}`,
-        );
+        target.setAttribute("data-tooltip-id", `item"\n\\${"😀".repeat(100)}`);
         target.setAttribute("title", `Native ${"界".repeat(100)}`);
         target.setAttribute("aria-describedby", "equipment-tooltip");
         target.setAttribute("aria-haspopup", "dialog");
@@ -676,6 +673,343 @@ describe("browser operation session", () => {
         expect(JSON.stringify(execution.result)).not.toContain(
           "unchanged body text",
         );
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
+  test("hover_batch captures open and nested open shadow tooltip text", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(`
+        <body>
+          <button id="open-target">Open shadow item</button>
+          <button id="nested-target">Nested shadow item</button>
+          <div id="open-host"></div>
+          <div id="outer-host"></div>
+        </body>
+      `);
+      await page.evaluate(() => {
+        const openRoot = document
+          .querySelector("#open-host")!
+          .attachShadow({ mode: "open" });
+        const openTooltip = document.createElement("span");
+        openTooltip.hidden = true;
+        openTooltip.textContent = "Open shadow tooltip details";
+        openRoot.append(openTooltip);
+
+        const outerRoot = document
+          .querySelector("#outer-host")!
+          .attachShadow({ mode: "open" });
+        const innerHost = document.createElement("div");
+        outerRoot.append(innerHost);
+        const innerRoot = innerHost.attachShadow({ mode: "open" });
+        const nestedTooltip = document.createElement("span");
+        nestedTooltip.hidden = true;
+        nestedTooltip.textContent = "Nested shadow tooltip details";
+        innerRoot.append(nestedTooltip);
+
+        document
+          .querySelector("#open-target")!
+          .addEventListener("mouseover", () => {
+            openTooltip.hidden = false;
+          });
+        document
+          .querySelector("#nested-target")!
+          .addEventListener("mouseover", () => {
+            nestedTooltip.hidden = false;
+          });
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const initial = await session.observe();
+        const openRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Open shadow item"/,
+        )?.[1];
+        const nestedRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Nested shadow item"/,
+        )?.[1];
+        expect(openRef).toBeDefined();
+        expect(nestedRef).toBeDefined();
+
+        const execution = await session.execute({
+          kind: "hover_batch",
+          refs: [openRef!, nestedRef!],
+        });
+
+        expect(execution.result).toEqual({
+          kind: "hover_batch",
+          items: [
+            {
+              ref: openRef,
+              outcome: "succeeded",
+              text: "Open shadow tooltip details",
+            },
+            {
+              ref: nestedRef,
+              outcome: "succeeded",
+              text: "Nested shadow tooltip details",
+            },
+          ],
+        });
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
+  test("hover_batch filters hidden generated text and closed shadow content", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(`
+        <style>
+          #generated.revealed::after {
+            content: "Generated tooltip details";
+          }
+          #filtered.revealed::before {
+            content: "Hidden generated details";
+            display: none;
+          }
+          #filtered.revealed::after {
+            content: "";
+          }
+        </style>
+        <body>
+          <button id="generated">Generated item</button>
+          <button id="filtered">Filtered generated item</button>
+          <button id="closed-target">Closed shadow item</button>
+          <div id="closed-host"></div>
+        </body>
+      `);
+      await page.evaluate(() => {
+        document
+          .querySelector("#generated")!
+          .addEventListener("mouseover", (event) => {
+            (event.currentTarget as Element).classList.add("revealed");
+          });
+        document
+          .querySelector("#filtered")!
+          .addEventListener("mouseover", (event) => {
+            (event.currentTarget as Element).classList.add("revealed");
+          });
+        const closedRoot = document
+          .querySelector("#closed-host")!
+          .attachShadow({ mode: "closed" });
+        const closedTooltip = document.createElement("span");
+        closedTooltip.hidden = true;
+        closedTooltip.textContent = "Closed shadow tooltip details";
+        closedRoot.append(closedTooltip);
+        document
+          .querySelector("#closed-target")!
+          .addEventListener("mouseover", () => {
+            closedTooltip.hidden = false;
+          });
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const initial = await session.observe();
+        const generatedRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Generated item"/,
+        )?.[1];
+        const filteredRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Filtered generated item"/,
+        )?.[1];
+        const closedRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Closed shadow item"/,
+        )?.[1];
+        expect(generatedRef).toBeDefined();
+        expect(filteredRef).toBeDefined();
+        expect(closedRef).toBeDefined();
+
+        const execution = await session.execute({
+          kind: "hover_batch",
+          refs: [generatedRef!, filteredRef!, closedRef!],
+        });
+
+        expect(execution.result).toEqual({
+          kind: "hover_batch",
+          items: [
+            {
+              ref: generatedRef,
+              outcome: "succeeded",
+              text: "Generated tooltip details",
+            },
+            { ref: filteredRef, outcome: "succeeded", text: "" },
+            { ref: closedRef, outcome: "succeeded", text: "" },
+          ],
+        });
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
+  test("hover_batch bounds newly visible open shadow text by UTF-8 bytes", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(`
+        <body>
+          <button id="bounded-target">Bounded shadow item</button>
+          <div id="bounded-host"></div>
+        </body>
+      `);
+      await page.evaluate(() => {
+        const root = document
+          .querySelector("#bounded-host")!
+          .attachShadow({ mode: "open" });
+        const tooltip = document.createElement("span");
+        tooltip.hidden = true;
+        tooltip.textContent = "😀".repeat(1_000);
+        root.append(tooltip);
+        document
+          .querySelector("#bounded-target")!
+          .addEventListener("mouseover", () => {
+            tooltip.hidden = false;
+          });
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const initial = await session.observe();
+        const targetRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Bounded shadow item"/,
+        )?.[1];
+        expect(targetRef).toBeDefined();
+
+        const execution = await session.execute({
+          kind: "hover_batch",
+          refs: [targetRef!],
+        });
+
+        expect(execution.result.kind).toBe("hover_batch");
+        if (execution.result.kind !== "hover_batch") {
+          throw new Error("expected hover_batch");
+        }
+        const item = execution.result.items[0];
+        expect(item?.outcome).toBe("succeeded");
+        if (item?.outcome !== "succeeded") {
+          throw new Error("expected succeeded hover_batch item");
+        }
+        expect(Buffer.byteLength(item.text, "utf8")).toBe(1_024);
+        expect(item.text).toBe("😀".repeat(256));
+      } finally {
+        await session.dispose();
+        await context.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 15_000);
+
+  test("hover_batch bounds accepted generated text and rejects oversized input before scanning", async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+      });
+      const page = await context.newPage();
+      await page.setContent(`
+        <style>
+          #boundary.revealed::after {
+            content: "${"😀".repeat(4_096)}";
+          }
+          #oversized.revealed::after {
+            content: "${"x".repeat(9_000)}";
+          }
+        </style>
+        <body>
+          <button id="boundary">Boundary generated item</button>
+          <button id="oversized">Oversized generated item</button>
+        </body>
+      `);
+      await page.evaluate(() => {
+        const originalTrim = String.prototype.trim;
+        String.prototype.trim = function (this: string): string {
+          if (this.length > 8_194) {
+            throw new Error("oversized generated content was scanned");
+          }
+          return originalTrim.call(this);
+        };
+        document
+          .querySelector("#boundary")!
+          .addEventListener("mouseover", (event) => {
+            (event.currentTarget as Element).classList.add("revealed");
+          });
+        document
+          .querySelector("#oversized")!
+          .addEventListener("mouseover", (event) => {
+            (event.currentTarget as Element).classList.add("revealed");
+          });
+      });
+      const session = createBrowserOperationSession({
+        page,
+        allowedDomains: [],
+        initialOrigin: null,
+      });
+      try {
+        const initial = await session.observe();
+        const boundaryRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Boundary generated item"/,
+        )?.[1];
+        const targetRef = initial.snapshotExcerpt.match(
+          /\[ref=(e\d+)\] <button> "Oversized generated item"/,
+        )?.[1];
+        expect(boundaryRef).toBeDefined();
+        expect(targetRef).toBeDefined();
+
+        const execution = await session.execute({
+          kind: "hover_batch",
+          refs: [boundaryRef!, targetRef!],
+        });
+
+        expect(execution.result).toEqual({
+          kind: "hover_batch",
+          items: [
+            {
+              ref: boundaryRef,
+              outcome: "succeeded",
+              text: "😀".repeat(256),
+            },
+            { ref: targetRef, outcome: "succeeded", text: "" },
+          ],
+        });
       } finally {
         await session.dispose();
         await context.close();

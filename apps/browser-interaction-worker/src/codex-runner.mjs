@@ -516,56 +516,72 @@ function truncateUtf8(value, maximumBytes) {
   return bytes.toString("utf8").replace(/\uFFFD$/u, "");
 }
 
-function usefulFallbackResult(result, resultNumber) {
+function fallbackEvidenceSection(observation, counters) {
+  const { result } = observation;
   if (result?.kind === "extract") {
-    return `Collected result ${resultNumber} (extract):\n${result.text}`;
+    counters.extract += 1;
+    return `Extract ${counters.extract}\n${result.text}`;
+  }
+  if (result?.kind === "hover") {
+    counters.hover += 1;
+    const snapshot = observation.page.snapshotExcerpt;
+    return snapshot === ""
+      ? `Hover ${counters.hover}\nNo visible page text was captured after this hover.`
+      : `Hover ${counters.hover}\nVisible page after hover:\n${snapshot}`;
   }
   if (result?.kind === "hover_batch") {
+    counters.hoverBatch += 1;
     const items = result.items.map((item, itemIndex) =>
       item.outcome === "succeeded"
-        ? `Hover item ${itemIndex + 1}:\n${item.text}`
-        : `Hover item ${itemIndex + 1} failed: ${item.error.category}: ${item.error.message}`,
+        ? `Item ${itemIndex + 1} — succeeded\n${item.text}`
+        : `Item ${itemIndex + 1} — failed\n${item.error.category}: ${item.error.message}`,
     );
-    return `Collected result ${resultNumber} (hover batch):\n${items.join("\n")}`;
+    return `Hover batch ${counters.hoverBatch}\n${items.join("\n\n")}`;
   }
   return null;
 }
 
 export function buildTimeoutFallbackDecision(request) {
   const sections = [
-    "Best-effort browser result: model synthesis was unavailable before the deadline.",
-    "Content below is unsynthesized data collected from validated browser protocol results.",
+    "Best-effort browser result",
+    "Model synthesis was unavailable before the deadline. Content below is unsynthesized data from validated browser results.",
   ];
-  let resultNumber = 0;
+  const page = request.observation.page;
+  sections.push(`Page summary\nTitle: ${page.title}\nURL: ${page.url}`);
+
+  const evidence = [];
+  const failures = [];
+  const counters = { extract: 0, hover: 0, hoverBatch: 0 };
   for (const entry of request.history) {
     const { observation } = entry;
     if (observation.result !== undefined) {
-      const rendered = usefulFallbackResult(
-        observation.result,
-        resultNumber + 1,
-      );
+      const rendered = fallbackEvidenceSection(observation, counters);
       if (rendered !== null) {
-        resultNumber += 1;
-        sections.push(rendered);
+        evidence.push(rendered);
       }
     } else if (observation.error !== undefined) {
-      sections.push(
-        `Browser action ${observation.sequence} failed: ${observation.error.category}: ${observation.error.message}`,
+      failures.push(
+        `${observation.actionKind}: ${observation.error.category}: ${observation.error.message}`,
       );
     }
   }
-  const page = request.observation.page;
-  sections.push(`Current page:\nTitle: ${page.title}\nURL: ${page.url}`);
+  sections.push(
+    evidence.length === 0
+      ? "Collected evidence\nNo extract or hover evidence was collected."
+      : `Collected evidence\n\n${evidence.join("\n\n")}`,
+  );
+  if (failures.length > 0) {
+    sections.push(`Browser failures\n${failures.join("\n")}`);
+  }
   if (page.snapshotExcerpt !== "") {
-    sections.push(`Current visible page snapshot:\n${page.snapshotExcerpt}`);
+    sections.push(`Current visible page snapshot\n${page.snapshotExcerpt}`);
   }
   const fullOutput = sections.join("\n\n");
   const truncationNotice =
     "\n\n[Collected data truncated to fit the fallback output bound.]";
   const noticeBytes = Buffer.byteLength(truncationNotice, "utf8");
   const output =
-    Buffer.byteLength(fullOutput, "utf8") <=
-    MAX_TIMEOUT_FALLBACK_OUTPUT_BYTES
+    Buffer.byteLength(fullOutput, "utf8") <= MAX_TIMEOUT_FALLBACK_OUTPUT_BYTES
       ? fullOutput
       : `${truncateUtf8(
           fullOutput,

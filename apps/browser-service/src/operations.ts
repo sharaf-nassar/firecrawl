@@ -342,7 +342,14 @@ function visibleTextDeltaTrackerInPage(limits: {
   maximumNodes: number;
   maximumSourceCharacters: number;
 }): VisibleTextDeltaTracker {
-  const previous = new Map<Node, string>();
+  type GeneratedText = { before: string; after: string };
+  type TraversalFrame =
+    | { phase: "enter"; node: Node }
+    | { phase: "exit"; element: Element }
+    | { phase: "siblings"; node: Node };
+
+  const previousText = new Map<Node, string>();
+  const previousGenerated = new Map<Element, GeneratedText>();
 
   function isWhitespace(character: string): boolean {
     return /\s/u.test(character);
@@ -378,8 +385,59 @@ function visibleTextDeltaTrackerInPage(limits: {
     );
   }
 
+  function generatedText(
+    element: Element,
+    pseudo: "::before" | "::after",
+  ): string {
+    let style: CSSStyleDeclaration;
+    try {
+      style = getComputedStyle(element, pseudo);
+    } catch {
+      return "";
+    }
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.contentVisibility === "hidden"
+    ) {
+      return "";
+    }
+    const serialized = style.content;
+    if (serialized.length > 8_194) return "";
+    const raw = serialized.trim();
+    if (
+      raw === "" ||
+      raw === "none" ||
+      raw === "normal" ||
+      Array.from(raw).length > 4_098
+    ) {
+      return "";
+    }
+    const quote = raw[0];
+    if (
+      (quote !== '"' && quote !== "'") ||
+      raw.at(-1) !== quote ||
+      raw.length < 2
+    ) {
+      return "";
+    }
+    const value = raw.slice(1, -1);
+    if (
+      value === "" ||
+      value.includes("\\") ||
+      value.includes(quote) ||
+      /[\u0000-\u001f\u007f-\u009f]/u.test(value) ||
+      Array.from(value).length > 4_096
+    ) {
+      return "";
+    }
+    return value;
+  }
+
   function captureCurrent(includeDelta: boolean): string {
-    const current = new Map<Node, string>();
+    const currentText = new Map<Node, string>();
+    const currentGenerated = new Map<Element, GeneratedText>();
     const deltaChunks: string[] = [];
     let deltaBytes = 0;
     let visitedNodes = 0;
@@ -414,38 +472,89 @@ function visibleTextDeltaTrackerInPage(limits: {
     }
 
     const root = document.body;
-    let node: Node | null = root;
+    const pending: TraversalFrame[] =
+      root === null ? [] : [{ phase: "enter", node: root }];
     while (
-      node !== null &&
+      pending.length !== 0 &&
       visitedNodes < limits.maximumNodes &&
       sourceCharacters <= limits.maximumSourceCharacters
     ) {
+      const frame = pending.pop()!;
+      if (frame.phase === "siblings") {
+        if (frame.node.nextSibling !== null) {
+          pending.push({ phase: "siblings", node: frame.node.nextSibling });
+        }
+        pending.push({ phase: "enter", node: frame.node });
+        continue;
+      }
+      if (frame.phase === "exit") {
+        const after = generatedText(frame.element, "::after");
+        sourceCharacters += Array.from(after).length;
+        if (sourceCharacters > limits.maximumSourceCharacters) break;
+        const generated = currentGenerated.get(frame.element);
+        if (generated === undefined) continue;
+        generated.after = after;
+        if (
+          includeDelta &&
+          after !== "" &&
+          previousGenerated.get(frame.element)?.after !== after
+        ) {
+          appendDelta(after);
+        }
+        continue;
+      }
+
+      const node = frame.node;
       visitedNodes += 1;
-      let descend = true;
       if (node.nodeType === Node.ELEMENT_NODE) {
-        descend = inspectElement(node as Element);
+        const element = node as Element;
+        if (!inspectElement(element)) continue;
+        const before = generatedText(element, "::before");
+        sourceCharacters += Array.from(before).length;
+        if (sourceCharacters > limits.maximumSourceCharacters) break;
+        currentGenerated.set(element, { before, after: "" });
+        if (
+          includeDelta &&
+          before !== "" &&
+          previousGenerated.get(element)?.before !== before
+        ) {
+          appendDelta(before);
+        }
+
+        pending.push({ phase: "exit", element });
+        const shadowChild = element.shadowRoot?.firstChild ?? null;
+        if (shadowChild !== null) {
+          pending.push({ phase: "siblings", node: shadowChild });
+        }
+        if (element.firstChild !== null) {
+          pending.push({ phase: "siblings", node: element.firstChild });
+        }
       } else if (node.nodeType === Node.TEXT_NODE) {
         const value = node.nodeValue ?? "";
         sourceCharacters += Array.from(value).length;
         if (sourceCharacters > limits.maximumSourceCharacters) break;
-        current.set(node, value);
-        if (includeDelta && previous.get(node) !== value) appendDelta(value);
-      } else {
-        descend = false;
+        currentText.set(node, value);
+        if (includeDelta && previousText.get(node) !== value) {
+          appendDelta(value);
+        }
+      } else if (
+        node.nodeType === Node.DOCUMENT_FRAGMENT_NODE ||
+        node.nodeType === Node.DOCUMENT_NODE
+      ) {
+        if (node.firstChild !== null) {
+          pending.push({ phase: "siblings", node: node.firstChild });
+        }
       }
-
-      if (descend && node.firstChild !== null) {
-        node = node.firstChild;
-        continue;
-      }
-      while (node !== root && node.nextSibling === null) {
-        node = node.parentNode!;
-      }
-      node = node === root ? null : node.nextSibling;
     }
 
-    previous.clear();
-    for (const [textNode, value] of current) previous.set(textNode, value);
+    previousText.clear();
+    for (const [textNode, value] of currentText) {
+      previousText.set(textNode, value);
+    }
+    previousGenerated.clear();
+    for (const [element, value] of currentGenerated) {
+      previousGenerated.set(element, value);
+    }
     return deltaChunks.join("");
   }
 

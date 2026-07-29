@@ -1129,14 +1129,6 @@ permissive validators, legacy root layers, duplicate database storage payloads,
 split activation, and stale code-result contracts from passing acceptance
 silently.
 
-### Host plan follow-up
-
-Before executing Task 5 of
-`2026-07-19-browser-host-execution-and-operations.md`, revise stale Codex
-`0.144.5` pins to consume the approved rolling installed-Codex contract. Keep
-model, reasoning effort, schema, safety, lifecycle, and capability gates
-pinned; do not restore an exact Codex CLI version requirement.
-
 ## Tests and acceptance
 
 New tests in the implementation plan must prove:
