@@ -33,7 +33,7 @@ jobs:
           password: ${{secrets.GITHUB_TOKEN}}
 
       - name: "Build and Push Image"
-        uses: useblacksmith/build-push-action@v2
+        uses: useblacksmith/build-push-action@v2.2.0
         with:
           context: ./apps/go-html-to-md-service
           push: true

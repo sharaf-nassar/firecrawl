@@ -48,7 +48,7 @@ jobs:
           echo "PLATFORM_SUFFIX=${platform//\//-}" >> $GITHUB_ENV
 
       - name: 'Build and Push Image'
-        uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
+        uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2
         with:
           context: ./apps/playwright-service-ts
           push: true
