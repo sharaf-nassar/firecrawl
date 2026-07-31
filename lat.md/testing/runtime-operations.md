@@ -92,6 +92,8 @@ Live acceptance should use `scripts/local-firecrawl start`, one `health` pass, t
 
 The Node test suite verifies the seven disabled tools, discovery filtering, prompt-only interact rewriting, clear rejection of stale code-mode calls, and supported prompt/stop passthrough against the importable launcher library.
 
+It also deep-compares the rewritten pinned upstream registration with a checked-in snapshot and requires the executable package pin to equal the fixture's recorded version.
+
 ## API-managed local acceptance
 
 API harness commands provide narrower live acceptance for local persistence and Browser Service without assembling the wrapper-managed Compose stack.

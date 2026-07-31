@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -8,6 +9,25 @@ import {
   rewriteInteractTool,
   unsupportedToolResponse,
 } from "./local-firecrawl-mcp.lib.mjs";
+
+const upstreamInteractFixture = JSON.parse(
+  await readFile(
+    new URL(
+      "./fixtures/firecrawl-mcp-3.22.3-interact-tool.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
+const rewrittenInteractSnapshot = JSON.parse(
+  await readFile(
+    new URL(
+      "./fixtures/firecrawl-mcp-3.22.3-interact-tool.snapshot.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+);
 
 const disabledToolNames = [
   "firecrawl_agent",
@@ -126,6 +146,25 @@ test("rewriteInteractTool advertises prompt-driven interaction only", () => {
 
   const otherTool = { name: "firecrawl_interact_stop" };
   assert.equal(rewriteInteractTool(otherTool), otherTool);
+});
+
+test("launcher pin matches the captured upstream interact fixture", async () => {
+  const launcherSource = await readFile(
+    new URL("./local-firecrawl-mcp", import.meta.url),
+    "utf8",
+  );
+  const pinnedVersions = [
+    ...launcherSource.matchAll(/firecrawl-mcp@(\d+\.\d+\.\d+)/g),
+  ].map((match) => match[1]);
+
+  assert.deepEqual(pinnedVersions, [upstreamInteractFixture.upstreamVersion]);
+});
+
+test("pinned upstream interact rewrite matches the prompt-only snapshot", () => {
+  assert.deepEqual(
+    rewriteInteractTool(upstreamInteractFixture.tool),
+    rewrittenInteractSnapshot,
+  );
 });
 
 test("interceptCodeCall rejects unsupported interact arguments clearly", () => {

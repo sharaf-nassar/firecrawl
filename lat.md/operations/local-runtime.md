@@ -92,6 +92,8 @@ The same launcher disables paper search, paper inspection, related-paper lookup,
 
 For `firecrawl_interact`, the launcher replaces upstream code-mode advertising with the local prompt-only contract. Its schema omits `code`, restricts `language` to `node`, and rejects stale code-mode calls as invalid parameters before they reach the API.
 
+The launcher pins `firecrawl-mcp@3.22.3`. A captured upstream registration and independent prompt-only snapshot make package-pin or tool-schema drift require an explicit fixture update.
+
 ## Lifecycle lock
 
 All lifecycle and diagnostic commands coordinate through a per-user, per-project advisory lock.
