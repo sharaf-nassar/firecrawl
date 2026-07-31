@@ -73,7 +73,7 @@ jobs:
       - run: pnpm config set store-dir ~/.pnpm-store
       - run: mkdir -p ~/.pnpm-store
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -472,7 +472,7 @@ jobs:
   #     - run: pnpm config set store-dir ~/.pnpm-store
   #     - run: mkdir -p ~/.pnpm-store
 
-  #     - uses: actions/setup-node@v6
+  #     - uses: actions/setup-node@v7
   #       with:
   #         node-version: 22
   #         cache: pnpm
@@ -583,7 +583,7 @@ jobs:
       - run: pnpm config set store-dir ~/.pnpm-store
       - run: mkdir -p ~/.pnpm-store
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
