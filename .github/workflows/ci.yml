@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository:
+    name: Repository validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.1
+          package-manager-cache: false
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+          shellcheck --version
+
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/local-firecrawl \
+            scripts/init-local-env.sh \
+            scripts/upgrade-local-env-phase1
+          # Container-side expansion and Bash namerefs trigger false positives.
+          shellcheck --exclude=SC2016 scripts/local-firecrawl
+          shellcheck scripts/init-local-env.sh
+          shellcheck --exclude=SC2034,SC2178 \
+            scripts/upgrade-local-env-phase1
+
+      - name: Run repository tests
+        run: |
+          node --test \
+            scripts/local-firecrawl.test.mjs \
+            scripts/local-firecrawl-mcp.test.mjs \
+            apps/browser-interaction-worker/src/*.test.mjs \
+            apps/codex-shim/src/*.test.mjs \
+            apps/api/scripts/package-migrations.test.mjs
+
+      - name: Validate architecture documentation
+        run: npx --yes lat.md@0.11.0 check
+
+  api-image:
+    name: API image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build API image
+        run: docker build -t firecrawl-api-ci apps/api
+
+  browser-service:
+    name: Browser Service
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build Browser Service test image
+        run: >-
+          docker build -f apps/browser-service/Dockerfile
+          --target browser-test -t firecrawl-browser-test .
+
+      - name: Run Browser Service tests
+        run: docker run --rm --init firecrawl-browser-test pnpm test
+
+      - name: Build Browser Service runtime image
+        run: >-
+          docker build -f apps/browser-service/Dockerfile
+          --target browser-service-runtime
+          -t firecrawl-browser-service-ci .
+
+  playwright-service:
+    name: Playwright Service
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/playwright-service-ts
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.1
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: |
+          npm install --global pnpm@10.33.0
+          test "$(pnpm --version)" = 10.33.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+  test-site:
+    name: Test Site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/test-site
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.1
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: |
+          npm install --global pnpm@10.33.0
+          test "$(pnpm --version)" = 10.33.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+  required:
+    name: Required
+    if: always()
+    needs:
+      - repository
+      - api-image
+      - browser-service
+      - playwright-service
+      - test-site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify required jobs
+        env:
+          REPOSITORY_RESULT: ${{ needs.repository.result }}
+          API_IMAGE_RESULT: ${{ needs['api-image'].result }}
+          BROWSER_SERVICE_RESULT: ${{ needs['browser-service'].result }}
+          PLAYWRIGHT_SERVICE_RESULT: ${{ needs['playwright-service'].result }}
+          TEST_SITE_RESULT: ${{ needs['test-site'].result }}
+        run: |
+          test "$REPOSITORY_RESULT" = success
+          test "$API_IMAGE_RESULT" = success
+          test "$BROWSER_SERVICE_RESULT" = success
+          test "$PLAYWRIGHT_SERVICE_RESULT" = success
+          test "$TEST_SITE_RESULT" = success

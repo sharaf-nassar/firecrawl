@@ -125,7 +125,7 @@ Each package declares its own consumer runtime floor rather than inheriting one 
 | .NET | .NET 8.0. |
 | Elixir | Elixir 1.15-compatible releases. |
 
-Build and publication runners do not redefine these consumer contracts. For example, JavaScript workflows currently run Node.js 20 even though the published package declares Node.js 22, so workflow success alone is not evidence for a supported runtime.
+Repository CI does not build SDKs and therefore cannot redefine these consumer contracts. Validation for a client must use the runtime declared by its native package metadata.
 
 ## JavaScript and Python compatibility façades
 
@@ -210,19 +210,19 @@ Elixir is the only SDK whose public client is explicitly generated from the exte
 
 All other SDK clients in this tree are maintained as language-specific source and models. Their request shaping, aliases, polling, pagination, and error semantics can intentionally exceed what an OpenAPI generator would provide, but must be reviewed for parity when the API evolves.
 
-## Versioning and publication
+## Versioning and external release boundary
 
-Each SDK owns its version in its native package metadata and publishes through a path-scoped GitHub Actions workflow.
+Each SDK owns its version in native package metadata, but this repository has no package-publication or release workflow.
 
 JavaScript uses its package manifest; Python uses `firecrawl/__init__.py`; Go uses `version.go`; Java uses Gradle; PHP uses `src/Version.php`; Rust uses Cargo; Ruby uses `lib/firecrawl/version.rb`; .NET uses its project file; and Elixir uses `mix.exs`.
 
-Most publication workflows compare that local version with the canonical registry before publishing. Go instead creates the nested-module tag `apps/go-sdk/vX.Y.Z`; a repository-root `vX.Y.Z` tag does not release that module.
+Any external or manual release process must compare the local version with its canonical registry and preserve package-specific coordinates. Go releases require the nested-module tag `apps/go-sdk/vX.Y.Z`; a repository-root tag does not release that module.
 
-JavaScript deliberately builds once and republishes the artifact under three npm names. Python similarly publishes the same source as both `firecrawl-py` and `firecrawl`, using `firecrawl-py` for the release gate.
+JavaScript's three npm names and Python's `firecrawl-py` and `firecrawl` names remain distribution contracts, but repository CI does not build or upload them.
 
-PHP is mirrored by a forced subtree split to the external `firecrawl-php` repository before Packagist is notified. That mirror is a publication artifact; this monorepo remains the source edited and tested for the PHP package.
+PHP's external `firecrawl-php` mirror and Packagist notification, when needed, belong to an external release process. This monorepo remains the source edited and tested for the PHP package.
 
-Elixir regeneration runs on a schedule or manual dispatch, opens a reviewable generated-code pull request, and publishes to Hex only after the resulting version reaches `main`.
+Elixir regeneration and Hex publication are also outside repository automation. Generated changes still require review before any external release.
 
 Package versions describe client compatibility, not synchronized monorepo releases. Changes to public method signatures or serialized option shapes require the appropriate semantic-version decision for each affected package.
 
@@ -243,6 +243,6 @@ SDK maintenance should preserve wire correctness first, then idiomatic ergonomic
 - Preserve opaque pagination links, same-origin credential handling, server error details, custom API URLs, and SDK origin metadata.
 - Coordinate additive response enums across clients whose decoders or public types use closed state sets.
 - Regenerate Elixir from its source specification; never patch generated output as the durable fix.
-- Update package-scoped tests, alias metadata, attribution versions, and publication metadata in the same SDK directory.
+- Update package-scoped tests, alias metadata, attribution versions, and distribution metadata in the same SDK directory.
 
 Cross-language parity is evidence-driven. A method existing in JavaScript or Python does not establish that it exists in every client.

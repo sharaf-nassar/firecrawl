@@ -66,7 +66,7 @@ Persistence suites cover both provider-neutral artifacts and the local applicati
 
 Local harness tests validate migrations, owner identity, manifest rollback, retention, shutdown, browser-service startup, stale-contract detection, billing outbox, reconciliation, replay checkpoints, and filesystem state.
 
-The dedicated `test:package-migrations` Node suite exercises packaging faults, path identity, exact inventory, rollback, and concurrent publishers for [[lat.md/api/persistence#Persistence and Storage#Database migrations]]. Current GitHub Actions workflows do not invoke this script directly.
+The dedicated `test:package-migrations` Node suite exercises packaging faults, path identity, exact inventory, rollback, and concurrent publishers for [[lat.md/api/persistence#Persistence and Storage#Database migrations]]. CI validates packaging through the API image build but does not invoke this suite directly.
 
 MinIO integration tests and GCS cache tests require their named services or mocks; pure manifest tests verify consistency without a provider.
 

@@ -22,6 +22,6 @@ Hosted use requires the CLI's supported API-key configuration; self-hosted use r
 
 Server changes should consider CLI compatibility even though CLI code and releases are independent.
 
-API route, request, response, status, pagination, or authentication changes can affect CLI commands. Compatibility review should use the external CLI's current source and tests, then coordinate a CLI release separately from this monorepo's SDK publications.
+API route, request, response, status, pagination, or authentication changes can affect CLI commands. Compatibility review should use the external CLI's current source and tests, then coordinate CLI and SDK releases through their separate external processes.
 
 See [[ui-and-extensions#CLI skills]] for the agent instructions that teach session-time CLI use and [[sdk-architecture#Asynchronous jobs]] for the shared server-side job model.

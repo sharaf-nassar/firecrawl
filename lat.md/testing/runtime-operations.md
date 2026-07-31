@@ -64,17 +64,17 @@ The suite places a recording `codex` stub first on `PATH`. It covers message and
 
 The package suite does not start the HTTP server or a real browser. It does not directly exercise `/scrape`, `/health`, URL/DNS interception, rendered content, selectors, headers, or cross-request browser-context isolation.
 
-The server integration matrix starts Playwright in one matrix branch and reaches it through API snippet tests. That is useful composition coverage but is not a substitute for focused service-level HTTP and real-browser tests.
+Repository CI installs, builds, and runs this package suite. That deterministic coverage is still not a substitute for focused service-level HTTP and real-browser tests.
 
 ## Support-service suites
 
 Support services have uneven direct coverage.
 
-Go HTML-to-Markdown uses `httptest` for index, health, conversion, malformed input, complex HTML, and ZDR logging behavior. Its path-scoped CI runs build, vet, and all Go tests.
+Go HTML-to-Markdown uses `httptest` for index, health, conversion, malformed input, complex HTML, and ZDR logging behavior. The suite remains package-local and is outside required repository CI.
 
-`apps/nuq-postgres/` has no direct SQL or image test. The server matrix builds and starts the image, so its initialization and ordinary queue paths receive indirect integration coverage.
+`apps/nuq-postgres/` has no direct SQL or image test and is outside required repository CI. Its initialization and ordinary queue paths need explicit service-backed validation when changed.
 
-`apps/redis/` has no automated test for its image, memory sizing, password, persistence, or Fly configuration. The server matrix uses the upstream Redis image, not this custom image.
+`apps/redis/` has no automated test for its image, memory sizing, password, persistence, or Fly configuration. The custom image is outside required repository CI.
 
 ## Local wrapper suite
 
@@ -83,6 +83,8 @@ Go HTML-to-Markdown uses `httptest` for index, health, conversion, malformed inp
 It creates private temporary fixtures and replaces `docker` with a recording fake. Tests cover environment creation and upgrade, Compose hardening validation, secret-safe errors, image build and one-shot ordering, recognized legacy provenance, writer-first stop, status, and diagnostic availability.
 
 The API script `test:local-firecrawl:lifecycle` passes `--full-lifecycle`, but the test file has no argument-controlled real-Docker mode. Every current case still uses the fake runtime.
+
+Repository CI runs the deterministic local-script contracts, including this fake-runtime suite. That gate verifies orchestration rules without claiming live Compose acceptance.
 
 ### Operations coverage gap
 
@@ -110,22 +112,22 @@ From `apps/api`, `pnpm harness pnpm test:snips:local-persistence` starts or uses
 
 These harnesses do not exercise MinIO, the wrapper's one-shots and lifecycle lock, container network hardening, the Browser Interaction Worker canary, or the assembled Compose health protocol. Replay cases that need Playwright remain capability-gated.
 
-Neither command is invoked by a checked-in GitHub Actions workflow. They supply live local contract coverage, not an automated repository release gate.
+Neither command is invoked by repository CI. They supply live local contract coverage, not an automated validation gate.
 
-## CI coverage gap
+## CI coverage boundary
 
-Runtime suites are not wired into repository GitHub Actions in this checkout.
+Repository CI covers deterministic active-runtime contracts that fit GitHub-hosted runners without secrets.
 
-No workflow runs Browser Service tests, Browser Interaction Worker tests, Playwright package tests, or local-wrapper tests. `test-server.yml` runs API snippet and NuQ FoundationDB suites, while `deploy-playwright.yml` builds and publishes without invoking `pnpm test`.
+The workflow checks repository and local scripts, builds the API image, builds Browser Service test and runtime image targets, runs Playwright Service install/build/test, and installs and builds Test Site. Container results are never published.
 
-Critical workflow decision scripts also lack direct tests. `resolve_api_image_version.py` chooses API image tags, `check_version_has_incremented.py` gates SDK publication, and `audit-ci-vuln-scan.mjs` selects vulnerability remediation work.
+Browser Interaction Worker tests, live Compose acceptance, API service-backed harnesses, FoundationDB, SDKs, support-service suites, and credentialed or hosted integrations remain outside the required gate.
 
-Until dedicated jobs exist, contributors must run affected package suites locally and record any required Docker, privileged, or real-browser acceptance separately.
+Contributors must run affected excluded suites locally or in their owning external system and record any required Docker, privileged, real-browser, or credentialed acceptance separately.
 
 ## Evaluation and benchmark layers
 
 Quality and performance assets answer different questions from deterministic tests.
 
-`apps/test-suite/` provides legacy Artillery load scenarios and external-site benchmark data. Production and pull-request evaluation workflows dispatch external systems; they do not run assertions in this checkout.
+`apps/test-suite/` provides legacy Artillery load scenarios and external-site benchmark data. No repository workflow runs them or dispatches an external evaluator.
 
 Use these layers for capacity and content-quality signals. Use package and server integration tests for deterministic protocol, lifecycle, and failure guarantees.

@@ -6,7 +6,6 @@ package firecrawl
 // Note: this version tracks the SDK release cycle, not the Firecrawl API
 // version. The SDK targets the Firecrawl v2 API.
 //
-// Bump this when preparing a new release. The publish-go-sdk GitHub workflow
-// reads this value and creates the corresponding monorepo-prefixed tag on
-// merge to main.
+// Bump this when preparing a new release. Tags and releases are created
+// manually or by external release tooling using the monorepo-prefixed version.
 const Version = "1.7.1"

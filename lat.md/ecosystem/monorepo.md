@@ -21,7 +21,7 @@ Top-level directories distinguish production services, client libraries, operati
 | `firecrawl-cli*`, `firecrawl-skills`, `firecrawl-workflows` | Locator stubs for separately maintained ecosystem repositories. |
 | `compose*.yaml`, `docker-compose.yaml`, `host` | Local and self-hosted service composition. |
 
-This is an ownership map, not a dependency graph. Runtime relationships are defined by service configuration and compose manifests, while publication relationships are defined by package workflows.
+This is an ownership map, not a dependency graph. Runtime relationships come from service configuration and Compose manifests; package identity and versioning come from each package's native metadata.
 
 ## Independent package roots
 
@@ -43,15 +43,13 @@ Some Node packages use local pnpm workspaces, but those are package islands rath
 
 ## Build and CI routing
 
-GitHub Actions routes tests, builds, deployments, and publications by application path.
+Repository CI is one validation-only workflow for active runtime surfaces, not a path-scoped build or release matrix.
 
-Dedicated SDK test workflows cover JavaScript, Go, Java, PHP, Ruby, Rust, and .NET with package-native checks. Python and Elixir do not have equivalent standalone test workflows in this checkout, so their publication paths must not be treated as the same validation gate.
+The required gate runs on GitHub-hosted `ubuntu-24.04` for pull requests, pushes to `main`, and manual dispatch. It validates repository and local scripts, API image buildability, Browser Service image targets, Playwright Service, and Test Site.
 
-SDK publication workflows read versions from native manifests, then publish to npm, PyPI, Maven Central, NuGet, RubyGems, crates.io, Hex, or Go module tags. PHP first mirrors a subtree to its external repository and then notifies Packagist.
+CI builds containers only to verify they remain buildable. It does not deploy services, push images, publish packages, create releases, or dispatch external evaluations; [[deployment-and-ci#Repository CI]] defines the complete automation boundary.
 
-The server test workflow composes Node, Rust native code, Go conversion code, browser services, queues, search, and the deterministic test site. Deployment workflows are service-specific rather than a global monorepo deploy.
-
-`validate-lockfiles.yml` currently validates only `apps/test-suite/pnpm-lock.yaml`; other lockfiles are enforced by their owning install or CI paths, not by that workflow.
+SDKs, support services outside the active runtime set, the ingestion UI, and legacy load or benchmark assets are not required CI jobs. Changes there need package-native validation selected from their own manifests.
 
 ## Documentation strata
 
@@ -75,7 +73,7 @@ Examples cover Python and JavaScript SDK use, structured extraction, crawling, r
 
 Repository location does not establish one license for every deliverable.
 
-The repository root is AGPL-3.0, while SDK manifests, package metadata, and local license files commonly declare MIT terms; the ingestion UI also carries its own MIT license. Consumers and release automation must use the owning package's included legal metadata.
+The repository root is AGPL-3.0, while SDK manifests, package metadata, and local license files commonly declare MIT terms; the ingestion UI also carries its own MIT license. Consumers and external release processes must use the owning package's included legal metadata.
 
 Not every SDK subtree carries the same set of legal files, and legacy metadata can disagree with newer manifests. Packaging changes should verify the license embedded in the published artifact rather than infer it from another SDK or the root.
 
@@ -87,6 +85,6 @@ An API contract change may require server implementation, SDK model updates, CLI
 
 `CODEOWNERS` is selective and has no catchall. It omits newer browser services, operational scripts and configuration, several SDKs, and `lat.md`, so an unmatched path has no owner assigned by that file.
 
-The repository Husky hook is API-local: it runs `knip` and `lint-staged` from `apps/api`. It neither runs the server integration matrix nor defines server CI authority.
+The repository Husky hook is API-local: it runs `knip` and `lint-staged` from `apps/api`. It neither runs the active-runtime gate nor defines repository CI authority.
 
-Do not assume a root install, root version bump, or root build validates the tree. Use path-scoped workflows and manifests to determine the required verification.
+Do not assume the required CI gate validates the entire polyglot tree. Use package manifests and [[deployment-and-ci#Repository CI#Automation exclusions|the documented CI exclusions]] to select additional verification.

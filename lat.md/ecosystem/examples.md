@@ -40,7 +40,7 @@ The Kubernetes subtree offers both an imperative manifest set and a more complet
 
 `cluster-install` applies individual API, worker, queue, database, Redis, and Playwright resources. `firecrawl-helm` adds configurable worker roles, RabbitMQ, overlays, image selection, resources, secrets, and optional multi-architecture image builds.
 
-These assets are examples rather than the canonical deployment release. The Helm defaults can reference third-party multi-architecture images, and neither sample is automatically synchronized with compose files, service workflows, or current self-hosting requirements.
+These assets are examples rather than a canonical deployment release. Helm defaults can reference third-party multi-architecture images, and neither sample is automatically synchronized with Compose files, active-runtime builds, or current self-hosting requirements.
 
 Before production use, compare component roles, environment variables, image tags, persistence, ingress, secret management, architecture support, and upgrade behavior with the current runtime and operations documentation.
 

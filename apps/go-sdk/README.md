@@ -376,7 +376,7 @@ apps/go-sdk/v1.3.0
 
 A bare `v1.3.0` tag will not be resolvable by the Go module proxy.
 
-### Release workflow
+### Release process
 
 The SDK version is the single source of truth in
 [`version.go`](./version.go):
@@ -385,18 +385,14 @@ The SDK version is the single source of truth in
 const Version = "1.3.0"
 ```
 
-To cut a release:
+This repository does not publish SDK releases from GitHub Actions. To cut a
+release manually:
 
 1. Bump the `Version` constant in `apps/go-sdk/version.go`
 2. Merge to `main`
-3. The [`publish-go-sdk`](../../.github/workflows/publish-go-sdk.yml) workflow
-   will automatically:
-   - create the `apps/go-sdk/v{Version}` tag on the merge commit,
-   - push it to the repository,
-   - warm `proxy.golang.org` to trigger indexing on
-     [pkg.go.dev](https://pkg.go.dev/github.com/firecrawl/firecrawl/apps/go-sdk).
-
-The workflow is idempotent: if the tag already exists, it is a no-op.
+3. Create and push the `apps/go-sdk/v{Version}` tag on the merge commit
+4. Request that version from `proxy.golang.org` to trigger indexing on
+   [pkg.go.dev](https://pkg.go.dev/github.com/firecrawl/firecrawl/apps/go-sdk)
 
 ### Consuming a specific version
 

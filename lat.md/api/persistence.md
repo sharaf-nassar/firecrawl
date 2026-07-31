@@ -18,7 +18,7 @@ The migration set establishes local owners, artifact manifests, endpoint records
 
 Foreign keys use request ownership to coordinate deletion. Browser migrations encode leases, deadlines, fencing generations, idempotent action ordering, and outbox claims so crash recovery does not depend on process memory.
 
-The production API build invokes `scripts/package-migrations.mjs` to publish migrations into `dist`; this makes migration packaging part of the [[lat.md/operations/deployment-and-ci#Deployment and CI Operations#Container publication|deployment artifact]], not an optional release step.
+The production API build invokes `scripts/package-migrations.mjs` to copy migrations into `dist`; this makes migration packaging part of the [[lat.md/operations/deployment-and-ci#Deployment and CI Operations#Repository CI#Active-runtime validation|API image build contract]].
 
 Publication serializes cooperative writers with an exclusive lock, captures and revalidates destination-ancestor identity, and stages an exact-byte source inventory. Any failure before final verification rolls back the prior tree; successful final inventory verification is the commit point.
 
