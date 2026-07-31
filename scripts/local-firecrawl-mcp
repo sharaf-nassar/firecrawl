@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+
+import { spawn } from "node:child_process";
+
+const upstreamArgs =
+  process.argv.length > 2
+    ? process.argv.slice(2)
+    : ["-y", "firecrawl-mcp@3.22.3"];
+
+const disabledLocalTools = new Set([
+  // Disabled locally, not deleted upstream: these require Firecrawl's
+  // external Agent service, which this self-hosted stack does not configure.
+  "firecrawl_agent",
+  "firecrawl_agent_status",
+
+  // Disabled locally, not deleted upstream: these require the external
+  // research proxy, which this self-hosted stack does not configure.
+  "firecrawl_research_search_papers",
+  "firecrawl_research_inspect_paper",
+  "firecrawl_research_related_papers",
+  "firecrawl_research_read_paper",
+  "firecrawl_research_search_github",
+]);
+
+const child = spawn("npx", upstreamArgs, {
+  env: process.env,
+  stdio: ["pipe", "pipe", "inherit"],
+});
+
+let inputBuffer = "";
+let outputBuffer = "";
+
+function encodeMessage(message) {
+  return `${JSON.stringify(message)}\n`;
+}
+
+function unsupportedToolResponse(message) {
+  if (
+    message?.method !== "tools/call" ||
+    !disabledLocalTools.has(message.params?.name)
+  ) {
+    return undefined;
+  }
+
+  return {
+    jsonrpc: "2.0",
+    id: message.id,
+    error: {
+      code: -32601,
+      message: `${message.params.name} is disabled in the local Firecrawl MCP because its external service is not configured`,
+    },
+  };
+}
+
+function filterToolList(message) {
+  if (!Array.isArray(message?.result?.tools)) {
+    return message;
+  }
+
+  return {
+    ...message,
+    result: {
+      ...message.result,
+      tools: message.result.tools.filter(
+        (tool) => !disabledLocalTools.has(tool?.name),
+      ),
+    },
+  };
+}
+
+function consumeLines(buffer, chunk, handleLine) {
+  const combined = buffer + chunk;
+  const lines = combined.split("\n");
+  const remainder = lines.pop() ?? "";
+
+  for (const line of lines) {
+    handleLine(line);
+  }
+
+  return remainder;
+}
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  inputBuffer = consumeLines(inputBuffer, chunk, (line) => {
+    if (line.trim() === "") {
+      child.stdin.write(`${line}\n`);
+      return;
+    }
+
+    try {
+      const message = JSON.parse(line);
+      const response = unsupportedToolResponse(message);
+      if (response) {
+        process.stdout.write(encodeMessage(response));
+        return;
+      }
+    } catch {
+      // Preserve non-JSON output so protocol errors remain attributable upstream.
+    }
+
+    child.stdin.write(`${line}\n`);
+  });
+});
+
+process.stdin.on("end", () => {
+  if (inputBuffer !== "") {
+    child.stdin.write(inputBuffer);
+  }
+  child.stdin.end();
+});
+
+child.stdout.setEncoding("utf8");
+child.stdout.on("data", (chunk) => {
+  outputBuffer = consumeLines(outputBuffer, chunk, (line) => {
+    if (line.trim() === "") {
+      process.stdout.write(`${line}\n`);
+      return;
+    }
+
+    try {
+      process.stdout.write(encodeMessage(filterToolList(JSON.parse(line))));
+    } catch {
+      process.stdout.write(`${line}\n`);
+    }
+  });
+});
+
+child.stdout.on("end", () => {
+  if (outputBuffer !== "") {
+    process.stdout.write(outputBuffer);
+  }
+});
+
+child.on("error", (error) => {
+  process.stderr.write(`local_firecrawl_mcp_start_failed: ${error.message}\n`);
+  process.exitCode = 1;
+});
+
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exitCode = code ?? 1;
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    child.kill(signal);
+  });
+}

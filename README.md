@@ -807,11 +807,14 @@ and shutdown, waits for application health, and emits bounded, redacted
 diagnostics. `status` and `health` also support `--json`.
 
 SDKs can use `http://127.0.0.1:3002` as their API URL. Claude Code and Codex
-can use the external Firecrawl MCP server with
+use `scripts/local-firecrawl-mcp`, which filters the external Firecrawl MCP
+server to the capabilities configured by this stack, with
 `FIRECRAWL_API_URL=http://127.0.0.1:3002`; no paid Firecrawl API key is needed
 for this endpoint. The MCP path supports scrape, crawl, map, search, and local
-browser interaction. Batch operations remain available through the local REST
-API.
+browser interaction. Agent and research-proxy tools remain listed in the
+launcher source but are not advertised or callable until their external
+services are configured. Batch operations remain available through the local
+REST API.
 
 ### Stateful browser interaction
 
