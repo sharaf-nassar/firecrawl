@@ -88,9 +88,9 @@ Live acceptance should use `scripts/local-firecrawl start`, one `health` pass, t
 
 ## Local MCP launcher suite
 
-`scripts/local-firecrawl-mcp.test.mjs` locks the local MCP capability filter's static policy while keeping process transport concerns in the executable entrypoint.
+`scripts/local-firecrawl-mcp.test.mjs` locks the local MCP capability policy while keeping process transport concerns in the executable entrypoint.
 
-The Node test suite verifies the exact seven disabled tools, discovery filtering, stale disabled-call errors, and supported-message passthrough against the importable launcher library.
+The Node test suite verifies the seven disabled tools, discovery filtering, prompt-only interact rewriting, clear rejection of stale code-mode calls, and supported prompt/stop passthrough against the importable launcher library.
 
 ## API-managed local acceptance
 

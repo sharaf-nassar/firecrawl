@@ -90,6 +90,8 @@ The launcher disables Agent start and status because they require the external F
 
 The same launcher disables paper search, paper inspection, related-paper lookup, paper reading, and GitHub research because `RESEARCH_PROXY_URL` is not configured. Core local tools and prompt-driven browser interaction continue to target `http://127.0.0.1:3002`.
 
+For `firecrawl_interact`, the launcher replaces upstream code-mode advertising with the local prompt-only contract. Its schema omits `code`, restricts `language` to `node`, and rejects stale code-mode calls as invalid parameters before they reach the API.
+
 ## Lifecycle lock
 
 All lifecycle and diagnostic commands coordinate through a per-user, per-project advisory lock.
