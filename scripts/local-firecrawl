@@ -1320,6 +1320,65 @@ show_logs() {
     redact_local_logs
 }
 
+run_quiet_health_probe() {
+  local label="$1"
+  local output
+  local status
+
+  shift
+  if output="$("$@" 2>&1)"; then
+    return 0
+  else
+    status=$?
+  fi
+
+  printf 'Health check failed: %s\n' "$label" >&2
+  if [[ -n "$output" ]]; then
+    while IFS= read -r line; do
+      printf '  %s\n' "$line" >&2
+    done <<< "$output"
+  fi
+  return "$status"
+}
+
+print_health_report() {
+  local bold_green=
+  local cyan=
+  local green=
+  local reset=
+
+  if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-}" != dumb ]]; then
+    bold_green=$'\033[1;32m'
+    cyan=$'\033[36m'
+    green=$'\033[32m'
+    reset=$'\033[0m'
+  fi
+
+  printf 'Local Firecrawl health: %sPASS%s\n' "$bold_green" "$reset"
+  printf 'Endpoint: http://127.0.0.1:%s\n' "${PORT:-3002}"
+  printf '\n%sDependencies%s\n' "$cyan" "$reset"
+  printf '  %-30s %sPASS%s\n' \
+    'Redis' "$green" "$reset" \
+    'RabbitMQ' "$green" "$reset" \
+    'PostgreSQL (application)' "$green" "$reset" \
+    'PostgreSQL (NuQ)' "$green" "$reset" \
+    'MinIO' "$green" "$reset"
+  printf '\n%sApplication%s\n' "$cyan" "$reset"
+  printf '  %-30s %sPASS%s (%s)\n' \
+    'Migration' "$green" "$reset" "$health_migration"
+  printf '  %-30s %sPASS%s\n' \
+    'Initialization jobs' "$green" "$reset" \
+    'Artifact access policy' "$green" "$reset" \
+    'Public API' "$green" "$reset" \
+    'Loopback port policy' "$green" "$reset"
+  printf '\n%sBrowser runtime%s\n' "$cyan" "$reset"
+  printf '  %-30s %sPASS%s\n' \
+    'Playwright' "$green" "$reset" \
+    'Browser Service' "$green" "$reset" \
+    'Interaction worker' "$green" "$reset" \
+    'Egress proxy' "$green" "$reset"
+}
+
 verify_health() {
   local api_container_id
   local latest_applied_checksum
@@ -1340,10 +1399,13 @@ verify_health() {
       "$redis_response" >&2
     return 1
   fi
-  "${compose[@]}" exec -T rabbitmq rabbitmq-diagnostics -q check_running
-  "${compose[@]}" exec -T nuq-postgres sh -c \
+  run_quiet_health_probe 'RabbitMQ' \
+    "${compose[@]}" exec -T rabbitmq rabbitmq-diagnostics -q check_running
+  run_quiet_health_probe 'NuQ PostgreSQL' \
+    "${compose[@]}" exec -T nuq-postgres sh -c \
     'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-  "${compose[@]}" exec -T app-postgres sh -c \
+  run_quiet_health_probe 'application PostgreSQL' \
+    "${compose[@]}" exec -T app-postgres sh -c \
     'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
   latest_checked_in_migration="$(
@@ -1382,10 +1444,12 @@ verify_health() {
   require_completed_one_shot browser-state-init
   require_completed_one_shot app-db-migrate
   require_completed_one_shot minio-init
-  "${compose[@]}" exec -T minio curl --fail --silent --show-error \
+  run_quiet_health_probe 'MinIO liveness' \
+    "${compose[@]}" exec -T minio curl --fail --silent --show-error \
     --max-time 10 --output /dev/null \
     http://127.0.0.1:9000/minio/health/live
-  "${compose[@]}" exec -T api sh -ec \
+  run_quiet_health_probe 'artifact access policy' \
+    "${compose[@]}" exec -T api sh -ec \
     'test -z "${MINIO_ROOT_USER+x}" && test -z "${MINIO_ROOT_PASSWORD+x}" && node dist/src/cli/artifact-health.js'
   "${compose[@]}" exec -T playwright-service node -e \
     "fetch('http://127.0.0.1:3000/health', {
@@ -1543,8 +1607,7 @@ case "$command" in
           browserInteractionWorker:"healthy",
           browserInteractionEgressProxy:"healthy"}'
     else
-      printf '%s\n' \
-        "Local Firecrawl is healthy at http://127.0.0.1:${PORT:-3002}; migrations: $health_migration; artifacts: MinIO; browser service: PASS; browser interaction worker: PASS; browser interaction egress proxy: PASS"
+      print_health_report
     fi
     ;;
   logs)

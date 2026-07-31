@@ -4,5 +4,6 @@ Runtime documentation covers specialized browser, model-decision, conversion, an
 
 - [[browser-service]] — Stateful replayable Chromium sessions, generation fencing, profile persistence, artifacts, and streams.
 - [[browser-interaction]] — Constrained Codex decision worker, Unix-socket protocol, deadlines, and isolated model egress.
+- [[codex-shim]] — Host-side OpenAI chat-completion adapter for ephemeral Codex CLI execution.
 - [[playwright-service]] — Stateless Playwright scrape lifecycle, target security, and checkpoint capture.
 - [[support-services]] — HTML conversion, NuQ Postgres, Redis, RabbitMQ, and optional FoundationDB.

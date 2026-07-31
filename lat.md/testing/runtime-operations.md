@@ -50,6 +50,12 @@ The suite does not exercise `createWorkerServer`, request authentication and cap
 
 Those behaviors are partially constrained by local Compose validation and health checks, but need package-level failure and race tests for deterministic regression coverage.
 
+## Codex Shim suite
+
+`apps/codex-shim/` uses Node's built-in test runner to verify the OpenAI-to-Codex translation boundary without contacting model providers.
+
+The suite places a recording `codex` stub first on `PATH`. It covers message and argv translation, exact schema-file creation and cleanup, final-message event parsing, FIFO concurrency, chat and embeddings routes, and secret-safe OpenAI error responses.
+
 ## Playwright service suite
 
 `apps/playwright-service-ts/` uses Node's test runner through `tsx`.

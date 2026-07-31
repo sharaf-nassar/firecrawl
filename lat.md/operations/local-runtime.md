@@ -138,7 +138,9 @@ API, interaction worker, and Browser Service stop first, then the egress proxy, 
 
 Checks include Redis `PONG`, RabbitMQ diagnostics, both Postgres servers, latest migration filename and checksum, successful one-shots, MinIO liveness and restricted application artifact access, Playwright health, Browser Service authenticated liveness, egress socket, worker readiness, public API, and loopback-only port policy.
 
-`--json` returns endpoint, migration, artifact provider, and browser component status. A healthy container with a stale migration, wrong checksum, failed canary, inaccessible artifact policy, or unexpected port still fails overall health.
+Human output groups passing checks by dependency, application, and browser runtime. Interactive terminals use restrained status color unless `NO_COLOR` is set or `TERM=dumb`; pipes, logs, and JSON remain ANSI-free. Successful probe chatter stays hidden and failed probes retain named diagnostics.
+
+`--json` returns only the endpoint, migration, artifact provider, and browser component status JSON object. A healthy container with a stale migration, wrong checksum, failed canary, inaccessible artifact policy, or unexpected port still fails overall health.
 
 ## Egress probe
 

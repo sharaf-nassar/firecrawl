@@ -37,6 +37,154 @@
 
 ---
 
+## Local Self-Hosted Runtime
+
+This repository is a fork of the upstream
+[Firecrawl repository](https://github.com/firecrawl/firecrawl), maintained to
+provide a hardened, Docker-only local runtime. It keeps Firecrawl's control
+plane and durable state on the machine while supporting stateful,
+Codex-driven browser interaction. See
+[Local Firecrawl](./LOCAL_DEPLOYMENT.md) for setup, configuration, and recovery
+procedures.
+
+### Stack and persistence
+
+The local Compose topology publishes only the Firecrawl API at
+`http://127.0.0.1:3002`. Playwright, Browser Service, Redis, RabbitMQ, MinIO,
+application PostgreSQL, and NuQ PostgreSQL remain on private networks.
+
+Named volumes preserve queue state, application records, artifacts, browser
+profiles and replay checkpoints, worker-owned Codex authentication, and the
+Unix sockets between trust boundaries. Initialization jobs create the browser
+state layout, apply checked-in database migrations, and provision the
+restricted MinIO artifact bucket before the API becomes ready. Normal
+lifecycle operations never delete these volumes.
+
+This is the active runtime architecture. It does not install systemd units,
+sudoers or polkit policy, a privileged host broker, OCI/rootfs bundles, or an
+arbitrary-code execution runtime.
+
+### Lifecycle and local clients
+
+Use the repository wrapper for all lifecycle and diagnostics:
+
+```bash
+scripts/local-firecrawl start
+scripts/local-firecrawl stop
+scripts/local-firecrawl restart
+scripts/local-firecrawl status
+scripts/local-firecrawl health
+scripts/local-firecrawl logs
+scripts/local-firecrawl probe-egress
+```
+
+The wrapper serializes maintenance, validates Compose provenance and security
+invariants, rebuilds local images, runs bounded one-shot jobs, orders startup
+and shutdown, waits for application health, and emits bounded, redacted
+diagnostics. `status` and `health` also support `--json`.
+
+SDKs can use `http://127.0.0.1:3002` as their API URL. Claude Code and Codex
+use `scripts/local-firecrawl-mcp`, which filters the external Firecrawl MCP
+server to the capabilities configured by this stack, with
+`FIRECRAWL_API_URL=http://127.0.0.1:3002`; no paid Firecrawl API key is needed
+for this endpoint. The MCP path supports scrape, crawl, map, search, and local
+browser interaction. Agent and research-proxy tools remain listed in the
+launcher source but are not advertised or callable until their external
+services are configured. Batch operations remain available through the local
+REST API.
+
+### Stateful browser interaction
+
+Browser Service owns authenticated browser leases, persistent profiles,
+absolute and idle expiry, CDP and live-view proxying, replay state, artifacts,
+restart reconciliation, and ordered shutdown. The API owns the interaction
+loop and validates every model-selected action before Browser Service executes
+it.
+
+The Docker interaction worker runs one ephemeral, structured Codex decision at
+a time. It automatically discovers the active local `@openai/codex` package
+and authentication, so the repository does not pin a Codex version, model, or
+reasoning effort. Codex has no browser, shell, file-editing, MCP, web-search,
+or agent tools in the worker; it can only return one schema-validated action
+or a plain-text final answer.
+
+Supported typed actions are:
+
+- `navigate`
+- `click`
+- `hover`
+- `hover_batch`
+- `type`
+- `wait`
+- `extract`
+- `screenshot`
+
+Actions use current observation refs instead of model-generated selectors.
+The runtime rejects stale refs, performs actionability trials before real
+pointer effects, bounds request and result sizes, and returns a fresh
+observation after each effect.
+
+### Isolation and model egress
+
+The interaction worker has no application or internet network membership. It
+serves authenticated HTTP over a private Unix socket shared with the API and
+reaches the model only through a second Unix socket and a dedicated egress
+proxy.
+
+That proxy accepts CONNECT requests only for allowlisted OpenAI and ChatGPT
+hosts on port 443. It rejects plaintext HTTP, IP literals, private and metadata
+addresses, DNS rebinding, and TLS SNI mismatches. Worker and proxy containers
+use read-only roots, non-root users, dropped capabilities,
+`no-new-privileges`, resource limits, and small `noexec` temporary filesystems.
+The API cannot access Codex credentials or the model-egress socket.
+
+### Durable execution and bounded completion
+
+Interaction runs persist their action history and terminal state. Browser
+effects are replay-safe by run and sequence, cancellation propagates through
+the API and worker, and retries do not repeat a previously committed click,
+type, or pointer movement.
+
+One absolute deadline governs the whole run. The worker reserves part of that
+budget for final synthesis and forces a final response when the action limit
+or final-only window is reached. If Codex times out after collecting valid
+evidence, Firecrawl returns a deterministic, UTF-8-bounded evidence summary
+instead of losing the run to a generic timeout or missing-job error.
+
+### Tooltips and dynamic page evidence
+
+`hover_batch` inspects up to 16 unique current refs as one bounded,
+replay-safe action. It prevalidates the batch, preserves result order,
+continues through typed per-target failures, and captures newly visible
+tooltip text without site-specific selectors.
+
+Element observations expose only a small allowlist of interaction hints such
+as `data-tooltip-trigger`, `data-tooltip-id`, `title`,
+`aria-describedby`, and `aria-haspopup`. Tooltip evidence includes portals,
+open and nested open shadow roots, and visible `::before` and `::after`
+content, with strict traversal and byte limits. Closed shadow roots remain
+outside the browser-visible contract.
+
+### Health, validation, and capability boundaries
+
+The health gate verifies both PostgreSQL databases, migration identity and
+checksums, Redis, RabbitMQ, MinIO policy and artifact access, Playwright,
+authenticated Browser Service liveness, worker canary-backed readiness, egress
+socket availability, public API behavior, and loopback-only host ports.
+Focused suites cover lifecycle recovery, browser persistence and replay,
+operation contracts, deadline fallback, egress policy, migrations, shutdown,
+and tooltip extraction; the complete path has also been exercised through a
+real local MCP session.
+
+This topology provides local scrape, crawl, map, search, batch API, and
+stateful prompt-driven browser capabilities. It does not imply parity with
+hosted Agent, managed Browser sandbox, Actions, managed proxies, or hosted AI
+extraction; those require separately configured services. Model calls still
+use the locally authenticated OpenAI Codex service even though Firecrawl
+requests no longer use the paid Firecrawl cloud.
+
+---
+
 # **🔥 Firecrawl**
 
 **The API to search, scrape, and interact with the web at scale. 🔥** The web context API to find sources, extract content, and turn it into clean Markdown or structured data your agents can ship with. Open source and available as a [hosted service](https://firecrawl.dev/?ref=github).
@@ -759,149 +907,3 @@ This project is primarily licensed under the GNU Affero General Public License v
     ↑ Back to Top ↑
   </a>
 </p>
-
----
-
-## Local Self-Hosted Runtime
-
-This checkout includes a hardened, Docker-only local deployment that keeps
-Firecrawl's control plane and durable state on the machine while supporting
-stateful, Codex-driven browser interaction. See
-[Local Firecrawl](./LOCAL_DEPLOYMENT.md) for setup, configuration, and recovery
-procedures.
-
-### Stack and persistence
-
-The local Compose topology publishes only the Firecrawl API at
-`http://127.0.0.1:3002`. Playwright, Browser Service, Redis, RabbitMQ, MinIO,
-application PostgreSQL, and NuQ PostgreSQL remain on private networks.
-
-Named volumes preserve queue state, application records, artifacts, browser
-profiles and replay checkpoints, worker-owned Codex authentication, and the
-Unix sockets between trust boundaries. Initialization jobs create the browser
-state layout, apply checked-in database migrations, and provision the
-restricted MinIO artifact bucket before the API becomes ready. Normal
-lifecycle operations never delete these volumes.
-
-This is the active runtime architecture. It does not install systemd units,
-sudoers or polkit policy, a privileged host broker, OCI/rootfs bundles, or an
-arbitrary-code execution runtime.
-
-### Lifecycle and local clients
-
-Use the repository wrapper for all lifecycle and diagnostics:
-
-```bash
-scripts/local-firecrawl start
-scripts/local-firecrawl stop
-scripts/local-firecrawl restart
-scripts/local-firecrawl status
-scripts/local-firecrawl health
-scripts/local-firecrawl logs
-scripts/local-firecrawl probe-egress
-```
-
-The wrapper serializes maintenance, validates Compose provenance and security
-invariants, rebuilds local images, runs bounded one-shot jobs, orders startup
-and shutdown, waits for application health, and emits bounded, redacted
-diagnostics. `status` and `health` also support `--json`.
-
-SDKs can use `http://127.0.0.1:3002` as their API URL. Claude Code and Codex
-use `scripts/local-firecrawl-mcp`, which filters the external Firecrawl MCP
-server to the capabilities configured by this stack, with
-`FIRECRAWL_API_URL=http://127.0.0.1:3002`; no paid Firecrawl API key is needed
-for this endpoint. The MCP path supports scrape, crawl, map, search, and local
-browser interaction. Agent and research-proxy tools remain listed in the
-launcher source but are not advertised or callable until their external
-services are configured. Batch operations remain available through the local
-REST API.
-
-### Stateful browser interaction
-
-Browser Service owns authenticated browser leases, persistent profiles,
-absolute and idle expiry, CDP and live-view proxying, replay state, artifacts,
-restart reconciliation, and ordered shutdown. The API owns the interaction
-loop and validates every model-selected action before Browser Service executes
-it.
-
-The Docker interaction worker runs one ephemeral, structured Codex decision at
-a time. It automatically discovers the active local `@openai/codex` package
-and authentication, so the repository does not pin a Codex version, model, or
-reasoning effort. Codex has no browser, shell, file-editing, MCP, web-search,
-or agent tools in the worker; it can only return one schema-validated action
-or a plain-text final answer.
-
-Supported typed actions are:
-
-- `navigate`
-- `click`
-- `hover`
-- `hover_batch`
-- `type`
-- `wait`
-- `extract`
-- `screenshot`
-
-Actions use current observation refs instead of model-generated selectors.
-The runtime rejects stale refs, performs actionability trials before real
-pointer effects, bounds request and result sizes, and returns a fresh
-observation after each effect.
-
-### Isolation and model egress
-
-The interaction worker has no application or internet network membership. It
-serves authenticated HTTP over a private Unix socket shared with the API and
-reaches the model only through a second Unix socket and a dedicated egress
-proxy.
-
-That proxy accepts CONNECT requests only for allowlisted OpenAI and ChatGPT
-hosts on port 443. It rejects plaintext HTTP, IP literals, private and metadata
-addresses, DNS rebinding, and TLS SNI mismatches. Worker and proxy containers
-use read-only roots, non-root users, dropped capabilities,
-`no-new-privileges`, resource limits, and small `noexec` temporary filesystems.
-The API cannot access Codex credentials or the model-egress socket.
-
-### Durable execution and bounded completion
-
-Interaction runs persist their action history and terminal state. Browser
-effects are replay-safe by run and sequence, cancellation propagates through
-the API and worker, and retries do not repeat a previously committed click,
-type, or pointer movement.
-
-One absolute deadline governs the whole run. The worker reserves part of that
-budget for final synthesis and forces a final response when the action limit
-or final-only window is reached. If Codex times out after collecting valid
-evidence, Firecrawl returns a deterministic, UTF-8-bounded evidence summary
-instead of losing the run to a generic timeout or missing-job error.
-
-### Tooltips and dynamic page evidence
-
-`hover_batch` inspects up to 16 unique current refs as one bounded,
-replay-safe action. It prevalidates the batch, preserves result order,
-continues through typed per-target failures, and captures newly visible
-tooltip text without site-specific selectors.
-
-Element observations expose only a small allowlist of interaction hints such
-as `data-tooltip-trigger`, `data-tooltip-id`, `title`,
-`aria-describedby`, and `aria-haspopup`. Tooltip evidence includes portals,
-open and nested open shadow roots, and visible `::before` and `::after`
-content, with strict traversal and byte limits. Closed shadow roots remain
-outside the browser-visible contract.
-
-### Health, validation, and capability boundaries
-
-The health gate verifies both PostgreSQL databases, migration identity and
-checksums, Redis, RabbitMQ, MinIO policy and artifact access, Playwright,
-authenticated Browser Service liveness, worker canary-backed readiness, egress
-socket availability, public API behavior, and loopback-only host ports.
-Focused suites cover lifecycle recovery, browser persistence and replay,
-operation contracts, deadline fallback, egress policy, migrations, shutdown,
-and tooltip extraction; the complete path has also been exercised through a
-real local MCP session.
-
-This topology provides local scrape, crawl, map, search, batch API, and
-stateful prompt-driven browser capabilities. It does not imply parity with
-hosted Agent, managed Browser sandbox, Actions, managed proxies, or hosted AI
-extraction; those require separately configured services. Model calls still
-use the locally authenticated OpenAI Codex service even though Firecrawl
-requests no longer use the paid Firecrawl cloud.
