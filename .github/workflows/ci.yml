@@ -89,7 +89,14 @@ jobs:
           --target browser-test -t firecrawl-browser-test .
 
       - name: Run Browser Service tests
-        run: docker run --rm --init firecrawl-browser-test pnpm test
+        run: >-
+          docker run --rm --init
+          --mount
+          type=bind,source=${GITHUB_WORKSPACE}/apps/browser-service/Dockerfile,target=/app/apps/browser-service/Dockerfile,readonly
+          firecrawl-browser-test
+          pnpm exec vitest run --no-file-parallelism
+          src/atomic-directory-publication.integration.test.ts
+          src/dockerfile.test.ts
 
       - name: Build Browser Service runtime image
         run: >-
