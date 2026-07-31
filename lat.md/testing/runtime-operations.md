@@ -86,6 +86,12 @@ They do not start real containers, run migrations, validate MinIO policy, execut
 
 Live acceptance should use `scripts/local-firecrawl start`, one `health` pass, targeted egress and browser checks, then ordered `stop` without deleting volumes.
 
+## Local MCP launcher suite
+
+`scripts/local-firecrawl-mcp.test.mjs` locks the local MCP capability filter's static policy while keeping process transport concerns in the executable entrypoint.
+
+The Node test suite verifies the exact seven disabled tools, discovery filtering, stale disabled-call errors, and supported-message passthrough against the importable launcher library.
+
 ## API-managed local acceptance
 
 API harness commands provide narrower live acceptance for local persistence and Browser Service without assembling the wrapper-managed Compose stack.

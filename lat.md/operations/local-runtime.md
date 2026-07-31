@@ -84,7 +84,9 @@ The host auth seed is mounted read-only. Refreshed state lives only in `codex-au
 
 The checked-in MCP launcher exposes only capabilities backed by the configured local stack while preserving disabled upstream tool names for future enablement.
 
-`scripts/local-firecrawl-mcp` launches the external Firecrawl MCP package and filters both discovery and stale direct calls. It disables Agent start and status because they require the external Firecrawl Agent service.
+`scripts/local-firecrawl-mcp` is the thin stdio and signal-handling entrypoint for the external Firecrawl MCP package. Its importable library owns the disabled-tool set plus discovery and stale-call filtering.
+
+The launcher disables Agent start and status because they require the external Firecrawl Agent service.
 
 The same launcher disables paper search, paper inspection, related-paper lookup, paper reading, and GitHub research because `RESEARCH_PROXY_URL` is not configured. Core local tools and prompt-driven browser interaction continue to target `http://127.0.0.1:3002`.
 

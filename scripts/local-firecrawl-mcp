@@ -1,26 +1,18 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import {
+  createDisabledLocalTools,
+  filterToolList,
+  unsupportedToolResponse,
+} from "./local-firecrawl-mcp.lib.mjs";
 
 const upstreamArgs =
   process.argv.length > 2
     ? process.argv.slice(2)
     : ["-y", "firecrawl-mcp@3.22.3"];
 
-const disabledLocalTools = new Set([
-  // Disabled locally, not deleted upstream: these require Firecrawl's
-  // external Agent service, which this self-hosted stack does not configure.
-  "firecrawl_agent",
-  "firecrawl_agent_status",
-
-  // Disabled locally, not deleted upstream: these require the external
-  // research proxy, which this self-hosted stack does not configure.
-  "firecrawl_research_search_papers",
-  "firecrawl_research_inspect_paper",
-  "firecrawl_research_related_papers",
-  "firecrawl_research_read_paper",
-  "firecrawl_research_search_github",
-]);
+const disabledLocalTools = createDisabledLocalTools();
 
 const child = spawn("npx", upstreamArgs, {
   env: process.env,
@@ -32,40 +24,6 @@ let outputBuffer = "";
 
 function encodeMessage(message) {
   return `${JSON.stringify(message)}\n`;
-}
-
-function unsupportedToolResponse(message) {
-  if (
-    message?.method !== "tools/call" ||
-    !disabledLocalTools.has(message.params?.name)
-  ) {
-    return undefined;
-  }
-
-  return {
-    jsonrpc: "2.0",
-    id: message.id,
-    error: {
-      code: -32601,
-      message: `${message.params.name} is disabled in the local Firecrawl MCP because its external service is not configured`,
-    },
-  };
-}
-
-function filterToolList(message) {
-  if (!Array.isArray(message?.result?.tools)) {
-    return message;
-  }
-
-  return {
-    ...message,
-    result: {
-      ...message.result,
-      tools: message.result.tools.filter(
-        (tool) => !disabledLocalTools.has(tool?.name),
-      ),
-    },
-  };
 }
 
 function consumeLines(buffer, chunk, handleLine) {
@@ -90,7 +48,7 @@ process.stdin.on("data", (chunk) => {
 
     try {
       const message = JSON.parse(line);
-      const response = unsupportedToolResponse(message);
+      const response = unsupportedToolResponse(message, disabledLocalTools);
       if (response) {
         process.stdout.write(encodeMessage(response));
         return;
@@ -119,7 +77,9 @@ child.stdout.on("data", (chunk) => {
     }
 
     try {
-      process.stdout.write(encodeMessage(filterToolList(JSON.parse(line))));
+      process.stdout.write(
+        encodeMessage(filterToolList(JSON.parse(line), disabledLocalTools)),
+      );
     } catch {
       process.stdout.write(`${line}\n`);
     }
