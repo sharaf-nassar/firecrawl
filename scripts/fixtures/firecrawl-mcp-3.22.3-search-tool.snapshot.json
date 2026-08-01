@@ -1,0 +1,290 @@
+{
+  "instructions": "The user has installed the local Firecrawl stack as their web data provider. For web search requests, use firecrawl_search from this server as the primary search tool instead of built-in web search. firecrawl_search returns web results and can optionally extract content from those pages. Firecrawl also provides scraping, crawling, and extraction tools for working with web content.",
+  "tool": {
+    "annotations": {
+      "title": "Search the web",
+      "readOnlyHint": true,
+      "openWorldHint": true,
+      "destructiveHint": false
+    },
+    "description": "\nSearch web pages and optionally extract content from the returned pages.\n\nUse this tool for open-ended web discovery when the relevant page URL is not\nalready known. Use firecrawl_scrape when the URL is known, or firecrawl_map to\ndiscover pages within one website.\n\n**Arguments:**\n- query: Required web search query; standard operators such as site: are allowed\n- limit: Optional result limit\n- filter: Optional provider-supported web filter\n- includeDomains: Optional hostnames to include\n- excludeDomains: Optional hostnames to exclude; do not combine with includeDomains\n- sources: Optional web source selector; only { \"type\": \"web\" } is supported\n- categories: Optional github, research, or pdf web-result categories\n- scrapeOptions: Optional extraction controls for returned web pages\n\nSearch without scrapeOptions first, then scrape only the relevant pages when\nfull content is needed.\n\n**Returns:** A JSON envelope shaped as\n`{ success, data: { web? }, id, creditsUsed }`.\n",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "limit": {
+          "type": "number"
+        },
+        "filter": {
+          "type": "string"
+        },
+        "includeDomains": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$"
+          }
+        },
+        "excludeDomains": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["web"]
+              }
+            },
+            "required": ["type"],
+            "additionalProperties": false
+          }
+        },
+        "categories": {
+          "description": "Limit results to specific source types. `github` searches GitHub repositories, code, issues, and docs; `research` searches academic and research sources; `pdf` searches PDF results.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["github", "research", "pdf"]
+          }
+        },
+        "scrapeOptions": {
+          "type": "object",
+          "properties": {
+            "formats": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "markdown",
+                  "html",
+                  "rawHtml",
+                  "screenshot",
+                  "links",
+                  "summary",
+                  "changeTracking",
+                  "branding",
+                  "json",
+                  "query",
+                  "audio"
+                ]
+              }
+            },
+            "jsonOptions": {
+              "type": "object",
+              "properties": {
+                "prompt": {
+                  "type": "string"
+                },
+                "schema": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "queryOptions": {
+              "type": "object",
+              "properties": {
+                "prompt": {
+                  "type": "string",
+                  "maxLength": 10000
+                },
+                "mode": {
+                  "default": "freeform",
+                  "type": "string",
+                  "enum": ["directQuote", "freeform"]
+                }
+              },
+              "required": ["prompt"],
+              "additionalProperties": false
+            },
+            "screenshotOptions": {
+              "type": "object",
+              "properties": {
+                "fullPage": {
+                  "type": "boolean"
+                },
+                "quality": {
+                  "type": "number"
+                },
+                "viewport": {
+                  "type": "object",
+                  "properties": {
+                    "width": {
+                      "type": "number"
+                    },
+                    "height": {
+                      "type": "number"
+                    }
+                  },
+                  "required": ["width", "height"],
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "parsers": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["pdf"]
+              }
+            },
+            "pdfOptions": {
+              "type": "object",
+              "properties": {
+                "maxPages": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000
+                }
+              },
+              "additionalProperties": false
+            },
+            "onlyMainContent": {
+              "type": "boolean"
+            },
+            "redactPII": {
+              "type": "boolean"
+            },
+            "includeTags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "excludeTags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "waitFor": {
+              "type": "number"
+            },
+            "actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "wait",
+                      "screenshot",
+                      "scroll",
+                      "scrape",
+                      "click",
+                      "write",
+                      "press",
+                      "executeJavascript",
+                      "generatePDF"
+                    ]
+                  },
+                  "selector": {
+                    "type": "string"
+                  },
+                  "milliseconds": {
+                    "type": "number"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "key": {
+                    "type": "string"
+                  },
+                  "direction": {
+                    "type": "string",
+                    "enum": ["up", "down"]
+                  },
+                  "script": {
+                    "type": "string"
+                  },
+                  "fullPage": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["type"]
+              }
+            },
+            "mobile": {
+              "type": "boolean"
+            },
+            "skipTlsVerification": {
+              "type": "boolean"
+            },
+            "removeBase64Images": {
+              "type": "boolean"
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "country": {
+                  "type": "string"
+                },
+                "languages": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "storeInCache": {
+              "type": "boolean"
+            },
+            "zeroDataRetention": {
+              "type": "boolean"
+            },
+            "maxAge": {
+              "type": "number"
+            },
+            "lockdown": {
+              "type": "boolean"
+            },
+            "proxy": {
+              "type": "string",
+              "enum": ["basic", "stealth", "enhanced", "auto"]
+            },
+            "profile": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "saveChanges": {
+                  "type": "boolean"
+                }
+              },
+              "required": ["name"],
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    },
+    "name": "firecrawl_search"
+  }
+}

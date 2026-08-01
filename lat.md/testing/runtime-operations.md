@@ -136,9 +136,9 @@ Live acceptance should use `scripts/local-firecrawl start`, one `health` pass, t
 
 `scripts/local-firecrawl-mcp.test.mjs` locks the local MCP capability policy while keeping process transport concerns in the executable entrypoint.
 
-The Node test suite verifies the seven disabled tools, discovery filtering, prompt-only interact rewriting, clear rejection of stale code-mode calls, and supported prompt/stop passthrough against the importable launcher library.
+The Node test suite verifies eight disabled tools, discovery filtering, prompt-only interaction, and web-only search instructions and schema. It proves stale interaction and unsupported local search calls stop before upstream execution with their exact protocol errors.
 
-It also deep-compares the rewritten pinned upstream registration with a checked-in snapshot and requires the executable package pin to equal the fixture's recorded version.
+Provider-result cases cover exact 502 and 503 error JSON, one text block, call-ID correlation, valid empty success, and unrelated-error passthrough. Pinned interact and search registrations deep-compare with independent snapshots, and fixtures must match the executable package pin.
 
 ## API-managed local acceptance
 

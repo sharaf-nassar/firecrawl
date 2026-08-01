@@ -5,6 +5,9 @@ import {
   createDisabledLocalTools,
   filterToolList,
   interceptCodeCall,
+  interceptUnsupportedSearchCall,
+  isSearchToolCall,
+  rewriteSearchCallResult,
   unsupportedToolResponse,
 } from "./local-firecrawl-mcp.lib.mjs";
 
@@ -14,6 +17,7 @@ const upstreamArgs =
     : ["-y", "firecrawl-mcp@3.22.3"];
 
 const disabledLocalTools = createDisabledLocalTools();
+const pendingSearchCallIds = new Set();
 
 const child = spawn("npx", upstreamArgs, {
   env: process.env,
@@ -51,10 +55,14 @@ process.stdin.on("data", (chunk) => {
       const message = JSON.parse(line);
       const response =
         unsupportedToolResponse(message, disabledLocalTools) ??
-        interceptCodeCall(message);
+        interceptCodeCall(message) ??
+        interceptUnsupportedSearchCall(message);
       if (response) {
         process.stdout.write(encodeMessage(response));
         return;
+      }
+      if (isSearchToolCall(message) && message.id !== undefined) {
+        pendingSearchCallIds.add(message.id);
       }
     } catch {
       // Preserve non-JSON output so protocol errors remain attributable upstream.
@@ -80,8 +88,9 @@ child.stdout.on("data", (chunk) => {
     }
 
     try {
+      const message = filterToolList(JSON.parse(line), disabledLocalTools);
       process.stdout.write(
-        encodeMessage(filterToolList(JSON.parse(line), disabledLocalTools)),
+        encodeMessage(rewriteSearchCallResult(message, pendingSearchCallIds)),
       );
     } catch {
       process.stdout.write(`${line}\n`);

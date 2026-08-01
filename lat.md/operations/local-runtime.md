@@ -88,15 +88,21 @@ The host auth seed is mounted read-only. Refreshed state lives only in `codex-au
 
 The checked-in MCP launcher exposes only capabilities backed by the configured local stack while preserving disabled upstream tool names for future enablement.
 
-`scripts/local-firecrawl-mcp` is the thin stdio and signal-handling entrypoint for the external Firecrawl MCP package. Its importable library owns the disabled-tool set plus discovery and stale-call filtering.
+`scripts/local-firecrawl-mcp` is the thin stdio and signal-handling entrypoint for the external Firecrawl MCP package. Its importable library owns disabled tools, discovery and instruction rewrites, stale-call filtering, and local search result translation.
 
 The launcher disables Agent start and status because they require the external Firecrawl Agent service.
 
 The same launcher disables paper search, paper inspection, related-paper lookup, paper reading, and GitHub research because `RESEARCH_PROXY_URL` is not configured. Core local tools and prompt-driven browser interaction continue to target `http://127.0.0.1:3002`.
 
+Local discovery removes `firecrawl_search_feedback` and replaces upstream search instructions and schema with the web-only contract. Search keeps query, limit, filter, domain, category, and scrape controls while exposing only the `web` source.
+
+Direct calls that bypass discovery cannot request non-web sources, geo or recency controls, enterprise mode, or feedback. The launcher rejects them as JSON-RPC `-32602 Invalid params` with data code `LOCAL_SEARCH_WEB_ONLY` before the upstream package or API sees them.
+
+The launcher correlates forwarded search call IDs because the pinned upstream package discards typed REST error bodies. Search HTTP 502 and 503 responses become `isError` tool results with one compact canonical JSON text block; legitimate empty web results pass through as successful calls.
+
 For `firecrawl_interact`, the launcher replaces upstream code-mode advertising with the local prompt-only contract. Its schema omits `code`, restricts `language` to `node`, and rejects stale code-mode calls as invalid parameters before they reach the API.
 
-The launcher pins `firecrawl-mcp@3.22.3`. A captured upstream registration and independent prompt-only snapshot make package-pin or tool-schema drift require an explicit fixture update.
+The launcher pins `firecrawl-mcp@3.22.3`. Captured upstream interact and search registrations plus independent local snapshots make package-pin, instruction, or tool-schema drift require an explicit fixture update.
 
 ## Lifecycle lock
 
