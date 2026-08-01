@@ -233,6 +233,16 @@ export const configSchema = z.object({
   SEARXNG_ENDPOINT: z.string().optional(),
   SEARXNG_ENGINES: z.string().optional(),
   SEARXNG_CATEGORIES: z.string().optional(),
+  LOCAL_SEARCH_WEB_ONLY: z.stringbool().optional(),
+  SEARCH_PROVIDER_TIMEOUT_MS: emptyStringAsDefault(
+    z.coerce.number().int().min(1000).max(30000).default(10000),
+  ),
+  SEARCH_PROVIDER_MAX_RESULTS: emptyStringAsDefault(
+    z.coerce.number().int().positive().max(100).default(100),
+  ),
+  SEARCH_PROVIDER_MAX_CONCURRENCY: emptyStringAsDefault(
+    z.coerce.number().int().positive().max(4).default(4),
+  ),
   SEARCH_SERVICE_URL: z.string().optional(),
   SEARCH_INDEX_SAMPLE_RATE: z.coerce.number().default(0.1),
   ENABLE_SEARCH_INDEX: z.stringbool().optional(),

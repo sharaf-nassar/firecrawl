@@ -14,9 +14,11 @@ Package scripts select environments by excluding authenticated, unauthenticated,
 
 Most tests are colocated beside the library, controller, scraper, search, or service behavior they protect.
 
-High-density areas include browser runtime/state, scrape interactions and replay, artifact manifests/providers, index cache, keyless accounting, authentication helpers, billing, feedback refunds, monitoring, webhook filters, deterministic JSON, URL validation, search highlighting, and engine utilities.
+High-density areas include browser runtime/state, scrape interactions and replay, artifact manifests/providers, index cache, keyless accounting, authentication helpers, billing, feedback refunds, monitoring, webhook filters, deterministic JSON, URL validation, search provider contracts, highlighting, and engine utilities.
 
 These tests usually replace external dependencies and focus on state transitions, schema projection, retry policy, privacy, and edge conditions.
+
+Search provider unit tests fix the local and non-local precedence matrix, SearXNG POST/deadline/result/page/concurrency bounds, strict engine diagnostics, canonical errors, valid empty results, partial warnings, and zero application retries.
 
 ## Queue and worker tests
 

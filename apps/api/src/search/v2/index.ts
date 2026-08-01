@@ -1,8 +1,7 @@
 import { SearchV2Response, SearchResultType } from "../../lib/entities";
-import { config } from "../../config";
 import { fire_engine_search_v2 } from "./fireEngine-v2";
-import { searxng_search } from "./searxng";
-import { ddgSearch } from "./ddgsearch";
+import { searxng_search } from "../searxng";
+import { resolveSearchProvider } from "../provider";
 import { Logger } from "winston";
 
 export async function search({
@@ -36,50 +35,27 @@ export async function search({
   type?: SearchResultType | SearchResultType[];
   enterprise?: ("default" | "anon" | "zdr")[];
 }): Promise<SearchV2Response> {
-  try {
-    if (config.FIRE_ENGINE_BETA_URL) {
-      logger.info("Using fire engine search");
-      const results = await fire_engine_search_v2(query, {
-        numResults: num_results,
-        tbs,
-        filter,
-        lang,
-        country,
-        location,
-        type,
-        enterprise,
-      });
-
-      return results;
-    }
-
-    if (config.SEARXNG_ENDPOINT) {
-      logger.info("Using searxng search");
-      const results = await searxng_search(query, {
-        num_results,
-        tbs,
-        filter,
-        lang,
-        country,
-        location,
-      });
-      if (results.web && results.web.length > 0) return results;
-    }
-
-    logger.info("Using DuckDuckGo search");
-    const ddgResults = await ddgSearch(query, num_results, {
+  const provider = resolveSearchProvider();
+  if (provider.type === "fire-engine") {
+    logger.info("Using fire engine search");
+    return fire_engine_search_v2(query, {
+      numResults: num_results,
       tbs,
+      filter,
       lang,
       country,
-      proxy,
-      timeout,
+      location,
+      type,
+      enterprise,
     });
-    if (ddgResults.web && ddgResults.web.length > 0) return ddgResults;
-
-    // Fallback to empty response
-    return {};
-  } catch (error) {
-    logger.error(`Error in search function`, { error });
-    return {};
   }
+
+  logger.info("Using searxng search");
+  return searxng_search(query, {
+    endpoint: provider.endpoint,
+    engines: provider.engines,
+    categories: provider.categories,
+    num_results,
+    lang,
+  });
 }

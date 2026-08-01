@@ -142,7 +142,9 @@ Search is a synchronous federated query that may enrich result records by scrapi
 
 `POST /v1/search` and `/v2/search` accept query, result limit, sources, category/domain filters, locale, enterprise privacy mode, timeout, and optional scrape formats. V2 supports separate web, images, and news result collections.
 
-[[apps/api/src/controllers/v2/search.ts#searchController]] normalizes search intent, enforces team ZDR policy, calls [[apps/api/src/search/execute.ts#executeSearch]], and bills search results separately from scrape enrichment. Provider routing prefers Fire Engine, then SearXNG, then DuckDuckGo where configured.
+[[apps/api/src/controllers/v2/search.ts#searchController]] normalizes search intent, enforces team ZDR policy, calls [[apps/api/src/search/execute.ts#executeSearch]], and bills search results separately from scrape enrichment.
+
+Provider selection has no fallback loop. Local web-only mode requires SearXNG; elsewhere Fire Engine wins over configured SearXNG, and no provider is a typed 503. The shared SearXNG client uses bounded form-encoded POST requests and preserves valid empty responses.
 
 Each source is capped to the requested limit. Scraping occurs only when output formats are requested, and merged scrape costs join provider-result costs in `creditsUsed`. Timeouts from enrichment return 408.
 

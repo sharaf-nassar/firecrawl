@@ -35,6 +35,10 @@ import {
   VideoUnsupportedUrlError,
   XTwitterConfigurationError,
 } from "../scraper/scrapeURL/error";
+import {
+  SearchProviderBadResponseError,
+  SearchProviderUnavailableError,
+} from "../search/errors";
 
 // TODO: figure out correct typing for this
 const errorMap: Record<ErrorCodes, any> = {
@@ -69,6 +73,8 @@ const errorMap: Record<ErrorCodes, any> = {
   SCRAPE_VIDEO_UNSUPPORTED_URL: VideoUnsupportedUrlError,
   SCRAPE_X_TWITTER_CONFIGURATION_ERROR: XTwitterConfigurationError,
   MAP_FAILED: MapFailedError,
+  SEARCH_PROVIDER_UNAVAILABLE: SearchProviderUnavailableError,
+  SEARCH_PROVIDER_BAD_RESPONSE: SearchProviderBadResponseError,
 
   // Zod errors
   BAD_REQUEST: null,

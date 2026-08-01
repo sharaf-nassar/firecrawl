@@ -169,7 +169,7 @@ Validation, malformed JSON, queue saturation, and unexpected errors have separat
 Optional dependencies degrade in bounded ways rather than causing silent policy bypass.
 
 - Index-cache failure falls back to the index database.
-- Search provider failure falls through the configured provider chain.
+- Search provider selection is terminal: typed failures surface as 502 or 503, while valid empty results and sanitized partial warnings remain successful.
 - PII redaction returns no source markdown when its optional service cannot produce a complete safe result.
 - Tracking, analytics, and webhook-log failure do not fail completed work.
 - Autumn admission failure fails open; keyless limiter failure fails closed.

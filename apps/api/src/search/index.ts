@@ -1,9 +1,8 @@
 import { SearchResult } from "../../src/lib/entities";
-import { config } from "../config";
 import { searxng_search } from "./searxng";
 import { fire_engine_search } from "./fireEngine";
 import { Logger } from "winston";
-import { ddgSearch } from "./v2/ddgsearch";
+import { resolveSearchProvider } from "./provider";
 
 export async function search({
   query,
@@ -32,47 +31,30 @@ export async function search({
   sleep_interval?: number;
   timeout?: number;
 }): Promise<SearchResult[]> {
-  try {
-    if (config.FIRE_ENGINE_BETA_URL) {
-      logger.info("Using fire engine search");
-      const results = await fire_engine_search(query, {
-        numResults: num_results,
-        tbs,
-        filter,
-        lang,
-        country,
-        location,
-      });
-      return results;
-    }
-    if (config.SEARXNG_ENDPOINT) {
-      logger.info("Using searxng search");
-      const results = await searxng_search(query, {
-        num_results,
-        tbs,
-        filter,
-        lang,
-        country,
-        location,
-      });
-      if (results.length > 0) return results;
-    }
-    logger.info("Using DuckDuckGo search");
-    const ddg = await ddgSearch(query, num_results, {
+  const provider = resolveSearchProvider();
+  if (provider.type === "fire-engine") {
+    logger.info("Using fire engine search");
+    return fire_engine_search(query, {
+      numResults: num_results,
       tbs,
+      filter,
       lang,
       country,
-      proxy,
-      timeout,
+      location,
     });
-    return (
-      ddg.web?.map(
-        result =>
-          new SearchResult(result.url, result.title, result.description),
-      ) || []
-    );
-  } catch (error) {
-    logger.error(`Error in search function`, { error });
-    return [];
   }
+
+  logger.info("Using searxng search");
+  const results = await searxng_search(query, {
+    endpoint: provider.endpoint,
+    engines: provider.engines,
+    categories: provider.categories,
+    num_results,
+    lang,
+  });
+  return (
+    results.web?.map(
+      result => new SearchResult(result.url, result.title, result.description),
+    ) ?? []
+  );
 }

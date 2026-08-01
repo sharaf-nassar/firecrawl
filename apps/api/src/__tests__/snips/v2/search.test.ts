@@ -18,7 +18,7 @@ beforeAll(async () => {
   });
 }, 10000);
 
-// NOTE: if DDG gives us issues with this, we can disable if SEARXNG is not enabled
+// External-provider coverage can be disabled when no search provider is configured.
 describeIf(TEST_PRODUCTION || HAS_SEARCH || HAS_PROXY)("Search tests", () => {
   it.concurrent(
     "works",
