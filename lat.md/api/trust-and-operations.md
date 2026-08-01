@@ -36,11 +36,19 @@ Quota enforcement fails closed when its Redis store is unavailable. Accepted req
 
 x402 adds an EVM micropayment gate to conditionally registered v1 and v2 search routes; it does not replace ordinary authentication or request policy.
 
-The route exists only when `X402_PAY_TO_ADDRESS` is configured. Authentication, search rate limiting, restricted-country checks, and blocklist policy run before x402 payment verification, after which the dedicated search controller performs provider and scrape work.
+The route exists only when `X402_PAY_TO_ADDRESS` is configured. Authentication and search rate limiting run together first, followed by restricted-country policy. V2 also applies its blocklist middleware at this boundary; V1 currently does not register that middleware.
 
 [[apps/api/src/lib/x402.ts#createX402RouteConfig]] advertises the `exact` EVM scheme, configured recipient, and configured price with a `$0.01` default. Base Sepolia is the default network; known Base, Avalanche, and IoTeX names map to CAIP-2 identifiers.
 
-Payment verification uses a lazily initialized facilitator, defaulting to `https://x402.org/facilitator`. Facilitator availability and settlement are admission dependencies for this route, while ordinary `/search` retains account or keyless credit policy.
+Payment verification uses a lazily initialized facilitator, defaulting to `https://x402.org/facilitator`. Facilitator availability and settlement are dependencies for this route, while ordinary `/search` retains account or keyless credit policy.
+
+Today the pinned `@x402/express` middleware verifies before invoking the controller, buffers response writes, skips settlement for status 400 or higher, and withholds other responses until settlement finishes. Its facilitator verification validates payment evidence, but nonce consumption happens during settlement. A duplicate authorization can therefore verify and execute controller work before its settlement fails as a replay.
+
+The frozen target order is authorization, search-rate consumption, route policy, facilitator verification, an atomic shared replay claim, one provider execution, controller response mapping, then one settlement attempt only for a 2xx response. Unpaid, invalid, replayed, rate-limited, 4xx, 5xx, and exceptional requests never settle. No stage after the replay claim has an application retry.
+
+[[apps/api/src/lib/x402-ordering.ts#executeX402SettlementPrototype]] isolates the target from provider and facilitator types. The replay claim must be atomic across API replicas, keyed by the canonical authorization identity, occur only after successful verification, and remain terminal through provider, controller, and settlement failures. Its bounded retention must last until the authorization expires, preventing both early replay and unbounded storage growth. Unpaid or invalid traffic cannot reserve claims. Authentication and rate limiting remain before facilitator work, so bad-payment traffic cannot bypass request policy or consume verification capacity for free.
+
+Implementation must attach the replay claim to the resource server's post-verification boundary before controller dispatch. The current controller keeps request validation and team policy before its single provider call; provider results then map to an HTTP response. Settlement failure replaces a buffered success with a payment failure and never re-executes provider work.
 
 ## Authorization and ownership
 
