@@ -106,6 +106,10 @@ The API script `test:local-firecrawl:lifecycle` passes `--full-lifecycle`, but t
 
 Repository CI runs the deterministic local-script contracts, including this fake-runtime suite. That gate verifies orchestration rules without claiming live Compose acceptance.
 
+### SearXNG environment migration
+
+`scripts/local-searxng-env.test.mjs` verifies fresh defaults, endpoint normalization, external overrides, secret generation, unsafe-input rejection, locking, atomic publication, concurrent changes, and repeat-run behavior.
+
 ### Operations coverage gap
 
 Wrapper tests do not prove live Compose behavior.

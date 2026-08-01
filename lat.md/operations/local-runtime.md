@@ -64,9 +64,11 @@ Compose requires healthy application Postgres, Browser Interaction Worker, Brows
 
 `scripts/init-local-env.sh` creates a new mode-`0600` `.env` and refuses to overwrite any existing file or symlink.
 
-It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO root, and MinIO application access. It also generates a stable local owner UUID and writes explicit retention and service defaults.
+It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO, and SearXNG. It also writes the canonical internal search endpoint, a stable local owner UUID, retention, and service defaults.
 
 `scripts/upgrade-local-env-phase1` upgrades earlier environment files under an exclusive mode-`0600` lock. It validates file type, ownership, duplicate keys, secret distinctness, and phase values, then replaces through a bounded temporary file only if the source did not change.
+
+`scripts/normalize-searxng-endpoint.mjs` canonicalizes origin-only HTTP(S) overrides. Missing or blank values use `http://searxng:8080`; the reserved hostname rejects every other scheme or effective port.
 
 Secrets from `.env` must not be copied into documentation or logs. The wrapper's log path performs pattern-based redaction, but operators should still treat diagnostic output as sensitive.
 

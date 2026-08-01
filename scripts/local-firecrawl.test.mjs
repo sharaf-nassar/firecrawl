@@ -49,6 +49,8 @@ function phaseEnvironment(overrides = {}) {
     ARTIFACT_MINIO_SECRET_KEY: "d".repeat(64),
     ARTIFACT_MINIO_BUCKET: "firecrawl-artifacts",
     ARTIFACT_MINIO_REGION: "us-east-1",
+    SEARXNG_ENDPOINT: "http://searxng:8080",
+    SEARXNG_SECRET: "e".repeat(64),
     ...overrides,
   };
   return Object.entries(values)
@@ -511,6 +513,8 @@ test("local environment templates generate Docker browser settings", async () =>
   assert.match(combined, /LOCAL_BROWSER_SERVICE_ENABLED=true/);
   assert.match(combined, /MAX_BROWSER_SESSIONS=4/);
   assert.match(combined, /BROWSER_INTERACTION_WORKER_TOKEN=/);
+  assert.match(combined, /SEARXNG_ENDPOINT=http:\/\/searxng:8080/);
+  assert.match(combined, /SEARXNG_SECRET=/);
 });
 
 test("environment upgrade rotates legacy browser settings", async t => {

@@ -36,6 +36,17 @@ minio_app_secret_key="$(openssl rand -hex 32)"
 while [[ "${minio_app_secret_key}" == "${minio_root_password}" ]]; do
   minio_app_secret_key="$(openssl rand -hex 32)"
 done
+searxng_secret="$(openssl rand -hex 32)"
+while [[ "${searxng_secret}" == "${postgres_password}" ]] ||
+  [[ "${searxng_secret}" == "${app_postgres_password}" ]] ||
+  [[ "${searxng_secret}" == "${bull_auth_key}" ]] ||
+  [[ "${searxng_secret}" == "${browser_service_api_key}" ]] ||
+  [[ "${searxng_secret}" == "${browser_replay_ingest_api_key}" ]] ||
+  [[ "${searxng_secret}" == "${browser_interaction_worker_token}" ]] ||
+  [[ "${searxng_secret}" == "${minio_root_password}" ]] ||
+  [[ "${searxng_secret}" == "${minio_app_secret_key}" ]]; do
+  searxng_secret="$(openssl rand -hex 32)"
+done
 local_owner_id="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
 
 umask 077
@@ -90,8 +101,9 @@ trap cleanup EXIT HUP INT TERM PIPE XFSZ
   printf '%s\n' 'PROXY_SERVER='
   printf '%s\n' 'PROXY_USERNAME='
   printf '%s\n' 'SEARXNG_CATEGORIES='
-  printf '%s\n' 'SEARXNG_ENDPOINT='
+  printf '%s\n' 'SEARXNG_ENDPOINT=http://searxng:8080'
   printf '%s\n' 'SEARXNG_ENGINES='
+  printf '%s\n' "SEARXNG_SECRET=${searxng_secret}"
   printf '%s\n' 'SELF_HOSTED_WEBHOOK_URL='
   printf '%s\n' 'SLACK_WEBHOOK_URL='
   printf '%s\n' 'SUPABASE_ANON_TOKEN='

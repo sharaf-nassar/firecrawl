@@ -6,6 +6,7 @@ env_file="${repo_root}/.env"
 check_only=false
 snapshot_file=""
 output_file=""
+endpoint_normalizer="${repo_root}/scripts/normalize-searxng-endpoint.mjs"
 
 usage() {
   printf 'Usage: %s [--check] [--env-file <path>]\n' "${0##*/}" >&2
@@ -86,6 +87,31 @@ copy_environment() {
   done
 }
 
+normalize_searxng_endpoint() {
+  local normalized
+
+  if ! normalized="$(
+    printf '%s' "$1" | node "${endpoint_normalizer}" 2>/dev/null
+  )"; then
+    return 1
+  fi
+  printf '%s' "${normalized}"
+}
+
+searxng_secret_is_unique() {
+  local values_name="$1"
+  local -n secret_values="${values_name}"
+  local key
+
+  for key in "${local_secret_keys[@]}"; do
+    if [[ -v "secret_values[${key}]" ]] &&
+      [[ "${secret_values[SEARXNG_SECRET]}" == "${secret_values[${key}]}" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 require_phase_keys() {
   local values_name="$1"
   local -n required_values="${values_name}"
@@ -101,7 +127,7 @@ require_phase_keys() {
 validate_phase_values() {
   local values_name="$1"
   local -n managed_values="${values_name}"
-  local expected_database_url key
+  local expected_database_url key normalized_searxng_endpoint
 
   require_phase_keys "${values_name}"
 
@@ -183,6 +209,17 @@ validate_phase_values() {
   if [[ "${managed_values[ARTIFACT_MINIO_REGION]}" != us-east-1 ]]; then
     fail_field ARTIFACT_MINIO_REGION
   fi
+
+  if ! normalized_searxng_endpoint="$(
+    normalize_searxng_endpoint "${managed_values[SEARXNG_ENDPOINT]}"
+  )" ||
+    [[ "${managed_values[SEARXNG_ENDPOINT]}" != "${normalized_searxng_endpoint}" ]]; then
+    fail_field SEARXNG_ENDPOINT
+  fi
+  if [[ ! "${managed_values[SEARXNG_SECRET]}" =~ ^[0-9a-f]{64}$ ]] ||
+    ! searxng_secret_is_unique "${values_name}"; then
+    fail_field SEARXNG_SECRET
+  fi
 }
 
 while (( $# > 0 )); do
@@ -232,6 +269,19 @@ phase_keys=(
   ARTIFACT_MINIO_SECRET_KEY
   ARTIFACT_MINIO_BUCKET
   ARTIFACT_MINIO_REGION
+  SEARXNG_ENDPOINT
+  SEARXNG_SECRET
+)
+
+local_secret_keys=(
+  POSTGRES_PASSWORD
+  APP_POSTGRES_PASSWORD
+  BULL_AUTH_KEY
+  BROWSER_SERVICE_API_KEY
+  BROWSER_REPLAY_INGEST_API_KEY
+  BROWSER_INTERACTION_WORKER_TOKEN
+  MINIO_ROOT_PASSWORD
+  ARTIFACT_MINIO_SECRET_KEY
 )
 
 if [[ "${check_only}" == true ]]; then
@@ -302,6 +352,13 @@ generate_base64url_secret() {
   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
 }
 
+generate_searxng_secret() {
+  candidate_values[SEARXNG_SECRET]="$(openssl rand -hex 32)"
+  while ! searxng_secret_is_unique candidate_values; do
+    candidate_values[SEARXNG_SECRET]="$(openssl rand -hex 32)"
+  done
+}
+
 set_default APP_POSTGRES_USER firecrawl
 if [[ ! -v 'candidate_values[APP_POSTGRES_PASSWORD]' ]]; then
   candidate_values[APP_POSTGRES_PASSWORD]="$(openssl rand -hex 32)"
@@ -370,6 +427,29 @@ if [[ ! -v 'candidate_values[ARTIFACT_MINIO_SECRET_KEY]' ]]; then
 fi
 set_default ARTIFACT_MINIO_BUCKET firecrawl-artifacts
 set_default ARTIFACT_MINIO_REGION us-east-1
+if [[ ! -v 'candidate_values[SEARXNG_ENDPOINT]' ]] ||
+  [[ -z "${candidate_values[SEARXNG_ENDPOINT]}" ]]; then
+  candidate_values[SEARXNG_ENDPOINT]=http://searxng:8080
+  mark_changed SEARXNG_ENDPOINT
+else
+  if ! normalized_searxng_endpoint="$(
+    normalize_searxng_endpoint "${candidate_values[SEARXNG_ENDPOINT]}"
+  )"; then
+    fail_field SEARXNG_ENDPOINT
+  fi
+  if [[ "${candidate_values[SEARXNG_ENDPOINT]}" != "${normalized_searxng_endpoint}" ]]; then
+    candidate_values[SEARXNG_ENDPOINT]="${normalized_searxng_endpoint}"
+    mark_changed SEARXNG_ENDPOINT
+  fi
+fi
+if [[ ! -v 'candidate_values[SEARXNG_SECRET]' ]] ||
+  [[ -z "${candidate_values[SEARXNG_SECRET]}" ]]; then
+  generate_searxng_secret
+  mark_changed SEARXNG_SECRET
+elif [[ ! "${candidate_values[SEARXNG_SECRET]}" =~ ^[0-9a-f]{64}$ ]] ||
+  ! searxng_secret_is_unique candidate_values; then
+  fail_field SEARXNG_SECRET
+fi
 
 validate_phase_values candidate_values
 
