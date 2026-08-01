@@ -3,11 +3,13 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +25,7 @@ const upgradeEnv = join(repoRoot, "scripts", "upgrade-local-env-phase1");
 const apiId = "a".repeat(64);
 const browserId = "b".repeat(64);
 const oneShotId = "c".repeat(64);
+const searxngId = "d".repeat(64);
 
 function phaseEnvironment(overrides = {}) {
   const values = {
@@ -88,7 +91,12 @@ function run(command, args, options = {}) {
   });
 }
 
-async function makeFakeRuntime({ provenance = "current" } = {}) {
+async function makeFakeRuntime({
+  provenance = "current",
+  providerMode = "internal",
+  staleSearxng = false,
+  searchHealth = "healthy",
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "local-firecrawl-docker-test-"));
   const bin = join(root, "bin");
   const runtime = join(root, "runtime");
@@ -97,6 +105,22 @@ async function makeFakeRuntime({ provenance = "current" } = {}) {
   const caBundle = join(root, "ca-certificates.crt");
   const log = join(root, "events.jsonl");
   const state = join(root, "provenance");
+  const migrationDirectory = join(
+    repoRoot,
+    "apps",
+    "api",
+    "src",
+    "db",
+    "migrations",
+  );
+  const latestMigration = (await readdir(migrationDirectory))
+    .filter(name => /^\d{4}_.+\.sql$/u.test(name))
+    .sort()
+    .at(-1);
+  assert.ok(latestMigration);
+  const migrationChecksum = createHash("sha256")
+    .update(await readFile(join(migrationDirectory, latestMigration)))
+    .digest("hex");
   await run("mkdir", ["-m", "700", bin, runtime]);
   await mkdir(join(home, ".codex"), { recursive: true, mode: 0o700 });
   await mkdir(join(codexPackage, "bin"), { recursive: true, mode: 0o755 });
@@ -203,6 +227,15 @@ if (has("config")) {
         api: {
           environment: {
             LOCAL_BROWSER_SERVICE_ENABLED: "true",
+            LOCAL_SEARCH_WEB_ONLY: "true",
+            SEARXNG_ENDPOINT: process.env.FAKE_SEARCH_PROVIDER_MODE === "external"
+              ? "https://search.example.test"
+              : process.env.FAKE_SEARCH_PROVIDER_MODE === "unnormalized"
+                ? "https://SEARCH.example.test/"
+                : "http://searxng:8080",
+            SEARCH_PROVIDER_TIMEOUT_MS: "10000",
+            SEARCH_PROVIDER_MAX_RESULTS: "100",
+            SEARCH_PROVIDER_MAX_CONCURRENCY: "4",
             BROWSER_SERVICE_API_KEY: "A".repeat(43),
             BROWSER_INTERACTION_WORKER_SOCKET_PATH:
               "/run/firecrawl-interaction/worker.sock",
@@ -319,6 +352,7 @@ if (has("config")) {
           ],
         },
         "app-db-migrate": { networks: { backend: null } },
+        searxng: { networks: { backend: null } },
       },
     };
     if (!maintenanceProfileEnabled) {
@@ -367,13 +401,33 @@ if (has("config")) {
   }
   process.exit(0);
 }
-if (has("build") || has("stop") || has("logs")) process.exit(0);
+if (has("logs")) {
+  if (process.env.FAKE_SENSITIVE_LOGS === "true") {
+    process.stdout.write(
+      '{"query":"SearXNG metasearch","endpoint":' +
+      '"https://search.example.test","secret":"provider-secret"}' +
+      "\\nurl=https://search.example.test/search?q=private\\n",
+    );
+  }
+  process.exit(0);
+}
+if (has("build") || has("stop") || has("rm")) process.exit(0);
 if (has("up")) {
   if (has("api")) fs.writeFileSync(statePath, "current");
   process.exit(0);
 }
 if (has("exec")) {
   if (has("redis-cli")) process.stdout.write("PONG\\n");
+  if (args.join(" ").includes("SELECT concat_ws")) {
+    process.stdout.write(process.env.FAKE_MIGRATION_LEDGER + "\\n");
+  }
+  if (args.join(" ").includes("SearXNG metasearch") &&
+      process.env.FAKE_SEARCH_HEALTH === "unavailable") {
+    process.stderr.write(
+      "SearXNG metasearch https://search.example.test provider-secret\\n",
+    );
+    process.exit(1);
+  }
   process.exit(0);
 }
 if (has("ps")) {
@@ -387,6 +441,12 @@ if (has("ps")) {
         Protocol: "tcp",
       }],
     }) + "\\n");
+    if (has("searxng")) {
+      process.stdout.write(JSON.stringify({
+        Service: "searxng",
+        Publishers: [],
+      }) + "\\n");
+    }
     process.exit(0);
   }
   if (has("--format") &&
@@ -400,6 +460,8 @@ if (has("ps")) {
       process.stdout.write(${JSON.stringify(browserId)} + "\\n");
     } else if (last === "browser-interaction-worker") {
       process.stdout.write("e".repeat(64) + "\\n");
+    } else if (last === "searxng" && process.env.FAKE_STALE_SEARXNG === "true") {
+      process.stdout.write(${JSON.stringify(searxngId)} + "\\n");
     } else if (["browser-state-init", "app-db-migrate", "minio-init"].includes(last)) {
       process.stdout.write(${JSON.stringify(oneShotId)} + "\\n");
     }
@@ -412,6 +474,8 @@ process.exit(2);
     { mode: 0o755 },
   );
   await chmod(docker, 0o755);
+  const curl = join(bin, "curl");
+  await writeFile(curl, "#!/usr/bin/env sh\nexit 0\n", { mode: 0o755 });
 
   return {
     root,
@@ -422,6 +486,10 @@ process.exit(2);
       FAKE_DOCKER_LOG: log,
       FAKE_PROVENANCE_STATE: state,
       FAKE_REPO: repoRoot,
+      FAKE_MIGRATION_LEDGER: `${latestMigration}|${migrationChecksum}`,
+      FAKE_SEARCH_PROVIDER_MODE: providerMode,
+      FAKE_STALE_SEARXNG: staleSearxng ? "true" : "false",
+      FAKE_SEARCH_HEALTH: searchHealth,
       LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS: "10",
       LOCAL_FIRECRAWL_CA_BUNDLE_FILE: caBundle,
       XDG_RUNTIME_DIR: runtime,
@@ -447,6 +515,16 @@ test("local compose keeps Docker browser state", async () => {
     source.match(/\n  api:\n[\s\S]*?\n  browser-interaction-worker:/)?.[0] ??
     "";
   assert.match(source, /LOCAL_BROWSER_SERVICE_ENABLED: "true"/);
+  assert.match(apiBlock, /LOCAL_SEARCH_WEB_ONLY: "true"/);
+  assert.match(
+    apiBlock,
+    /SEARXNG_ENDPOINT: \$\{SEARXNG_ENDPOINT:-http:\/\/searxng:8080\}/,
+  );
+  assert.match(apiBlock, /SEARCH_PROVIDER_TIMEOUT_MS: "10000"/);
+  assert.match(apiBlock, /SEARCH_PROVIDER_MAX_RESULTS: "100"/);
+  assert.match(apiBlock, /SEARCH_PROVIDER_MAX_CONCURRENCY: "4"/);
+  assert.doesNotMatch(apiBlock, /SEARXNG_SECRET/);
+  assert.doesNotMatch(apiBlock, /searxng:\s*\n\s*condition:/);
   assert.match(
     source,
     /BROWSER_SERVICE_REQUEST_TIMEOUT_MS: \$\{BROWSER_SERVICE_REQUEST_TIMEOUT_MS:-60000\}/,
@@ -670,14 +748,92 @@ test("start builds images, runs migrations, and publishes API last", async t => 
   const apiUp = events.findIndex(
     event => event.includes("up") && event.includes("api"),
   );
+  const searxngUp = events.findIndex(
+    event => event.includes("up") && event.at(-1) === "searxng",
+  );
   const interactionWorkerUp = events.findIndex(
     event =>
       event.includes("up") && event.includes("browser-interaction-worker"),
   );
   assert.ok(migrationUp >= 0 && apiUp > migrationUp);
   assert.ok(interactionWorkerUp >= 0 && apiUp > interactionWorkerUp);
+  assert.ok(searxngUp >= 0 && apiUp > searxngUp);
+  assert.ok(events[searxngUp].includes("--no-deps"));
+  assert.ok(events[searxngUp].includes("--wait"));
+  assert.ok(
+    events.every(event => !event.join(" ").includes("SearXNG metasearch")),
+    "startup readiness must not issue an upstream search",
+  );
   assert.ok(events.some(event => event.includes("browser-state-init")));
   assert.ok(events.some(event => event.includes("minio-init")));
+});
+
+// @lat: [[runtime-operations#Local wrapper suite#Provider-aware lifecycle]]
+test("external failover removes stale bundled search without data loss", async t => {
+  const fake = await makeFakeRuntime({
+    providerMode: "external",
+    staleSearxng: true,
+  });
+  t.after(() => fake.cleanup());
+
+  const failedOver = await run(wrapper, ["restart"], { env: fake.env });
+  assert.equal(failedOver.code, 0, failedOver.stderr);
+  const failoverEvents = await fake.events();
+  const staleStop = failoverEvents.findIndex(
+    event => event.includes("stop") && event.at(-1) === "searxng",
+  );
+  const staleRemove = failoverEvents.findIndex(
+    event => event.includes("rm") && event.at(-1) === "searxng",
+  );
+  const apiUp = failoverEvents.findIndex(
+    event => event.includes("up") && event.includes("api"),
+  );
+  assert.ok(staleStop >= 0 && staleRemove > staleStop && apiUp > staleRemove);
+  assert.ok(
+    failoverEvents.every(
+      event => !(event.includes("up") && event.at(-1) === "searxng"),
+    ),
+  );
+  assert.ok(failoverEvents.every(event => !event.includes("--volumes")));
+  assert.ok(failoverEvents.every(event => !event.includes("-v")));
+  assert.ok(failoverEvents.every(event => !event.includes("down")));
+
+  const rolledBack = await run(wrapper, ["status", "--json"], {
+    env: fake.env,
+  });
+  assert.equal(rolledBack.code, 0, rolledBack.stderr);
+  assert.equal(JSON.parse(rolledBack.stdout).searchProviderMode, "external");
+
+  const reUpgraded = await run(wrapper, ["restart"], {
+    env: {
+      ...fake.env,
+      FAKE_SEARCH_PROVIDER_MODE: "internal",
+      FAKE_STALE_SEARXNG: "false",
+    },
+  });
+  assert.equal(reUpgraded.code, 0, reUpgraded.stderr);
+  const allEvents = await fake.events();
+  assert.ok(
+    allEvents.some(event => event.includes("up") && event.at(-1) === "searxng"),
+  );
+  assert.ok(allEvents.every(event => !event.includes("--volumes")));
+});
+
+test("unnormalized provider mode fails before lifecycle mutation", async t => {
+  const fake = await makeFakeRuntime({ providerMode: "unnormalized" });
+  t.after(() => fake.cleanup());
+  const result = await run(wrapper, ["start"], { env: fake.env });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /endpoint must be normalized/);
+  assert.ok(
+    (await fake.events()).every(
+      event =>
+        !event.includes("build") &&
+        !event.includes("up") &&
+        !event.includes("stop") &&
+        !event.includes("rm"),
+    ),
+  );
 });
 
 test("restart migrates a recognized legacy API container", async t => {
@@ -739,29 +895,119 @@ test("stop remains Docker-only and preserves dependency ordering", async t => {
   const dependencyStop = events.findIndex(
     event => event.includes("stop") && event.includes("app-postgres"),
   );
-  assert.ok(browserStop >= 0 && dependencyStop > browserStop);
+  const searxngStop = events.findIndex(
+    event => event.includes("stop") && event.at(-1) === "searxng",
+  );
+  assert.ok(
+    browserStop >= 0 &&
+      searxngStop > browserStop &&
+      dependencyStop > searxngStop,
+  );
 });
 
-test("status JSON is derived only from Compose state", async t => {
+test("status JSON reports internal provider inventory without secrets", async t => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   await rm(fake.codexPath);
   await rm(fake.authPath);
   const result = await run(wrapper, ["status", "--json"], { env: fake.env });
   assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), [
-    {
-      Service: "api",
-      Publishers: [
-        {
-          URL: "127.0.0.1",
-          TargetPort: 3002,
-          PublishedPort: 3002,
-          Protocol: "tcp",
-        },
-      ],
-    },
-  ]);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    searchProviderMode: "internal",
+    services: [
+      {
+        Service: "api",
+        Publishers: [
+          {
+            URL: "127.0.0.1",
+            TargetPort: 3002,
+            PublishedPort: 3002,
+            Protocol: "tcp",
+          },
+        ],
+      },
+      { Service: "searxng", Publishers: [] },
+    ],
+  });
+  assert.doesNotMatch(result.stdout, /http:\/\/searxng|SEARXNG_SECRET/);
+});
+
+test("status and logs suppress bundled inventory in external mode", async t => {
+  const fake = await makeFakeRuntime({ providerMode: "external" });
+  t.after(() => fake.cleanup());
+  const status = await run(wrapper, ["status", "--json"], { env: fake.env });
+  assert.equal(status.code, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout), {
+    searchProviderMode: "external",
+    services: [
+      {
+        Service: "api",
+        Publishers: [
+          {
+            URL: "127.0.0.1",
+            TargetPort: 3002,
+            PublishedPort: 3002,
+            Protocol: "tcp",
+          },
+        ],
+      },
+    ],
+  });
+  const logs = await run(wrapper, ["logs"], { env: fake.env });
+  assert.equal(logs.code, 0, logs.stderr);
+  const logEvent = (await fake.events()).find(event => event.includes("logs"));
+  assert.ok(logEvent);
+  assert.ok(!logEvent.includes("searxng"));
+  const rejected = await run(wrapper, ["logs", "searxng"], { env: fake.env });
+  assert.equal(rejected.code, 64);
+});
+
+// @lat: [[runtime-operations#Local wrapper suite#Bounded search smoke]]
+test("health makes one bounded redacted search smoke", async t => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const healthy = await run(wrapper, ["health", "--json"], { env: fake.env });
+  assert.equal(healthy.code, 0, healthy.stderr);
+  assert.equal(JSON.parse(healthy.stdout).searchProviderMode, "internal");
+  assert.equal(JSON.parse(healthy.stdout).searchProvider, "healthy");
+  let smokeEvents = (await fake.events()).filter(event =>
+    event.join(" ").includes("SearXNG metasearch"),
+  );
+  assert.equal(smokeEvents.length, 1);
+  const smoke = smokeEvents[0].join(" ");
+  assert.match(smoke, /method: 'POST'/);
+  assert.match(smoke, /sources: \['web'\]/);
+  assert.match(smoke, /limit: 1/);
+  assert.match(smoke, /AbortSignal\.timeout\(10000\)/);
+  const wrapperSource = await readFile(wrapper, "utf8");
+  assert.match(
+    wrapperSource,
+    /timeout --signal=TERM --kill-after=2s 15s[\s\\]+[\s\S]*SearXNG metasearch/,
+  );
+
+  const unavailable = await run(wrapper, ["health"], {
+    env: { ...fake.env, FAKE_SEARCH_HEALTH: "unavailable" },
+  });
+  assert.equal(unavailable.code, 1);
+  assert.match(unavailable.stderr, /search provider functional smoke/);
+  assert.doesNotMatch(
+    unavailable.stderr + unavailable.stdout,
+    /SearXNG metasearch|search\.example\.test|provider-secret/,
+  );
+  smokeEvents = (await fake.events()).filter(event =>
+    event.join(" ").includes("SearXNG metasearch"),
+  );
+  assert.equal(smokeEvents.length, 2);
+  const postOutageEvents = await fake.events();
+  assert.ok(postOutageEvents.every(event => !event.includes("stop")));
+
+  const status = await run(wrapper, ["status", "--json"], { env: fake.env });
+  assert.equal(status.code, 0, status.stderr);
+  assert.ok(
+    JSON.parse(status.stdout).services.some(
+      service => service.Service === "api",
+    ),
+  );
 });
 
 test("logs remain available without current Codex or auth", async t => {
@@ -769,8 +1015,15 @@ test("logs remain available without current Codex or auth", async t => {
   t.after(() => fake.cleanup());
   await rm(fake.codexPath);
   await rm(fake.authPath);
-  const result = await run(wrapper, ["logs"], { env: fake.env });
+  const result = await run(wrapper, ["logs", "searxng"], {
+    env: { ...fake.env, FAKE_SENSITIVE_LOGS: "true" },
+  });
   assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /\[REDACTED\]/);
+  assert.doesNotMatch(
+    result.stdout,
+    /SearXNG metasearch|search\.example\.test|provider-secret|private/,
+  );
   assert.ok((await fake.events()).some(event => event.includes("logs")));
 });
 

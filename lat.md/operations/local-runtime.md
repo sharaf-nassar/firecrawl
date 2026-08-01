@@ -14,7 +14,7 @@ Browser Interaction Worker has no network namespace connectivity. Browser Intera
 
 ## Long-running services
 
-The wrapper treats API, browser services, stores, queues, and object storage as one health domain.
+The wrapper derives its service inventory from the normalized local search provider mode while treating API, browser services, stores, queues, and object storage as one runtime.
 
 Long-running services are:
 
@@ -26,6 +26,8 @@ Long-running services are:
 - `redis`, `rabbitmq`, and `nuq-postgres`, queue and coordination infrastructure;
 - `app-postgres`, durable application records;
 - `minio`, durable artifact objects.
+
+Internal search mode adds private `searxng`; external mode omits it and preserves the validated external endpoint without disclosing it in diagnostics.
 
 FoundationDB services are optional and profile-gated.
 
@@ -56,9 +58,9 @@ The browser state volume is writable by the initialization job and Browser Servi
 
 API readiness is downstream of all required local capabilities.
 
-Compose requires healthy application Postgres, Browser Interaction Worker, Browser Service, Redis, Playwright, RabbitMQ, and NuQ Postgres before API. The wrapper additionally completes migrations and MinIO initialization before starting browser and API layers.
+Compose requires healthy application Postgres, Browser Interaction Worker, Browser Service, Redis, Playwright, RabbitMQ, and NuQ Postgres before API. SearXNG has no fixed API dependency because external mode suppresses the bundled service.
 
-`start_runtime` orders durable dependencies, one-shots, Browser Service, egress proxy, interaction worker, and API. This ordering ensures the model worker's canary has egress and the API does not reconcile browser state before its volume is initialized.
+`start_runtime` orders durable dependencies, bundled SearXNG readiness when internal, one-shots, Browser Service, egress proxy, interaction worker, and API. SearXNG readiness uses only its local `/healthz`, so later upstream failure cannot make API unhealthy.
 
 ## Environment bootstrap
 
@@ -112,6 +114,10 @@ They prove Compose schema, network separation, mount direction, fixed worker pat
 
 Writers are quiesced before dependencies stop. Browser rollback validation, when explicitly enabled, runs from the current immutable image against a read-only view of the state volume before the replacement starts.
 
+The wrapper reads the normalized endpoint from rendered API configuration. Canonical `http://searxng:8080` starts SearXNG with `--no-deps --wait` before API; any validated external origin stops and removes a stale bundled container before startup.
+
+Provider failover and rollback never remove volumes. Switch to an external endpoint with current code before rolling code back; a later re-upgrade preserves that normalized external mode, while restoring the canonical endpoint re-enables the bundled service.
+
 One-shot timeout defaults to 300 seconds and service health wait to 180 seconds. Timeouts are configuration errors when nonpositive and operational failures when exceeded.
 
 ## Browser rollback
@@ -126,13 +132,13 @@ The wrapper stops API, interaction worker, Browser Service, and egress proxy, th
 
 Stop validates recoverable Compose provenance and shuts down writers before dependencies.
 
-API, interaction worker, and Browser Service stop first, then the egress proxy, then storage and queue dependencies. Volumes are not deleted, and one-shot records remain available for diagnosis.
+API, interaction worker, and Browser Service stop first, followed by egress proxy, bundled SearXNG when internal, then storage and queue dependencies. External mode removes only a stale SearXNG container. Volumes and one-shot records remain.
 
 ## Status
 
 `scripts/local-firecrawl status` reports both long-running and one-shot containers under a shared lifecycle lock.
 
-`--json` returns Compose state sorted by service. Status validates known project provenance but does not claim functional health.
+Human and JSON output name `internal` or `external` mode without showing its endpoint. JSON returns `searchProviderMode` plus selected Compose services sorted by name; external inventory excludes stale bundled SearXNG.
 
 ## Health
 
@@ -140,9 +146,11 @@ API, interaction worker, and Browser Service stop first, then the egress proxy, 
 
 Checks include Redis `PONG`, RabbitMQ diagnostics, both Postgres servers, latest migration filename and checksum, successful one-shots, MinIO liveness and restricted application artifact access, Playwright health, Browser Service authenticated liveness, egress socket, worker readiness, public API, and loopback-only port policy.
 
+Health makes exactly one functional `POST /v2/search` using fixed query `SearXNG metasearch`, web source, and limit 1. Request timeout is 10 seconds inside a 15-second outer deadline; success requires HTTP 200, `success:true`, and one HTTP(S) web result.
+
 Human output groups passing checks by dependency, application, and browser runtime. Interactive terminals use restrained status color unless `NO_COLOR` is set or `TERM=dumb`; pipes, logs, and JSON remain ANSI-free. Successful probe chatter stays hidden and failed probes retain named diagnostics.
 
-`--json` returns only the endpoint, migration, artifact provider, and browser component status JSON object. A healthy container with a stale migration, wrong checksum, failed canary, inaccessible artifact policy, or unexpected port still fails overall health.
+`--json` also reports provider mode and functional search health without its endpoint. Provider outage fails wrapper health but does not stop API or disable scrape and crawl.
 
 ## Egress probe
 
@@ -154,9 +162,9 @@ The probe sends CONNECT requests through loopback and verifies policy outcomes. 
 
 `scripts/local-firecrawl logs` provides bounded, redacted diagnostics for all services or selected browser/API components.
 
-It reads at most 200 recent lines, optionally filters by canonical UUID correlation ID, and redacts common authorization, bearer, token, secret, password, capability, prompt, source, and page-value fields.
+It reads at most 200 recent lines, optionally filters by canonical UUID correlation ID, and redacts credentials, prompts, queries, endpoints, URLs, sources, and page values.
 
-Use `logs browser-service`, `logs browser-interaction-worker`, or `logs browser-interaction-egress-proxy` to isolate the corresponding trust boundary. Remaining failure after wrapper recovery should be surfaced instead of hidden by repeated restarts.
+Internal mode supports `logs searxng`; external mode rejects that target and omits it from `logs all`. Browser component targets isolate their corresponding trust boundaries. Remaining failure after wrapper recovery should be surfaced instead of hidden by repeated restarts.
 
 ## Local recovery procedure
 

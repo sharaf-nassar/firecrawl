@@ -51,7 +51,7 @@ dependency_services=(
   app-postgres
   minio
 )
-long_running_services=(
+base_long_running_services=(
   api
   browser-service
   browser-interaction-worker
@@ -59,7 +59,9 @@ long_running_services=(
   "${dependency_services[@]}"
 )
 one_shot_services=(browser-state-init app-db-migrate minio-init)
+long_running_services=("${base_long_running_services[@]}")
 diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
+search_provider_mode=
 
 usage() {
   printf '%s\n' \
@@ -67,7 +69,7 @@ usage() {
     "       ${0##*/} status [--json]" \
     "       ${0##*/} health [--json]" \
     "       ${0##*/} probe-egress" \
-    "       ${0##*/} logs [all|api|browser-service|browser-interaction-worker|browser-interaction-egress-proxy] [correlation-id]" \
+    "       ${0##*/} logs [all|api|searxng|browser-service|browser-interaction-worker|browser-interaction-egress-proxy] [correlation-id]" \
     >&2
 }
 
@@ -264,6 +266,34 @@ prepare_recovery_compose_sources() {
   export LOCAL_CODEX_CA_BUNDLE_FILE=/dev/null
 }
 
+configure_search_provider_mode() {
+  local endpoint
+  local normalized_endpoint
+  local rendered="$1"
+
+  if ! endpoint="$(
+    jq -er '.services.api.environment.SEARXNG_ENDPOINT | strings' \
+      <<< "$rendered"
+  )" || ! normalized_endpoint="$(
+    printf '%s' "$endpoint" |
+      node "$repo_root/scripts/normalize-searxng-endpoint.mjs"
+  )" || [[ "$endpoint" != "$normalized_endpoint" ]]; then
+    printf '%s\n' \
+      'Local search provider invariant failed: endpoint must be normalized' \
+      >&2
+    return 1
+  fi
+
+  if [[ "$normalized_endpoint" == http://searxng:8080 ]]; then
+    search_provider_mode=internal
+    long_running_services=(searxng "${base_long_running_services[@]}")
+  else
+    search_provider_mode=external
+    long_running_services=("${base_long_running_services[@]}")
+  fi
+  diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
+}
+
 validate_compose() {
   local failed_invariant
   local source_mode="${1:-current}"
@@ -290,6 +320,18 @@ validate_compose() {
       {
         name: "api_local_browser_service_enabled",
         ok: (.services.api.environment.LOCAL_BROWSER_SERVICE_ENABLED == "true")
+      },
+      {
+        name: "api_local_search_web_only",
+        ok: (.services.api.environment.LOCAL_SEARCH_WEB_ONLY == "true")
+      },
+      {
+        name: "api_search_provider_bounds",
+        ok: (
+          .services.api.environment.SEARCH_PROVIDER_TIMEOUT_MS == "10000" and
+          .services.api.environment.SEARCH_PROVIDER_MAX_RESULTS == "100" and
+          .services.api.environment.SEARCH_PROVIDER_MAX_CONCURRENCY == "4"
+        )
       },
       {
         name: "browser_service_local_enabled",
@@ -634,6 +676,7 @@ validate_compose() {
       "$failed_invariant" >&2
     return 1
   fi
+  configure_search_provider_mode "$rendered"
 }
 
 known_legacy_compose_sources() {
@@ -1209,6 +1252,10 @@ start_runtime() {
   "${compose[@]}" up -d --wait \
     --wait-timeout "$health_wait_timeout_seconds" \
     "${dependency_services[@]}"
+  if [[ "$search_provider_mode" == internal ]]; then
+    "${compose[@]}" up -d --no-deps --wait \
+      --wait-timeout "$health_wait_timeout_seconds" searxng
+  fi
   run_one_shot app-db-migrate
   run_one_shot minio-init
   "${compose[@]}" up -d --no-deps --wait \
@@ -1231,9 +1278,34 @@ start_runtime() {
   check_port_policy
 }
 
+remove_stale_bundled_search_provider() {
+  local container_ids
+
+  container_ids="$("${compose[@]}" ps --all -q searxng)"
+  if [[ -z "$container_ids" ]]; then
+    return
+  fi
+  if [[ "$container_ids" == *$'\n'* ]] ||
+    [[ ! "$container_ids" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' 'Bundled SearXNG container identity is ambiguous' >&2
+    return 1
+  fi
+  "${compose[@]}" stop searxng
+  "${compose[@]}" rm --force searxng
+}
+
+stop_search_provider_for_transition() {
+  if [[ "$search_provider_mode" == internal ]]; then
+    "${compose[@]}" stop searxng
+  else
+    remove_stale_bundled_search_provider
+  fi
+}
+
 stop_runtime() {
   "${compose[@]}" stop api browser-interaction-worker browser-service
   "${compose[@]}" stop browser-interaction-egress-proxy
+  stop_search_provider_for_transition
   "${compose[@]}" stop "${dependency_services[@]}"
 }
 
@@ -1288,9 +1360,11 @@ probe_worker_egress() {
 
 redact_local_logs() {
   sed -E \
-    -e 's/("(authorization|bearer|token|secret|password|capability|prompt|source|page(Value|Text)?)"[[:space:]]*:[[:space:]]*)"([^"\\]|\\.)*"/\1"[REDACTED]"/Ig' \
+    -e 's/("(authorization|bearer|token|secret|password|capability|prompt|query|endpoint|url|source|page(Value|Text)?)"[[:space:]]*:[[:space:]]*)"([^"\\]|\\.)*"/\1"[REDACTED]"/Ig' \
     -e 's/(Bearer[[:space:]]+)[^[:space:],;}]*/\1[REDACTED]/Ig' \
-    -e 's/(authorization|token|secret|password|capability|prompt|source|page(Value|Text)?)([=:][[:space:]]*)[^,;}]*/\1\3[REDACTED]/Ig'
+    -e 's/(authorization|token|secret|password|capability|prompt|query|endpoint|url|source|page(Value|Text)?)([=:][[:space:]]*)[^,;}]*/\1\3[REDACTED]/Ig' \
+    -e 's#https?://[^[:space:]",;}]+#[REDACTED_URL]#Ig' \
+    -e 's/SearXNG metasearch/[REDACTED]/g'
 }
 
 filter_correlation() {
@@ -1311,6 +1385,10 @@ show_logs() {
     all) services=("${diagnostic_services[@]}") ;;
     api|browser-service|browser-interaction-worker|browser-interaction-egress-proxy)
       services=("$target")
+      ;;
+    searxng)
+      [[ "$search_provider_mode" == internal ]] || return 64
+      services=(searxng)
       ;;
     *) return 64 ;;
   esac
@@ -1356,6 +1434,7 @@ print_health_report() {
 
   printf 'Local Firecrawl health: %sPASS%s\n' "$bold_green" "$reset"
   printf 'Endpoint: http://127.0.0.1:%s\n' "${PORT:-3002}"
+  printf 'Search provider mode: %s\n' "$search_provider_mode"
   printf '\n%sDependencies%s\n' "$cyan" "$reset"
   printf '  %-30s %sPASS%s\n' \
     'Redis' "$green" "$reset" \
@@ -1371,12 +1450,47 @@ print_health_report() {
     'Artifact access policy' "$green" "$reset" \
     'Public API' "$green" "$reset" \
     'Loopback port policy' "$green" "$reset"
+  printf '  %-30s %sPASS%s (%s)\n' \
+    'Search provider' "$green" "$reset" "$search_provider_mode"
   printf '\n%sBrowser runtime%s\n' "$cyan" "$reset"
   printf '  %-30s %sPASS%s\n' \
     'Playwright' "$green" "$reset" \
     'Browser Service' "$green" "$reset" \
     'Interaction worker' "$green" "$reset" \
     'Egress proxy' "$green" "$reset"
+}
+
+verify_search_provider_health() {
+  if ! timeout --signal=TERM --kill-after=2s 15s \
+    "${compose[@]}" exec -T api node -e \
+    "fetch('http://127.0.0.1:' + (process.env.PORT || '3002') + '/v2/search', {
+       method: 'POST',
+       headers: { 'content-type': 'application/json' },
+       body: JSON.stringify({
+         query: 'SearXNG metasearch',
+         sources: ['web'],
+         limit: 1,
+       }),
+       signal: AbortSignal.timeout(10000),
+     }).then(async response => {
+       let payload;
+       try {
+         payload = await response.json();
+       } catch {
+         process.exit(1);
+       }
+       const result = payload?.data?.web?.[0];
+       let validUrl = false;
+       try {
+         validUrl = ['http:', 'https:'].includes(new URL(result?.url).protocol);
+       } catch {}
+       if (response.status !== 200 || payload?.success !== true || !validUrl) {
+         process.exit(1);
+       }
+     }).catch(() => process.exit(1))" >/dev/null 2>&1; then
+    printf '%s\n' 'Health check failed: search provider functional smoke' >&2
+    return 1
+  fi
 }
 
 verify_health() {
@@ -1496,6 +1610,7 @@ verify_health() {
      request.end();"
   curl --fail --silent --show-error --max-time 10 \
     --output /dev/null "http://127.0.0.1:${PORT:-3002}/"
+  verify_search_provider_health
   check_port_policy
 
   health_migration="$latest_applied_migration"
@@ -1536,6 +1651,7 @@ case "$command" in
     current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
     quiesce_browser_writers
     check_browser_rollback_offline
+    stop_search_provider_for_transition
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
     ;;
@@ -1558,6 +1674,7 @@ case "$command" in
     current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
     quiesce_browser_writers
     check_browser_rollback_offline
+    stop_search_provider_for_transition
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
     ;;
@@ -1580,9 +1697,12 @@ case "$command" in
     validate_compose recovery
     validate_running_project_provenance
     if [[ "${1:-}" == --json ]]; then
-      "${compose[@]}" ps --all --format json |
-        jq -cs 'sort_by(.Service)'
+      "${compose[@]}" ps --all --format json \
+        "${long_running_services[@]}" "${one_shot_services[@]}" |
+        jq -cs --arg mode "$search_provider_mode" \
+          '{searchProviderMode:$mode, services:sort_by(.Service)}'
     else
+      printf 'Search provider mode: %s\n\n' "$search_provider_mode"
       printf '%s\n' 'Long-running services:'
       "${compose[@]}" ps --all "${long_running_services[@]}"
       printf '\n%s\n' 'Initialization and migration one-shots:'
@@ -1602,10 +1722,13 @@ case "$command" in
       jq -cn \
         --arg endpoint "http://127.0.0.1:${PORT:-3002}" \
         --arg migration "$health_migration" \
+        --arg search_provider_mode "$search_provider_mode" \
         '{status:"healthy", endpoint:$endpoint,
           migration:$migration, artifacts:"MinIO", browserService:"healthy",
           browserInteractionWorker:"healthy",
-          browserInteractionEgressProxy:"healthy"}'
+          browserInteractionEgressProxy:"healthy",
+          searchProviderMode:$search_provider_mode,
+          searchProvider:"healthy"}'
     else
       print_health_report
     fi

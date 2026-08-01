@@ -104,6 +104,18 @@ The current host architecture must boot the hardened service, pass `/healthz`, a
 
 It creates private temporary fixtures and replaces `docker` with a recording fake. Tests cover environment creation and upgrade, Compose hardening validation, secret-safe errors, image build and one-shot ordering, recognized legacy provenance, writer-first stop, status, and diagnostic availability.
 
+### Provider-aware lifecycle
+
+Recording fixtures prove normalized internal and external modes select the correct inventories, ordering, stale-container cleanup, log targets, and volume-preserving failover, rollback, and re-upgrade paths.
+
+Internal startup waits for bundled SearXNG before API without a functional query. External startup never starts it and removes a stale container before API while preserving every volume.
+
+### Bounded search smoke
+
+Fake health probes require exactly one redacted POST through API with fixed query, web source, limit 1, a 10-second request timeout, and a 15-second outer deadline.
+
+Success and provider-outage fixtures prove health reports provider mode without endpoint or query disclosure. Outage fails functional health without stopping API, so non-search scrape and crawl availability remain independent.
+
 The API script `test:local-firecrawl:lifecycle` passes `--full-lifecycle`, but the test file has no argument-controlled real-Docker mode. Every current case still uses the fake runtime.
 
 Repository CI runs the deterministic local-script contracts, including this fake-runtime suite. That gate verifies orchestration rules without claiming live Compose acceptance.
@@ -116,7 +128,7 @@ Repository CI runs the deterministic local-script contracts, including this fake
 
 Wrapper tests do not prove live Compose behavior.
 
-They do not start real containers, run migrations, validate MinIO policy, execute Browser Service reconciliation, run the Codex canary, probe model egress, test advisory-lock contention, verify log redaction, or run `health` against the assembled stack.
+They do not start real containers, run migrations, validate MinIO policy, execute Browser Service reconciliation, run the Codex canary, probe model egress, test advisory-lock contention, or run `health` against the assembled stack.
 
 Live acceptance should use `scripts/local-firecrawl start`, one `health` pass, targeted egress and browser checks, then ordered `stop` without deleting volumes.
 
