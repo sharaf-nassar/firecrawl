@@ -148,7 +148,9 @@ Provider selection has no fallback loop. Local web-only mode requires SearXNG; e
 
 Ordinary v0, v1, and v2 controllers map canonical provider failures to stable 502 or 503 envelopes before billing or scrape dispatch. Valid empty responses cost zero credits, while sanitized partial-provider diagnostics appear only as a top-level warning.
 
-Local web-only source validation runs before keyless reservation or provider execution. This shared admission seam rejects non-web sources with a stable 400 response; broader local option enforcement extends the same boundary.
+Local web-only validation inspects raw v0, v1, and v2 bodies before schema defaults, request logging, credit reservation, or provider execution. It rejects non-web sources and explicit search geo, recency, enterprise, or feedback inputs with stable 400 `BAD_REQUEST` responses.
+
+Web sources, domain and category filters, language, and downstream scrape options remain available locally. Outside local web-only mode, request capabilities and Fire Engine precedence remain unchanged.
 
 Each source is capped to the requested limit. Scraping occurs only when output formats are requested, and merged scrape costs join provider-result costs in `creditsUsed`. Timeouts from enrichment return 408.
 
@@ -221,6 +223,8 @@ See [[lat.md/api/monitoring#Change Monitoring]] and [[lat.md/api/browser#Interac
 V2 feedback binds a rating and diagnostics to an owned, recently completed search, scrape, parse, or map job.
 
 `POST /v2/feedback` uses an endpoint discriminator and job UUID; the legacy search-specific path maps into the same recorder. Duplicate feedback for one team, endpoint, and job succeeds idempotently but never issues a second refund.
+
+Local web-only mode rejects both the search-specific feedback route and generic feedback with `endpoint: "search"` before parsing or persistence. Other endpoint feedback remains available locally, and search feedback remains unchanged outside local web-only mode.
 
 Database authentication, team ownership, job age, success requirements, team opt-out, ZDR, refund enablement, billed cost, rating, endpoint feature, and daily refund cap all influence acceptance or refund amount.
 

@@ -18,15 +18,40 @@ function sourceType(source: unknown): unknown {
   return undefined;
 }
 
-function requestedSources(body: Record<string, unknown>): unknown {
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function hasOwn(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+const unsupportedSearchOptionKeys = [
+  "tbs",
+  "country",
+  "location",
+  "enterprise",
+  "feedback",
+] as const;
+
+function requestsUnsupportedOptions(body: Record<string, unknown>): boolean {
+  return unsupportedSearchOptionKeys.some(key => hasOwn(body, key));
+}
+
+function requestedSources(
+  body: Record<string, unknown>,
+  searchOptions: Record<string, unknown> | undefined,
+): unknown {
   if (body.sources !== undefined) return body.sources;
+  return searchOptions?.sources;
+}
 
-  const searchOptions = body.searchOptions;
-  if (searchOptions && typeof searchOptions === "object") {
-    return (searchOptions as Record<string, unknown>).sources;
-  }
-
-  return undefined;
+function requestsUnsupportedSource(source: unknown): boolean {
+  if (sourceType(source) !== "web") return true;
+  const options = asRecord(source);
+  return options !== undefined && requestsUnsupportedOptions(options);
 }
 
 // @lat: [[http#Search]]
@@ -35,11 +60,24 @@ export function validateLocalSearchCapabilities(body: unknown): void {
     return;
   }
 
-  const sources = requestedSources(body as Record<string, unknown>);
+  const request = body as Record<string, unknown>;
+  const searchOptions = asRecord(request.searchOptions);
+  const sources = requestedSources(request, searchOptions);
   if (
-    Array.isArray(sources) &&
-    sources.some(source => sourceType(source) !== "web")
+    (sources !== undefined && !Array.isArray(sources)) ||
+    (Array.isArray(sources) && sources.some(requestsUnsupportedSource)) ||
+    requestsUnsupportedOptions(request) ||
+    (searchOptions !== undefined && requestsUnsupportedOptions(searchOptions))
   ) {
+    throw new LocalSearchCapabilityError();
+  }
+}
+
+// @lat: [[http#Endpoint feedback]]
+export function validateLocalSearchFeedbackCapability(
+  endpoint: unknown = "search",
+): void {
+  if (config.LOCAL_SEARCH_WEB_ONLY && endpoint === "search") {
     throw new LocalSearchCapabilityError();
   }
 }

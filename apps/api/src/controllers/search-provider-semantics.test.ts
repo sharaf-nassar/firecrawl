@@ -120,15 +120,24 @@ function response() {
   return result;
 }
 
-function request(version: Version, unsupported = false) {
-  const sources = unsupported ? [{ type: "images" }] : [{ type: "web" }];
+function request(
+  version: Version,
+  bodyOverrides: Record<string, unknown> = {},
+) {
   if (version === "v0") {
+    const searchOptions =
+      bodyOverrides.searchOptions &&
+      typeof bodyOverrides.searchOptions === "object" &&
+      !Array.isArray(bodyOverrides.searchOptions)
+        ? (bodyOverrides.searchOptions as Record<string, unknown>)
+        : {};
     return {
       body: {
         query: "private query",
         origin: "api",
         pageOptions: { fetchPageContent: false },
-        searchOptions: { limit: 5, ...(unsupported ? { sources } : {}) },
+        ...bodyOverrides,
+        searchOptions: { limit: 5, ...searchOptions },
       },
     } as never;
   }
@@ -138,8 +147,9 @@ function request(version: Version, unsupported = false) {
       query: "private query",
       origin: "api",
       limit: 5,
-      ...(version === "v2" || unsupported ? { sources } : {}),
+      ...(version === "v2" ? { sources: [{ type: "web" }] } : {}),
       scrapeOptions: { formats: [] },
+      ...bodyOverrides,
     },
     auth: { team_id: "team-id" },
     acuc: { api_key_id: 1, sub_id: "subscription-id", flags: {} },
@@ -161,13 +171,62 @@ function successfulResult(
   return warning ? { ...result, warning } : result;
 }
 
-async function invoke(version: Version, unsupported = false) {
+async function invoke(
+  version: Version,
+  bodyOverrides: Record<string, unknown> = {},
+) {
   const res = response();
-  const req = request(version, unsupported);
+  const req = request(version, bodyOverrides);
   if (version === "v0") await searchControllerV0(req, res as never);
   if (version === "v1") await searchControllerV1(req, res as never);
   if (version === "v2") await searchControllerV2(req, res as never);
   return res;
+}
+
+function searchBodyOverride(
+  version: Version,
+  options: Record<string, unknown>,
+): Record<string, unknown> {
+  return version === "v0" ? { searchOptions: options } : options;
+}
+
+function unsupportedLocalRequests(version: Version) {
+  return [
+    {
+      name: "image source",
+      body: searchBodyOverride(version, { sources: [{ type: "images" }] }),
+    },
+    {
+      name: "news source",
+      body: searchBodyOverride(version, { sources: ["news"] }),
+    },
+    {
+      name: "country targeting",
+      body: searchBodyOverride(version, { country: "ca" }),
+    },
+    {
+      name: "location targeting",
+      body: searchBodyOverride(version, { location: "Toronto, Ontario" }),
+    },
+    {
+      name: "recency filter",
+      body: searchBodyOverride(version, { tbs: "qdr:d" }),
+    },
+    {
+      name: "nested web recency filter",
+      body: searchBodyOverride(version, {
+        sources: [{ type: "web", tbs: "qdr:d" }],
+      }),
+    },
+    {
+      name: "enterprise mode",
+      body: searchBodyOverride(version, { enterprise: ["zdr"] }),
+    },
+    {
+      name: "feedback option",
+      body: searchBodyOverride(version, { feedback: { rating: "good" } }),
+    },
+  ];
 }
 
 function rejectProvider(version: Version, error: Error) {
@@ -258,23 +317,66 @@ describe.each<Version>(["v0", "v1", "v2"])(
       },
     );
 
-    it("rejects unsupported local sources before reservation or provider work", async () => {
+    it.each(unsupportedLocalRequests(version))(
+      "rejects local $name before reservation or provider work",
+      async ({ body }) => {
+        (config as { LOCAL_SEARCH_WEB_ONLY: boolean }).LOCAL_SEARCH_WEB_ONLY =
+          true;
+
+        const res = await invoke(version, body);
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body).toEqual({
+          success: false,
+          code: "BAD_REQUEST",
+          error: LOCAL_SEARCH_WEB_ONLY_MESSAGE,
+        });
+        expect(mocks.reserveKeyless).not.toHaveBeenCalled();
+        expect(mocks.checkTeamCredits).not.toHaveBeenCalled();
+        expect(mocks.legacySearch).not.toHaveBeenCalled();
+        expect(mocks.executeSearch).not.toHaveBeenCalled();
+        expect(mocks.billTeam).not.toHaveBeenCalled();
+      },
+    );
+
+    it("accepts supported local web, filter, language, and scrape inputs", async () => {
       (config as { LOCAL_SEARCH_WEB_ONLY: boolean }).LOCAL_SEARCH_WEB_ONLY =
         true;
+      if (version === "v0") {
+        mocks.legacySearch.mockResolvedValueOnce([]);
+      } else {
+        mocks.executeSearch.mockResolvedValueOnce(successfulResult({}));
+      }
+      const body =
+        version === "v0"
+          ? {
+              searchOptions: { filter: "site:example.test", lang: "fr" },
+              pageOptions: { fetchPageContent: false, includeHtml: true },
+            }
+          : version === "v1"
+            ? {
+                filter: "site:example.test",
+                lang: "fr",
+                scrapeOptions: { formats: [] },
+              }
+            : {
+                sources: [{ type: "web", filter: "site:example.test" }],
+                categories: ["pdf"],
+                includeDomains: ["example.test"],
+                lang: "fr",
+                scrapeOptions: { formats: [] },
+              };
 
-      const res = await invoke(version, true);
+      const res = await invoke(version, body);
 
-      expect(res.statusCode).toBe(400);
-      expect(res.body).toEqual({
-        success: false,
-        code: "BAD_REQUEST",
-        error: LOCAL_SEARCH_WEB_ONLY_MESSAGE,
-      });
-      expect(mocks.reserveKeyless).not.toHaveBeenCalled();
-      expect(mocks.checkTeamCredits).not.toHaveBeenCalled();
-      expect(mocks.legacySearch).not.toHaveBeenCalled();
-      expect(mocks.executeSearch).not.toHaveBeenCalled();
-      expect(mocks.billTeam).not.toHaveBeenCalled();
+      expect(res.statusCode).toBe(200);
+      if (version === "v0") {
+        expect(mocks.checkTeamCredits).toHaveBeenCalledOnce();
+        expect(mocks.legacySearch).toHaveBeenCalledOnce();
+      } else {
+        expect(mocks.reserveKeyless).toHaveBeenCalledOnce();
+        expect(mocks.executeSearch).toHaveBeenCalledOnce();
+      }
     });
 
     it("returns partial diagnostics only as an exact top-level warning", async () => {

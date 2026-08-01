@@ -10,6 +10,10 @@ import {
 import { recordEndpointFeedback } from "./feedback/record";
 import { searchFeedbackRecordOptions } from "./feedback/record-options";
 import { toSearchFeedbackInput } from "./feedback/request-input";
+import {
+  toLocalSearchCapabilityHttpError,
+  validateLocalSearchFeedbackCapability,
+} from "../../search/capabilities";
 
 export async function searchFeedbackController(
   req: RequestWithAuth<
@@ -29,8 +33,14 @@ export async function searchFeedbackController(
 
   let parsedBody: SearchFeedbackRequest;
   try {
+    validateLocalSearchFeedbackCapability();
     parsedBody = searchFeedbackSchema.parse(req.body);
   } catch (error) {
+    const capabilityError = toLocalSearchCapabilityHttpError(error);
+    if (capabilityError) {
+      return res.status(capabilityError.status).json(capabilityError.body);
+    }
+
     if (error instanceof z.ZodError) {
       logger.warn("Invalid feedback body", { error: error.issues });
       return res.status(400).json({

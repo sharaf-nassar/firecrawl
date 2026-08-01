@@ -9,6 +9,10 @@ import {
 import { recordEndpointFeedback } from "./record";
 import { endpointFeedbackRecordOptions } from "./record-options";
 import { toFeedbackInput } from "./request-input";
+import {
+  toLocalSearchCapabilityHttpError,
+  validateLocalSearchFeedbackCapability,
+} from "../../../search/capabilities";
 
 export async function feedbackController(
   req: RequestWithAuth<{}, EndpointFeedbackResponse, EndpointFeedbackRequest>,
@@ -16,8 +20,14 @@ export async function feedbackController(
 ) {
   let parsedBody: EndpointFeedbackRequest;
   try {
+    validateLocalSearchFeedbackCapability(req.body?.endpoint);
     parsedBody = endpointFeedbackSchema.parse(req.body);
   } catch (error) {
+    const capabilityError = toLocalSearchCapabilityHttpError(error);
+    if (capabilityError) {
+      return res.status(capabilityError.status).json(capabilityError.body);
+    }
+
     if (error instanceof z.ZodError) {
       return res.status(400).json({
         success: false,
