@@ -5,6 +5,10 @@ import { Logger } from "winston";
 import { resolveSearchProvider } from "./provider";
 import { SEARCH_PROVIDER_WARNING, splitSearchProviderResponse } from "./errors";
 
+type LegacySearchResponse = SearchResult[] & {
+  warning?: typeof SEARCH_PROVIDER_WARNING;
+};
+
 export async function search({
   query,
   logger,
@@ -33,7 +37,7 @@ export async function search({
   sleep_interval?: number;
   timeout?: number;
   onWarning?: (warning: typeof SEARCH_PROVIDER_WARNING) => void;
-}): Promise<SearchResult[]> {
+}): Promise<LegacySearchResponse> {
   const provider = resolveSearchProvider();
   if (provider.type === "fire-engine") {
     logger.info("Using fire engine search");
@@ -58,9 +62,9 @@ export async function search({
   const { data: results, warning } =
     splitSearchProviderResponse(providerResponse);
   if (warning) onWarning?.(warning);
-  return (
-    results.web?.map(
-      result => new SearchResult(result.url, result.title, result.description),
-    ) ?? []
-  );
+  const mappedResults = (results.web?.map(
+    result => new SearchResult(result.url, result.title, result.description),
+  ) ?? []) as LegacySearchResponse;
+  if (warning) mappedResults.warning = warning;
+  return mappedResults;
 }

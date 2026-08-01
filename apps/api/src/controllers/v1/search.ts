@@ -35,6 +35,11 @@ import {
 } from "../../lib/keyless";
 import { projectSearchTotalCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import {
+  toLocalSearchCapabilityHttpError,
+  validateLocalSearchCapabilities,
+} from "../../search/capabilities";
+import { toSearchProviderHttpError } from "../../search/errors";
 
 // Used for deep research
 export async function searchAndScrapeSearchResult(
@@ -104,7 +109,6 @@ export async function searchController(
     method: "searchController",
     zeroDataRetention,
     teamForcedKind,
-    searchQuery: req.body.query.slice(0, 100),
   });
 
   let responseData: SearchResponse = {
@@ -120,11 +124,11 @@ export async function searchController(
   let reconciledKeylessCredits = false;
 
   try {
+    validateLocalSearchCapabilities(req.body);
     req.body = searchRequestSchema.parse(req.body);
 
     logger = logger.child({
       version: "v1",
-      query: req.body.query,
       origin: req.body.origin,
     });
 
@@ -212,16 +216,17 @@ export async function searchController(
     // Transform v2 response to v1 format (flat array)
     const docs = transformToV1Response(result.response);
 
+    if (result.warning) responseData.warning = result.warning;
+
     if (docs.length === 0) {
       logger.info("No search results found");
-      responseData.warning = "No search results found";
     } else if (shouldScrape) {
       // Filter documents that have content
       const filteredDocs = filterDocumentsWithContent(docs);
 
       if (filteredDocs.length === 0) {
         responseData.data = docs;
-        responseData.warning = "No content found in search results";
+        responseData.warning ??= "No content found in search results";
       } else {
         responseData.data = filteredDocs;
       }
@@ -235,7 +240,7 @@ export async function searchController(
     }
 
     // Bill team for search credits only
-    if (!isSearchPreview) {
+    if (!isSearchPreview && result.searchCredits > 0) {
       billTeam(
         req.auth.team_id,
         req.acuc?.sub_id ?? undefined,
@@ -317,6 +322,19 @@ export async function searchController(
         error: "Invalid request body",
         details: error.issues,
       });
+    }
+
+    const capabilityError = toLocalSearchCapabilityHttpError(error);
+    if (capabilityError) {
+      return res.status(capabilityError.status).json(capabilityError.body);
+    }
+
+    const providerError = toSearchProviderHttpError(error);
+    if (providerError) {
+      logger.warn("Search provider request failed", {
+        code: providerError.body.code,
+      });
+      return res.status(providerError.status).json(providerError.body);
     }
 
     if (error instanceof ScrapeJobTimeoutError) {

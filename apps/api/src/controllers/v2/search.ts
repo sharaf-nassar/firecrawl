@@ -28,6 +28,11 @@ import type { BillingMetadata } from "../../services/billing/types";
 import { getSearchForcedKind, getSearchZDR } from "../../lib/zdr-helpers";
 import { projectSearchTotalCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import {
+  toLocalSearchCapabilityHttpError,
+  validateLocalSearchCapabilities,
+} from "../../search/capabilities";
+import { toSearchProviderHttpError } from "../../search/errors";
 
 export async function searchController(
   req: RequestWithAuth<{}, SearchResponse, SearchRequest>,
@@ -59,6 +64,7 @@ export async function searchController(
   let reconciledKeylessCredits = false;
 
   try {
+    validateLocalSearchCapabilities(req.body);
     req.body = searchRequestSchema.parse(req.body);
 
     if (
@@ -85,7 +91,6 @@ export async function searchController(
 
     logger = logger.child({
       version: "v2",
-      query: req.body.query,
       origin: req.body.origin,
     });
 
@@ -193,7 +198,7 @@ export async function searchController(
     );
 
     // Bill team for search credits only (scrape jobs bill themselves)
-    if (!isSearchPreview && shouldBill) {
+    if (!isSearchPreview && shouldBill && result.searchCredits > 0) {
       billTeam(
         req.auth.team_id,
         req.acuc?.sub_id ?? undefined,
@@ -259,6 +264,7 @@ export async function searchController(
 
     return res.status(200).json({
       success: true,
+      ...(result.warning ? { warning: result.warning } : {}),
       data: result.response,
       creditsUsed: result.totalCredits,
       id: jobId,
@@ -278,6 +284,19 @@ export async function searchController(
         error: "Invalid request body",
         details: error.issues,
       });
+    }
+
+    const capabilityError = toLocalSearchCapabilityHttpError(error);
+    if (capabilityError) {
+      return res.status(capabilityError.status).json(capabilityError.body);
+    }
+
+    const providerError = toSearchProviderHttpError(error);
+    if (providerError) {
+      logger.warn("Search provider request failed", {
+        code: providerError.body.code,
+      });
+      return res.status(providerError.status).json(providerError.body);
     }
 
     if (error instanceof ScrapeJobTimeoutError) {

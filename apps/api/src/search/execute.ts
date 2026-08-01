@@ -16,6 +16,7 @@ import {
 import { applySearchHighlights, highlightsEnvReady } from "./highlights";
 import { trackSearchResults, trackSearchRequest } from "../lib/tracking";
 import type { BillingMetadata } from "../services/billing/types";
+import { SEARCH_PROVIDER_WARNING } from "./errors";
 
 interface SearchOptions {
   query: string;
@@ -52,6 +53,7 @@ interface SearchContext {
 
 interface SearchExecuteResult {
   response: SearchV2Response;
+  warning?: typeof SEARCH_PROVIDER_WARNING;
   totalResultsCount: number;
   searchCredits: number;
   scrapeCredits: number;
@@ -90,7 +92,7 @@ export async function executeSearch(
     },
   );
 
-  const searchResponse = (await search({
+  const providerResponse = await search({
     query: searchQuery,
     logger,
     advanced: false,
@@ -102,7 +104,11 @@ export async function executeSearch(
     location: options.location,
     type: searchTypes,
     enterprise: options.enterprise,
-  })) as SearchV2Response;
+  });
+  const { warning, ...searchResponse } =
+    providerResponse as SearchV2Response & {
+      warning?: typeof SEARCH_PROVIDER_WARNING;
+    };
 
   if (searchResponse.web && searchResponse.web.length > 0) {
     searchResponse.web = searchResponse.web.map(result => ({
@@ -244,6 +250,7 @@ export async function executeSearch(
 
   return {
     response: searchResponse,
+    warning,
     totalResultsCount,
     searchCredits,
     scrapeCredits,

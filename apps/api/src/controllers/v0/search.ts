@@ -26,6 +26,11 @@ import { scrapeQueue } from "../../services/worker/nuq-router";
 import { defaultOrigin } from "../../lib/default-values";
 import { getSearchZDR } from "../../lib/zdr-helpers";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import {
+  toLocalSearchCapabilityHttpError,
+  validateLocalSearchCapabilities,
+} from "../../search/capabilities";
+import { toSearchProviderHttpError } from "../../search/errors";
 
 async function searchHelper(
   jobId: string,
@@ -41,6 +46,7 @@ async function searchHelper(
   success: boolean;
   error?: string;
   data?: any;
+  warning?: string;
   returnCode: number;
 }> {
   const query = req.body.query;
@@ -70,6 +76,8 @@ async function searchHelper(
     country: searchOptions.country ?? "us",
     location: searchOptions.location,
   });
+  const providerWarning = res.warning;
+  delete res.warning;
 
   let justSearch = pageOptions.fetchPageContent === false;
 
@@ -83,20 +91,26 @@ async function searchHelper(
 
   if (justSearch) {
     const searchCredits = Math.ceil(res.length / 10) * 2;
-    billTeam(
-      team_id,
-      subscription_id,
-      searchCredits,
-      api_key_id,
-      { endpoint: "search", jobId },
-      logger,
-    ).catch(error => {
-      logger.error(
-        `Failed to bill team ${team_id} for ${searchCredits} credits: ${error}`,
-      );
-      // Optionally, you could notify an admin or add to a retry queue here
-    });
-    return { success: true, data: res, returnCode: 200 };
+    if (searchCredits > 0) {
+      billTeam(
+        team_id,
+        subscription_id,
+        searchCredits,
+        api_key_id,
+        { endpoint: "search", jobId },
+        logger,
+      ).catch(error => {
+        logger.error(
+          `Failed to bill team ${team_id} for ${searchCredits} credits: ${error}`,
+        );
+      });
+    }
+    return {
+      success: true,
+      data: res,
+      ...(providerWarning ? { warning: providerWarning } : {}),
+      returnCode: 200,
+    };
   }
 
   res = res.filter(
@@ -111,7 +125,12 @@ async function searchHelper(
   }
 
   if (res.length === 0) {
-    return { success: true, error: "No search results found", returnCode: 200 };
+    return {
+      success: true,
+      data: [],
+      ...(providerWarning ? { warning: providerWarning } : {}),
+      returnCode: 200,
+    };
   }
 
   const jobPriority = await getJobPriority({ team_id, basePriority: 20 });
@@ -193,6 +212,8 @@ export async function searchController(req: Request, res: Response) {
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
       });
     }
+
+    validateLocalSearchCapabilities(req.body);
 
     const jobId = uuidv7();
 
@@ -279,6 +300,19 @@ export async function searchController(req: Request, res: Response) {
     });
     return res.status(result.returnCode).json(result);
   } catch (error) {
+    const capabilityError = toLocalSearchCapabilityHttpError(error);
+    if (capabilityError) {
+      return res.status(capabilityError.status).json(capabilityError.body);
+    }
+
+    const providerError = toSearchProviderHttpError(error);
+    if (providerError) {
+      logger.warn("Search provider request failed", {
+        code: providerError.body.code,
+      });
+      return res.status(providerError.status).json(providerError.body);
+    }
+
     if (error instanceof ScrapeJobTimeoutError) {
       return res.status(408).json({ error: error.message });
     }

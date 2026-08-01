@@ -146,6 +146,10 @@ Search is a synchronous federated query that may enrich result records by scrapi
 
 Provider selection has no fallback loop. Local web-only mode requires SearXNG; elsewhere Fire Engine wins over configured SearXNG, and no provider is a typed 503. The shared SearXNG client uses bounded form-encoded POST requests and preserves valid empty responses.
 
+Ordinary v0, v1, and v2 controllers map canonical provider failures to stable 502 or 503 envelopes before billing or scrape dispatch. Valid empty responses cost zero credits, while sanitized partial-provider diagnostics appear only as a top-level warning.
+
+Local web-only source validation runs before keyless reservation or provider execution. This shared admission seam rejects non-web sources with a stable 400 response; broader local option enforcement extends the same boundary.
+
 Each source is capped to the requested limit. Scraping occurs only when output formats are requested, and merged scrape costs join provider-result costs in `creditsUsed`. Timeouts from enrichment return 408.
 
 An experimental highlights option can replace provider snippets with query-relevant spans from recent indexed content. It runs only when team and deployment capabilities are present, batches scoring after scrape enrichment, and keeps the original snippet on any cache or model failure.
