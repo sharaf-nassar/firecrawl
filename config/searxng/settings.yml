@@ -1,0 +1,56 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - brave
+      - qwant
+      - startpage
+      - bing
+
+general:
+  debug: false
+  instance_name: Firecrawl Local Search
+  enable_metrics: false
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  favicon_resolver: ""
+  default_lang: en
+  max_page: 5
+  formats:
+    - json
+
+server:
+  secret_key: ultrasecretkey
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: POST
+
+categories_as_tabs:
+  general:
+
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 4.0
+  retries: 0
+  pool_connections: 16
+  pool_maxsize: 8
+
+engines:
+  - name: brave
+    categories:
+      - general
+    disabled: false
+  - name: qwant
+    categories:
+      - general
+    disabled: false
+  - name: startpage
+    categories:
+      - general
+    disabled: false
+  - name: bing
+    categories:
+      - general
+    disabled: false

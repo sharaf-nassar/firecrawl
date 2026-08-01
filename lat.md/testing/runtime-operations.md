@@ -76,6 +76,26 @@ Go HTML-to-Markdown uses `httptest` for index, health, conversion, malformed inp
 
 `apps/redis/` has no automated test for its image, memory sizing, password, persistence, or Fly configuration. The custom image is outside required repository CI.
 
+## SearXNG configuration suite
+
+`scripts/searxng-config.test.mjs` locks the local search image, settings, rendered Compose boundary, and current-architecture startup without issuing an upstream search.
+
+### Static settings policy
+
+The pinned image's settings loader must parse the tracked configuration into the exact private JSON/POST policy, four enabled general engines, and bounded outgoing request settings with no DuckDuckGo or Valkey path.
+
+### Rendered service hardening
+
+Rendered Compose must retain the digest, backend-only topology, read-only settings and root, non-root identity, dropped privileges, bounded resources, rotating logs, and local-only health probe without exposing the secret to API.
+
+### Immutable image architectures
+
+The registry descriptor for the exact image digest must remain an OCI image index containing both `linux/amd64` and `linux/arm64` manifests.
+
+### Boot and effective settings
+
+The current host architecture must boot the hardened service, pass `/healthz`, and report only the four selected engines as enabled in SearXNG's effective `/config` response.
+
 ## Local wrapper suite
 
 `scripts/local-firecrawl.test.mjs` validates orchestration without mutating a real Docker installation.

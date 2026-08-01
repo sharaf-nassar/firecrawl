@@ -325,6 +325,54 @@ services:
       minio:
         condition: service_healthy
 
+  searxng:
+    image: ghcr.io/searxng/searxng:2026.7.31-6bfd82705@sha256:79c2be18a18367484474bae9b18a8cd9085114ab3dcd49cac091cad8c548a0a9
+    user: "977:977"
+    read_only: true
+    init: true
+    environment:
+      FORCE_OWNERSHIP: "false"
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+    networks:
+      - backend
+    volumes:
+      - type: bind
+        source: ./config/searxng/settings.yml
+        target: /etc/searxng/settings.yml
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 512M
+    memswap_limit: 512M
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=64m,mode=1777
+      - /var/cache/searxng:noexec,nosuid,nodev,size=128m,mode=0750,uid=977,gid=977
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - --spider
+        - --timeout=3
+        - http://127.0.0.1:8080/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
   playwright-service:
     restart: unless-stopped
     healthcheck:

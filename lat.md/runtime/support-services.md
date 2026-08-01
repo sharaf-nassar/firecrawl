@@ -4,6 +4,16 @@ Firecrawl uses small conversion and persistence services around the API and brow
 
 These services have narrower contracts than the API: HTML conversion is request/response, NuQ Postgres is a durable queue backend, and Redis supplies shared ephemeral coordination and rate-limit state.
 
+## SearXNG
+
+The local Compose overlay defines a private, bounded SearXNG service as the reproducible web-search dependency for the wrapper-managed runtime.
+
+The official image is pinned by release and immutable digest. It joins only the `backend` network, publishes no host port, runs as UID/GID `977:977` with a read-only root, drops all capabilities, and uses bounded CPU, memory, PID, and tmpfs resources.
+
+`config/searxng/settings.yml` inherits the pinned image defaults while retaining only Brave, Qwant, Startpage, and Bing. Every retained engine is explicitly enabled for `general`; autocomplete, favicons, limiter, public-instance behavior, image proxying, and Valkey are disabled.
+
+Only JSON search output is enabled, with POST as the server method. A local `/healthz` probe proves the process loaded its configuration without contacting upstream engines; functional search health belongs to the wrapper lifecycle contract.
+
 ## HTML to Markdown service
 
 The Go HTML-to-Markdown service converts a bounded HTML string without browser execution.
