@@ -32,6 +32,7 @@ export type StoredDeepResearch = {
   createdAt: number;
   status: "processing" | "completed" | "failed" | "cancelled";
   error?: any;
+  warning?: string;
   currentDepth: number;
   maxDepth: number;
   completedSteps: number;

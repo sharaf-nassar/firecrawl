@@ -1,6 +1,6 @@
 import { logger as _logger } from "../logger";
 import { updateDeepResearch } from "./deep-research-redis";
-import { searchAndScrapeSearchResult } from "../../controllers/v1/search";
+import { searchAndScrapeSearchResult } from "./search";
 import { ResearchLLMService, ResearchStateManager } from "./research-manager";
 import { logDeepResearch } from "../../services/logging/log_job";
 import { billTeam } from "../../services/billing/credit_billing";
@@ -8,6 +8,7 @@ import { ExtractOptions } from "../../controllers/v1/types";
 import { CostTracking } from "../cost-tracking";
 import { getACUCTeam } from "../../controllers/auth";
 import { includesFormat } from "../format-utils";
+import { SEARCH_PROVIDER_WARNING } from "../../search/errors";
 export interface DeepResearchServiceOptions {
   researchId: string;
   teamId: string;
@@ -29,6 +30,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
   const startTime = Date.now();
   let currentTopic = options.query;
   let urlsAnalyzed = 0;
+  let providerWarning: typeof SEARCH_PROVIDER_WARNING | undefined;
 
   const logger = _logger.child({
     module: "deep-research",
@@ -157,7 +159,8 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
           logger,
           acuc?.flags ?? null,
         );
-        return response.length > 0 ? response : [];
+        if (response.warning) providerWarning = response.warning;
+        return response.documents.length > 0 ? response.documents : [];
       });
 
       const searchResultsArrays = await Promise.all(searchPromises);
@@ -423,6 +426,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       status: "completed",
       finalAnalysis: finalAnalysis,
       json: finalAnalysisJson,
+      warning: providerWarning,
     });
     // Bill team for usage based on URLs analyzed
     billTeam(
@@ -440,6 +444,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     });
     return {
       success: true,
+      ...(providerWarning ? { warning: providerWarning } : {}),
       data: {
         finalAnalysis: finalAnalysis,
         sources: state.getSources(),

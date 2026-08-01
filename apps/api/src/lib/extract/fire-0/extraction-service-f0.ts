@@ -16,7 +16,6 @@ import { getErrorContactMessage } from "../../deployment";
 import { ExtractStep, updateExtract } from "../extract-redis";
 import { CUSTOM_U_TEAMS } from "../config";
 import { normalizeUrl } from "../../canonical-url";
-import { search } from "../../../search";
 import { buildRephraseToSerpPrompt_F0 } from "./build-prompts-f0";
 import { processUrl_F0, generateBasicCompletion_FO } from "./url-processor-f0";
 import {
@@ -39,6 +38,8 @@ import {
 } from "./usage/llm-cost-f0";
 import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
 import { getACUCTeam } from "../../../controllers/auth";
+import { SEARCH_PROVIDER_WARNING } from "../../../search/errors";
+import { discoverExtractionUrls } from "../search";
 
 interface ExtractServiceOptions {
   request: ExtractRequest;
@@ -89,6 +90,7 @@ export async function performExtraction_F0(
   let singleAnswerResult: any = {};
   let totalUrlsScraped = 0;
   let sources: Record<string, string[]> = {};
+  let providerWarning: typeof SEARCH_PROVIDER_WARNING | undefined;
 
   const acuc = await getACUCTeam(teamId);
 
@@ -109,13 +111,12 @@ export async function performExtraction_F0(
       buildRephraseToSerpPrompt_F0(request.prompt),
       { teamId, extractId },
     );
-    const searchResults = await search({
-      query: rephrasedPrompt.replace('"', "").replace("'", ""),
+    const searchResult = await discoverExtractionUrls(
+      rephrasedPrompt.replace('"', "").replace("'", ""),
       logger,
-      num_results: 10,
-    });
-
-    request.urls = searchResults.map(result => result.url) as string[];
+    );
+    providerWarning = searchResult.warning;
+    request.urls = searchResult.urls;
   }
   if (request.urls && request.urls.length === 0) {
     logger.error("No search results found", {
@@ -136,6 +137,7 @@ export async function performExtraction_F0(
       success: false,
       error: "No search results found",
       extractId,
+      warning: providerWarning,
     };
   }
 
@@ -220,6 +222,7 @@ export async function performExtraction_F0(
       error:
         "No valid URLs found to scrape. Try adjusting your search criteria or including more URLs.",
       extractId,
+      warning: providerWarning,
       urlTrace: urlTraces,
       totalUrlsScraped: 0,
     };
@@ -592,6 +595,7 @@ export async function performExtraction_F0(
         success: false,
         error: getErrorContactMessage(),
         extractId,
+        warning: providerWarning,
         urlTrace: urlTraces,
         totalUrlsScraped,
       };
@@ -684,6 +688,7 @@ export async function performExtraction_F0(
         success: false,
         error: error.message,
         extractId,
+        warning: providerWarning,
         urlTrace: urlTraces,
         totalUrlsScraped,
       };
@@ -708,6 +713,7 @@ export async function performExtraction_F0(
         error:
           "All provided URLs are invalid. Please check your input and try again.",
         extractId,
+        warning: providerWarning,
         urlTrace: request.urlTrace ? urlTraces : undefined,
         totalUrlsScraped: 0,
       };
@@ -931,7 +937,7 @@ export async function performExtraction_F0(
     success: true,
     data: finalResult ?? {},
     extractId,
-    warning: undefined,
+    warning: providerWarning,
     urlTrace: request.urlTrace ? urlTraces : undefined,
     llmUsage,
     totalUrlsScraped,

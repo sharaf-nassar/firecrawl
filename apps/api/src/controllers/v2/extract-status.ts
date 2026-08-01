@@ -130,6 +130,7 @@ export async function extractStatusController(
       }
       return undefined;
     })(),
+    warning: redisExtract.warning,
     expiresAt: (await getExtractExpiry(req.params.jobId)).toISOString(),
     steps: redisExtract.showSteps ? redisExtract.steps : undefined,
     llmUsage: redisExtract.showLLMUsage ? redisExtract.llmUsage : undefined,

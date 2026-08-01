@@ -156,6 +156,14 @@ An experimental highlights option can replace provider snippets with query-relev
 
 Optional x402 search uses a separate controller and payment gate described by [[trust-and-operations#x402 paid search]].
 
+## Internal search consumers
+
+Extraction and deep research use the shared provider contract without translating provider errors into valid empty results.
+
+[[apps/api/src/search/internal.ts#searchForInternalConsumer]] executes legacy web search once, returns only the canonical sanitized warning beside results, and lets canonical provider errors or unexpected defects bubble unchanged.
+
+Prompt-based extraction preserves empty discovery as its existing no-results outcome and carries partial warnings into extraction status. Deep research keeps valid empty searches in its normal iteration flow and stores partial warnings with completed status.
+
 ## Research
 
 Research is a synchronous proxy family for paper discovery, paper reading, citation relationships, and GitHub history or README search.

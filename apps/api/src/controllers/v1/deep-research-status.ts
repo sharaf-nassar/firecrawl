@@ -29,6 +29,7 @@ export async function deepResearchStatusController(
       // totalSteps: research.totalExpectedSteps,
     },
     error: research?.error ?? undefined,
+    warning: research.warning,
     expiresAt: (await getDeepResearchExpiry(req.params.jobId)).toISOString(),
     currentDepth: research.currentDepth,
     maxDepth: research.maxDepth,

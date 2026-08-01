@@ -22,6 +22,42 @@ Search provider unit tests fix the local and non-local precedence matrix, SearXN
 
 Ordinary search controller tests cover v0, v1, and v2 provider-error envelopes, pre-reservation local source rejection, top-level partial warnings, valid-empty zero billing, keyless reconciliation, and absence of scrape dispatch after provider failure.
 
+## Internal search consumers
+
+Focused contracts keep extraction and deep research aligned with shared search-provider semantics.
+
+### Extraction
+
+Extraction search tests cover provider failures, legitimate empty discovery, and sanitized partial warnings.
+
+#### Errors propagate
+
+Canonical unavailable and bad-response errors plus unexpected defects bubble unchanged, with one provider execution per discovery request and no local HTTP mapping.
+
+#### Valid empty
+
+A legitimate empty provider response remains an ordinary empty URL list after exactly one provider execution.
+
+#### Partial warning
+
+A partial result keeps the canonical sanitized warning and discovered URL after exactly one provider execution.
+
+### Deep research
+
+Deep-research search tests cover provider failures before scraping, legitimate empty results, and sanitized partial warnings.
+
+#### Errors propagate
+
+Canonical unavailable and bad-response errors plus unexpected defects bubble unchanged before scraping, with one provider execution and no local HTTP mapping.
+
+#### Valid empty
+
+A legitimate empty provider response remains ordinary empty input to scraping after exactly one provider execution.
+
+#### Partial warning
+
+A partial result keeps the canonical sanitized warning with scraped documents after exactly one provider execution.
+
 ## Queue and worker tests
 
 Queue tests exercise backend semantics and migration invariants without treating queue implementations as interchangeable black boxes.

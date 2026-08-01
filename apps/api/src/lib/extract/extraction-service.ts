@@ -36,10 +36,11 @@ import { batchExtractPromise } from "./completions/batchExtract";
 import { singleAnswerCompletion } from "./completions/singleAnswer";
 import { SourceTracker } from "./helpers/source-tracker";
 import { normalizeUrl } from "../canonical-url";
-import { search } from "../../search";
 import { buildRephraseToSerpPrompt } from "./build-prompts";
 import { getACUCTeam } from "../../controllers/auth";
 import { CostLimitExceededError, CostTracking } from "../cost-tracking";
+import { SEARCH_PROVIDER_WARNING } from "../../search/errors";
+import { discoverExtractionUrls } from "./search";
 
 interface ExtractServiceOptions {
   request: ExtractRequest;
@@ -91,6 +92,7 @@ async function performExtraction(
   let singleAnswerResult: any = {};
   let totalUrlsScraped = 0;
   let sources: Record<string, string[]> = {};
+  let providerWarning: typeof SEARCH_PROVIDER_WARNING | undefined;
 
   let costTracking = new CostTracking(subId ? null : 1.5);
   const acuc = await getACUCTeam(teamId);
@@ -120,13 +122,9 @@ async function performExtraction(
         { teamId, extractId },
       );
       let rptxt = rephrasedPrompt?.text.replace('"', "").replace("'", "") || "";
-      const searchResults = await search({
-        query: rptxt,
-        logger,
-        num_results: 10,
-      });
-
-      request.urls = searchResults.map(result => result.url) as string[];
+      const searchResult = await discoverExtractionUrls(rptxt, logger);
+      providerWarning = searchResult.warning;
+      request.urls = searchResult.urls;
     }
     if (request.urls && request.urls.length === 0) {
       logger.error("No search results found", {
@@ -165,6 +163,7 @@ async function performExtraction(
         success: false,
         error: "No search results found",
         extractId,
+        warning: providerWarning,
       };
     }
 
@@ -680,6 +679,7 @@ async function performExtraction(
           success: false,
           error: getErrorContactMessage(),
           extractId,
+          warning: providerWarning,
           urlTrace: urlTraces,
           totalUrlsScraped,
         };
@@ -792,6 +792,7 @@ async function performExtraction(
           success: false,
           error: error.message,
           extractId,
+          warning: providerWarning,
           urlTrace: urlTraces,
           totalUrlsScraped,
         };
@@ -832,6 +833,7 @@ async function performExtraction(
           success: false,
           error: errorMessage,
           extractId,
+          warning: providerWarning,
           urlTrace: request.urlTrace ? urlTraces : undefined,
           totalUrlsScraped: 0,
         };
@@ -1053,7 +1055,7 @@ async function performExtraction(
       success: true,
       data: finalResult ?? {},
       extractId,
-      warning: undefined,
+      warning: providerWarning,
       urlTrace: request.urlTrace ? urlTraces : undefined,
       llmUsage,
       totalUrlsScraped,

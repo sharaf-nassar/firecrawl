@@ -28,6 +28,7 @@ type StoredExtract = {
   createdAt: number;
   status: "processing" | "completed" | "failed" | "cancelled";
   error?: any;
+  warning?: string;
   showSteps?: boolean;
   steps?: ExtractedStep[];
   showLLMUsage?: boolean;

@@ -68,6 +68,7 @@ const processExtractJob = async (
         status: "completed",
         llmUsage: result.llmUsage,
         sources: result.sources,
+        warning: result.warning,
         tokensBilled: result.tokensBilled,
         creditsBilled: result.creditsBilled,
       });
@@ -86,6 +87,7 @@ const processExtractJob = async (
       await updateExtract(data.extractId, {
         status: "failed",
         error: result?.error ?? getErrorContactMessage(data.extractId),
+        warning: result?.warning,
       });
 
       if (sender) {

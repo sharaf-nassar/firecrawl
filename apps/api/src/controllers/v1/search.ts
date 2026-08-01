@@ -10,17 +10,11 @@ import {
 import { billTeam } from "../../services/billing/credit_billing";
 import { v7 as uuidv7 } from "uuid";
 import { logSearch, logRequest } from "../../services/logging/log_job";
-import { search } from "../../search";
 import { logger as _logger } from "../../lib/logger";
-import type { Logger } from "winston";
 import { ScrapeJobTimeoutError } from "../../lib/error";
 import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { z } from "zod";
 import { executeSearch } from "../../search/execute";
-import {
-  DocumentWithCostTracking,
-  scrapeSearchResults,
-} from "../../search/scrape";
 import {
   transformToV1Response,
   filterDocumentsWithContent,
@@ -40,55 +34,6 @@ import {
   validateLocalSearchCapabilities,
 } from "../../search/capabilities";
 import { toSearchProviderHttpError } from "../../search/errors";
-
-// Used for deep research
-export async function searchAndScrapeSearchResult(
-  query: string,
-  options: {
-    teamId: string;
-    origin: string;
-    timeout: number;
-    scrapeOptions: any;
-    apiKeyId: number | null;
-    requestId?: string;
-  },
-  logger: Logger,
-  flags: any,
-): Promise<DocumentWithCostTracking[]> {
-  try {
-    const searchResults = await search({
-      query,
-      logger,
-      num_results: 5,
-    });
-
-    const { scrapeOptions } = fromV1ScrapeOptions(
-      options.scrapeOptions,
-      options.timeout,
-      options.teamId,
-    );
-
-    return await scrapeSearchResults(
-      searchResults.map(r => ({
-        url: r.url,
-        title: r.title,
-        description: r.description,
-      })),
-      {
-        teamId: options.teamId,
-        origin: options.origin,
-        timeout: options.timeout,
-        scrapeOptions,
-        apiKeyId: options.apiKeyId,
-        requestId: options.requestId,
-      },
-      logger,
-      flags,
-    );
-  } catch (error) {
-    return [];
-  }
-}
 
 export async function searchController(
   req: RequestWithAuth<{}, SearchResponse, SearchRequest>,
