@@ -35,14 +35,14 @@ interface X402SettlementPrototype<
 }
 
 /**
- * Prototype for the frozen x402 ordering contract.
+ * Executable model for the frozen x402 ordering contract.
  *
  * Route policy that is not represented here (country and blocklist checks)
  * remains before this payment lifecycle. claimPayment must atomically reserve
  * a facilitator-verified payment in a shared replay store and keep the claim
- * terminal on every outcome until its authorization expires. This seam is
- * intentionally not wired to the search controllers; downstream x402 work
- * will adapt the real boundaries without changing the order proved here.
+ * terminal on every outcome until its authorization expires. The real route
+ * installs that claim at the resource server's post-verification hook; this
+ * model keeps the complete boundary order visible and counter-testable.
  */
 // @lat: [[api/trust-and-operations#Trust, Billing, and Operations#x402 paid search]]
 export async function executeX402SettlementPrototype<

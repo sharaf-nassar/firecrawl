@@ -35,6 +35,10 @@ import {
   captureExceptionWithZdrCheck,
 } from "../../services/sentry";
 import { getSearchForcedKind, getSearchZDR } from "../../lib/zdr-helpers";
+import {
+  splitSearchProviderResponse,
+  toSearchProviderHttpError,
+} from "../../search/errors";
 
 interface DocumentWithCostTracking {
   document: Document;
@@ -294,7 +298,7 @@ export async function x402SearchController(
       },
     );
 
-    const searchResponse = (await search({
+    const providerResponse = await search({
       query: searchQuery,
       logger,
       advanced: false,
@@ -306,7 +310,9 @@ export async function x402SearchController(
       location: req.body.location,
       type: searchTypes,
       enterprise: req.body.enterprise,
-    })) as SearchV2Response;
+    });
+    const { data: searchResponse, warning: providerWarning } =
+      splitSearchProviderResponse(providerResponse);
 
     // Add category labels to web results
     if (searchResponse.web && searchResponse.web.length > 0) {
@@ -569,6 +575,7 @@ export async function x402SearchController(
 
         return res.status(200).json({
           success: true,
+          ...(providerWarning ? { warning: providerWarning } : {}),
           data: searchResponse,
           scrapeIds,
           creditsUsed: credits_billed,
@@ -655,6 +662,7 @@ export async function x402SearchController(
     // For sync scraping or no scraping, don't include scrapeIds
     return res.status(200).json({
       success: true,
+      ...(providerWarning ? { warning: providerWarning } : {}),
       data: searchResponse,
       creditsUsed: credits_billed,
       id: jobId,
@@ -677,13 +685,15 @@ export async function x402SearchController(
       });
     }
 
+    const providerError = toSearchProviderHttpError(error);
+    if (providerError) {
+      return res.status(providerError.status).json(providerError.body);
+    }
+
     captureExceptionWithZdrCheck(error, {
       extra: { zeroDataRetention },
     });
     logger.error("Unhandled error occurred in search [x402]", { error });
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    throw error;
   }
 }

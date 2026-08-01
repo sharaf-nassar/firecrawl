@@ -5,7 +5,7 @@ lat:
 
 # x402 Settlement Ordering Tests
 
-Counter tests freeze payment ordering so rejected work cannot consume provider capacity and successful work cannot escape or duplicate settlement.
+Counter tests exercise the real replay hook inside the frozen payment order so rejected work cannot consume provider capacity and successful work cannot escape or duplicate settlement.
 
 ## Unauthorized requests
 

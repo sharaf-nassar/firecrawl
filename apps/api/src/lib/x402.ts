@@ -6,6 +6,11 @@ import {
 } from "@x402/express";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { registerExactEvmScheme } from "@x402/evm/exact/server";
+import { redisEvictConnection } from "../services/redis";
+import {
+  createRedisX402ReplayStore,
+  createX402ReplayClaimHook,
+} from "./x402-replay";
 
 // Network name to CAIP-2 chain ID mapping
 const NETWORK_TO_CAIP2: Record<string, Network> = {
@@ -37,6 +42,11 @@ export function getX402ResourceServer(): X402ResourceServer {
     registerExactEvmScheme(_resourceServer, {
       networks: [getX402Network()],
     });
+    _resourceServer.onAfterVerify(
+      createX402ReplayClaimHook({
+        store: createRedisX402ReplayStore(redisEvictConnection),
+      }),
+    );
   }
   return _resourceServer;
 }

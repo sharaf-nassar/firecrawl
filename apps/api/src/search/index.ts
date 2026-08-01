@@ -3,6 +3,7 @@ import { searxng_search } from "./searxng";
 import { fire_engine_search } from "./fireEngine";
 import { Logger } from "winston";
 import { resolveSearchProvider } from "./provider";
+import { SEARCH_PROVIDER_WARNING, splitSearchProviderResponse } from "./errors";
 
 export async function search({
   query,
@@ -17,6 +18,7 @@ export async function search({
   proxy = undefined,
   sleep_interval = 0,
   timeout = 5000,
+  onWarning,
 }: {
   query: string;
   logger: Logger;
@@ -30,6 +32,7 @@ export async function search({
   proxy?: string;
   sleep_interval?: number;
   timeout?: number;
+  onWarning?: (warning: typeof SEARCH_PROVIDER_WARNING) => void;
 }): Promise<SearchResult[]> {
   const provider = resolveSearchProvider();
   if (provider.type === "fire-engine") {
@@ -45,13 +48,16 @@ export async function search({
   }
 
   logger.info("Using searxng search");
-  const results = await searxng_search(query, {
+  const providerResponse = await searxng_search(query, {
     endpoint: provider.endpoint,
     engines: provider.engines,
     categories: provider.categories,
     num_results,
     lang,
   });
+  const { data: results, warning } =
+    splitSearchProviderResponse(providerResponse);
+  if (warning) onWarning?.(warning);
   return (
     results.web?.map(
       result => new SearchResult(result.url, result.title, result.description),

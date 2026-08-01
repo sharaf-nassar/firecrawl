@@ -5,6 +5,11 @@ import {
   type X402PrototypeResponse,
   type X402ReplayDecision,
 } from "./x402-ordering";
+import type { PaymentPayload, PaymentRequirements } from "@x402/express";
+import {
+  X402PaymentReplayError,
+  createX402ReplayClaimHook,
+} from "./x402-replay";
 
 type Stage =
   | "authorize"
@@ -34,6 +39,37 @@ interface Scenario {
   settlementError?: Error;
 }
 
+const paymentRequirements = {
+  scheme: "exact",
+  network: "eip155:84532",
+  asset: "0xasset",
+  amount: "10000",
+  payTo: "0xrecipient",
+  maxTimeoutSeconds: 120,
+  extra: {},
+} as PaymentRequirements;
+
+const verifiedPayment = {
+  x402Version: 2,
+  accepted: paymentRequirements,
+  resource: {
+    url: "https://api.example/v2/x402/search",
+    description: "Paid search",
+    mimeType: "application/json",
+  },
+  payload: {
+    signature: "0xsignature",
+    authorization: {
+      from: "0xpayer",
+      to: "0xrecipient",
+      value: "10000",
+      validAfter: "900",
+      validBefore: "1120",
+      nonce: "0xnonce",
+    },
+  },
+} as PaymentPayload;
+
 function response(statusCode: number, outcome: string): X402PrototypeResponse {
   return { statusCode, body: { outcome } };
 }
@@ -49,6 +85,16 @@ function createHarness(scenario: Scenario = {}) {
     settlement: 0,
   };
   const claimedPayments = new Set<string>();
+  const replayClaim = createX402ReplayClaimHook({
+    store: {
+      async claim(key) {
+        if (scenario.replayed || claimedPayments.has(key)) return false;
+        claimedPayments.add(key);
+        return true;
+      },
+    },
+    nowSeconds: () => 1000,
+  });
   const order: Stage[] = [];
   const count = (stage: Stage) => {
     calls[stage] += 1;
@@ -74,19 +120,29 @@ function createHarness(scenario: Scenario = {}) {
             ? { allowed: false, response: response(429, "rate-limited") }
             : { allowed: true };
         },
-        async verifyPayment(): Promise<X402PaymentDecision<string>> {
+        async verifyPayment(): Promise<X402PaymentDecision<PaymentPayload>> {
           count("verifyPayment");
           const payment = scenario.payment ?? "verified";
           return payment === "verified"
-            ? { verified: true, payment: "verified-payment" }
+            ? { verified: true, payment: verifiedPayment }
             : { verified: false, response: response(402, payment) };
         },
-        async claimPayment(payment): Promise<X402ReplayDecision<string>> {
+        async claimPayment(
+          payment,
+        ): Promise<X402ReplayDecision<PaymentPayload>> {
           count("claimPayment");
-          if (scenario.replayed || claimedPayments.has(payment)) {
-            return { claimed: false, response: response(402, "replay") };
+          try {
+            await replayClaim({
+              paymentPayload: payment,
+              requirements: paymentRequirements,
+              result: { isValid: true },
+            });
+          } catch (error) {
+            if (error instanceof X402PaymentReplayError) {
+              return { claimed: false, response: response(402, "replay") };
+            }
+            throw error;
           }
-          claimedPayments.add(payment);
           return { claimed: true, settlement: payment };
         },
         async executeProvider(): Promise<ProviderOutcome> {
@@ -107,7 +163,7 @@ function createHarness(scenario: Scenario = {}) {
           return response(200, result);
         },
         async settlePayment(settlement): Promise<void> {
-          expect(settlement).toBe("verified-payment");
+          expect(settlement).toBe(verifiedPayment);
           count("settlement");
           if (scenario.settlementError) {
             throw scenario.settlementError;
@@ -156,7 +212,7 @@ function expectSettledSuccess(harness: ReturnType<typeof createHarness>) {
   expect(harness.calls.settlement).toBe(1);
 }
 
-describe("x402 settlement ordering prototype", () => {
+describe("x402 paid search boundary", () => {
   // @lat: [[testing/x402-settlement#x402 Settlement Ordering Tests#Unauthorized requests]]
   it("rejects unauthorized requests before rate limit and payment work", async () => {
     const harness = createHarness({ authorized: false });

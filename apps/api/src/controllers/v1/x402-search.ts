@@ -30,6 +30,7 @@ import {
 } from "../../services/sentry";
 import { getJobPriority } from "../../lib/job-priority";
 import { getSearchForcedKind } from "../../lib/zdr-helpers";
+import { toSearchProviderHttpError } from "../../search/errors";
 
 interface DocumentWithCostTracking {
   document: Document;
@@ -239,6 +240,7 @@ export async function x402SearchController(
 
     logger.info("Searching [x402] for results");
 
+    let providerWarning: string | undefined;
     let searchResults = await search({
       query: req.body.query,
       logger,
@@ -249,6 +251,9 @@ export async function x402SearchController(
       lang: req.body.lang,
       country: req.body.country,
       location: req.body.location,
+      onWarning: warning => {
+        providerWarning = warning;
+      },
     });
 
     if (req.body.ignoreInvalidURLs) {
@@ -324,6 +329,8 @@ export async function x402SearchController(
       }
     }
 
+    if (providerWarning) responseData.warning = providerWarning;
+
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - startTime) / 1000;
 
@@ -360,13 +367,15 @@ export async function x402SearchController(
       });
     }
 
+    const providerError = toSearchProviderHttpError(error);
+    if (providerError) {
+      return res.status(providerError.status).json(providerError.body);
+    }
+
     captureExceptionWithZdrCheck(error, {
       extra: { zeroDataRetention },
     });
     logger.error("Unhandled error occurred in search [x402]", { error });
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    throw error;
   }
 }

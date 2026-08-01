@@ -8,6 +8,8 @@ import {
   SEARCH_PROVIDER_UNAVAILABLE_MESSAGE,
   SearchProviderBadResponseError,
   SearchProviderUnavailableError,
+  SEARCH_PROVIDER_WARNING,
+  splitSearchProviderResponse,
   toSearchProviderHttpError,
 } from "./errors";
 import { resolveSearchProvider, SearchProviderConfig } from "./provider";
@@ -75,6 +77,21 @@ describe("resolveSearchProvider", () => {
 });
 
 describe("search provider errors", () => {
+  it("moves only the canonical provider warning out of result data", () => {
+    expect(
+      splitSearchProviderResponse({
+        web: [{ url: "https://example.com" }],
+        warning: SEARCH_PROVIDER_WARNING,
+      }),
+    ).toEqual({
+      data: { web: [{ url: "https://example.com" }] },
+      warning: SEARCH_PROVIDER_WARNING,
+    });
+    expect(
+      splitSearchProviderResponse({ web: [], warning: "private detail" }),
+    ).toEqual({ data: { web: [] } });
+  });
+
   it("maps only canonical errors to stable 502 and 503 envelopes", () => {
     expect(
       toSearchProviderHttpError(new SearchProviderUnavailableError()),

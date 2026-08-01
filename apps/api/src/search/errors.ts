@@ -7,6 +7,19 @@ export const SEARCH_PROVIDER_BAD_RESPONSE_MESSAGE =
 export const SEARCH_PROVIDER_WARNING =
   "Some search results could not be retrieved.";
 
+export function splitSearchProviderResponse<T extends object>(
+  response: T,
+): {
+  data: Omit<T, "warning">;
+  warning?: typeof SEARCH_PROVIDER_WARNING;
+} {
+  const { warning, ...data } = response as T & { warning?: unknown };
+  return {
+    data,
+    ...(warning === SEARCH_PROVIDER_WARNING ? { warning } : {}),
+  };
+}
+
 export class SearchProviderUnavailableError extends TransportableError {
   constructor(options?: ErrorOptions) {
     super(
