@@ -136,6 +136,64 @@ CI and live acceptance:
 - Before CI and documentation, benchmark 20 sequential and 8 concurrent searches on a Linux x86_64 host with at least 4 logical CPUs and 8 GiB RAM allocated to Docker. Keep the SearXNG container at 1 CPU, 512 MiB memory/swap, 128 PIDs, the stated tmpfs limits, HTTP pools 16/8, and Firecrawl concurrency four. Acceptance: no OOM/PID breach, p95 below 6 seconds, and no request exceeds the 10-second provider deadline. This task qualifies engines and freezes the final engine/resource/deadline values, updating implementation and plan artifacts before it closes. Later CI, documentation, and final E2E consume those values without mutation.
 - Run existing wrapper, MCP, API, CI, Compose, and `lat check` gates.
 
+### Frozen deterministic CI command contract
+
+These commands succeeded on the repository baseline with Node 22.22.1, the API package's pinned pnpm 10.16.1, Docker 29.6.2, and Docker Compose 5.3.1. CI must keep the working directories and selectors exact.
+
+From the repository root, validate the rendered local Compose project without building, starting, or contacting a service:
+
+```bash
+SEARXNG_SECRET=0000000000000000000000000000000000000000000000000000000000000000 \
+LOCAL_CODEX_PACKAGE_DIR=/tmp/firecrawl-ci-codex-package \
+LOCAL_CODEX_AUTH_FILE=/tmp/firecrawl-ci-codex-auth.json \
+LOCAL_CODEX_CA_BUNDLE_FILE=/tmp/firecrawl-ci-ca.pem \
+docker compose --env-file .env.example.local -f compose.yaml \
+  config --quiet
+```
+
+`compose.yaml` is the only file selector because it already includes both `docker-compose.yaml` and `compose.local.yaml`. Adding a second `-f compose.local.yaml` applies the overlay twice and is invalid. `.env.example.local` supplies the checked-in non-secret defaults and placeholder browser tokens; CI supplies the exact 64-character lowercase hexadecimal SearXNG placeholder because a generated secret is intentionally absent from that template. The three temporary Codex paths satisfy required bind-source interpolation without reading the files. This render gate has no build target and performs no image pull or container execution.
+
+From the repository root, run exactly the deterministic SearXNG settings-loader and rendered-Compose cases:
+
+```bash
+node --test \
+  --test-name-pattern='^(tracked SearXNG settings enforce the private engine policy|rendered local Compose keeps SearXNG private and bounded)$' \
+  scripts/searxng-config.test.mjs
+```
+
+Node 22.22.1 supports `--test-name-pattern`; this exact selector reports two tests and excludes the registry-manifest inspection and current-architecture boot cases in the same file. The settings case uses the Docker daemon to run the pinned image's Python settings loader in a one-shot, read-only container with `--network none` and the tracked settings bind-mounted read-only. Docker may pull that exact digest from GHCR when it is not cached, but the test container has no network and does not start the SearXNG service. The rendered case runs `docker compose config --format json`; it does not pull, build, or start a service. The test harness supplies its complete deterministic Compose environment internally and requires the repository root as its working directory.
+
+Registry-manifest inspection and current-architecture boot remain final non-mutating E2E acceptance, as assigned in Sequencing. Manifest inspection requires registry access, while boot launches the hardened service and checks its local `/healthz` and `/config` endpoints. Neither case issues an upstream-engine query, but their registry/runtime requirements are intentionally outside required CI.
+
+From the repository root, run the fake-runtime wrapper orchestration contracts with the whole file selector:
+
+```bash
+node --test scripts/local-firecrawl.test.mjs
+```
+
+This wrapper suite does not cover the tracked SearXNG settings, rendered service, registry manifest, or real boot; those contracts live in `scripts/searxng-config.test.mjs`. Do not use `--full-lifecycle`: the current wrapper suite does not branch on that argument and every case already uses a recording Docker fake.
+
+From the repository root, run the complete local MCP capability contract:
+
+```bash
+node --test scripts/local-firecrawl-mcp.test.mjs
+```
+
+From `apps/api`, install the frozen package graph, run only shared provider and versioned search-controller contracts, then compile the API and package its migrations:
+
+```bash
+pnpm install --frozen-lockfile
+shopt -s nullglob
+pnpm exec vitest run --no-file-parallelism \
+  src/search/{provider,searxng}.test.ts \
+  src/controllers/{v0,v1,v2}/search*.test.ts
+pnpm run build
+```
+
+The Vitest selectors deliberately exclude snippet, E2E, and unrelated controller suites. Search-controller contract files must use the colocated `search*.test.ts` naming convention so Bash includes them when they land; `nullglob` keeps the baseline command valid before those files exist. The exact build target is the package `build` script (`tsc && node scripts/package-migrations.mjs`).
+
+No selected suite issues a live provider or upstream-engine request: the SearXNG settings container has networking disabled, Compose only renders configuration, the wrapper replaces Docker with a recorder, MCP uses local fixtures and pure rewrites, provider tests inject fetch doubles, and the API build performs no provider request. A GitHub-hosted runner may pull the pinned SearXNG image before the isolated settings container runs. Do not add a live SearXNG, upstream-engine, snippet, or wrapper-health smoke to these commands.
+
 ## Risks
 
 - Upstream engines can still throttle or block one egress IP. Mitigation: four-engine diversity, explicit engine failures, bounded smoke, sanitized diagnostics, and benchmark before allowlist freeze; no SLA claim.

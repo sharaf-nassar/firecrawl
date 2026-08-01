@@ -84,6 +84,8 @@ Go HTML-to-Markdown uses `httptest` for index, health, conversion, malformed inp
 
 The pinned image's settings loader must parse the tracked configuration into the exact private JSON/POST policy, four enabled general engines, and bounded outgoing request settings with no DuckDuckGo or Valkey path.
 
+The loader runs in a one-shot, read-only container with networking disabled and the tracked settings mounted read-only. Docker may fetch the exact pinned image first, but the test cannot contact an upstream engine.
+
 ### Rendered service hardening
 
 Rendered Compose must retain the digest, backend-only topology, read-only settings and root, non-root identity, dropped privileges, bounded resources, rotating logs, and local-only health probe without exposing the secret to API.

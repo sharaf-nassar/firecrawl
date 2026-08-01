@@ -112,6 +112,8 @@ print(json.dumps({
     "--user",
     "977:977",
     "--read-only",
+    "--network",
+    "none",
     "--mount",
     `type=bind,source=${settingsPath},target=/etc/searxng/settings.yml,readonly`,
     "--entrypoint",
