@@ -65,6 +65,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM PIPE XFSZ
 
+# @lat: [[operations/local-runtime#Local Runtime Operations#Environment bootstrap]]
 {
   printf '%s\n' 'COMPOSE_FILE=compose.yaml'
   printf '%s\n' 'PORT=3002'
@@ -101,11 +102,12 @@ trap cleanup EXIT HUP INT TERM PIPE XFSZ
   printf '%s\n' 'BLOCK_MEDIA=false'
   printf '%s\n' 'AUTUMN_SECRET_KEY='
   printf '%s\n' 'MODEL_EMBEDDING_NAME='
-  printf '%s\n' 'MODEL_NAME='
+  printf '%s\n' 'MODEL_NAME=gpt-5.6-luna'
   printf '%s\n' 'NUQ_BACKEND='
   printf '%s\n' 'OLLAMA_BASE_URL='
   printf '%s\n' 'OPENAI_API_KEY='
-  printf '%s\n' 'OPENAI_BASE_URL='
+  printf '%s\n' 'OPENAI_BASE_URL=http://host.docker.internal:3030/v1'
+  printf '%s\n' 'OPENAI_CHAT_COMPLETIONS_ONLY=true'
   printf '%s\n' 'PROXY_PASSWORD='
   printf '%s\n' 'PROXY_SERVER='
   printf '%s\n' 'PROXY_USERNAME='

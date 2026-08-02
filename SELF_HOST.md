@@ -59,8 +59,15 @@ USE_DB_AUTHENTICATION=false
 # MODEL_EMBEDDING_NAME=nomic-embed-text
 
 # Experimental: Use any OpenAI-compatible API
+# An empty OPENAI_BASE_URL behaves as unset.
 # OPENAI_BASE_URL=https://example.com/v1
 # OPENAI_API_KEY=
+
+# Wrapper-managed local extract instead targets the host Codex Shim:
+# OPENAI_BASE_URL=http://host.docker.internal:3030/v1
+# OPENAI_CHAT_COMPLETIONS_ONLY=true
+# MODEL_NAME=gpt-5.6-luna
+# The shim must be running separately; Compose does not manage it.
 
 ## === Proxy ===
 # PROXY_SERVER can be a full URL (e.g. http://0.1.2.3:1234) or just an IP and port combo (e.g. 0.1.2.3:1234)

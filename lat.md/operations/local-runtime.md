@@ -68,6 +68,8 @@ Compose requires healthy application Postgres, Browser Interaction Worker, Brows
 
 It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO, and SearXNG. It also writes the canonical internal search endpoint, local owner UUID, retention, and service defaults.
 
+Fresh environments target the host Codex Shim at `http://host.docker.internal:3030/v1`, enable chat-only OpenAI requests, and select `gpt-5.6-luna`. The separately managed shim must be running before local extract can succeed.
+
 Interactive setup privately requires a Brave Search API key. Noninteractive setup reads only `FIRECRAWL_SEARXNG_BRAVE_API_KEY`; missing, blank, or whitespace-containing input fails before `.env` creation. Only its Base64 encoding is persisted.
 
 `scripts/upgrade-local-env-phase1` upgrades earlier environment files under an exclusive mode-`0600` lock. It validates file type, ownership, duplicate keys, secret distinctness, and phase values, then replaces through a bounded temporary file only if the source did not change.
