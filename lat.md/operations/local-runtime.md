@@ -119,7 +119,7 @@ The complete disabled-name policy contains seventeen reserved upstream names:
 - Search feedback: `firecrawl_search_feedback`.
 - Monitor and feedback storage: `firecrawl_monitor_create`, `firecrawl_monitor_get`, `firecrawl_monitor_list`, `firecrawl_monitor_update`, `firecrawl_monitor_delete`, `firecrawl_monitor_run`, `firecrawl_monitor_check`, `firecrawl_monitor_checks`, `firecrawl_feedback`.
 
-`firecrawl_extract` remains enabled. Fresh local API configuration targets `http://host.docker.internal:3030/v1`, and `OPENAI_CHAT_COMPLETIONS_ONLY=true` routes both extraction pipelines through the separately managed [[runtime/codex-shim#Codex Shim#HTTP and capacity boundary|Codex Shim chat-completions boundary]].
+`firecrawl_extract` remains enabled. Compose forwards `OPENAI_CHAT_COMPLETIONS_ONLY` only to the API service and defaults it to `false` when unset. Fresh local configuration sets it to `true` and targets `http://host.docker.internal:3030/v1`, routing both extraction pipelines through the separately managed [[runtime/codex-shim#Codex Shim#HTTP and capacity boundary|Codex Shim chat-completions boundary]].
 
 ## Lifecycle lock
 
