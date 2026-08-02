@@ -60,10 +60,19 @@ const disabledToolNames = [
   "firecrawl_research_read_paper",
   "firecrawl_research_search_github",
   "firecrawl_search_feedback",
+  "firecrawl_monitor_create",
+  "firecrawl_monitor_get",
+  "firecrawl_monitor_list",
+  "firecrawl_monitor_update",
+  "firecrawl_monitor_delete",
+  "firecrawl_monitor_run",
+  "firecrawl_monitor_check",
+  "firecrawl_monitor_checks",
+  "firecrawl_feedback",
 ];
 
 // @lat: [[testing/runtime-operations#Runtime and Operations Testing#Local MCP launcher suite]]
-test("disabled local tools contain the eight unsupported capabilities", () => {
+test("disabled local tools contain the seventeen unsupported capabilities", () => {
   assert.deepEqual([...createDisabledLocalTools()], disabledToolNames);
 });
 
@@ -116,7 +125,7 @@ test("filterToolList removes disabled tools without changing passthrough data", 
     },
     metadata: "preserved",
   });
-  assert.equal(message.result.tools.length, 10);
+  assert.equal(message.result.tools.length, 19);
 
   const notification = { jsonrpc: "2.0", method: "notifications/progress" };
   assert.equal(filterToolList(notification), notification);
@@ -556,6 +565,27 @@ test("unsupportedToolResponse rejects all disabled tools with exact errors", () 
       },
     );
   }
+});
+
+test("unsupportedToolResponse rejects monitor calls before forwarding", () => {
+  assert.deepEqual(
+    unsupportedToolResponse({
+      jsonrpc: "2.0",
+      id: "monitor-create",
+      method: "tools/call",
+      params: { name: "firecrawl_monitor_create", arguments: {} },
+    }),
+    {
+      jsonrpc: "2.0",
+      id: "monitor-create",
+      error: {
+        code: -32601,
+        message:
+          "firecrawl_monitor_create is disabled in the local Firecrawl MCP " +
+          "because its external service is not configured",
+      },
+    },
+  );
 });
 
 test("unsupportedToolResponse passes through supported and unrelated calls", () => {

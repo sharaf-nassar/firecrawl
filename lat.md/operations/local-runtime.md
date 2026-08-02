@@ -100,6 +100,8 @@ The same launcher disables paper search, paper inspection, related-paper lookup,
 
 Local discovery removes `firecrawl_search_feedback` and replaces upstream search instructions and schema with the web-only contract. Search keeps query, limit, filter, domain, category, and scrape controls while exposing only the `web` source.
 
+Local discovery also removes all eight `firecrawl_monitor_*` tools and `firecrawl_feedback`. The local stack does not configure monitor scheduling, persistence, artifacts, or feedback storage, so direct calls receive the standard JSON-RPC `-32601` disabled-tool error.
+
 Direct calls that bypass discovery cannot request non-web sources, geo or recency controls, enterprise mode, or feedback. The launcher rejects them as JSON-RPC `-32602 Invalid params` with data code `LOCAL_SEARCH_WEB_ONLY` before the upstream package or API sees them.
 
 The launcher correlates forwarded search call IDs because the pinned upstream package discards typed REST error bodies. Search HTTP 502 and 503 responses become `isError` tool results with one compact canonical JSON text block; legitimate empty web results pass through as successful calls.

@@ -15,6 +15,18 @@ const disabledLocalToolNames = [
   // Disabled locally because local search is web-only and its API feedback
   // endpoints are intentionally unavailable.
   "firecrawl_search_feedback",
+
+  // Disabled locally because monitor scheduling, persistence, artifacts, and
+  // feedback storage are not configured by the local stack.
+  "firecrawl_monitor_create",
+  "firecrawl_monitor_get",
+  "firecrawl_monitor_list",
+  "firecrawl_monitor_update",
+  "firecrawl_monitor_delete",
+  "firecrawl_monitor_run",
+  "firecrawl_monitor_check",
+  "firecrawl_monitor_checks",
+  "firecrawl_feedback",
 ];
 
 // @lat: [[operations/local-runtime#Local Runtime Operations#Local MCP capability filter]]
