@@ -68,7 +68,7 @@ export const configSchema = z.object({
   // API Keys & Authentication
   BULL_AUTH_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
-  OPENAI_BASE_URL: z.string().optional(),
+  OPENAI_BASE_URL: emptyStringAsUndefined(z.string()),
   OPENROUTER_API_KEY: z.string().optional(),
   XAI_API_KEY: z.string().optional(),
   LLAMAPARSE_API_KEY: z.string().optional(),
@@ -322,7 +322,7 @@ export const configSchema = z.object({
   // AI/ML
   MODEL_NAME: z.string().optional(),
   MODEL_EMBEDDING_NAME: z.string().optional(),
-  OLLAMA_BASE_URL: z.string().optional(),
+  OLLAMA_BASE_URL: emptyStringAsUndefined(z.string()),
   VERTEX_CREDENTIALS: z.string().optional(),
 
   // LangSmith (tracing for interact agent)

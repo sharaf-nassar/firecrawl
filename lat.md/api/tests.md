@@ -18,6 +18,8 @@ High-density areas include browser runtime/state, scrape interactions and replay
 
 These tests usually replace external dependencies and focus on state transitions, schema projection, retry policy, privacy, and edge conditions.
 
+Configuration regression tests verify that empty OpenAI and Ollama base URLs parse as unset while non-empty custom endpoints pass through unchanged.
+
 Search provider unit tests fix the local and non-local precedence matrix, SearXNG POST/deadline/result/page/concurrency bounds, strict engine diagnostics, canonical errors, valid empty results, partial warnings, and zero application retries.
 
 Ordinary search controller tests cover v0, v1, and v2 provider-error envelopes, pre-reservation local source rejection, top-level partial warnings, valid-empty zero billing, keyless reconciliation, and absence of scrape dispatch after provider failure.

@@ -60,6 +60,8 @@ Configuration is parsed once through a strict Zod schema, making malformed envir
 
 Most integrations are capability-gated by configuration. Missing optional engines reduce the available fallback set; missing core dependencies needed by a selected runtime mode fail startup or the owning worker.
 
+Optional OpenAI and Ollama base URLs normalize empty environment values to unset. This prevents blank Compose interpolation from becoming a configured provider URL while preserving non-empty custom endpoints.
+
 ## Local and hosted persistence modes
 
 The same API contract supports hosted infrastructure and a local persistence authority, but their consistency boundaries differ.
