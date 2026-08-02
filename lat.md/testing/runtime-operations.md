@@ -42,6 +42,14 @@ Tests cover turn-dependent schemas, bounded history, deadline and finalization p
 
 The egress tests use local sockets and injected resolution/dial functions. They prove policy sequencing without contacting model providers.
 
+### Provider inheritance boundary
+
+Runner tests prove selected model/provider routing composes with immutable never-approve, read-only, no-web, no-app, no-agent, no-history, and empty-MCP policy.
+
+### Loopback provider egress
+
+Proxy tests prove one rewritten loopback origin preserves path and authorization while exact-host policy rejects sibling HTTPS providers and unrelated plaintext targets.
+
 ### Worker coverage gap
 
 Important worker lifecycle behavior currently has no direct automated test.
@@ -131,6 +139,14 @@ Internal startup waits for bundled SearXNG before API without a functional query
 Fake health probes require exactly one redacted POST through API with fixed query, web source, limit 1, a 10-second request timeout, and a 15-second outer deadline.
 
 Success and provider-outage fixtures prove health reports provider mode without endpoint or query disclosure. Outage fails functional health without stopping API, so non-search scrape and crawl availability remain independent.
+
+### Codex provider snapshot
+
+Wrapper fixtures prove startup copies only selected provider routing and credentials into bounded snapshots without logging secrets.
+
+They require the provider credential, omit absent or empty optional headers, preserve present values, serialize timeout scalars, and force-recreate only snapshot consumers.
+
+They clean snapshots on stop or failure, regenerate them on start, and reject unsupported provider fields or host-gateway remaps before Docker mutation.
 
 The API script `test:local-firecrawl:lifecycle` passes `--full-lifecycle`, but the test file has no argument-controlled real-Docker mode. Every current case still uses the fake runtime.
 

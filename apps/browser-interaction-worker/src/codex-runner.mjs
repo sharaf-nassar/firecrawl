@@ -25,6 +25,8 @@ import {
 } from "./deadline-policy.mjs";
 
 const MAX_AUTH_BYTES = 1024 * 1024;
+const MAX_CONFIG_BYTES = 1024 * 1024;
+const MAX_PROVIDER_ENVIRONMENT_BYTES = 1024 * 1024;
 const AUTH_DIGEST_BYTES = 64;
 const MAX_STDOUT_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
@@ -52,11 +54,13 @@ const startupHookPath = fileURLToPath(
 );
 const MAX_STARTUP_DIAGNOSTIC_CHARS = 384;
 
-const CONFIG = `approval_policy = "never"
+const POLICY_CONFIG_PREFIX = `approval_policy = "never"
 sandbox_mode = "read-only"
 web_search = "disabled"
 check_for_update_on_startup = false
+`;
 
+const POLICY_CONFIG_SUFFIX = `
 [history]
 persistence = "none"
 
@@ -69,6 +73,13 @@ enabled = false
 
 [mcp_servers]
 `;
+
+const RESERVED_PROVIDER_ENVIRONMENT =
+  /^(?:CODEX_|DYLD_|LD_|NODE_|RUST_|HOME$|PATH$|SHELL$|TEMP$|TMP$|TMPDIR$|HTTP_PROXY$|HTTPS_PROXY$|NO_PROXY$|http_proxy$|https_proxy$|no_proxy$|SSL_CERT_FILE$|SSL_CERT_DIR$)/u;
+
+export function buildCodexConfig(providerConfig) {
+  return `${POLICY_CONFIG_PREFIX}${providerConfig.trim()}\n${POLICY_CONFIG_SUFFIX}`;
+}
 
 function shellQuote(value) {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -419,7 +430,39 @@ async function mergeRunAuth(config, source, snapshot) {
   }
 }
 
-function makeChildEnvironment(runHome) {
+function parseProviderEnvironment(bytes) {
+  let value;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new Error("Codex provider environment seed is invalid");
+  }
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length > 64
+  ) {
+    throw new Error("Codex provider environment seed is invalid");
+  }
+  let totalBytes = 0;
+  for (const [name, setting] of Object.entries(value)) {
+    if (
+      !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(name) ||
+      RESERVED_PROVIDER_ENVIRONMENT.test(name) ||
+      typeof setting !== "string"
+    ) {
+      throw new Error("Codex provider environment seed is unsafe");
+    }
+    totalBytes += Buffer.byteLength(name) + Buffer.byteLength(setting);
+  }
+  if (totalBytes > MAX_PROVIDER_ENVIRONMENT_BYTES) {
+    throw new Error("Codex provider environment seed is too large");
+  }
+  return Object.freeze(value);
+}
+
+export function makeChildEnvironment(runHome, providerEnvironment = {}) {
   const allowed = [
     "PATH",
     "LANG",
@@ -440,9 +483,9 @@ function makeChildEnvironment(runHome) {
       process.env[name] === undefined ? [] : [[name, process.env[name]]],
     ),
   );
+  Object.assign(env, providerEnvironment);
   env.CODEX_HOME = runHome;
   env.HOME = runHome;
-  env.TMPDIR = runHome;
   return env;
 }
 
@@ -836,6 +879,8 @@ export function createCodexRunner(config) {
   const activeRuns = new Map();
   const cancellationTombstones = new Map();
   const authMutex = new AbortableMutex();
+  let providerConfig;
+  let providerEnvironment;
 
   function pruneCancellationTombstones(now = Date.now()) {
     for (const [runId, expiresAt] of cancellationTombstones) {
@@ -868,6 +913,22 @@ export function createCodexRunner(config) {
   }
 
   async function initialize() {
+    const [configBytes, environmentBytes] = await Promise.all([
+      boundedRegularFile(config.codexConfigSeedFile, MAX_CONFIG_BYTES),
+      boundedRegularFile(
+        config.codexProviderEnvironmentFile,
+        MAX_PROVIDER_ENVIRONMENT_BYTES,
+      ),
+    ]);
+    const decodedConfig = new TextDecoder("utf-8", { fatal: true }).decode(
+      configBytes,
+    );
+    if (decodedConfig.trim() === "" || decodedConfig.includes("\0")) {
+      throw new Error("Codex config seed is invalid");
+    }
+    providerConfig = decodedConfig;
+    providerEnvironment = parseProviderEnvironment(environmentBytes);
+
     const release = await authMutex.acquire();
     try {
       await synchronizeHostAuthSeed(config);
@@ -960,10 +1021,17 @@ export function createCodexRunner(config) {
         flag: "wx",
         mode: 0o600,
       });
-      await writeFile(join(runHome, "config.toml"), CONFIG, {
-        flag: "wx",
-        mode: 0o600,
-      });
+      if (providerConfig === undefined || providerEnvironment === undefined) {
+        throw new Error("Codex runner is not initialized");
+      }
+      await writeFile(
+        join(runHome, "config.toml"),
+        buildCodexConfig(providerConfig),
+        {
+          flag: "wx",
+          mode: 0o600,
+        },
+      );
       if (options.canary === true) {
         canary = Object.freeze({
           auditToken: `FIRECRAWL_CANARY_AUDIT_${randomUUID()}`,
@@ -993,7 +1061,7 @@ export function createCodexRunner(config) {
       ];
       const child = spawn(process.execPath, args, {
         cwd: runHome,
-        env: makeChildEnvironment(runHome),
+        env: makeChildEnvironment(runHome, providerEnvironment),
         detached: true,
         stdio: ["pipe", "pipe", "pipe"],
       });

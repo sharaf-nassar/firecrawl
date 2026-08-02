@@ -93,9 +93,11 @@ services:
       BROWSER_INTERACTION_WORKER_SOCKET_PATH: /run/firecrawl-interaction/worker.sock
       BROWSER_INTERACTION_WORKER_TOKEN: ${BROWSER_INTERACTION_WORKER_TOKEN:?set BROWSER_INTERACTION_WORKER_TOKEN in .env}
       CODEX_BIN: /opt/codex/bin/codex.js
-      CODEX_HOME: /tmp/codex-home
+      CODEX_HOME: /var/lib/firecrawl-codex-runs
       CODEX_AUTH_SEED_FILE: /run/secrets/codex-auth.json
       CODEX_AUTH_STATE_DIR: /var/lib/firecrawl-codex-auth-state
+      CODEX_CONFIG_SEED_FILE: /run/secrets/codex-config.toml
+      CODEX_PROVIDER_ENVIRONMENT_FILE: /run/secrets/codex-provider-environment.json
       CODEX_CA_CERTIFICATE: /run/certs/host-ca-certificates.crt
       SSL_CERT_FILE: /run/certs/host-ca-certificates.crt
       NODE_EXTRA_CA_CERTS: /run/certs/host-ca-certificates.crt
@@ -117,6 +119,18 @@ services:
       - type: bind
         source: ${LOCAL_CODEX_AUTH_FILE:?scripts/local-firecrawl must resolve LOCAL_CODEX_AUTH_FILE}
         target: /run/secrets/codex-auth.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LOCAL_CODEX_WORKER_CONFIG_FILE:?scripts/local-firecrawl must resolve LOCAL_CODEX_WORKER_CONFIG_FILE}
+        target: /run/secrets/codex-config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE:?scripts/local-firecrawl must resolve LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE}
+        target: /run/secrets/codex-provider-environment.json
         read_only: true
         bind:
           create_host_path: false
@@ -146,7 +160,7 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:noexec,nosuid,nodev,size=256m,mode=1777
-      - /tmp/codex-home:noexec,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000
+      - /var/lib/firecrawl-codex-runs:noexec,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000
     healthcheck:
       test:
         - CMD
@@ -172,12 +186,21 @@ services:
     init: true
     environment:
       MODEL_EGRESS_PROXY_SOCKET_PATH: /run/firecrawl-model-egress/proxy.sock
+      MODEL_EGRESS_PROVIDER_POLICY_FILE: /run/secrets/codex-egress-policy.json
     networks:
       - model-uplink
     volumes:
+      - type: bind
+        source: ${LOCAL_CODEX_EGRESS_POLICY_FILE:?scripts/local-firecrawl must resolve LOCAL_CODEX_EGRESS_POLICY_FILE}
+        target: /run/secrets/codex-egress-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
       - type: volume
         source: browser-interaction-egress-socket
         target: /run/firecrawl-model-egress
+    extra_hosts:
+      - host.docker.internal:host-gateway
     restart: unless-stopped
     cpus: 0.25
     mem_limit: 64M

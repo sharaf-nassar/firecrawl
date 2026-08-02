@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { connect } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex } from "node:stream";
 import { test } from "node:test";
 
 import { createEgressProxy } from "./egress-proxy.mjs";
+import { parseConnectAuthority } from "./egress-policy.mjs";
 
 function clientHello(hostname) {
   const host = Buffer.from(hostname, "ascii");
@@ -146,4 +148,68 @@ test("proxy closes a tunnel when TLS SNI differs from CONNECT", async t => {
   socket.write(clientHello("api.openai.com"));
   await closed;
   assert.equal(context.received.length, 0);
+});
+
+test("proxy permits the selected HTTPS provider hostname only", () => {
+  assert.deepEqual(
+    parseConnectAuthority("proxy.example:443", "proxy.example"),
+    { hostname: "proxy.example", port: 443 },
+  );
+  assert.throws(() =>
+    parseConnectAuthority("sibling.example:443", "proxy.example"),
+  );
+});
+
+// @lat: [[runtime-operations#Browser Interaction Worker suite#Loopback provider egress]]
+test("proxy forwards only the rewritten loopback provider origin", async t => {
+  const upstreamRequests = [];
+  const upstream = createHttpServer((request, response) => {
+    upstreamRequests.push({
+      authorization: request.headers.authorization,
+      path: request.url,
+    });
+    response.writeHead(204);
+    response.end();
+  });
+  await new Promise((resolve, reject) => {
+    upstream.once("error", reject);
+    upstream.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise(resolve => upstream.close(resolve)));
+  const port = upstream.address().port;
+
+  const directory = await mkdtemp(
+    join(tmpdir(), "firecrawl-egress-http-test-"),
+  );
+  const socketPath = join(directory, "proxy.sock");
+  const proxy = createEgressProxy({
+    socketPath,
+    providerPolicy: { httpHost: "127.0.0.1", httpPort: port },
+    emitLog() {},
+  });
+  await proxy.listen();
+  t.after(async () => {
+    await proxy.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const tunnel = await openSocket(socketPath);
+  tunnel.write(
+    `CONNECT 127.0.0.1:${port} HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${port}\r\n\r\n`,
+  );
+  assert.equal(await waitForStatus(tunnel), 200);
+  tunnel.write(
+    "GET /v1/responses HTTP/1.1\r\n" +
+      `Host: 127.0.0.1:${port}\r\n` +
+      "Authorization: Bearer provider-secret\r\nConnection: close\r\n\r\n",
+  );
+  assert.equal(await waitForStatus(tunnel), 204);
+  assert.deepEqual(upstreamRequests, [
+    {
+      authorization: "Bearer provider-secret",
+      path: "/v1/responses",
+    },
+  ]);
+  tunnel.destroy();
 });

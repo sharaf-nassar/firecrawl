@@ -158,7 +158,9 @@ Delivery logs are staged in Redis and batch-inserted into PostgreSQL. Logging fa
 
 Logs, metrics, traces, and error reporting share request, team, job, mode, and privacy context.
 
-Winston emits structured logs and filters ZDR-sensitive records. Request timing middleware records Prometheus HTTP duration by API version, method, route pattern, and status. Workers expose queue, duration, health, liveness, and process metrics.
+Winston emits structured logs and filters ZDR-sensitive records before formatting. [[apps/api/src/lib/logger.ts#serializeLogMetadata]] bounds warn/error metadata at 8 KiB and retains only capped request/job/team context plus error name, message, stack, scalar codes, and cycle-safe cause summaries. Provider-specific error properties and arbitrary request, response, model, prompt, content, or body objects are not serialized.
+
+Search phase and provider-selection notices plus no-op reconciler completions use debug level. Request metrics, request completion, reconciliation changes, and failures remain operational signals at info, warn, or error. Request timing middleware records Prometheus HTTP duration by API version, method, route pattern, and status. Workers expose queue, duration, health, liveness, and process metrics.
 
 OpenTelemetry spans cover HTTP work, engine selection, waits, object storage, and external calls. Sentry tags distinguish API and worker services; ZDR-aware capture avoids attaching sensitive context.
 

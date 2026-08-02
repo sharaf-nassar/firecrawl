@@ -37,7 +37,7 @@ export async function search({
 }): Promise<SearchV2Response> {
   const provider = resolveSearchProvider();
   if (provider.type === "fire-engine") {
-    logger.info("Using fire engine search");
+    logger.debug("Using fire engine search");
     return fire_engine_search_v2(query, {
       numResults: num_results,
       tbs,
@@ -50,7 +50,7 @@ export async function search({
     });
   }
 
-  logger.info("Using searxng search");
+  logger.debug("Using searxng search");
   return searxng_search(query, {
     endpoint: provider.endpoint,
     engines: provider.engines,

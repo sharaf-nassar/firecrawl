@@ -31,6 +31,9 @@ fi
 control_runtime_root="${XDG_RUNTIME_DIR:-/run/user/${UID}}"
 control_runtime_dir="$control_runtime_root/firecrawl-control"
 runtime_lock_path="$control_runtime_dir/lifecycle.lock"
+codex_worker_config_path="$control_runtime_dir/codex-worker-config.${project_name}.toml"
+codex_provider_environment_path="$control_runtime_dir/codex-provider-environment.${project_name}.json"
+codex_egress_policy_path="$control_runtime_dir/codex-egress-policy.${project_name}.json"
 runtime_lock_held=
 if [[ "$project_name" != firecrawl ]]; then
   if [[ ! "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
@@ -62,6 +65,21 @@ one_shot_services=(browser-state-init app-db-migrate minio-init)
 long_running_services=("${base_long_running_services[@]}")
 diagnostic_services=("${long_running_services[@]}" "${one_shot_services[@]}")
 search_provider_mode=
+
+remove_codex_provider_snapshots() {
+  rm -f -- \
+    "$codex_worker_config_path" \
+    "$codex_provider_environment_path" \
+    "$codex_egress_policy_path"
+}
+
+remove_codex_provider_snapshots_on_failure() {
+  local status="$?"
+
+  if (( status != 0 )); then
+    remove_codex_provider_snapshots || true
+  fi
+}
 
 usage() {
   printf '%s\n' \
@@ -97,7 +115,10 @@ resolve_local_codex_runtime() {
   local ca_bundle_input
   local ca_bundle_path
   local command_path
+  local config_mode
+  local config_path
   local package_dir
+  local refresh="${1:-false}"
   local resolved_path
   local seen
   local -a resolved_entrypoints=()
@@ -175,6 +196,26 @@ resolve_local_codex_runtime() {
     return 1
   fi
 
+  config_path="$(readlink -e -- "$HOME/.codex/config.toml" 2>/dev/null || true)"
+  if [[ -z "$config_path" ]] || [[ ! -f "$config_path" ]]; then
+    printf '%s\n' \
+      'Local Codex config is unavailable: ~/.codex/config.toml is missing' >&2
+    return 1
+  fi
+  if [[ "$(stat -c '%u:%h' -- "$config_path")" != "$UID:1" ]]; then
+    printf '%s\n' \
+      'Local Codex config is unsafe: ~/.codex/config.toml ownership or link count is invalid' \
+      >&2
+    return 1
+  fi
+  config_mode="$(stat -c '%a' -- "$config_path")"
+  if [[ "$config_mode" != 400 && "$config_mode" != 600 ]]; then
+    printf '%s\n' \
+      'Local Codex config is unsafe: ~/.codex/config.toml must use mode 0400 or 0600' \
+      >&2
+    return 1
+  fi
+
   ca_bundle_input="${LOCAL_FIRECRAWL_CA_BUNDLE_FILE:-/etc/ssl/certs/ca-certificates.crt}"
   if [[ "$ca_bundle_input" != /* ]] || [[ "$ca_bundle_input" == *$'\n'* ]]; then
     printf '%s\n' \
@@ -191,9 +232,23 @@ resolve_local_codex_runtime() {
     return 1
   fi
 
+  if [[ "$refresh" == true ]] ||
+    [[ ! -s "$codex_worker_config_path" ]] ||
+    [[ ! -s "$codex_provider_environment_path" ]] ||
+    [[ ! -s "$codex_egress_policy_path" ]]; then
+    python3 "$repo_root/scripts/prepare-codex-worker-config.py" \
+      --source "$config_path" \
+      --config-output "$codex_worker_config_path" \
+      --environment-output "$codex_provider_environment_path" \
+      --egress-output "$codex_egress_policy_path"
+  fi
+
   export LOCAL_CODEX_PACKAGE_DIR="$package_dir"
   export LOCAL_CODEX_AUTH_FILE="$auth_path"
   export LOCAL_CODEX_CA_BUNDLE_FILE="$ca_bundle_path"
+  export LOCAL_CODEX_WORKER_CONFIG_FILE="$codex_worker_config_path"
+  export LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE="$codex_provider_environment_path"
+  export LOCAL_CODEX_EGRESS_POLICY_FILE="$codex_egress_policy_path"
 }
 
 acquire_runtime_lock() {
@@ -264,6 +319,9 @@ prepare_recovery_compose_sources() {
   export LOCAL_CODEX_PACKAGE_DIR=/dev/null
   export LOCAL_CODEX_AUTH_FILE=/dev/null
   export LOCAL_CODEX_CA_BUNDLE_FILE=/dev/null
+  export LOCAL_CODEX_WORKER_CONFIG_FILE=/dev/null
+  export LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE=/dev/null
+  export LOCAL_CODEX_EGRESS_POLICY_FILE=/dev/null
 }
 
 configure_search_provider_mode() {
@@ -325,7 +383,7 @@ validate_compose() {
   local rendered
 
   if [[ "$source_mode" == current ]]; then
-    resolve_local_codex_runtime
+    resolve_local_codex_runtime "${2:-false}"
   elif [[ "$source_mode" == recovery ]]; then
     prepare_recovery_compose_sources
   else
@@ -340,7 +398,10 @@ validate_compose() {
     jq -r \
     --arg codex_package "$LOCAL_CODEX_PACKAGE_DIR" \
     --arg codex_auth "$LOCAL_CODEX_AUTH_FILE" \
-    --arg codex_ca_bundle "$LOCAL_CODEX_CA_BUNDLE_FILE" '
+    --arg codex_ca_bundle "$LOCAL_CODEX_CA_BUNDLE_FILE" \
+    --arg codex_config "$LOCAL_CODEX_WORKER_CONFIG_FILE" \
+    --arg codex_provider_environment "$LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE" \
+    --arg codex_egress_policy "$LOCAL_CODEX_EGRESS_POLICY_FILE" '
     [
       {
         name: "api_local_browser_service_enabled",
@@ -533,6 +594,20 @@ validate_compose() {
             create_host_path: false
           },
           {
+            type: "bind",
+            source: $codex_config,
+            target: "/run/secrets/codex-config.toml",
+            read_only: true,
+            create_host_path: false
+          },
+          {
+            type: "bind",
+            source: $codex_provider_environment,
+            target: "/run/secrets/codex-provider-environment.json",
+            read_only: true,
+            create_host_path: false
+          },
+          {
             type: "volume",
             source: "codex-auth-state",
             target: "/var/lib/firecrawl-codex-auth-state",
@@ -572,6 +647,13 @@ validate_compose() {
         )
       },
       {
+        name: "egress_proxy_host_gateway",
+        ok: (
+          .services["browser-interaction-egress-proxy"].extra_hosts ==
+          ["host.docker.internal=host-gateway"]
+        )
+      },
+      {
         name: "egress_proxy_identity",
         ok: (
           .services["browser-interaction-egress-proxy"].user == "1000:1000" and
@@ -596,6 +678,13 @@ validate_compose() {
           ]
         ) == [
           {
+            type: "bind",
+            source: $codex_egress_policy,
+            target: "/run/secrets/codex-egress-policy.json",
+            read_only: true,
+            create_host_path: false
+          },
+          {
             type: "volume",
             source: "browser-interaction-egress-socket",
             target: "/run/firecrawl-model-egress",
@@ -619,7 +708,10 @@ validate_compose() {
         name: "egress_proxy_secret_minimization",
         ok: (
           (.services["browser-interaction-egress-proxy"].environment // {}) |
-          keys == ["MODEL_EGRESS_PROXY_SOCKET_PATH"]
+          keys == [
+            "MODEL_EGRESS_PROVIDER_POLICY_FILE",
+            "MODEL_EGRESS_PROXY_SOCKET_PATH"
+          ]
         )
       },
       {
@@ -873,8 +965,16 @@ browser_worker_container_provenance() {
     [[ "$project" == "$project_name" ]] &&
     [[ "$service" == browser-interaction-worker ]] &&
     [[ "$working_dir" == "$repo_root" ]] &&
-    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/certs/host-ca-certificates.crt | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /run/firecrawl-model-egress | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/certs/host-ca-certificates.crt | false\nbind | /run/secrets/codex-auth.json | false\nbind | /run/secrets/codex-config.toml | false\nbind | /run/secrets/codex-provider-environment.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /run/firecrawl-model-egress | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
     printf '%s\n' current
+    return
+  fi
+  if [[ "$config_sources" == "$compose_config_sources" ]] &&
+    [[ "$project" == "$project_name" ]] &&
+    [[ "$service" == browser-interaction-worker ]] &&
+    [[ "$working_dir" == "$repo_root" ]] &&
+    [[ "$mounts" == $'bind | /opt/codex | false\nbind | /run/certs/host-ca-certificates.crt | false\nbind | /run/secrets/codex-auth.json | false\nvolume | /run/firecrawl-interaction | true\nvolume | /run/firecrawl-model-egress | true\nvolume | /var/lib/firecrawl-codex-auth-state | true' ]]; then
+    printf '%s\n' legacy
     return
   fi
   if [[ "$config_sources" == "$compose_config_sources" ]] &&
@@ -1305,10 +1405,10 @@ start_runtime() {
   run_one_shot minio-init
   "${compose[@]}" up -d --no-deps --wait \
     --wait-timeout "$health_wait_timeout_seconds" browser-service
-  "${compose[@]}" up -d --no-deps --wait \
+  "${compose[@]}" up -d --no-deps --wait --force-recreate \
     --wait-timeout "$health_wait_timeout_seconds" \
     browser-interaction-egress-proxy
-  "${compose[@]}" up -d --no-deps --wait \
+  "${compose[@]}" up -d --no-deps --wait --force-recreate \
     --wait-timeout "$health_wait_timeout_seconds" \
     browser-interaction-worker
   "${compose[@]}" up -d --no-deps --wait \
@@ -1350,6 +1450,7 @@ stop_search_provider_for_transition() {
 stop_runtime() {
   "${compose[@]}" stop api browser-interaction-worker browser-service
   "${compose[@]}" stop browser-interaction-egress-proxy
+  remove_codex_provider_snapshots
   stop_search_provider_for_transition
   "${compose[@]}" stop "${dependency_services[@]}"
 }
@@ -1697,7 +1798,8 @@ case "$command" in
     require_no_arguments "$@"
     validate_runtime_options
     acquire_runtime_lock exclusive
-    validate_compose current
+    trap remove_codex_provider_snapshots_on_failure EXIT
+    validate_compose current true
     validate_browser_rollback_request
     build_runtime_images
     validate_running_project_provenance
@@ -1707,6 +1809,7 @@ case "$command" in
     stop_search_provider_for_transition
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
+    trap - EXIT
     ;;
   stop)
     require_no_arguments "$@"
@@ -1720,7 +1823,8 @@ case "$command" in
     require_no_arguments "$@"
     validate_runtime_options
     acquire_runtime_lock exclusive
-    validate_compose current
+    trap remove_codex_provider_snapshots_on_failure EXIT
+    validate_compose current true
     validate_browser_rollback_request
     build_runtime_images
     validate_running_project_provenance
@@ -1730,6 +1834,7 @@ case "$command" in
     stop_search_provider_for_transition
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
+    trap - EXIT
     ;;
   probe-egress)
     require_no_arguments "$@"

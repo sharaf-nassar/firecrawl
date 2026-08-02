@@ -80,7 +80,7 @@ export async function executeSearch(
 
   const num_results_buffer = Math.floor(limit * 2);
 
-  logger.info("Searching for results");
+  logger.debug("Searching for results");
 
   const searchTypes = [...new Set(sources.map((s: any) => s.type))];
   const { query: searchQuery, categoryMap } = buildSearchQuery(

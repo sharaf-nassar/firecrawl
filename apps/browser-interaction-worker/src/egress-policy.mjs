@@ -38,14 +38,18 @@ export function normalizeHostname(value) {
   return ascii;
 }
 
-export function hostnameIsAllowed(value) {
+export function hostnameIsAllowed(value, providerHostname) {
   const hostname = normalizeHostname(value);
-  return ALLOWED_APEXES.some(
-    apex => hostname === apex || hostname.endsWith(`.${apex}`),
+  return (
+    (providerHostname !== undefined &&
+      hostname === normalizeHostname(providerHostname)) ||
+    ALLOWED_APEXES.some(
+      apex => hostname === apex || hostname.endsWith(`.${apex}`),
+    )
   );
 }
 
-export function parseConnectAuthority(authority) {
+export function parseConnectAuthority(authority, providerHostname) {
   if (
     typeof authority !== "string" ||
     authority.length === 0 ||
@@ -59,7 +63,7 @@ export function parseConnectAuthority(authority) {
     throw policyError("only CONNECT port 443 is allowed");
   }
   const hostname = normalizeHostname(authority.slice(0, separator));
-  if (!hostnameIsAllowed(hostname)) {
+  if (!hostnameIsAllowed(hostname, providerHostname)) {
     throw policyError("hostname is not allowed");
   }
   return Object.freeze({ hostname, port: 443 });

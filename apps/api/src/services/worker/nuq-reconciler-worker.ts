@@ -85,7 +85,7 @@ const reconcilerJobsRecoveredTotal = new Counter({
           summary.jobsRequeued + summary.jobsStarted,
         );
 
-        _logger.info("Concurrency queue reconciler run complete", summary);
+        _logger.debug("Concurrency queue reconciler run complete", summary);
       } catch (error) {
         reconcilerFailuresTotal.inc();
         _logger.error("Concurrency queue reconciler run failed", { error });

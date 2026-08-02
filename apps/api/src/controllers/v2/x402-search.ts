@@ -282,7 +282,7 @@ export async function x402SearchController(
     // Buffer results by 50% to account for filtered URLs
     const num_results_buffer = Math.floor(limit * 2);
 
-    logger.info("Searching for results [x402]");
+    logger.debug("Searching for results [x402]");
 
     // Extract unique types from sources for the search function
     // After transformation, sources is always an array of objects

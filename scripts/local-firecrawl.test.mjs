@@ -6,6 +6,7 @@ import {
   readdir,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -96,6 +97,17 @@ async function makeFakeRuntime({
   providerMode = "internal",
   staleSearxng = false,
   searchHealth = "healthy",
+  codexConfig = `model = "gpt-test"
+model_provider = "local-proxy"
+
+[model_providers.local-proxy]
+name = "Local proxy"
+base_url = "http://127.0.0.1:8317/v1"
+env_key = "TEST_PROVIDER_API_KEY"
+env_http_headers = { "X-Optional" = "OPTIONAL_PROVIDER_HEADER", "X-Empty" = "EMPTY_PROVIDER_HEADER" }
+websocket_connect_timeout_ms = 12000
+wire_api = "responses"
+`,
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "local-firecrawl-docker-test-"));
   const bin = join(root, "bin");
@@ -136,6 +148,9 @@ async function makeFakeRuntime({
     mode: 0o755,
   });
   await writeFile(join(home, ".codex", "auth.json"), "{}\n", { mode: 0o600 });
+  await writeFile(join(home, ".codex", "config.toml"), codexConfig, {
+    mode: 0o600,
+  });
   await writeFile(
     caBundle,
     "-----BEGIN CERTIFICATE-----\nfake-fixture\n-----END CERTIFICATE-----\n",
@@ -187,6 +202,10 @@ if (args[0] === "inspect") {
       "bind | /opt/codex | false\\n" +
       "bind | /run/certs/host-ca-certificates.crt | false\\n" +
       "bind | /run/secrets/codex-auth.json | false\\n" +
+      (current() === "current"
+        ? "bind | /run/secrets/codex-config.toml | false\\n" +
+          "bind | /run/secrets/codex-provider-environment.json | false\\n"
+        : "") +
       "volume | /run/firecrawl-interaction | true\\n" +
       (["legacy", "pre-egress"].includes(current())
         ? ""
@@ -236,6 +255,7 @@ if (has("config")) {
             SEARCH_PROVIDER_TIMEOUT_MS: "10000",
             SEARCH_PROVIDER_MAX_RESULTS: "100",
             SEARCH_PROVIDER_MAX_CONCURRENCY: "4",
+            SEARXNG_ENGINES: "braveapi,bing",
             BROWSER_SERVICE_API_KEY: "A".repeat(43),
             BROWSER_INTERACTION_WORKER_SOCKET_PATH:
               "/run/firecrawl-interaction/worker.sock",
@@ -277,6 +297,9 @@ if (has("config")) {
             BROWSER_INTERACTION_WORKER_TOKEN: "B".repeat(43),
             CODEX_CA_CERTIFICATE:
               "/run/certs/host-ca-certificates.crt",
+            CODEX_CONFIG_SEED_FILE: "/run/secrets/codex-config.toml",
+            CODEX_PROVIDER_ENVIRONMENT_FILE:
+              "/run/secrets/codex-provider-environment.json",
             SSL_CERT_FILE: "/run/certs/host-ca-certificates.crt",
             NODE_EXTRA_CA_CERTS: "/run/certs/host-ca-certificates.crt",
             MODEL_EGRESS_PROXY_SOCKET_PATH:
@@ -312,6 +335,20 @@ if (has("config")) {
               bind: { create_host_path: false },
             },
             {
+              type: "bind",
+              source: process.env.LOCAL_CODEX_WORKER_CONFIG_FILE,
+              target: "/run/secrets/codex-config.toml",
+              read_only: true,
+              bind: { create_host_path: false },
+            },
+            {
+              type: "bind",
+              source: process.env.LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE,
+              target: "/run/secrets/codex-provider-environment.json",
+              read_only: true,
+              bind: { create_host_path: false },
+            },
+            {
               type: "volume",
               source: "codex-auth-state",
               target: "/var/lib/firecrawl-codex-auth-state",
@@ -340,9 +377,19 @@ if (has("config")) {
           environment: {
             MODEL_EGRESS_PROXY_SOCKET_PATH:
               "/run/firecrawl-model-egress/proxy.sock",
+            MODEL_EGRESS_PROVIDER_POLICY_FILE:
+              "/run/secrets/codex-egress-policy.json",
           },
           networks: { "model-uplink": null },
+          extra_hosts: ["host.docker.internal=host-gateway"],
           volumes: [
+            {
+              type: "bind",
+              source: process.env.LOCAL_CODEX_EGRESS_POLICY_FILE,
+              target: "/run/secrets/codex-egress-policy.json",
+              read_only: true,
+              bind: { create_host_path: false },
+            },
             {
               type: "volume",
               source: "browser-interaction-egress-socket",
@@ -352,7 +399,14 @@ if (has("config")) {
           ],
         },
         "app-db-migrate": { networks: { backend: null } },
-        searxng: { networks: { backend: null } },
+        searxng: {
+          environment: {
+            FORCE_OWNERSHIP: "true",
+            SEARXNG_BRAVE_API_KEY_B64: "fixture",
+            SEARXNG_SECRET: "fixture",
+          },
+          networks: { backend: null },
+        },
       },
     };
     if (!maintenanceProfileEnabled) {
@@ -390,6 +444,12 @@ if (has("config")) {
     ) {
       rendered.services["browser-interaction-egress-proxy"].networks.backend =
         null;
+    } else if (
+      process.env.FAKE_COMPOSE_INVALID === "egress_proxy_host_remap"
+    ) {
+      rendered.services["browser-interaction-egress-proxy"].extra_hosts = [
+        "host.docker.internal=203.0.113.10",
+      ];
     } else if (
       process.env.FAKE_COMPOSE_INVALID === "egress_proxy_secret"
     ) {
@@ -492,6 +552,7 @@ process.exit(2);
       FAKE_SEARCH_HEALTH: searchHealth,
       LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS: "10",
       LOCAL_FIRECRAWL_CA_BUNDLE_FILE: caBundle,
+      TEST_PROVIDER_API_KEY: "provider-secret-must-not-leak",
       XDG_RUNTIME_DIR: runtime,
       HOME: home,
       PATH: `${bin}:/usr/bin:/bin`,
@@ -539,6 +600,12 @@ test("local compose keeps Docker browser state", async () => {
   assert.match(source, /source: \$\{LOCAL_CODEX_PACKAGE_DIR:/);
   assert.match(source, /target: \/opt\/codex/);
   assert.match(source, /target: \/run\/secrets\/codex-auth\.json/);
+  assert.match(source, /target: \/run\/secrets\/codex-config\.toml/);
+  assert.match(
+    source,
+    /target: \/run\/secrets\/codex-provider-environment\.json/,
+  );
+  assert.match(source, /target: \/run\/secrets\/codex-egress-policy\.json/);
   assert.match(source, /source: \$\{LOCAL_CODEX_CA_BUNDLE_FILE:/);
   assert.match(source, /target: \/run\/certs\/host-ca-certificates\.crt/);
   assert.match(
@@ -551,6 +618,8 @@ test("local compose keeps Docker browser state", async () => {
   );
   assert.match(source, /source: codex-auth-state/);
   assert.match(source, /target: \/var\/lib\/firecrawl-codex-auth-state/);
+  assert.match(source, /CODEX_HOME: \/var\/lib\/firecrawl-codex-runs/);
+  assert.doesNotMatch(source, /CODEX_HOME: \/tmp\/codex-home/);
   assert.match(source, /source: browser-interaction-socket/);
   assert.match(source, /target: \/run\/firecrawl-interaction/);
   assert.match(source, /browser-interaction-worker:[\s\S]*?network_mode: none/);
@@ -580,6 +649,167 @@ test("local compose keeps Docker browser state", async () => {
     source,
     /browser-interaction-egress-proxy:[\s\S]*?expose:/,
   );
+});
+
+// @lat: [[runtime-operations#Local wrapper suite#Codex provider snapshot]]
+test("start snapshots only the selected Codex provider routing", async t => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+
+  const result = await run(wrapper, ["start"], { env: fake.env });
+  assert.equal(result.code, 0, result.stderr);
+  const snapshotDirectory = join(fake.env.XDG_RUNTIME_DIR, "firecrawl-control");
+  const configPath = join(
+    snapshotDirectory,
+    "codex-worker-config.firecrawl.toml",
+  );
+  const environmentPath = join(
+    snapshotDirectory,
+    "codex-provider-environment.firecrawl.json",
+  );
+  const egressPath = join(
+    snapshotDirectory,
+    "codex-egress-policy.firecrawl.json",
+  );
+  const config = await readFile(configPath, "utf8");
+  assert.match(config, /^model = "gpt-test"$/m);
+  assert.match(config, /^model_provider = "local-proxy"$/m);
+  assert.match(
+    config,
+    /"base_url" = "http:\/\/host\.docker\.internal:8317\/v1"/,
+  );
+  assert.match(config, /"websocket_connect_timeout_ms" = 12000/);
+  assert.doesNotMatch(config, /mcp_servers|hooks|approval_policy|sandbox_mode/);
+  assert.deepEqual(JSON.parse(await readFile(environmentPath, "utf8")), {
+    TEST_PROVIDER_API_KEY: "provider-secret-must-not-leak",
+  });
+  assert.deepEqual(JSON.parse(await readFile(egressPath, "utf8")), {
+    httpHost: "host.docker.internal",
+    httpPort: 8317,
+  });
+  assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  assert.equal((await stat(environmentPath)).mode & 0o777, 0o600);
+  assert.equal((await stat(egressPath)).mode & 0o777, 0o600);
+  assert.doesNotMatch(
+    result.stdout + result.stderr,
+    /provider-secret-must-not-leak/,
+  );
+
+  const restarted = await run(wrapper, ["restart"], { env: fake.env });
+  assert.equal(restarted.code, 0, restarted.stderr);
+  const forcedUpEvents = (await fake.events()).filter(
+    event => event.includes("up") && event.includes("--force-recreate"),
+  );
+  assert.equal(forcedUpEvents.length, 4);
+  assert.deepEqual(
+    forcedUpEvents.map(event => event.at(-1)),
+    [
+      "browser-interaction-egress-proxy",
+      "browser-interaction-worker",
+      "browser-interaction-egress-proxy",
+      "browser-interaction-worker",
+    ],
+  );
+
+  const stopped = await run(wrapper, ["stop"], { env: fake.env });
+  assert.equal(stopped.code, 0, stopped.stderr);
+  for (const path of [configPath, environmentPath, egressPath]) {
+    await assert.rejects(readFile(path), { code: "ENOENT" });
+  }
+
+  const startedAgain = await run(wrapper, ["start"], {
+    env: {
+      ...fake.env,
+      TEST_PROVIDER_API_KEY: "rotated-provider-secret",
+    },
+  });
+  assert.equal(startedAgain.code, 0, startedAgain.stderr);
+  assert.deepEqual(JSON.parse(await readFile(environmentPath, "utf8")), {
+    TEST_PROVIDER_API_KEY: "rotated-provider-secret",
+  });
+});
+
+test("provider snapshot includes only nonempty optional header values", async t => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const secret = "optional-header-secret-must-not-leak";
+
+  const result = await run(wrapper, ["start"], {
+    env: {
+      ...fake.env,
+      OPTIONAL_PROVIDER_HEADER: secret,
+      EMPTY_PROVIDER_HEADER: "",
+    },
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const environmentPath = join(
+    fake.env.XDG_RUNTIME_DIR,
+    "firecrawl-control",
+    "codex-provider-environment.firecrawl.json",
+  );
+  assert.deepEqual(JSON.parse(await readFile(environmentPath, "utf8")), {
+    TEST_PROVIDER_API_KEY: "provider-secret-must-not-leak",
+    OPTIONAL_PROVIDER_HEADER: secret,
+  });
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(secret));
+});
+
+test("selected provider env_key remains required", async t => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const env = { ...fake.env };
+  delete env.TEST_PROVIDER_API_KEY;
+
+  const result = await run(wrapper, ["start"], { env });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /requires environment variable TEST_PROVIDER_API_KEY/);
+  assert.deepEqual(await fake.events(), []);
+});
+
+test("unsafe selected provider fields fail before Docker mutation", async t => {
+  const cases = [
+    [
+      'auth = { command = "/bin/unsafe", args = ["auth-secret"] }',
+      /unsupported field auth/,
+      /auth-secret/,
+    ],
+    [
+      'aws = { profile = "aws-secret", region = "us-east-1" }',
+      /unsupported field aws/,
+      /aws-secret/,
+    ],
+    [
+      'websocket_connect_timeout_ms = "12000"',
+      /invalid websocket_connect_timeout_ms/,
+      null,
+    ],
+  ];
+  for (const [field, error, secret] of cases) {
+    await t.test(field.split(" = ")[0], async () => {
+      const fake = await makeFakeRuntime({
+        codexConfig: [
+          'model = "gpt-test"',
+          'model_provider = "unsafe"',
+          "",
+          "[model_providers.unsafe]",
+          'base_url = "https://proxy.example/v1"',
+          field,
+          "",
+        ].join("\n"),
+      });
+      try {
+        const result = await run(wrapper, ["start"], { env: fake.env });
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, error);
+        if (secret !== null) {
+          assert.doesNotMatch(result.stderr + result.stdout, secret);
+        }
+        assert.deepEqual(await fake.events(), []);
+      } finally {
+        await fake.cleanup();
+      }
+    });
+  }
 });
 
 test("local environment templates generate Docker browser settings", async () => {
@@ -716,6 +946,43 @@ test("compose validation rejects worker and proxy egress escapes", async t => {
       } finally {
         await fake.cleanup();
       }
+    });
+  }
+});
+
+test("compose validation rejects an unsafe host gateway override", async t => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const override = join(fake.root, "unsafe-override.yaml");
+  await writeFile(
+    override,
+    "services:\n  browser-interaction-egress-proxy:\n" +
+      "    extra_hosts:\n      - host.docker.internal:203.0.113.10\n",
+    { mode: 0o600 },
+  );
+
+  const result = await run(wrapper, ["start"], {
+    env: {
+      ...fake.env,
+      LOCAL_FIRECRAWL_COMPOSE_OVERRIDE: override,
+      FAKE_COMPOSE_INVALID: "egress_proxy_host_remap",
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /invariant failed: egress_proxy_host_gateway/);
+  const events = await fake.events();
+  assert.equal(events.length, 2);
+  assert.ok(events.every(event => event.includes("config")));
+  assert.ok(events.every(event => event.includes(override)));
+
+  const snapshotDirectory = join(fake.env.XDG_RUNTIME_DIR, "firecrawl-control");
+  for (const name of [
+    "codex-worker-config.firecrawl.toml",
+    "codex-provider-environment.firecrawl.json",
+    "codex-egress-policy.firecrawl.json",
+  ]) {
+    await assert.rejects(readFile(join(snapshotDirectory, name)), {
+      code: "ENOENT",
     });
   }
 });
@@ -857,7 +1124,7 @@ test("restart migrates a recognized legacy API container", async t => {
 });
 
 test("restart upgrades the immediately-prior worker mount shape", async t => {
-  const fake = await makeFakeRuntime({ provenance: "pre-egress" });
+  const fake = await makeFakeRuntime({ provenance: "pre-provider" });
   t.after(() => fake.cleanup());
   const result = await run(wrapper, ["restart"], { env: fake.env });
   assert.equal(result.code, 0, result.stderr);

@@ -1,5 +1,6 @@
 import { lookup } from "node:dns/promises";
-import { chmod, lstat, mkdir, realpath, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname } from "node:path";
 import process from "node:process";
@@ -9,12 +10,14 @@ import { createServer } from "node:http";
 import {
   addressesMatch,
   EGRESS_POLICY,
+  normalizeHostname,
   parseClientHelloSni,
   parseConnectAuthority,
   validateResolvedAddresses,
 } from "./egress-policy.mjs";
 
 const FIXED_SOCKET_PATH = "/run/firecrawl-model-egress/proxy.sock";
+const FIXED_PROVIDER_POLICY_PATH = "/run/secrets/codex-egress-policy.json";
 const MAX_CONNECTIONS = 64;
 const CONNECT_TIMEOUT_MS = 5_000;
 const CLIENT_HELLO_TIMEOUT_MS = 5_000;
@@ -74,6 +77,29 @@ async function dialValidatedAddresses(answers) {
     }
   }
   throw lastError ?? new Error("no validated upstream address was dialed");
+}
+
+function connectPlaintextProvider(providerPolicy) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({
+      host: providerPolicy.httpHost,
+      port: providerPolicy.httpPort,
+    });
+    const fail = cause => {
+      socket.destroy();
+      reject(cause);
+    };
+    socket.setTimeout(CONNECT_TIMEOUT_MS, () =>
+      fail(new Error("provider connection timed out")),
+    );
+    socket.once("error", fail);
+    socket.once("connect", () => {
+      socket.off("error", fail);
+      socket.setTimeout(0);
+      socket.once("error", () => socket.destroy());
+      resolve(socket);
+    });
+  });
 }
 
 function readVerifiedClientHello(client, expectedHostname, head) {
@@ -166,11 +192,49 @@ async function prepareSocket(path) {
   }
 }
 
+export async function loadProviderPolicy(path) {
+  const handle = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_CLOEXEC,
+  );
+  try {
+    const status = await handle.stat();
+    if (!status.isFile() || status.isSymbolicLink() || status.size > 4096) {
+      throw new Error("provider egress policy is not a bounded regular file");
+    }
+    const value = JSON.parse((await handle.readFile()).toString("utf8"));
+    const keys = Object.keys(value).sort();
+    if (keys.length === 0) return Object.freeze({});
+    if (
+      keys.join(",") === "httpsHost" &&
+      normalizeHostname(value.httpsHost) === value.httpsHost
+    ) {
+      return Object.freeze({ httpsHost: value.httpsHost });
+    }
+    if (
+      keys.join(",") === "httpHost,httpPort" &&
+      value.httpHost === "host.docker.internal" &&
+      Number.isInteger(value.httpPort) &&
+      value.httpPort >= 1 &&
+      value.httpPort <= 65535
+    ) {
+      return Object.freeze({
+        httpHost: value.httpHost,
+        httpPort: value.httpPort,
+      });
+    }
+    throw new Error("provider egress policy is invalid");
+  } finally {
+    await handle.close();
+  }
+}
+
 export function createEgressProxy({
   socketPath = FIXED_SOCKET_PATH,
   resolveHost = resolveAllowedHost,
   dialHost = dialValidatedAddresses,
   emitLog = log,
+  providerPolicy = Object.freeze({}),
 } = {}) {
   const tunnels = new Set();
   const server = createServer(
@@ -192,8 +256,15 @@ export function createEgressProxy({
       return;
     }
     let authority;
+    const providerAuthority = `${providerPolicy.httpHost}:${providerPolicy.httpPort}`;
+    const isPlaintextProvider =
+      providerPolicy.httpHost !== undefined &&
+      request.url === providerAuthority &&
+      request.headers.host === providerAuthority;
     try {
-      authority = parseConnectAuthority(request.url);
+      authority = isPlaintextProvider
+        ? { hostname: providerPolicy.httpHost, port: providerPolicy.httpPort }
+        : parseConnectAuthority(request.url, providerPolicy.httpsHost);
     } catch {
       emitLog("model_egress_denied", { category: "connect_policy" });
       sendStatus(client, 403, "Forbidden");
@@ -209,6 +280,23 @@ export function createEgressProxy({
     client.once("close", close);
     client.once("error", close);
     try {
+      if (isPlaintextProvider) {
+        tunnel.upstream = await connectPlaintextProvider(providerPolicy);
+        tunnel.upstream.once("close", close);
+        tunnel.upstream.once("error", close);
+        client.write(
+          "HTTP/1.1 200 Connection Established\r\nProxy-Agent: firecrawl-model-egress\r\n\r\n",
+        );
+        if (head.length > 0) tunnel.upstream.write(head);
+        client.setTimeout(TUNNEL_IDLE_TIMEOUT_MS, close);
+        tunnel.upstream.setTimeout(TUNNEL_IDLE_TIMEOUT_MS, close);
+        client.pipe(tunnel.upstream);
+        tunnel.upstream.pipe(client);
+        emitLog("model_egress_allowed", {
+          hostname: providerPolicy.httpHost,
+        });
+        return;
+      }
       const answers = await resolveHost(authority.hostname);
       tunnel.upstream = await dialHost(answers);
       tunnel.upstream.once("close", close);
@@ -279,12 +367,29 @@ async function main() {
   if (process.env.MODEL_EGRESS_PROXY_SOCKET_PATH !== FIXED_SOCKET_PATH) {
     throw new Error(`proxy socket path must be ${FIXED_SOCKET_PATH}`);
   }
+  if (
+    process.env.MODEL_EGRESS_PROVIDER_POLICY_FILE !== FIXED_PROVIDER_POLICY_PATH
+  ) {
+    throw new Error(
+      `provider policy path must be ${FIXED_PROVIDER_POLICY_PATH}`,
+    );
+  }
+  const providerPolicy = await loadProviderPolicy(
+    process.env.MODEL_EGRESS_PROVIDER_POLICY_FILE,
+  );
   const proxy = createEgressProxy({
     socketPath: process.env.MODEL_EGRESS_PROXY_SOCKET_PATH,
+    providerPolicy,
   });
   await proxy.listen();
   log("model_egress_proxy_ready", {
     allowedApexes: EGRESS_POLICY.allowedApexes,
+    ...(providerPolicy.httpsHost === undefined
+      ? {}
+      : { providerHostname: providerPolicy.httpsHost }),
+    ...(providerPolicy.httpHost === undefined
+      ? {}
+      : { providerHostname: providerPolicy.httpHost }),
   });
   let closing = false;
   const shutdown = async () => {

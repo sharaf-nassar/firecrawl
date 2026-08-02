@@ -33,6 +33,7 @@ vi.mock("../lib/tracking", () => ({
 import { executeSearch } from "./execute";
 
 const logger = {
+  debug: vi.fn(),
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),

@@ -187,6 +187,8 @@ The probe sends CONNECT requests through loopback and verifies policy outcomes. 
 
 It reads at most 200 recent lines, optionally filters by canonical UUID correlation ID, and redacts credentials, prompts, queries, endpoints, URLs, sources, and page values.
 
+Local environment initialization sets `LOGGING_LEVEL=INFO` and Compose passes it to API processes. Debug-only search phase, provider-selection, and no-op reconciler records are therefore opt-in rather than normal local output.
+
 Internal mode supports `logs searxng`; external mode rejects that target and omits it from `logs all`. Browser component targets isolate their corresponding trust boundaries. Remaining failure after wrapper recovery should be surfaced instead of hidden by repeated restarts.
 
 ## Local recovery procedure

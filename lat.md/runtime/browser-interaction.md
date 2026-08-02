@@ -39,6 +39,20 @@ The child uses read-only sandbox mode, approval policy `never`, disabled web sea
 
 The parent also parses Codex JSONL and rejects tool, command, file-change, MCP, browser, collaboration, or approval-shaped events. Only bounded message/reasoning items are accepted, so hook bypass or protocol drift fails the decision.
 
+Run homes live on a noexec tmpfs outside the OS temporary directory. This keeps runs ephemeral while allowing current Codex releases to establish their guarded `CODEX_HOME` aliases.
+
+## Model provider inheritance
+
+Local startup inherits only the host Codex model and selected provider routing, preserving user choice without importing the rest of the host configuration.
+
+`scripts/prepare-codex-worker-config.py` reads an owned, mode-0600 host `config.toml` and writes bounded mode-0600 snapshots containing `model`, `model_provider`, and the selected provider table. Required provider credentials and present nonempty optional header values enter a separate environment snapshot.
+
+Supported retry and timeout scalars preserve their validated unsigned values, including WebSocket connection timeout. Unsupported provider fields fail startup before Docker mutation.
+
+After atomic snapshot refresh, start and restart force-recreate only the worker and egress proxy so their bind mounts resolve the new inodes. Failed startup and stop remove all snapshots; the next start regenerates them.
+
+The runner combines that snapshot with its worker-owned approval, sandbox, history, feature, agent, MCP, and hook policy. Host project config, profiles, MCP servers, apps, agents, rules, hooks, history, and arbitrary environment variables never enter the child.
+
 ## Prompt trust model
 
 Page observations are explicitly treated as untrusted data and never as model authority.
@@ -87,9 +101,11 @@ The worker container has `network_mode: none`; a separate proxy container is its
 
 Inside the worker, `createLoopbackProxyRelay` listens on fixed loopback port `3128` and relays raw connections to a shared Unix socket. All uppercase and lowercase proxy variables must point to this loopback endpoint, with empty `NO_PROXY`.
 
-The separate proxy owns the `model-uplink` network and `createEgressProxy` accepts CONNECT only for an allowlisted model-host set on port 443.
+The separate proxy owns the `model-uplink` network and `createEgressProxy` accepts CONNECT only for the built-in allowlist plus the exact selected HTTPS provider hostname on port 443.
 
-DNS answers must all be global addresses. The proxy connects only to validated answers and requires TLS ClientHello SNI to exactly match CONNECT authority before forwarding. Hostname normalization, DNS rebinding, private ranges, IP literals, plaintext HTTP, and SNI mismatch fail closed.
+DNS answers must all be global addresses. The proxy connects only to validated answers and requires TLS ClientHello SNI to exactly match CONNECT authority before forwarding. Hostname normalization, DNS rebinding, private ranges, IP literals, arbitrary plaintext HTTP, and SNI mismatch fail closed.
+
+A host-loopback HTTP provider is rewritten to the fixed Docker host alias and exact configured port. Rendered Compose must map only that alias to Docker's host gateway. Only that derived origin accepts HTTP proxy requests; other plaintext destinations remain denied.
 
 `createEgressProxy` in `apps/browser-interaction-worker/src/egress-proxy.mjs` emits structured allow or deny outcomes. Allowed events include only the validated model hostname; denied events use bounded policy categories rather than request content.
 
@@ -97,7 +113,7 @@ DNS answers must all be global addresses. The proxy connects only to validated a
 
 Deployment treats the model worker and its uplink as different trust zones.
 
-Both containers run UID/GID 1000, read-only roots, dropped capabilities, no-new-privileges, PID/memory/CPU limits, and small noexec tmpfs mounts. The worker gets only Codex package, auth seed, CA bundle, auth state, interaction socket, and egress socket mounts.
+Both containers run UID/GID 1000, read-only roots, dropped capabilities, no-new-privileges, PID/memory/CPU limits, and small noexec tmpfs mounts. The worker adds only derived provider config/environment snapshots to the prior package, auth, CA, state, and socket mounts.
 
 The API sees the interaction socket but not the worker auth or egress socket. The proxy sees the egress socket and uplink network but not the interaction socket or Codex state.
 

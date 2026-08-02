@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildCodexConfig,
   buildPrompt,
   buildTimeoutFallbackDecision,
+  makeChildEnvironment,
   recoverFinalOnlyTimeout,
 } from "./codex-runner.mjs";
 import { MAX_BROWSER_ACTIONS, validateDecisionRequest } from "./protocol.mjs";
@@ -17,6 +19,29 @@ function requestAtTurn(turn) {
     observationJson: '{"type":"action_result"}',
   };
 }
+
+// @lat: [[runtime-operations#Browser Interaction Worker suite#Provider inheritance boundary]]
+test("runner combines selected provider routing with closed worker policy", () => {
+  const config = buildCodexConfig(`model = "gpt-test"
+model_provider = "proxy"
+model_providers = { "proxy" = { base_url = "https://proxy.example/v1" } }
+`);
+
+  assert.match(config, /model = "gpt-test"/);
+  assert.match(config, /model_provider = "proxy"/);
+  assert.match(config, /approval_policy = "never"/);
+  assert.match(config, /sandbox_mode = "read-only"/);
+  assert.match(config, /web_search = "disabled"/);
+  assert.match(config, /\[mcp_servers\]\s*$/u);
+
+  const environment = makeChildEnvironment("/var/lib/run-1", {
+    PROVIDER_API_KEY: "secret",
+  });
+  assert.equal(environment.PROVIDER_API_KEY, "secret");
+  assert.equal(environment.CODEX_HOME, "/var/lib/run-1");
+  assert.equal(environment.HOME, "/var/lib/run-1");
+  assert.equal(environment.TMPDIR, undefined);
+});
 
 test("turn 25 prompt requires best-effort final output", () => {
   const prompt = buildPrompt({
@@ -315,10 +340,10 @@ test("only a final-only Codex timeout recovers with fallback output", () => {
   );
   assert.throws(
     () => recoverFinalOnlyTimeout(request, false, timeout),
-    (error) => error === timeout,
+    error => error === timeout,
   );
   assert.throws(
     () => recoverFinalOnlyTimeout(request, true, protocolError),
-    (error) => error === protocolError,
+    error => error === protocolError,
   );
 });

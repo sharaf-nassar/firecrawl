@@ -11,9 +11,12 @@ import { dirname } from "node:path";
 
 const FIXED_SOCKET_PATH = "/run/firecrawl-interaction/worker.sock";
 const FIXED_CODEX_BIN = "/opt/codex/bin/codex.js";
-const FIXED_CODEX_HOME = "/tmp/codex-home";
+const FIXED_CODEX_HOME = "/var/lib/firecrawl-codex-runs";
 const FIXED_CODEX_AUTH_SEED_FILE = "/run/secrets/codex-auth.json";
 const FIXED_CODEX_AUTH_STATE_DIR = "/var/lib/firecrawl-codex-auth-state";
+const FIXED_CODEX_CONFIG_SEED_FILE = "/run/secrets/codex-config.toml";
+const FIXED_CODEX_PROVIDER_ENVIRONMENT_FILE =
+  "/run/secrets/codex-provider-environment.json";
 const FIXED_EGRESS_PROXY_SOCKET_PATH =
   "/run/firecrawl-model-egress/proxy.sock";
 const FIXED_EGRESS_PROXY_URL = "http://127.0.0.1:3128";
@@ -81,6 +84,16 @@ export function readConfig(env = process.env) {
       env.CODEX_AUTH_STATE_DIR,
       FIXED_CODEX_AUTH_STATE_DIR,
     ),
+    codexConfigSeedFile: fixedPath(
+      "CODEX_CONFIG_SEED_FILE",
+      env.CODEX_CONFIG_SEED_FILE,
+      FIXED_CODEX_CONFIG_SEED_FILE,
+    ),
+    codexProviderEnvironmentFile: fixedPath(
+      "CODEX_PROVIDER_ENVIRONMENT_FILE",
+      env.CODEX_PROVIDER_ENVIRONMENT_FILE,
+      FIXED_CODEX_PROVIDER_ENVIRONMENT_FILE,
+    ),
     egressProxySocketPath: fixedPath(
       "MODEL_EGRESS_PROXY_SOCKET_PATH",
       env.MODEL_EGRESS_PROXY_SOCKET_PATH,
@@ -122,6 +135,22 @@ export async function preflightConfig(config) {
     throw new Error("Codex auth secret is not a bounded regular file");
   }
   await access(config.codexAuthSeedFile, constants.R_OK);
+
+  for (const [path, label] of [
+    [config.codexConfigSeedFile, "Codex config seed"],
+    [config.codexProviderEnvironmentFile, "Codex provider environment"],
+  ]) {
+    const status = await lstat(path);
+    if (
+      !status.isFile() ||
+      status.isSymbolicLink() ||
+      status.size <= 0 ||
+      status.size > 1024 * 1024
+    ) {
+      throw new Error(`${label} is not a bounded regular file`);
+    }
+    await access(path, constants.R_OK);
+  }
 
   await mkdir(config.codexHome, { mode: 0o700, recursive: true });
   const homePath = await realpath(config.codexHome);

@@ -20,6 +20,10 @@ These tests usually replace external dependencies and focus on state transitions
 
 Configuration regression tests verify that empty OpenAI and Ollama base URLs parse as unset while non-empty custom endpoints pass through unchanged.
 
+### Bounded logger metadata
+
+Logger unit tests prove warn/error metadata stays within its byte budget when errors contain huge provider fields or cyclic causes while preserving bounded error identity, stack, scalar code, and cause context.
+
 ### OpenAI endpoint selection
 
 Generic AI tests invoke the returned OpenAI model with intercepted transport, proving endpoint selection from the installed provider rather than provider labels or implementation details.
