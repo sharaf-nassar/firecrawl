@@ -69,6 +69,7 @@ export const configSchema = z.object({
   BULL_AUTH_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: emptyStringAsUndefined(z.string()),
+  OPENAI_CHAT_COMPLETIONS_ONLY: z.stringbool().default(false),
   OPENROUTER_API_KEY: z.string().optional(),
   XAI_API_KEY: z.string().optional(),
   LLAMAPARSE_API_KEY: z.string().optional(),

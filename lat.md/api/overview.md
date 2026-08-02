@@ -62,6 +62,10 @@ Most integrations are capability-gated by configuration. Missing optional engine
 
 Optional OpenAI and Ollama base URLs normalize empty environment values to unset. This prevents blank Compose interpolation from becoming a configured provider URL while preserving non-empty custom endpoints.
 
+OpenAI language models use the Responses API by default. `OPENAI_CHAT_COMPLETIONS_ONLY=true` explicitly switches all OpenAI language models to Chat Completions for compatible endpoints, while the existing o3-mini exception remains chat-only.
+
+Both the current extraction pipeline and `fire-0` obtain OpenAI language models through [[apps/api/src/lib/generic-ai.ts#getModel]]. The flag therefore covers their LLM traffic without routing extraction through the embedding provider.
+
 ## Local and hosted persistence modes
 
 The same API contract supports hosted infrastructure and a local persistence authority, but their consistency boundaries differ.

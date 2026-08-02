@@ -15,3 +15,5 @@ Codex process failures and malformed event streams become generic OpenAI-style e
 The HTTP boundary accepts chat completions, rejects embeddings as unsupported, and limits concurrent Codex children with a FIFO queue.
 
 `createCodexShimServer` in `apps/codex-shim/src/server.mjs` binds to `0.0.0.0:3030` by default. `CODEX_SHIM_HOST`, `CODEX_SHIM_PORT`, and `CODEX_SHIM_MAX_CONCURRENCY` override the defaults; concurrency defaults to two.
+
+API deployments targeting the shim enable `OPENAI_CHAT_COMPLETIONS_ONLY` so [[apps/api/src/lib/generic-ai.ts#getModel]] selects its supported chat endpoint. Both current and `fire-0` extraction share this provider path; extraction does not request embeddings.
