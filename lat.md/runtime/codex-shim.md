@@ -12,7 +12,7 @@ Codex process failures and malformed event streams become generic OpenAI-style e
 
 ## HTTP and capacity boundary
 
-The HTTP boundary accepts chat completions, rejects embeddings as unsupported, and limits concurrent Codex children with a FIFO queue.
+The HTTP boundary accepts only `POST /v1/chat/completions`, rejects `/v1/embeddings`, implements no Responses API, and limits concurrent Codex children with a FIFO queue.
 
 `createCodexShimServer` in `apps/codex-shim/src/server.mjs` binds to `0.0.0.0:3030` by default. `CODEX_SHIM_HOST`, `CODEX_SHIM_PORT`, and `CODEX_SHIM_MAX_CONCURRENCY` override the defaults; concurrency defaults to two.
 

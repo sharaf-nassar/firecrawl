@@ -112,6 +112,15 @@ For `firecrawl_interact`, the launcher replaces upstream code-mode advertising w
 
 The launcher pins `firecrawl-mcp@3.22.3`. Captured upstream interact and search registrations plus independent local snapshots make package-pin, instruction, or tool-schema drift require an explicit fixture update.
 
+The complete disabled-name policy contains seventeen reserved upstream names:
+
+- Agent service: `firecrawl_agent`, `firecrawl_agent_status`.
+- Research proxy: `firecrawl_research_search_papers`, `firecrawl_research_inspect_paper`, `firecrawl_research_related_papers`, `firecrawl_research_read_paper`, `firecrawl_research_search_github`.
+- Search feedback: `firecrawl_search_feedback`.
+- Monitor and feedback storage: `firecrawl_monitor_create`, `firecrawl_monitor_get`, `firecrawl_monitor_list`, `firecrawl_monitor_update`, `firecrawl_monitor_delete`, `firecrawl_monitor_run`, `firecrawl_monitor_check`, `firecrawl_monitor_checks`, `firecrawl_feedback`.
+
+`firecrawl_extract` remains enabled. Fresh local API configuration targets `http://host.docker.internal:3030/v1`, and `OPENAI_CHAT_COMPLETIONS_ONLY=true` routes both extraction pipelines through the separately managed [[runtime/codex-shim#Codex Shim#HTTP and capacity boundary|Codex Shim chat-completions boundary]].
+
 ## Lifecycle lock
 
 All lifecycle and diagnostic commands coordinate through a per-user, per-project advisory lock.

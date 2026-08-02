@@ -56,6 +56,14 @@ Those behaviors are partially constrained by local Compose validation and health
 
 The suite places a recording `codex` stub first on `PATH`. It covers message and argv translation, exact schema-file creation and cleanup, final-message event parsing, FIFO concurrency, chat and embeddings routes, and secret-safe OpenAI error responses.
 
+## API LLM compatibility coverage
+
+API Vitest coverage keeps local Codex Shim compatibility opt-in while preserving hosted OpenAI defaults.
+
+`apps/api/src/config.test.ts` verifies empty OpenAI and Ollama base URLs become unset, non-empty URLs survive parsing, and chat-completions compatibility defaults off. `apps/api/src/lib/generic-ai.test.ts` proves opt-in traffic reaches `/chat/completions` while default traffic reaches `/responses`.
+
+See [[api/tests#API Test Organization#Unit and component tests]] and [[api/tests#API Test Organization#Unit and component tests#OpenAI endpoint selection]] for the API-owned test contract.
+
 ## Playwright service suite
 
 `apps/playwright-service-ts/` uses Node's test runner through `tsx`.
