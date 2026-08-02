@@ -7,10 +7,10 @@ Local MCP web search currently falls back to scraped DuckDuckGo whenever no exte
 ## Goals
 
 - Run SearXNG as the default search provider for the `scripts/local-firecrawl` stack while preserving explicitly configured Fire Engine precedence outside that stack.
-- Route ordinary local API and MCP web searches through SearXNG without requiring manual provider configuration; installations with neither SearXNG nor Fire Engine fail explicitly.
+- Route ordinary local API and MCP web searches through SearXNG without manual endpoint or engine selection after required Brave credential setup; installations with neither SearXNG nor Fire Engine fail explicitly.
 - Remove the direct DuckDuckGo provider, fallback branch, configuration surface, tests, and documentation, and disable every DuckDuckGo engine and autocomplete backend in the bundled SearXNG configuration.
 - Keep SearXNG private to the internal service network and expose no host or public port by default.
-- Make SearXNG readiness prove that its JSON search API can answer a real query, not merely that its process is alive.
+- Make Compose readiness prove process/config health without upstream traffic, then make wrapper `health` prove that the JSON search API can answer one bounded real query.
 - Return an explicit provider-unavailable error when SearXNG cannot answer instead of HTTP 200 with empty data.
 - Document supported search sources and options accurately so MCP clients do not infer capabilities that the local adapter does not implement.
 - Provide deterministic automated coverage for provider selection, response mapping, failure semantics, Compose wiring, and launcher capability exposure.
@@ -43,6 +43,7 @@ As a local MCP user, I want search to use the bundled SearXNG service, so that o
 Acceptance Criteria:
 
 - A default local stack started through `scripts/local-firecrawl` includes a healthy internal SearXNG service.
+- Bundled startup requires a privately collected Brave Search API key, enables exactly official `braveapi` plus Bing, and fails closed rather than operating Bing-only.
 - `firecrawl_search` returns mapped web results for a deterministic smoke query through the local API.
 - No DuckDuckGo provider request occurs in Firecrawl or the bundled SearXNG engine configuration.
 
@@ -89,17 +90,18 @@ Acceptance Criteria:
 - SearXNG engine availability can change independently; health checks and tests must avoid creating a permanently flaky startup gate.
 - Firecrawl makes one bounded provider attempt with no application retry or separate circuit breaker; SearXNG owns engine suspension. Planning must set and benchmark exact deadline, pagination/result, concurrency, and resource bounds.
 - Existing blank SearXNG environment values adopt `http://searxng:8080`, while an explicit external endpoint remains a supported override.
-- The internal service uses a dedicated generated secret, POST requests, query-safe logging, no host port, container hardening, and an immutable image pin with an update owner.
+- Bundled mode requires exactly `braveapi,bing` and a nonblank Brave credential. The credential is encoded in the protected local environment, passed only to SearXNG, decoded only into tmpfs, and never exposed to API; bundled overrides cannot remove Brave.
+- The internal service uses a dedicated generated service secret, POST requests, query-safe logging, no host port, container hardening, and an immutable image pin with an update owner.
 - Changes require updates to Compose, environment initialization, health/status output, API search code, MCP capability policy, tests, user documentation, and lat.md.
 - No project constitution exists, so the clarify gate must decide whether to continue without one.
 
-## Open Questions
+## Resolved Decisions
 
-- Which exact keyless web engines and categories pass reliability/privacy testing for the explicit bundled allowlist?
-- What concrete provider deadline, pagination/result cap, concurrency, and container resource limits fit the existing public API contract and local hardware baseline?
-- Which fixed non-user query and success predicate should wrapper `health` use for its bounded functional smoke?
-- Which immutable SearXNG release digest should ship, and who owns its documented update cadence?
-- Which existing Firecrawl error classes and controller mappings should carry the accepted 502/503 contract across legacy and v2 callers?
+- Bundled search uses official credentialed `braveapi` plus Bing. Both engines must qualify; Bing-only operation is invalid.
+- Firecrawl uses a 10-second provider deadline, 100-result cap, five-page cap, and concurrency four. SearXNG uses 3/4-second engine timeouts, zero retries, HTTP pools 16/8, 1 CPU, 512 MiB memory/swap, 128 PIDs, and bounded tmpfs.
+- Wrapper `health` uses one fixed non-user web query with limit 1 and requires HTTP 200, `success:true`, and one valid HTTP(S) result.
+- The immutable SearXNG image is `2026.7.31-6bfd82705` at digest `sha256:79c2be18a18367484474bae9b18a8cd9085114ab3dcd49cac091cad8c548a0a9`; local-runtime maintainers own monthly and security-triggered review.
+- Canonical provider errors and the shared controller mapping carry the accepted 502/503 contract across legacy, v2, MCP, and internal callers.
 
 ## Clarifications
 
@@ -107,7 +109,7 @@ Acceptance Criteria:
 A: Bundle SearXNG only for `scripts/local-firecrawl`. Preserve explicitly configured Fire Engine elsewhere, remove direct DuckDuckGo globally, and fail clearly when neither provider exists.
 
 **Q2: Does removal prohibit DuckDuckGo inside SearXNG, and what engine policy ships?**
-A: Yes. Disable all DuckDuckGo engines and autocomplete. Ship a small, explicit, tested keyless-engine allowlist with operator overrides.
+A: Yes. Disable all DuckDuckGo engines and autocomplete. Bundled mode requires the fixed official `braveapi,bing` pair and a Brave credential; it rejects bundled engine overrides and cannot operate Bing-only. External SearXNG endpoints suppress the bundled service but Firecrawl still validates any engine override against `braveapi,bing` and bounds categories to its supported contract.
 
 **Q3: Is local search a web-only MVP, and how are unsupported capabilities handled?**
 A: Yes. Advertise web-only MCP search, reject unsupported REST options, and hide local search feedback.
@@ -119,10 +121,10 @@ A: Use `503 SEARCH_PROVIDER_UNAVAILABLE` for timeouts, unreachable service, and 
 A: Require process/config readiness at startup, keep scrape/crawl available during later search outages, return typed 503s for search, and perform a bounded functional query through wrapper `health` rather than continuous Compose health checks.
 
 **Q6: What latency and load policy applies?**
-A: Make one bounded provider attempt with no Firecrawl retry or separate circuit breaker, honor a capped request deadline, bound pagination/results and concurrency, and let SearXNG manage engine suspension. Planning will finalize and benchmark exact values.
+A: Make one provider attempt with no Firecrawl retry or separate circuit breaker. Use the frozen 10-second deadline, 100-result and five-page caps, concurrency four, 3/4-second engine timeouts, zero retries, and SearXNG pools 16/8. Credentialed live acceptance passed with overall p95 1,048 ms and max 1,961 ms on 2026-08-01.
 
 **Q7: What migration and security contract applies?**
-A: Existing blank env values adopt `http://searxng:8080`; explicit external overrides remain supported. Generate a dedicated secret, use POST and query-safe logs, expose no host port, harden and digest-pin the container, and keep generic Compose and Helm changes outside this MVP.
+A: Existing blank endpoints adopt `http://searxng:8080`; explicit external overrides remain supported. Bundled setup privately requires the Brave key and stores only its Base64 transport value in the mode-`0600` environment. Only SearXNG receives it and decodes it into tmpfs. Keep POST, query-safe logs, no host port, container hardening, immutable pinning, and generic Compose/Helm outside this MVP.
 
 The feature proceeds without a repository constitution, as approved by accepting all recommended clarification defaults.
 

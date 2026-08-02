@@ -82,13 +82,13 @@ Go HTML-to-Markdown uses `httptest` for index, health, conversion, malformed inp
 
 ### Static settings policy
 
-The pinned image's settings loader must parse the tracked configuration into the exact private JSON/POST policy, four enabled general engines, and bounded outgoing request settings with no DuckDuckGo or Valkey path.
+The pinned image's settings loader must parse the tracked configuration into the exact private JSON/POST policy, Bing plus inactive `braveapi`, and bounded outgoing settings with no credential or Valkey path.
 
 The loader runs in a one-shot, read-only container with networking disabled and the tracked settings mounted read-only. Docker may fetch the exact pinned image first, but the test cannot contact an upstream engine.
 
 ### Rendered service hardening
 
-Rendered Compose must retain the digest, backend-only topology, read-only settings and root, non-root identity, dropped privileges, bounded resources, rotating logs, and local-only health probe without exposing the secret to API.
+Rendered Compose must retain the digest, backend-only topology, read-only settings and launcher, non-root identity, dropped privileges, resource bounds, rotating logs, and local health probe. Only SearXNG receives the encoded Brave credential.
 
 ### Immutable image architectures
 
@@ -96,7 +96,15 @@ The registry descriptor for the exact image digest must remain an OCI image inde
 
 ### Boot and effective settings
 
-The current host architecture must boot the hardened service, pass `/healthz`, and report only the four selected engines as enabled in SearXNG's effective `/config` response.
+The current host architecture must reject keyless boot, then boot with a fake key, pass `/healthz`, and report Bing plus `braveapi`. Renderer smoke checks cover syntax-significant fake key characters without contacting Brave.
+
+### Credentialed live qualification
+
+Credentialed acceptance verifies both frozen engines and the assembled Firecrawl path without persisting credentials, queries, URLs, snippets, or payloads in its evidence.
+
+On 2026-08-01, official `braveapi` and Bing each passed 3/3 isolated attempts. Wrapper restart and health passed, then 20 sequential and one batch of 8 concurrent `/v2/search` calls all returned structurally valid HTTP 200 web results.
+
+The overall nearest-rank p50 was 521 ms, p95 was 1,048 ms, and max was 1,961 ms. Final inspection found API and SearXNG healthy with no OOM or restart, while SearXNG used 108.2 MiB and 14 PIDs under its frozen limits.
 
 ## Local wrapper suite
 
@@ -122,7 +130,7 @@ Repository CI runs the deterministic local-script contracts, including this fake
 
 ### SearXNG environment migration
 
-`scripts/local-searxng-env.test.mjs` verifies fresh defaults, endpoint normalization, external overrides, secret generation, unsafe-input rejection, locking, atomic publication, concurrent changes, and repeat-run behavior.
+`scripts/local-searxng-env.test.mjs` verifies required-key setup, endpoint normalization, external overrides, secret generation, credential rotation, blank rejection, locking, atomic publication, concurrent changes, and repeat-run behavior.
 
 ### Operations coverage gap
 

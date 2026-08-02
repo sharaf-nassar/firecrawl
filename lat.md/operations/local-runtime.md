@@ -66,9 +66,13 @@ Compose requires healthy application Postgres, Browser Interaction Worker, Brows
 
 `scripts/init-local-env.sh` creates a new mode-`0600` `.env` and refuses to overwrite any existing file or symlink.
 
-It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO, and SearXNG. It also writes the canonical internal search endpoint, a stable local owner UUID, retention, and service defaults.
+It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO, and SearXNG. It also writes the canonical internal search endpoint, local owner UUID, retention, and service defaults.
+
+Interactive setup privately requires a Brave Search API key. Noninteractive setup reads only `FIRECRAWL_SEARXNG_BRAVE_API_KEY`; missing, blank, or whitespace-containing input fails before `.env` creation. Only its Base64 encoding is persisted.
 
 `scripts/upgrade-local-env-phase1` upgrades earlier environment files under an exclusive mode-`0600` lock. It validates file type, ownership, duplicate keys, secret distinctness, and phase values, then replaces through a bounded temporary file only if the source did not change.
+
+`scripts/local-firecrawl configure-search` collects a nonblank replacement before locking, then uses the atomic updater. It supports addition and rotation, preserves unrelated lines, and never passes the credential to API. External engine overrides remain valid only within `braveapi,bing`.
 
 `scripts/normalize-searxng-endpoint.mjs` canonicalizes origin-only HTTP(S) overrides. Missing or blank values use `http://searxng:8080`; the reserved hostname rejects every other scheme or effective port.
 
@@ -120,7 +124,7 @@ They prove Compose schema, network separation, mount direction, fixed worker pat
 
 Writers are quiesced before dependencies stop. Browser rollback validation, when explicitly enabled, runs from the current immutable image against a read-only view of the state volume before the replacement starts.
 
-The wrapper reads the normalized endpoint from rendered API configuration. Canonical `http://searxng:8080` starts SearXNG with `--no-deps --wait` before API; any validated external origin stops and removes a stale bundled container before startup.
+The wrapper reads the normalized endpoint from rendered API configuration. Canonical `http://searxng:8080` requires a Brave key and `braveapi,bing`, then starts SearXNG before API; any validated external origin removes a stale bundled container before startup.
 
 Provider failover and rollback never remove volumes. Switch to an external endpoint with current code before rolling code back; a later re-upgrade preserves that normalized external mode, while restoring the canonical endpoint re-enables the bundled service.
 
@@ -188,7 +192,9 @@ Do not remove volumes to resolve ordinary startup, migration, browser reconcilia
 
 `docker-compose.yaml` remains the simpler general self-host configuration.
 
-It runs API, Playwright, Redis, RabbitMQ, NuQ Postgres, and optional FoundationDB. It does not include local application persistence, MinIO, Browser Service, or Browser Interaction Worker unless combined through `compose.yaml`.
+It runs API, Playwright, Redis, RabbitMQ, NuQ Postgres, and optional FoundationDB. It does not include bundled SearXNG, its Brave credential flow, local application persistence, MinIO, Browser Service, or Browser Interaction Worker unless combined through `compose.yaml`.
+
+Generic Compose and Helm operators configure Fire Engine or an external JSON SearXNG explicitly. They do not inherit the wrapper's internal/external lifecycle, web-only filter, functional search health, or rollback contract.
 
 The basic file publishes API on all host interfaces by default, while the local overlay replaces that binding with loopback-only ingress and persistent volumes. Operators must not assume the local hardening or recovery wrapper applies to a standalone self-host deployment.
 

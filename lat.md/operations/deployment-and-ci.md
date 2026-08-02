@@ -16,6 +16,8 @@ The Helm chart separates API admission, queue execution, extraction, NuQ executi
 
 The default topology contains API, queue worker, extract worker, NuQ worker, NuQ prefetch worker, Playwright, Redis, RabbitMQ, and NuQ Postgres. API, Playwright, Redis, RabbitMQ, and NuQ Postgres use ClusterIP services.
 
+The examples do not bundle SearXNG or the local Brave credential flow. Operators must configure Fire Engine or an external JSON SearXNG explicitly and own its engine privacy, health, and update policy.
+
 API probes `/v0/health/liveness` and `/v0/health/readiness`. Workers use their process health ports, while Playwright probes `/health`; these probes establish process readiness, not end-to-end scrape success.
 
 Shared configuration is rendered into one ConfigMap and one Secret. `config.extra` and `secret.extra` extend those environment contracts without changing templates.
@@ -69,3 +71,5 @@ SDKs, the legacy load suite, hosted integrations, and other optional ecosystems 
 Dependabot tracks only the action dependencies needed by the validation workflow.
 
 GitHub Actions updates run weekly and are grouped into one update set. Package-manager ecosystems are intentionally excluded because repository CI does not provide a complete cross-package release or compatibility gate.
+
+The pinned local SearXNG image is manually owned by Firecrawl local-runtime maintainers. They review it on the first business day of each month and upon SearXNG security notices, verify tag/digest and architectures, review settings changes, update the pair together, run deterministic and live acceptance, and record the result in release notes.

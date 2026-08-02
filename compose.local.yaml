@@ -337,8 +337,12 @@ services:
     user: "977:977"
     read_only: true
     init: true
+    entrypoint:
+      - /usr/local/searxng/.venv/bin/python
+      - /opt/firecrawl/searxng-entrypoint.py
     environment:
       FORCE_OWNERSHIP: "false"
+      SEARXNG_BRAVE_API_KEY_B64: ${SEARXNG_BRAVE_API_KEY_B64:-}
       SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
     networks:
       - backend
@@ -346,6 +350,12 @@ services:
       - type: bind
         source: ./config/searxng/settings.yml
         target: /etc/searxng/settings.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/searxng/entrypoint.py
+        target: /opt/firecrawl/searxng-entrypoint.py
         read_only: true
         bind:
           create_host_path: false

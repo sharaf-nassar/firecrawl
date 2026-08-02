@@ -4,12 +4,16 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="${repo_root}/.env"
 check_only=false
+configure_search=false
 snapshot_file=""
 output_file=""
 endpoint_normalizer="${repo_root}/scripts/normalize-searxng-endpoint.mjs"
+source "${repo_root}/scripts/local-search-key.lib.sh"
 
 usage() {
-  printf 'Usage: %s [--check] [--env-file <path>]\n' "${0##*/}" >&2
+  printf '%s\n' \
+    "Usage: ${0##*/} [--check] [--env-file <path>]" \
+    "       ${0##*/} --configure-search [--env-file <path>]" >&2
 }
 
 fail_field() {
@@ -220,16 +224,42 @@ validate_phase_values() {
     ! searxng_secret_is_unique "${values_name}"; then
     fail_field SEARXNG_SECRET
   fi
+  if [[ "${managed_values[SEARXNG_ENDPOINT]}" == http://searxng:8080 ]] &&
+    { [[ ! -v 'managed_values[SEARXNG_BRAVE_API_KEY_B64]' ]] ||
+      [[ -z "${managed_values[SEARXNG_BRAVE_API_KEY_B64]:-}" ]]; }; then
+    printf '%s\n' \
+      'Brave Search API key is required for bundled search.' \
+      'Run scripts/local-firecrawl configure-search before starting the local runtime.' >&2
+    exit 1
+  fi
+  if [[ -v 'managed_values[SEARXNG_BRAVE_API_KEY_B64]' ]] &&
+    [[ -n "${managed_values[SEARXNG_BRAVE_API_KEY_B64]}" ]] &&
+    ! firecrawl_validate_brave_api_key_b64 \
+      "${managed_values[SEARXNG_BRAVE_API_KEY_B64]}"; then
+    fail_field SEARXNG_BRAVE_API_KEY_B64
+  fi
+  if [[ "${managed_values[SEARXNG_ENDPOINT]}" == http://searxng:8080 ]] &&
+    [[ "${managed_values[SEARXNG_ENGINES]}" != braveapi,bing ]]; then
+    fail_field SEARXNG_ENGINES
+  fi
 }
 
 while (( $# > 0 )); do
   case "$1" in
     --check)
-      if [[ "${check_only}" == true ]]; then
+      if [[ "${check_only}" == true || "${configure_search}" == true ]]; then
         usage
         exit 64
       fi
       check_only=true
+      shift
+      ;;
+    --configure-search)
+      if [[ "${configure_search}" == true || "${check_only}" == true ]]; then
+        usage
+        exit 64
+      fi
+      configure_search=true
       shift
       ;;
     --env-file)
@@ -270,6 +300,7 @@ phase_keys=(
   ARTIFACT_MINIO_BUCKET
   ARTIFACT_MINIO_REGION
   SEARXNG_ENDPOINT
+  SEARXNG_ENGINES
   SEARXNG_SECRET
 )
 
@@ -299,6 +330,10 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 
 validate_environment_file
+
+if [[ "${configure_search}" == true ]]; then
+  firecrawl_collect_brave_api_key
+fi
 
 umask 077
 lock_file="${env_file}.phase1.lock"
@@ -427,6 +462,13 @@ if [[ ! -v 'candidate_values[ARTIFACT_MINIO_SECRET_KEY]' ]]; then
 fi
 set_default ARTIFACT_MINIO_BUCKET firecrawl-artifacts
 set_default ARTIFACT_MINIO_REGION us-east-1
+set_default SEARXNG_BRAVE_API_KEY_B64 ""
+if [[ "${configure_search}" == true ]]; then
+  if [[ "${candidate_values[SEARXNG_BRAVE_API_KEY_B64]}" != "${FIRECRAWL_COLLECTED_BRAVE_API_KEY_B64}" ]]; then
+    candidate_values[SEARXNG_BRAVE_API_KEY_B64]="${FIRECRAWL_COLLECTED_BRAVE_API_KEY_B64}"
+    mark_changed SEARXNG_BRAVE_API_KEY_B64
+  fi
+fi
 if [[ ! -v 'candidate_values[SEARXNG_ENDPOINT]' ]] ||
   [[ -z "${candidate_values[SEARXNG_ENDPOINT]}" ]]; then
   candidate_values[SEARXNG_ENDPOINT]=http://searxng:8080
@@ -442,6 +484,16 @@ else
     mark_changed SEARXNG_ENDPOINT
   fi
 fi
+if [[ ! -v 'candidate_values[SEARXNG_ENGINES]' ]]; then
+  candidate_values[SEARXNG_ENGINES]=""
+  mark_changed SEARXNG_ENGINES
+fi
+if [[ "${candidate_values[SEARXNG_ENDPOINT]}" == http://searxng:8080 ]]; then
+  if [[ "${candidate_values[SEARXNG_ENGINES]}" != braveapi,bing ]]; then
+    candidate_values[SEARXNG_ENGINES]=braveapi,bing
+    mark_changed SEARXNG_ENGINES
+  fi
+fi
 if [[ ! -v 'candidate_values[SEARXNG_SECRET]' ]] ||
   [[ -z "${candidate_values[SEARXNG_SECRET]}" ]]; then
   generate_searxng_secret
@@ -454,6 +506,10 @@ fi
 validate_phase_values candidate_values
 
 if (( ${#changed_keys[@]} == 0 )); then
+  if [[ "${configure_search}" == true ]]; then
+    printf 'Brave Search configuration is unchanged: %s\n' "${env_file}"
+    exit 0
+  fi
   printf 'Phase 1 environment is already configured: %s\n' "${env_file}"
   exit 0
 fi
@@ -496,4 +552,10 @@ rm -f -- "${snapshot_file}"
 snapshot_file=""
 trap - EXIT HUP INT TERM
 
-printf 'Updated Phase 1 environment fields: %s\n' "${env_file}"
+if [[ "${configure_search}" == true ]]; then
+  printf 'Updated Brave Search configuration: %s\n' "${env_file}"
+  printf '%s\n' \
+    'Run scripts/local-firecrawl restart to apply it to the local runtime.'
+else
+  printf 'Updated Phase 1 environment fields: %s\n' "${env_file}"
+fi

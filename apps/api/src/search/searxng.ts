@@ -6,7 +6,7 @@ import {
   SearchProviderUnavailableError,
 } from "./errors";
 
-const SEARXNG_ENGINES = ["brave", "qwant", "startpage", "bing"] as const;
+const SEARXNG_ENGINES = ["braveapi", "bing"] as const;
 const SEARXNG_MAX_PAGES = 5;
 const SEARXNG_RESULTS_PER_PAGE = 20;
 

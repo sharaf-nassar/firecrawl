@@ -70,10 +70,16 @@ USE_DB_AUTHENTICATION=false
 # PROXY_PASSWORD=
 
 ## === /search API ===
-# By default, the /search API will use Google search.
-
-# You can specify a SearXNG server with the JSON format enabled, if you'd like to use that instead of direct Google.
-# You can also customize the engines and categories parameters, but the defaults should also work just fine.
+# Generic self-hosting does not include the wrapper-managed SearXNG service or
+# its Brave credential setup. Configure an external SearXNG server with JSON
+# output enabled when SearXNG should provide search. Outside the wrapper's
+# local web-only mode, configured Fire Engine takes precedence over SearXNG.
+# Selection has no fallback; if neither provider exists, search returns
+# SEARCH_PROVIDER_UNAVAILABLE.
+# Engine overrides are optional but Firecrawl accepts only the qualified
+# braveapi,bing allowlist; categories remain bounded by Firecrawl's supported
+# search contract. The external operator owns service privacy, availability,
+# and logs.
 # SEARXNG_ENDPOINT=http://your.searxng.server
 # SEARXNG_ENGINES=
 # SEARXNG_CATEGORIES=
@@ -225,3 +231,9 @@ Read the [examples/kubernetes/cluster-install/README.md](https://github.com/fire
 ## Install Firecrawl on a Kubernetes Cluster with Helm
 
 Read the [examples/kubernetes/firecrawl-helm/README.md](https://github.com/firecrawl/firecrawl/blob/main/examples/kubernetes/firecrawl-helm/README.md) for instructions on how to install Firecrawl on a Kubernetes Cluster with Helm.
+
+Neither generic `docker-compose.yaml` nor the Helm examples bundle SearXNG or
+the local Brave credential flow. Configure Fire Engine or an external JSON
+SearXNG endpoint explicitly. The wrapper's internal/external lifecycle,
+web-only capability filter, health smoke, and rollback procedures do not apply
+to those deployments.

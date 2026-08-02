@@ -2,8 +2,8 @@
 
 This checkout runs Firecrawl through Docker Compose. Only
 `http://127.0.0.1:3002` is published. Redis, RabbitMQ, PostgreSQL, MinIO,
-Playwright, Browser Service, and the Codex-backed browser interaction worker
-remain private to Compose.
+Playwright, SearXNG, Browser Service, and the Codex-backed browser interaction
+worker remain private to Compose.
 
 The deployment stores:
 
@@ -37,14 +37,32 @@ For a new deployment without `.env`:
 ```
 
 `.env` contains generated credentials, uses mode `0600`, and is ignored by
-Git. The initialization script refuses to overwrite it.
+Git. The initialization script refuses to overwrite it. When attached to a
+terminal, it privately prompts for the required Brave Search API key. Blank
+or whitespace-containing input fails before `.env` is created.
+
+Noninteractive setup never prompts. Supply the key only through the
+`FIRECRAWL_SEARXNG_BRAVE_API_KEY` process environment; missing, blank, or
+whitespace-containing input fails. The script stores a Base64-encoded value,
+never the raw key, and sets the bundled engine list to `braveapi,bing`.
 
 For an existing `.env`, audit it against `.env.example.local`. Preserve all
-credentials and `LOCAL_OWNER_ID`. Then run:
+credentials and `LOCAL_OWNER_ID`. A missing, blank, or canonical
+`SEARXNG_ENDPOINT` selects bundled mode and requires the Brave key. Collect it
+and apply the environment migration with:
 
 ```bash
-scripts/upgrade-local-env-phase1 &&
-  scripts/upgrade-local-env-phase1 --check &&
+scripts/local-firecrawl configure-search
+```
+
+A validated non-canonical HTTP(S) endpoint selects external mode and needs no
+bundled Brave credential. Firecrawl still accepts only explicit engine
+overrides within `braveapi,bing` and categories supported by that contract.
+Migrate that environment with `scripts/upgrade-local-env-phase1`. In either
+mode, finish with:
+
+```bash
+scripts/upgrade-local-env-phase1 --check &&
   scripts/local-firecrawl restart &&
   scripts/local-firecrawl health
 ```
@@ -134,7 +152,18 @@ scripts/local-firecrawl logs
 scripts/local-firecrawl logs api
 scripts/local-firecrawl logs browser-service
 scripts/local-firecrawl logs browser-interaction-worker
+scripts/local-firecrawl configure-search
 ```
+
+`configure-search` privately prompts for a replacement Brave Search API key.
+Blank or whitespace-containing input fails without changing `.env`; only
+addition and rotation are supported. Automation may use the same process
+environment variable as first setup. The command atomically updates the
+mode-`0600` `.env`, preserves other entries, never accepts the key as an
+argument, and requires a restart to take effect. Bundled search always uses
+`braveapi,bing`. External SearXNG endpoints do not require this credential,
+but Firecrawl accepts engine overrides only within the same qualified pair and
+keeps categories within its supported search contract.
 
 The wrapper:
 
@@ -170,6 +199,86 @@ that exact legacy deployment. New containers must carry the canonical
 `stop` orders API, interaction worker, and Browser Service before
 dependencies. It does not remove containers or volumes. Never use
 `docker compose down --volumes` as a recovery experiment.
+
+## Local search
+
+The wrapper sets local web-only mode and selects exactly one SearXNG endpoint.
+It never falls through to another provider after selection or after a
+structurally valid empty response.
+
+- Internal mode uses canonical `http://searxng:8080`, starts the private
+  bundled service, and requires exactly `braveapi,bing` plus the Brave key.
+- External mode uses a validated non-canonical HTTP(S) origin, does not start
+  bundled SearXNG, and still restricts engine selection to the qualified
+  `braveapi,bing` allowlist and categories to Firecrawl's supported contract. A
+  mode change removes a stale bundled container without deleting volumes.
+- Outside local web-only mode, an explicitly configured Fire Engine takes
+  precedence over SearXNG. Without either provider, search returns the typed
+  unavailable error below.
+
+Local REST v0, v1, and v2 accept web search, domain/category filters, language,
+and downstream scrape options. Image, news, geo, recency, enterprise, and
+search-feedback semantics are unsupported. Explicit unsupported input stops
+before reservation or provider work with:
+
+```json
+{"success":false,"code":"BAD_REQUEST","error":"Local search supports web results only."}
+```
+
+Provider failures and partial results use these stable contracts:
+
+| Condition | HTTP response |
+| --- | --- |
+| Missing, unreachable, or timed-out provider; all selected engines fail | `503 {"success":false,"code":"SEARCH_PROVIDER_UNAVAILABLE","error":"Search provider is temporarily unavailable. Please try again later."}` |
+| Provider returns non-2xx, malformed data, or only invalid nonempty results | `502 {"success":false,"code":"SEARCH_PROVIDER_BAD_RESPONSE","error":"Search provider returned an invalid response. Please try again later."}` |
+| Structurally valid empty result | `200` success with no fallback and no warning unless a proper subset of engines failed |
+| Valid partial or empty result with a proper subset of engines failed | `200` success with top-level `"warning":"Some search results could not be retrieved."` |
+
+The warning is a sibling of `success` and the version's result field, never a
+result item or provider-metadata field. Local MCP advertises only web search,
+hides search feedback, rejects bypassed unsupported arguments as JSON-RPC
+`-32602 Invalid params` with data code `LOCAL_SEARCH_WEB_ONLY`, and converts
+the typed 502/503 REST bodies into `isError` tool results.
+
+Search queries are sent to Brave API and Bing in bundled mode, or to the
+operator's external SearXNG using a selected subset of the same qualified
+engines. SearXNG uses POST so the query is not placed in the request URL.
+Status, health, and logs name only `internal` or `external` mode and redact the
+endpoint, query, URLs, sources, and credentials. Treat all diagnostic output
+as sensitive despite that redaction.
+
+Compose readiness checks only local SearXNG process/config health and creates
+no upstream traffic. `scripts/local-firecrawl health` makes one fixed,
+non-user web query through the API with a 10-second request timeout inside a
+15-second deadline. A later provider outage fails this functional health check
+and makes search return 503, but API scrape and crawl remain available. Use
+`scripts/local-firecrawl logs searxng` only in internal mode; external mode
+rejects that target because the service is operator-owned.
+
+### Failover, rollback, and re-upgrade
+
+For provider failover, keep current code, set `SEARXNG_ENDPOINT` to a validated
+external origin, set any engine override to a subset of `braveapi,bing`, keep
+categories within Firecrawl's supported contract, then run `restart` and
+`health`. Returning the endpoint to
+`http://searxng:8080`, restoring `SEARXNG_ENGINES=braveapi,bing`, and restarting
+re-enables bundled mode; use `configure-search` first if its key is absent.
+
+For a code rollback, switch to external mode and restart while current code can
+remove the bundled container. Then restore the older code and restart against
+that external provider. Older versions safely ignore the added environment
+keys. Do not depend on an older wrapper to discover a newer bundled container.
+
+A later re-upgrade preserves a normalized external endpoint and continues to
+suppress bundled SearXNG. Missing or blank endpoints migrate to the canonical
+internal value; the canonical value starts bundled SearXNG after required-key
+validation. Failover, rollback, re-upgrade, and recovery never delete volumes.
+
+Firecrawl local-runtime maintainers review the pinned SearXNG release and
+digest on the first business day of each month and upon SearXNG security
+notices. The review verifies upstream tag/digest and architectures, checks
+settings changes, updates tag and digest together, runs deterministic provider
+tests plus live acceptance, and records the result in release notes.
 
 ## Local Codex interaction worker
 
@@ -357,6 +466,7 @@ commit or paste the value.
 - Browser Service and Playwright;
 - Codex-backed browser interaction worker readiness;
 - MinIO and application artifact credentials;
+- SearXNG provider mode and one bounded functional web search;
 - API response;
 - exact loopback port publication.
 
@@ -373,6 +483,12 @@ scripts/local-firecrawl health
 If restart stops before API startup, keep the stopped state and inspect
 one-shot logs. Do not delete volumes when migrations, MinIO, or provenance
 checks fail.
+
+For search-only failure, inspect provider mode with `status`, run `health`, and
+use `logs searxng` only in internal mode. Restart once after correcting the
+credential, endpoint, or external service. If it still fails, preserve the
+reported category and redacted logs instead of looping; scrape and crawl can
+remain available while search is unavailable.
 
 Self-hosting does not include Fire-engine or managed proxy rotation. A target
 that works through Firecrawl Cloud may block this machine's direct IP.

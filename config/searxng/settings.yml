@@ -1,9 +1,7 @@
 use_default_settings:
   engines:
     keep_only:
-      - brave
-      - qwant
-      - startpage
+      - braveapi
       - bing
 
 general:
@@ -38,18 +36,12 @@ outgoing:
   pool_maxsize: 8
 
 engines:
-  - name: brave
+  - name: braveapi
+    engine: braveapi
     categories:
       - general
     disabled: false
-  - name: qwant
-    categories:
-      - general
-    disabled: false
-  - name: startpage
-    categories:
-      - general
-    disabled: false
+    inactive: true
   - name: bing
     categories:
       - general

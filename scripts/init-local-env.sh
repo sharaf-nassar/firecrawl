@@ -3,11 +3,20 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="${repo_root}/.env"
+search_key_helper="${repo_root}/scripts/local-search-key.lib.sh"
+if [[ ! -r "${search_key_helper}" ]]; then
+  printf 'Required Brave Search key helper is unavailable: %s\n' \
+    "${search_key_helper}" >&2
+  exit 1
+fi
+source "${search_key_helper}"
 
 if [[ -e "${env_file}" || -L "${env_file}" ]]; then
   printf 'Refusing to overwrite existing %s\n' "${env_file}" >&2
   exit 1
 fi
+
+firecrawl_collect_brave_api_key
 
 postgres_password="$(openssl rand -hex 32)"
 app_postgres_password="$(openssl rand -hex 32)"
@@ -102,7 +111,9 @@ trap cleanup EXIT HUP INT TERM PIPE XFSZ
   printf '%s\n' 'PROXY_USERNAME='
   printf '%s\n' 'SEARXNG_CATEGORIES='
   printf '%s\n' 'SEARXNG_ENDPOINT=http://searxng:8080'
-  printf '%s\n' 'SEARXNG_ENGINES='
+  printf '%s\n' 'SEARXNG_ENGINES=braveapi,bing'
+  printf '%s\n' \
+    "SEARXNG_BRAVE_API_KEY_B64=${FIRECRAWL_COLLECTED_BRAVE_API_KEY_B64}"
   printf '%s\n' "SEARXNG_SECRET=${searxng_secret}"
   printf '%s\n' 'SELF_HOSTED_WEBHOOK_URL='
   printf '%s\n' 'SLACK_WEBHOOK_URL='

@@ -146,9 +146,11 @@ Search is a synchronous federated query that may enrich result records by scrapi
 
 Provider selection has no fallback loop. Local web-only mode requires SearXNG; elsewhere Fire Engine wins over configured SearXNG, and no provider is a typed 503. The shared SearXNG client uses bounded form-encoded POST requests and preserves valid empty responses.
 
-Ordinary v0, v1, and v2 controllers map canonical provider failures to stable 502 or 503 envelopes before billing or scrape dispatch. Valid empty responses cost zero credits, while sanitized partial-provider diagnostics appear only as a top-level warning.
+Ordinary v0, v1, and v2 controllers map canonical provider failures before billing or scrape dispatch. Unavailable is `503 {"success":false,"code":"SEARCH_PROVIDER_UNAVAILABLE","error":"Search provider is temporarily unavailable. Please try again later."}`; malformed is `502 {"success":false,"code":"SEARCH_PROVIDER_BAD_RESPONSE","error":"Search provider returned an invalid response. Please try again later."}`.
 
-Local web-only validation inspects raw v0, v1, and v2 bodies before schema defaults, request logging, credit reservation, or provider execution. It rejects non-web sources and explicit search geo, recency, enterprise, or feedback inputs with stable 400 `BAD_REQUEST` responses.
+Valid empty responses cost zero credits. Partial provider failure keeps HTTP 200 and adds only the top-level sibling `"warning":"Some search results could not be retrieved."`; it never exposes query, endpoint, engine error, credentials, or provider metadata.
+
+Local web-only validation inspects raw v0, v1, and v2 bodies before schema defaults, request logging, credit reservation, or provider execution. It rejects non-web sources and explicit search geo, recency, enterprise, or feedback inputs as `400 {"success":false,"code":"BAD_REQUEST","error":"Local search supports web results only."}`.
 
 Web sources, domain and category filters, language, and downstream scrape options remain available locally. Outside local web-only mode, request capabilities and Fire Engine precedence remain unchanged.
 

@@ -51,7 +51,8 @@ procedures.
 
 The local Compose topology publishes only the Firecrawl API at
 `http://127.0.0.1:3002`. Playwright, Browser Service, Redis, RabbitMQ, MinIO,
-application PostgreSQL, and NuQ PostgreSQL remain on private networks.
+application PostgreSQL, NuQ PostgreSQL, and bundled SearXNG remain on private
+networks.
 
 Named volumes preserve queue state, application records, artifacts, browser
 profiles and replay checkpoints, worker-owned Codex authentication, and the
@@ -76,12 +77,38 @@ scripts/local-firecrawl status
 scripts/local-firecrawl health
 scripts/local-firecrawl logs
 scripts/local-firecrawl probe-egress
+scripts/local-firecrawl configure-search
 ```
 
 The wrapper serializes maintenance, validates Compose provenance and security
 invariants, rebuilds local images, runs bounded one-shot jobs, orders startup
 and shutdown, waits for application health, and emits bounded, redacted
 diagnostics. `status` and `health` also support `--json`.
+
+Fresh environment setup requires a Brave Search API key and prompts privately
+when attached to a terminal. Blank or whitespace-containing input fails.
+Noninteractive setup must set
+`FIRECRAWL_SEARXNG_BRAVE_API_KEY` in the process environment. Use
+`configure-search` to add or rotate the key without command arguments, then
+restart. Bundled search always requires its Brave credential and uses Brave
+API plus Bing.
+
+Local search is web-only and always uses the configured SearXNG endpoint; a
+Fire Engine setting cannot override it. The canonical internal endpoint starts
+the private bundled service, while a validated external endpoint suppresses
+that service. Firecrawl still restricts every SearXNG request to the qualified
+`braveapi,bing` allowlist and its supported category contract. Outside this
+local mode, Fire Engine retains precedence over configured SearXNG. There is
+no provider fallback after selection or after a valid empty response.
+
+Unsupported local search capabilities return `400 BAD_REQUEST`; unavailable
+providers return `503 SEARCH_PROVIDER_UNAVAILABLE`; invalid provider responses
+return `502 SEARCH_PROVIDER_BAD_RESPONSE`. Partial results remain successful
+with one sanitized top-level warning. Queries leave the machine for the
+selected upstream engines, while local status, health, and bounded logs omit
+the query, endpoint, and credentials. See
+[Local Firecrawl](./LOCAL_DEPLOYMENT.md#local-search) for exact envelopes,
+health, failover, rollback, and recovery procedures.
 
 SDKs can use `http://127.0.0.1:3002` as their API URL. Claude Code and Codex
 use `scripts/local-firecrawl-mcp`, which filters the external Firecrawl MCP

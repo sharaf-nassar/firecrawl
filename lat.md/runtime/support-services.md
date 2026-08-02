@@ -10,9 +10,23 @@ The local Compose overlay defines a private, bounded SearXNG service as the repr
 
 The official image is pinned by release and immutable digest. It joins only the `backend` network, publishes no host port, runs as UID/GID `977:977` with a read-only root, drops all capabilities, and uses bounded CPU, memory, PID, and tmpfs resources.
 
-`config/searxng/settings.yml` inherits the pinned image defaults while retaining only Brave, Qwant, Startpage, and Bing. Every retained engine is explicitly enabled for `general`; autocomplete, favicons, limiter, public-instance behavior, image proxying, and Valkey are disabled.
+`config/searxng/settings.yml` inherits pinned defaults while retaining Bing and official `braveapi`. The tracked file contains no credential; bundled startup requires one, injects it into `braveapi`, activates the engine, and otherwise fails closed.
+
+The tracked YAML contains no Brave credential. A Python launcher decodes the Base64 transport value, uses PyYAML `safe_load`, changes only the exact `braveapi` entry, and atomically writes a mode-`0600` settings file in tmpfs before unsetting the transport variable and executing the official entrypoint.
+
+Only `braveapi,bing` engine names reach SearXNG from API, whether the endpoint is internal or external; external overrides may select only within that qualified pair, and categories remain bounded by Firecrawl's supported contract. The credential reaches only bundled SearXNG. Autocomplete, favicons, limiter, public-instance behavior, image proxying, and Valkey are disabled.
 
 Only JSON search output is enabled, with POST as the server method. A local `/healthz` probe proves the process loaded its configuration without contacting upstream engines; functional search health belongs to the wrapper lifecycle contract.
+
+### Verified operating envelope
+
+Credentialed live acceptance on 2026-08-01 freezes the bundled engine, timeout, pool, and resource values used by local operations.
+
+Official `braveapi` and Bing each returned valid HTTP(S) results in 3/3 isolated attempts within the four-second engine ceiling. No auth, rate-limit, CAPTCHA, account-cookie, hostname-drift, or upstream-error signal occurred.
+
+Twenty sequential Firecrawl searches measured p50 497 ms, p95 880 ms, and max 896 ms. One eight-request concurrent batch measured p50 549 ms, p95 1,961 ms, and max 1,961 ms; overall p95 was 1,048 ms.
+
+All 28 requests returned structurally valid HTTP 200 web results. SearXNG remained healthy with zero restarts, no OOM, 108.2 MiB observed memory, and 14 PIDs under its 1 CPU, 512 MiB, 128 PID, tmpfs, and 16/8 pool limits.
 
 ## HTML to Markdown service
 
