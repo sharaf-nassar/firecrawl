@@ -7,6 +7,7 @@ import test from "node:test";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const settingsPath = join(repoRoot, "config", "searxng", "settings.yml");
+const localComposePath = join(repoRoot, "compose.local.yaml");
 const entrypointPath = join(repoRoot, "config", "searxng", "entrypoint.py");
 const image =
   "ghcr.io/searxng/searxng:2026.7.31-6bfd82705@" +
@@ -179,6 +180,7 @@ print(json.dumps({
 
 // @lat: [[testing/runtime-operations#Runtime and Operations Testing#SearXNG configuration suite#Rendered service hardening]]
 test("rendered local Compose keeps SearXNG private and bounded", async () => {
+  const localComposeSource = await readFile(localComposePath, "utf8");
   const stdout = await mustRunDocker(composeArgs("config", "--format", "json"));
   const rendered = JSON.parse(stdout);
   const service = rendered.services.searxng;
@@ -207,7 +209,10 @@ test("rendered local Compose keeps SearXNG private and bounded", async () => {
   assert.equal(settingsMount.type, "bind");
   assert.equal(settingsMount.source, settingsPath);
   assert.equal(settingsMount.read_only, true);
-  assert.equal(settingsMount.bind.create_host_path, false);
+  assert.match(
+    localComposeSource,
+    /source: \.\/config\/searxng\/settings\.yml\r?\n[ \t]+target: \/etc\/searxng\/settings\.yml\r?\n[ \t]+read_only: true\r?\n[ \t]+bind:\r?\n[ \t]+create_host_path: false/,
+  );
   assert.equal(service.environment.FORCE_OWNERSHIP, "false");
   assert.equal(
     service.environment.SEARXNG_BRAVE_API_KEY_B64,

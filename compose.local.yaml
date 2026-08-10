@@ -427,7 +427,8 @@ services:
       start_period: 30s
 
   redis:
-    command: redis-server --bind 0.0.0.0 --appendonly yes
+    image: redis:8.8.0-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    command: redis-server --bind 0.0.0.0 --appendonly yes --aof-load-corrupt-tail-max-size 4096
     restart: unless-stopped
     volumes:
       - redis-data:/data

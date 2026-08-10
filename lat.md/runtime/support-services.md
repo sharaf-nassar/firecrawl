@@ -89,7 +89,9 @@ Aggressive autovacuum settings apply to hot queue tables. Daily `REINDEX CONCURR
 
 Redis supplies shared queue-adjacent coordination, rate limiting, and API runtime state.
 
-Standard Compose uses `redis:alpine` with no persistence guarantee. The local overlay enables append-only persistence and mounts `redis-data`, so restart behavior differs between basic self-host and the managed local wrapper.
+Standard Compose uses `redis:alpine` with no persistence guarantee. The local overlay pins Redis 8.8.0 by digest, enables append-only persistence, and mounts `redis-data`, so restart behavior differs between basic self-host and the managed local wrapper.
+
+Local startup may automatically truncate at most 4,096 corrupted bytes from the AOF tail. Larger corruption and corruption outside the tail still fail closed for manual recovery.
 
 The repository also contains a custom image under `apps/redis/` intended for Fly-style deployment. Its entrypoint sizes `maxmemory` to 80 percent of detected VM RAM, defaults to `noeviction`, supports optional password/AOF/snapshot settings, and stores data under `/data/redis`.
 

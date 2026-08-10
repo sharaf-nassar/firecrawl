@@ -611,8 +611,15 @@ test("local compose keeps Docker browser state", async () => {
   const apiBlock =
     source.match(/\n  api:\n[\s\S]*?\n  browser-interaction-worker:/)?.[0] ??
     "";
+  const redisBlock =
+    source.match(/\n  redis:\n[\s\S]*?\n  rabbitmq:/)?.[0] ?? "";
   assert.match(source, /LOCAL_BROWSER_SERVICE_ENABLED: "true"/);
   assert.match(apiBlock, /LOCAL_SEARCH_WEB_ONLY: "true"/);
+  assert.match(
+    redisBlock,
+    /image: redis:8\.8\.0-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005/,
+  );
+  assert.match(redisBlock, /--aof-load-corrupt-tail-max-size 4096/);
   assert.match(
     apiBlock,
     /SEARXNG_ENDPOINT: \$\{SEARXNG_ENDPOINT:-http:\/\/searxng:8080\}/,

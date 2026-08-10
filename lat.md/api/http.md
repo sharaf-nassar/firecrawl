@@ -188,6 +188,10 @@ Extract is an asynchronous structured-data workflow backed by RabbitMQ, Redis st
 
 `POST /v1|v2/extract` accepts URLs or a prompt, schema and prompt instructions, scrape options, link-scope controls, and optional web search. The legacy endpoints are deprecated, and forced-ZDR teams are rejected because extraction retention does not support ZDR.
 
+Every extract request requires a configured, reachable LLM backend. [[apps/api/src/lib/extract/llm-precondition.ts#getExtractLlmPreconditionError]] probes Ollama or the selected OpenAI-compatible provider before request persistence or queue publication; missing or unreachable providers fail fast with an actionable HTTP 400. Any HTTP response proves liveness, and results are cached for about 15 seconds.
+
+The supported local backend is the separately supervised host Codex Shim described by [[operations/local-runtime#Local Runtime Operations#Codex host inputs#Codex Shim supervision]]. Local configuration routes API model traffic to its OpenAI-compatible endpoint without placing the host process or credentials inside Compose.
+
 [[apps/api/src/controllers/v2/extract.ts#extractController]] records a processing state and publishes an extraction message. The extract worker emits started/completed/failed webhooks, updates Redis status, persists logs/artifacts, and acknowledges handled failures. Crashed messages reaching the dead-letter queue are converted into explicit failed status.
 
 Status prefers durable artifacts for completed data, falls back to Redis result storage, and uses database request ownership to hide other teams' jobs.

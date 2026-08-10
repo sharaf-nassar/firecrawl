@@ -114,6 +114,8 @@ The loader runs in a one-shot, read-only container with networking disabled and 
 
 Rendered Compose must retain the hardened SearXNG boundary and keep its Brave credential isolated. The private-network opt-in must reach API and Playwright together so their outbound checks agree.
 
+The test checks the settings bind's `create_host_path: false` in source because Compose JSON renderers can omit explicit false values.
+
 ### Immutable image architectures
 
 The registry descriptor for the exact image digest must remain an OCI image index containing both `linux/amd64` and `linux/arm64` manifests.
@@ -216,7 +218,7 @@ Neither command is invoked by repository CI. They supply live local contract cov
 
 Repository CI covers deterministic active-runtime contracts that fit GitHub-hosted runners without secrets.
 
-The workflow renders local Compose, runs focused SearXNG plus complete fake wrapper and MCP contracts, tests versioned API search boundaries, builds the API package and image, and validates Browser Service, Playwright Service, and Test Site. Images are never published.
+The workflow checks wrapper shell syntax and ShellCheck, renders local Compose, runs focused SearXNG plus complete fake wrapper and MCP contracts, tests versioned API search boundaries, builds the API package and image, and validates Browser Service, Playwright Service, and Test Site. Images are never published.
 
 Registry-manifest inspection, current-architecture SearXNG boot, live Compose and wrapper health, API service-backed harnesses, FoundationDB, SDKs, support services, and credentialed or hosted integrations remain outside the required gate.
 

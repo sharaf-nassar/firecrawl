@@ -44,8 +44,8 @@ jobs:
             scripts/upgrade-local-env-phase1
           # Container-side expansion and Bash namerefs trigger false positives.
           shellcheck --exclude=SC2016 scripts/local-firecrawl
-          shellcheck scripts/init-local-env.sh
-          shellcheck --exclude=SC2034,SC2178 \
+          shellcheck -x scripts/init-local-env.sh
+          shellcheck -x --exclude=SC2034,SC2178 \
             scripts/upgrade-local-env-phase1
 
       - name: Validate local Compose

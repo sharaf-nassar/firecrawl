@@ -9,6 +9,7 @@ if [[ ! -r "${search_key_helper}" ]]; then
     "${search_key_helper}" >&2
   exit 1
 fi
+# shellcheck source=scripts/local-search-key.lib.sh
 source "${search_key_helper}"
 
 if [[ -e "${env_file}" || -L "${env_file}" ]]; then
