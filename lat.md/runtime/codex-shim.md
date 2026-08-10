@@ -28,4 +28,12 @@ The HTTP boundary serves chat completions, model discovery, and readiness, rejec
 
 API deployments targeting the shim enable `OPENAI_CHAT_COMPLETIONS_ONLY` so [[apps/api/src/lib/generic-ai.ts#getModel]] selects its supported chat endpoint. Both current and `fire-0` extraction share this provider path; extraction does not request embeddings.
 
-Fresh local environments target the shim at `http://host.docker.internal:3030/v1` and select `gpt-5.6-luna`. Compose does not manage the host process, so the shim must be running before local extract requests.
+Fresh local environments leave extract disabled while preselecting chat-only mode and `gpt-5.6-luna`. Operators explicitly start the shim, then set its base URL and a nonsecret API-key placeholder.
+
+## Host lifecycle
+
+The local wrapper owns explicit shim startup, verified shutdown, bounded logs, and extract-capability reporting while keeping Compose unaware of host Codex credentials.
+
+Startup reuses the wrapper's Codex runtime preflight and requires `/health` after spawn. The private control PID is accepted for termination only when `/proc` proves the process belongs to the user and runs this shim server.
+
+Runtime stop always terminates a managed shim; restart restores it only when previously running. Start never enables it, and crashes are not auto-restarted. This keeps opt-in behavior visible and prevents an orphan listener during stack teardown.

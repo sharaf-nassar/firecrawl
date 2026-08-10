@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  appendFile,
   mkdir,
   mkdtemp,
   readdir,
@@ -11,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,13 +56,17 @@ function phaseEnvironment(overrides = {}) {
     ARTIFACT_MINIO_BUCKET: "firecrawl-artifacts",
     ARTIFACT_MINIO_REGION: "us-east-1",
     SEARXNG_ENDPOINT: "http://searxng:8080",
+    SEARXNG_BRAVE_API_KEY_B64: "ZmFrZQ==",
+    SEARXNG_ENGINES: "braveapi,bing",
     SEARXNG_SECRET: "e".repeat(64),
     ...overrides,
   };
-  return Object.entries(values)
-    .filter(([, value]) => value !== undefined)
-    .map(([key, value]) => `${key}=${value}`)
-    .join("\n") + "\n";
+  return (
+    Object.entries(values)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n") + "\n"
+  );
 }
 
 function parseEnvironment(source) {
@@ -68,7 +74,7 @@ function parseEnvironment(source) {
     source
       .trim()
       .split("\n")
-      .map(line => line.split(/=(.*)/s).slice(0, 2)),
+      .map((line) => line.split(/=(.*)/s).slice(0, 2)),
   );
 }
 
@@ -81,14 +87,14 @@ function run(command, args, options = {}) {
     });
     let stdout = "";
     let stderr = "";
-    child.stdout?.on("data", chunk => {
+    child.stdout?.on("data", (chunk) => {
       stdout += chunk;
     });
-    child.stderr?.on("data", chunk => {
+    child.stderr?.on("data", (chunk) => {
       stderr += chunk;
     });
     child.on("error", reject);
-    child.on("close", code => resolve({ code, stdout, stderr }));
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
 
@@ -126,7 +132,7 @@ wire_api = "responses"
     "migrations",
   );
   const latestMigration = (await readdir(migrationDirectory))
-    .filter(name => /^\d{4}_.+\.sql$/u.test(name))
+    .filter((name) => /^\d{4}_.+\.sql$/u.test(name))
     .sort()
     .at(-1);
   assert.ok(latestMigration);
@@ -144,9 +150,13 @@ wire_api = "responses"
       bin: { codex: "bin/codex.js" },
     }),
   );
-  await writeFile(join(codexPackage, "bin", "codex.js"), "#!/usr/bin/env node\n", {
-    mode: 0o755,
-  });
+  await writeFile(
+    join(codexPackage, "bin", "codex.js"),
+    "#!/usr/bin/env node\n",
+    {
+      mode: 0o755,
+    },
+  );
   await writeFile(join(home, ".codex", "auth.json"), "{}\n", { mode: 0o600 });
   await writeFile(join(home, ".codex", "config.toml"), codexConfig, {
     mode: 0o600,
@@ -573,7 +583,7 @@ process.exit(2);
       return data
         .split("\n")
         .filter(Boolean)
-        .map(line => JSON.parse(line));
+        .map((line) => JSON.parse(line));
     },
     async cleanup() {
       await rm(root, { recursive: true, force: true });
@@ -663,7 +673,7 @@ test("local compose keeps Docker browser state", async () => {
 });
 
 // @lat: [[runtime-operations#Local wrapper suite#Codex provider snapshot]]
-test("start snapshots only the selected Codex provider routing", async t => {
+test("start snapshots only the selected Codex provider routing", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
 
@@ -709,11 +719,11 @@ test("start snapshots only the selected Codex provider routing", async t => {
   const restarted = await run(wrapper, ["restart"], { env: fake.env });
   assert.equal(restarted.code, 0, restarted.stderr);
   const forcedUpEvents = (await fake.events()).filter(
-    event => event.includes("up") && event.includes("--force-recreate"),
+    (event) => event.includes("up") && event.includes("--force-recreate"),
   );
   assert.equal(forcedUpEvents.length, 4);
   assert.deepEqual(
-    forcedUpEvents.map(event => event.at(-1)),
+    forcedUpEvents.map((event) => event.at(-1)),
     [
       "browser-interaction-egress-proxy",
       "browser-interaction-worker",
@@ -740,7 +750,7 @@ test("start snapshots only the selected Codex provider routing", async t => {
   });
 });
 
-test("provider snapshot includes only nonempty optional header values", async t => {
+test("provider snapshot includes only nonempty optional header values", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const secret = "optional-header-secret-must-not-leak";
@@ -765,7 +775,7 @@ test("provider snapshot includes only nonempty optional header values", async t 
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(secret));
 });
 
-test("selected provider env_key remains required", async t => {
+test("selected provider env_key remains required", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const env = { ...fake.env };
@@ -773,11 +783,14 @@ test("selected provider env_key remains required", async t => {
 
   const result = await run(wrapper, ["start"], { env });
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /requires environment variable TEST_PROVIDER_API_KEY/);
+  assert.match(
+    result.stderr,
+    /requires environment variable TEST_PROVIDER_API_KEY/,
+  );
   assert.deepEqual(await fake.events(), []);
 });
 
-test("unsafe selected provider fields fail before Docker mutation", async t => {
+test("unsafe selected provider fields fail before Docker mutation", async (t) => {
   const cases = [
     [
       'auth = { command = "/bin/unsafe", args = ["auth-secret"] }',
@@ -834,9 +847,16 @@ test("local environment templates generate Docker browser settings", async () =>
   assert.match(combined, /BROWSER_INTERACTION_WORKER_TOKEN=/);
   assert.match(combined, /SEARXNG_ENDPOINT=http:\/\/searxng:8080/);
   assert.match(combined, /SEARXNG_SECRET=/);
+  assert.match(combined, /Extract is disabled by default/);
+  assert.match(combined, /scripts\/local-firecrawl shim-start/);
+  assert.match(combined, /OPENAI_API_KEY=local-codex-shim/);
+  assert.match(
+    combined,
+    /OPENAI_BASE_URL=http:\/\/host\.docker\.internal:3030\/v1/,
+  );
 });
 
-test("environment upgrade rotates legacy browser settings", async t => {
+test("environment upgrade rotates legacy browser settings", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "local-firecrawl-env-test-"));
   const envFile = join(root, ".env");
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -864,7 +884,7 @@ test("environment upgrade rotates legacy browser settings", async t => {
   assert.equal(checked.code, 0, checked.stderr);
 });
 
-test("environment upgrade preserves current browser secrets", async t => {
+test("environment upgrade preserves current browser secrets", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "local-firecrawl-env-test-"));
   const envFile = join(root, ".env");
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -876,7 +896,7 @@ test("environment upgrade preserves current browser secrets", async t => {
   assert.equal(await readFile(envFile, "utf8"), original);
 });
 
-test("invalid immutable downgrade request fails before Docker", async t => {
+test("invalid immutable downgrade request fails before Docker", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const result = await run(wrapper, ["start"], {
@@ -894,7 +914,7 @@ test("invalid immutable downgrade request fails before Docker", async t => {
   ]);
 });
 
-test("compose validation names failures without exposing secrets", async t => {
+test("compose validation names failures without exposing secrets", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const secret = "compose-secret-must-not-leak";
@@ -914,7 +934,7 @@ test("compose validation names failures without exposing secrets", async t => {
   assert.doesNotMatch(result.stdout, new RegExp(secret));
 });
 
-test("compose validation rejects unsafe CA mount shapes", async t => {
+test("compose validation rejects unsafe CA mount shapes", async (t) => {
   const cases = [
     "worker_ca_mount_missing",
     "worker_ca_mount_writeable",
@@ -936,7 +956,7 @@ test("compose validation rejects unsafe CA mount shapes", async t => {
   }
 });
 
-test("compose validation rejects worker and proxy egress escapes", async t => {
+test("compose validation rejects worker and proxy egress escapes", async (t) => {
   const cases = [
     ["worker_network_enabled", "worker_network_disabled"],
     ["egress_proxy_backend", "egress_proxy_networks"],
@@ -961,7 +981,7 @@ test("compose validation rejects worker and proxy egress escapes", async t => {
   }
 });
 
-test("compose validation rejects an unsafe host gateway override", async t => {
+test("compose validation rejects an unsafe host gateway override", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const override = join(fake.root, "unsafe-override.yaml");
@@ -983,8 +1003,8 @@ test("compose validation rejects an unsafe host gateway override", async t => {
   assert.match(result.stderr, /invariant failed: egress_proxy_host_gateway/);
   const events = await fake.events();
   assert.equal(events.length, 2);
-  assert.ok(events.every(event => event.includes("config")));
-  assert.ok(events.every(event => event.includes(override)));
+  assert.ok(events.every((event) => event.includes("config")));
+  assert.ok(events.every((event) => event.includes(override)));
 
   const snapshotDirectory = join(fake.env.XDG_RUNTIME_DIR, "firecrawl-control");
   for (const name of [
@@ -998,22 +1018,22 @@ test("compose validation rejects an unsafe host gateway override", async t => {
   }
 });
 
-test("start builds images, runs migrations, and publishes API last", async t => {
+test("start builds images, runs migrations, and publishes API last", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const result = await run(wrapper, ["start"], { env: fake.env });
   assert.equal(result.code, 0, result.stderr);
   const events = await fake.events();
-  const runtimeUpEvents = events.filter(event => event.includes("up"));
+  const runtimeUpEvents = events.filter((event) => event.includes("up"));
   assert.ok(runtimeUpEvents.length > 0);
   assert.ok(
-    runtimeUpEvents.every(event => !event.includes("--profile")),
+    runtimeUpEvents.every((event) => !event.includes("--profile")),
     "runtime up commands must not enable maintenance profile",
   );
-  assert.ok(events.some(event => event.includes("build")));
+  assert.ok(events.some((event) => event.includes("build")));
   assert.ok(
     events.some(
-      event =>
+      (event) =>
         event.includes("build") &&
         event.includes("browser-interaction-worker") &&
         event.includes("browser-interaction-egress-proxy") &&
@@ -1021,16 +1041,16 @@ test("start builds images, runs migrations, and publishes API last", async t => 
     ),
   );
   const migrationUp = events.findIndex(
-    event => event.includes("up") && event.includes("app-db-migrate"),
+    (event) => event.includes("up") && event.includes("app-db-migrate"),
   );
   const apiUp = events.findIndex(
-    event => event.includes("up") && event.includes("api"),
+    (event) => event.includes("up") && event.includes("api"),
   );
   const searxngUp = events.findIndex(
-    event => event.includes("up") && event.at(-1) === "searxng",
+    (event) => event.includes("up") && event.at(-1) === "searxng",
   );
   const interactionWorkerUp = events.findIndex(
-    event =>
+    (event) =>
       event.includes("up") && event.includes("browser-interaction-worker"),
   );
   assert.ok(migrationUp >= 0 && apiUp > migrationUp);
@@ -1039,15 +1059,15 @@ test("start builds images, runs migrations, and publishes API last", async t => 
   assert.ok(events[searxngUp].includes("--no-deps"));
   assert.ok(events[searxngUp].includes("--wait"));
   assert.ok(
-    events.every(event => !event.join(" ").includes("SearXNG metasearch")),
+    events.every((event) => !event.join(" ").includes("SearXNG metasearch")),
     "startup readiness must not issue an upstream search",
   );
-  assert.ok(events.some(event => event.includes("browser-state-init")));
-  assert.ok(events.some(event => event.includes("minio-init")));
+  assert.ok(events.some((event) => event.includes("browser-state-init")));
+  assert.ok(events.some((event) => event.includes("minio-init")));
 });
 
 // @lat: [[runtime-operations#Local wrapper suite#Provider-aware lifecycle]]
-test("external failover removes stale bundled search without data loss", async t => {
+test("external failover removes stale bundled search without data loss", async (t) => {
   const fake = await makeFakeRuntime({
     providerMode: "external",
     staleSearxng: true,
@@ -1058,23 +1078,23 @@ test("external failover removes stale bundled search without data loss", async t
   assert.equal(failedOver.code, 0, failedOver.stderr);
   const failoverEvents = await fake.events();
   const staleStop = failoverEvents.findIndex(
-    event => event.includes("stop") && event.at(-1) === "searxng",
+    (event) => event.includes("stop") && event.at(-1) === "searxng",
   );
   const staleRemove = failoverEvents.findIndex(
-    event => event.includes("rm") && event.at(-1) === "searxng",
+    (event) => event.includes("rm") && event.at(-1) === "searxng",
   );
   const apiUp = failoverEvents.findIndex(
-    event => event.includes("up") && event.includes("api"),
+    (event) => event.includes("up") && event.includes("api"),
   );
   assert.ok(staleStop >= 0 && staleRemove > staleStop && apiUp > staleRemove);
   assert.ok(
     failoverEvents.every(
-      event => !(event.includes("up") && event.at(-1) === "searxng"),
+      (event) => !(event.includes("up") && event.at(-1) === "searxng"),
     ),
   );
-  assert.ok(failoverEvents.every(event => !event.includes("--volumes")));
-  assert.ok(failoverEvents.every(event => !event.includes("-v")));
-  assert.ok(failoverEvents.every(event => !event.includes("down")));
+  assert.ok(failoverEvents.every((event) => !event.includes("--volumes")));
+  assert.ok(failoverEvents.every((event) => !event.includes("-v")));
+  assert.ok(failoverEvents.every((event) => !event.includes("down")));
 
   const rolledBack = await run(wrapper, ["status", "--json"], {
     env: fake.env,
@@ -1092,12 +1112,14 @@ test("external failover removes stale bundled search without data loss", async t
   assert.equal(reUpgraded.code, 0, reUpgraded.stderr);
   const allEvents = await fake.events();
   assert.ok(
-    allEvents.some(event => event.includes("up") && event.at(-1) === "searxng"),
+    allEvents.some(
+      (event) => event.includes("up") && event.at(-1) === "searxng",
+    ),
   );
-  assert.ok(allEvents.every(event => !event.includes("--volumes")));
+  assert.ok(allEvents.every((event) => !event.includes("--volumes")));
 });
 
-test("unnormalized provider mode fails before lifecycle mutation", async t => {
+test("unnormalized provider mode fails before lifecycle mutation", async (t) => {
   const fake = await makeFakeRuntime({ providerMode: "unnormalized" });
   t.after(() => fake.cleanup());
   const result = await run(wrapper, ["start"], { env: fake.env });
@@ -1105,7 +1127,7 @@ test("unnormalized provider mode fails before lifecycle mutation", async t => {
   assert.match(result.stderr, /endpoint must be normalized/);
   assert.ok(
     (await fake.events()).every(
-      event =>
+      (event) =>
         !event.includes("build") &&
         !event.includes("up") &&
         !event.includes("stop") &&
@@ -1114,7 +1136,7 @@ test("unnormalized provider mode fails before lifecycle mutation", async t => {
   );
 });
 
-test("restart migrates a recognized legacy API container", async t => {
+test("restart migrates a recognized legacy API container", async (t) => {
   const fake = await makeFakeRuntime({ provenance: "legacy" });
   t.after(() => fake.cleanup());
   const result = await run(wrapper, ["restart"], { env: fake.env });
@@ -1122,19 +1144,20 @@ test("restart migrates a recognized legacy API container", async t => {
   const events = await fake.events();
   assert.ok(
     events.some(
-      event => event.includes("build") && event.includes("playwright-service"),
+      (event) =>
+        event.includes("build") && event.includes("playwright-service"),
     ),
   );
   const apiStop = events.findIndex(
-    event => event.includes("stop") && event.includes("api"),
+    (event) => event.includes("stop") && event.includes("api"),
   );
   const apiUp = events.findIndex(
-    event => event.includes("up") && event.includes("api"),
+    (event) => event.includes("up") && event.includes("api"),
   );
   assert.ok(apiStop >= 0 && apiUp > apiStop);
 });
 
-test("restart upgrades the immediately-prior worker mount shape", async t => {
+test("restart upgrades the immediately-prior worker mount shape", async (t) => {
   const fake = await makeFakeRuntime({ provenance: "pre-provider" });
   t.after(() => fake.cleanup());
   const result = await run(wrapper, ["restart"], { env: fake.env });
@@ -1142,20 +1165,20 @@ test("restart upgrades the immediately-prior worker mount shape", async t => {
   const events = await fake.events();
   assert.ok(
     events.some(
-      event =>
+      (event) =>
         event.includes("stop") && event.includes("browser-interaction-worker"),
     ),
   );
   assert.ok(
     events.some(
-      event =>
+      (event) =>
         event.includes("up") &&
         event.includes("browser-interaction-egress-proxy"),
     ),
   );
 });
 
-test("stop remains Docker-only and preserves dependency ordering", async t => {
+test("stop remains Docker-only and preserves dependency ordering", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   await rm(fake.codexPath);
@@ -1164,17 +1187,17 @@ test("stop remains Docker-only and preserves dependency ordering", async t => {
   assert.equal(result.code, 0, result.stderr);
   const events = await fake.events();
   const browserStop = events.findIndex(
-    event =>
+    (event) =>
       event.includes("stop") &&
       event.includes("api") &&
       event.includes("browser-service") &&
       event.includes("browser-interaction-worker"),
   );
   const dependencyStop = events.findIndex(
-    event => event.includes("stop") && event.includes("app-postgres"),
+    (event) => event.includes("stop") && event.includes("app-postgres"),
   );
   const searxngStop = events.findIndex(
-    event => event.includes("stop") && event.at(-1) === "searxng",
+    (event) => event.includes("stop") && event.at(-1) === "searxng",
   );
   assert.ok(
     browserStop >= 0 &&
@@ -1183,7 +1206,7 @@ test("stop remains Docker-only and preserves dependency ordering", async t => {
   );
 });
 
-test("status JSON reports internal provider inventory without secrets", async t => {
+test("status JSON reports internal provider inventory without secrets", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   await rm(fake.codexPath);
@@ -1192,6 +1215,10 @@ test("status JSON reports internal provider inventory without secrets", async t 
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {
     searchProviderMode: "internal",
+    extractCapability: {
+      enabled: false,
+      reason: "OPENAI_BASE_URL unset",
+    },
     services: [
       {
         Service: "api",
@@ -1210,13 +1237,17 @@ test("status JSON reports internal provider inventory without secrets", async t 
   assert.doesNotMatch(result.stdout, /http:\/\/searxng|SEARXNG_SECRET/);
 });
 
-test("status and logs suppress bundled inventory in external mode", async t => {
+test("status and logs suppress bundled inventory in external mode", async (t) => {
   const fake = await makeFakeRuntime({ providerMode: "external" });
   t.after(() => fake.cleanup());
   const status = await run(wrapper, ["status", "--json"], { env: fake.env });
   assert.equal(status.code, 0, status.stderr);
   assert.deepEqual(JSON.parse(status.stdout), {
     searchProviderMode: "external",
+    extractCapability: {
+      enabled: false,
+      reason: "OPENAI_BASE_URL unset",
+    },
     services: [
       {
         Service: "api",
@@ -1233,7 +1264,9 @@ test("status and logs suppress bundled inventory in external mode", async t => {
   });
   const logs = await run(wrapper, ["logs"], { env: fake.env });
   assert.equal(logs.code, 0, logs.stderr);
-  const logEvent = (await fake.events()).find(event => event.includes("logs"));
+  const logEvent = (await fake.events()).find((event) =>
+    event.includes("logs"),
+  );
   assert.ok(logEvent);
   assert.ok(!logEvent.includes("searxng"));
   const rejected = await run(wrapper, ["logs", "searxng"], { env: fake.env });
@@ -1241,14 +1274,14 @@ test("status and logs suppress bundled inventory in external mode", async t => {
 });
 
 // @lat: [[runtime-operations#Local wrapper suite#Bounded search smoke]]
-test("health makes one bounded redacted search smoke", async t => {
+test("health makes one bounded redacted search smoke", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const healthy = await run(wrapper, ["health", "--json"], { env: fake.env });
   assert.equal(healthy.code, 0, healthy.stderr);
   assert.equal(JSON.parse(healthy.stdout).searchProviderMode, "internal");
   assert.equal(JSON.parse(healthy.stdout).searchProvider, "healthy");
-  let smokeEvents = (await fake.events()).filter(event =>
+  let smokeEvents = (await fake.events()).filter((event) =>
     event.join(" ").includes("SearXNG metasearch"),
   );
   assert.equal(smokeEvents.length, 1);
@@ -1272,24 +1305,24 @@ test("health makes one bounded redacted search smoke", async t => {
     unavailable.stderr + unavailable.stdout,
     /SearXNG metasearch|search\.example\.test|provider-secret/,
   );
-  smokeEvents = (await fake.events()).filter(event =>
+  smokeEvents = (await fake.events()).filter((event) =>
     event.join(" ").includes("SearXNG metasearch"),
   );
   assert.equal(smokeEvents.length, 2);
   const postOutageEvents = await fake.events();
-  assert.ok(postOutageEvents.every(event => !event.includes("stop")));
+  assert.ok(postOutageEvents.every((event) => !event.includes("stop")));
 
   const status = await run(wrapper, ["status", "--json"], { env: fake.env });
   assert.equal(status.code, 0, status.stderr);
   assert.ok(
     JSON.parse(status.stdout).services.some(
-      service => service.Service === "api",
+      (service) => service.Service === "api",
     ),
   );
 });
 
 // @lat: [[runtime-operations#Local wrapper suite#Structured health output]]
-test("health structures success and labels probe failures", async t => {
+test("health structures success and labels probe failures", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   const env = { ...fake.env, FAKE_HEALTH_CHATTER: "true" };
@@ -1318,7 +1351,7 @@ test("health structures success and labels probe failures", async t => {
   assert.doesNotMatch(failed.stdout, /Local Firecrawl health: PASS/);
 });
 
-test("logs remain available without current Codex or auth", async t => {
+test("logs remain available without current Codex or auth", async (t) => {
   const fake = await makeFakeRuntime();
   t.after(() => fake.cleanup());
   await rm(fake.codexPath);
@@ -1332,7 +1365,136 @@ test("logs remain available without current Codex or auth", async t => {
     result.stdout,
     /SearXNG metasearch|search\.example\.test|provider-secret|private/,
   );
-  assert.ok((await fake.events()).some(event => event.includes("logs")));
+  assert.ok((await fake.events()).some((event) => event.includes("logs")));
+});
+
+async function reservePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address();
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+
+// @lat: [[runtime-operations#Local wrapper suite#Codex Shim lifecycle]]
+test("wrapper owns the bounded Codex Shim lifecycle", async (t) => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const port = await reservePort();
+  const stateHome = join(fake.root, "state");
+  const logDirectory = join(stateHome, "firecrawl");
+  const logPath = join(logDirectory, "codex-shim.log");
+  const envFile = join(fake.root, ".env");
+  await mkdir(logDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(logPath, "x".repeat(1_048_577), { mode: 0o600 });
+  await writeFile(
+    envFile,
+    `OPENAI_BASE_URL=http://host.docker.internal:${port}/v1\n` +
+      "OPENAI_API_KEY=AUTH_SECRET_MUST_NOT_ESCAPE\n",
+    { mode: 0o600 },
+  );
+  const env = {
+    ...fake.env,
+    CODEX_SHIM_HOST: "127.0.0.1",
+    CODEX_SHIM_PORT: String(port),
+    LOCAL_FIRECRAWL_ENV_FILE: envFile,
+    XDG_STATE_HOME: stateHome,
+  };
+  const started = await run(wrapper, ["shim-start"], { env });
+  assert.equal(
+    started.code,
+    0,
+    `${started.stderr}\n${await readFile(logPath, "utf8")}`,
+  );
+  const pidPath = join(
+    env.XDG_RUNTIME_DIR,
+    "firecrawl-control",
+    "codex-shim.pid",
+  );
+  const firstPid = Number((await readFile(pidPath, "utf8")).trim());
+  assert.ok(firstPid > 0);
+  assert.ok(
+    (await stat(join(logDirectory, "codex-shim.log.1"))).size <= 1_048_576,
+  );
+
+  const duplicate = await run(wrapper, ["shim-start"], { env });
+  assert.equal(duplicate.code, 1);
+  assert.match(duplicate.stderr, /already running/);
+
+  const status = await run(wrapper, ["status", "--json"], { env });
+  assert.equal(status.code, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout).extractCapability, {
+    enabled: true,
+    provider: "codex-shim",
+    models: { small: "gpt-5.6-luna", main: "gpt-5.6-terra" },
+  });
+  assert.doesNotMatch(status.stdout + status.stderr, /AUTH_SECRET/);
+
+  await appendFile(
+    logPath,
+    '\n{"authorization":"Bearer AUTH_SECRET_MUST_NOT_ESCAPE"}\n',
+  );
+  const logs = await run(wrapper, ["logs", "shim"], { env });
+  assert.equal(logs.code, 0, logs.stderr);
+  assert.match(logs.stdout, /\[REDACTED\]/);
+  assert.doesNotMatch(logs.stdout, /AUTH_SECRET/);
+
+  const restarted = await run(wrapper, ["restart"], { env });
+  assert.equal(restarted.code, 0, restarted.stderr);
+  const secondPid = Number((await readFile(pidPath, "utf8")).trim());
+  assert.notEqual(secondPid, firstPid);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+
+  const stoppedRuntime = await run(wrapper, ["stop"], { env });
+  assert.equal(stoppedRuntime.code, 0, stoppedRuntime.stderr);
+  await assert.rejects(fetch(`http://127.0.0.1:${port}/health`));
+
+  const startedAgain = await run(wrapper, ["shim-start"], { env });
+  assert.equal(startedAgain.code, 0, startedAgain.stderr);
+  const stopped = await run(wrapper, ["shim-stop"], { env });
+  assert.equal(stopped.code, 0, stopped.stderr);
+  const disabled = await run(wrapper, ["status", "--json"], { env });
+  assert.equal(disabled.code, 0, disabled.stderr);
+  assert.deepEqual(JSON.parse(disabled.stdout).extractCapability, {
+    enabled: false,
+    reason: "codex-shim unreachable",
+  });
+});
+
+test("shim health and PID ownership failures are fail-closed", async (t) => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const port = await reservePort();
+  const blocker = createServer((_request, response) => {
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end('{"status":"unavailable"}');
+  });
+  await new Promise((resolve, reject) => {
+    blocker.once("error", reject);
+    blocker.listen(port, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => blocker.close(resolve)));
+  const env = {
+    ...fake.env,
+    CODEX_SHIM_HOST: "127.0.0.1",
+    CODEX_SHIM_PORT: String(port),
+    XDG_STATE_HOME: join(fake.root, "state"),
+  };
+  const failed = await run(wrapper, ["shim-start"], { env });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /post-start health check/);
+
+  const control = join(env.XDG_RUNTIME_DIR, "firecrawl-control");
+  const pidPath = join(control, "codex-shim.pid");
+  await writeFile(pidPath, `${process.pid}\n`, { mode: 0o600 });
+  const refused = await run(wrapper, ["shim-stop"], { env });
+  assert.equal(refused.code, 70);
+  assert.match(refused.stderr, /not the managed Codex Shim/);
 });
 
 function expectCompose(...suffix) {

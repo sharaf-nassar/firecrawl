@@ -34,6 +34,12 @@ runtime_lock_path="$control_runtime_dir/lifecycle.lock"
 codex_worker_config_path="$control_runtime_dir/codex-worker-config.${project_name}.toml"
 codex_provider_environment_path="$control_runtime_dir/codex-provider-environment.${project_name}.json"
 codex_egress_policy_path="$control_runtime_dir/codex-egress-policy.${project_name}.json"
+codex_shim_pid_path="$control_runtime_dir/codex-shim.pid"
+codex_shim_server_path="$repo_root/apps/codex-shim/src/server.mjs"
+codex_shim_state_root="${XDG_STATE_HOME:-${HOME:-}/.local/state}"
+codex_shim_log_dir="$codex_shim_state_root/firecrawl"
+codex_shim_log_path="$codex_shim_log_dir/codex-shim.log"
+codex_shim_log_max_bytes=1048576
 runtime_lock_held=
 if [[ "$project_name" != firecrawl ]]; then
   if [[ ! "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
@@ -41,6 +47,7 @@ if [[ "$project_name" != firecrawl ]]; then
     exit 64
   fi
   runtime_lock_path="$control_runtime_dir/lifecycle.${project_name}.lock"
+  codex_shim_pid_path="$control_runtime_dir/codex-shim.${project_name}.pid"
 fi
 
 lock_wait_seconds="${LOCAL_FIRECRAWL_LOCK_WAIT_SECONDS:-30}"
@@ -84,11 +91,242 @@ remove_codex_provider_snapshots_on_failure() {
 usage() {
   printf '%s\n' \
     "Usage: ${0##*/} {start|stop|restart|lock-path|configure-search}" \
+    "       ${0##*/} {shim-start|shim-stop}" \
     "       ${0##*/} status [--json]" \
     "       ${0##*/} health [--json]" \
     "       ${0##*/} probe-egress" \
-    "       ${0##*/} logs [all|api|searxng|browser-service|browser-interaction-worker|browser-interaction-egress-proxy] [correlation-id]" \
+    "       ${0##*/} logs [all|api|shim|searxng|browser-service|browser-interaction-worker|browser-interaction-egress-proxy] [correlation-id]" \
     >&2
+}
+
+validate_codex_shim_options() {
+  if [[ ! "${CODEX_SHIM_PORT:-3030}" =~ ^[1-9][0-9]*$ ]] ||
+    (( ${CODEX_SHIM_PORT:-3030} > 65535 )); then
+    printf '%s\n' 'CODEX_SHIM_PORT must be an integer between 1 and 65535' >&2
+    return 64
+  fi
+}
+
+prepare_codex_shim_log() {
+  local identity
+  local rotated_tmp="$codex_shim_log_path.rotate.$$"
+
+  if [[ "$codex_shim_state_root" != /* ]]; then
+    printf '%s\n' 'Codex Shim state root must be absolute' >&2
+    return 70
+  fi
+  install -d -m 0700 -- "$codex_shim_log_dir"
+  if [[ ! -d "$codex_shim_log_dir" ]] || [[ -L "$codex_shim_log_dir" ]] ||
+    [[ "$(readlink -f -- "$codex_shim_log_dir")" != "$codex_shim_log_dir" ]] ||
+    [[ "$(stat -c '%u:%a' -- "$codex_shim_log_dir")" != "$UID:700" ]]; then
+    printf '%s\n' 'Codex Shim log directory is unsafe' >&2
+    return 70
+  fi
+  if [[ -e "$codex_shim_log_path" || -L "$codex_shim_log_path" ]]; then
+    if [[ ! -f "$codex_shim_log_path" ]] || [[ -L "$codex_shim_log_path" ]]; then
+      printf '%s\n' 'Codex Shim log file is unsafe' >&2
+      return 70
+    fi
+    identity="$(stat -c '%u:%a:%h' -- "$codex_shim_log_path")"
+    if [[ "$identity" != "$UID:600:1" ]]; then
+      printf '%s\n' 'Codex Shim log ownership or mode is unsafe' >&2
+      return 70
+    fi
+    if (( $(stat -c '%s' -- "$codex_shim_log_path") >= codex_shim_log_max_bytes )); then
+      umask 077
+      tail -c "$codex_shim_log_max_bytes" -- "$codex_shim_log_path" > "$rotated_tmp"
+      mv -f -- "$rotated_tmp" "$codex_shim_log_path.1"
+      : > "$codex_shim_log_path"
+    fi
+  else
+    umask 077
+    : > "$codex_shim_log_path"
+  fi
+  chmod 0600 -- "$codex_shim_log_path"
+}
+
+read_codex_shim_pid() {
+  local identity
+
+  codex_shim_pid=
+  if [[ ! -e "$codex_shim_pid_path" && ! -L "$codex_shim_pid_path" ]]; then
+    return 1
+  fi
+  if [[ ! -f "$codex_shim_pid_path" ]] || [[ -L "$codex_shim_pid_path" ]]; then
+    printf '%s\n' 'Codex Shim PID file is unsafe' >&2
+    return 70
+  fi
+  identity="$(stat -c '%u:%a:%h' -- "$codex_shim_pid_path")"
+  if [[ "$identity" != "$UID:600:1" ]]; then
+    printf '%s\n' 'Codex Shim PID file ownership or mode is unsafe' >&2
+    return 70
+  fi
+  IFS= read -r codex_shim_pid < "$codex_shim_pid_path" || true
+  if [[ ! "$codex_shim_pid" =~ ^[1-9][0-9]*$ ]] ||
+    [[ "$(wc -l < "$codex_shim_pid_path")" != 1 ]]; then
+    printf '%s\n' 'Codex Shim PID file is invalid' >&2
+    return 70
+  fi
+}
+
+codex_shim_process_is_managed() {
+  local pid="$1"
+
+  [[ -d "/proc/$pid" ]] || return 1
+  [[ "$(stat -c '%u' -- "/proc/$pid")" == "$UID" ]] || return 1
+  tr '\0' '\n' < "/proc/$pid/cmdline" |
+    grep -Fx -- "$codex_shim_server_path" >/dev/null
+}
+
+probe_codex_shim() {
+  node -e '
+    const port = process.argv[1];
+    fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(500),
+    }).then(async response => {
+      const body = await response.json();
+      if (!response.ok || body.status !== "ok" ||
+          body.backend !== "codex-shim" ||
+          typeof body.models?.small !== "string" ||
+          typeof body.models?.main !== "string") process.exit(1);
+      process.stdout.write(JSON.stringify(body));
+    }).catch(() => process.exit(1));
+  ' "${CODEX_SHIM_PORT:-3030}"
+}
+
+start_codex_shim() {
+  local attempt
+  local pid_status
+
+  if read_codex_shim_pid; then
+    if kill -0 "$codex_shim_pid" 2>/dev/null; then
+      printf 'Codex Shim is already running with PID %s\n' "$codex_shim_pid" >&2
+      return 1
+    fi
+    rm -f -- "$codex_shim_pid_path"
+  else
+    pid_status=$?
+    (( pid_status == 1 )) || return "$pid_status"
+  fi
+  resolve_local_codex_runtime false
+  prepare_codex_shim_log
+  (
+    exec {runtime_lock_fd}>&-
+    exec nohup node "$codex_shim_server_path"
+  ) </dev/null >>"$codex_shim_log_path" 2>&1 &
+  codex_shim_pid=$!
+  umask 077
+  printf '%s\n' "$codex_shim_pid" > "$codex_shim_pid_path"
+  chmod 0600 -- "$codex_shim_pid_path"
+  for attempt in {1..50}; do
+    if probe_codex_shim >/dev/null 2>&1; then
+      printf 'Codex Shim started with PID %s\n' "$codex_shim_pid"
+      return 0
+    fi
+    kill -0 "$codex_shim_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  stop_codex_shim >/dev/null || true
+  printf 'Codex Shim failed its post-start health check; see %s\n' \
+    "$codex_shim_log_path" >&2
+  return 1
+}
+
+stop_codex_shim() {
+  local attempt
+  local pid_status
+
+  if read_codex_shim_pid; then
+    :
+  else
+    pid_status=$?
+    (( pid_status == 1 )) && return 0
+    return "$pid_status"
+  fi
+  if ! kill -0 "$codex_shim_pid" 2>/dev/null; then
+    rm -f -- "$codex_shim_pid_path"
+    return 0
+  fi
+  if ! codex_shim_process_is_managed "$codex_shim_pid"; then
+    printf 'Refusing to stop PID %s: it is not the managed Codex Shim\n' \
+      "$codex_shim_pid" >&2
+    return 70
+  fi
+  kill "$codex_shim_pid"
+  for attempt in {1..50}; do
+    kill -0 "$codex_shim_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$codex_shim_pid" 2>/dev/null; then
+    kill -KILL "$codex_shim_pid"
+  fi
+  rm -f -- "$codex_shim_pid_path"
+  prepare_codex_shim_log
+  printf '%s\n' 'Codex Shim stopped'
+}
+
+codex_shim_was_running() {
+  local pid_status
+
+  if read_codex_shim_pid; then
+    :
+  else
+    pid_status=$?
+    (( pid_status == 1 )) && return 1
+    return "$pid_status"
+  fi
+  kill -0 "$codex_shim_pid" 2>/dev/null || return 1
+  if ! codex_shim_process_is_managed "$codex_shim_pid"; then
+    printf 'Codex Shim PID %s does not identify the managed process\n' \
+      "$codex_shim_pid" >&2
+    return 70
+  fi
+}
+
+read_local_openai_base_url() {
+  local env_file="${LOCAL_FIRECRAWL_ENV_FILE:-$repo_root/.env}"
+  local line
+
+  local_openai_base_url=
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == OPENAI_BASE_URL=* ]]; then
+      local_openai_base_url="${line#OPENAI_BASE_URL=}"
+      local_openai_base_url="${local_openai_base_url%$'\r'}"
+    fi
+  done < "$env_file"
+}
+
+codex_shim_capability_json() {
+  local expected_base_url="http://host.docker.internal:${CODEX_SHIM_PORT:-3030}/v1"
+  local health
+
+  read_local_openai_base_url
+  if [[ -z "$local_openai_base_url" ]]; then
+    jq -cn '{enabled:false,reason:"OPENAI_BASE_URL unset"}'
+  elif [[ "$local_openai_base_url" != "$expected_base_url" &&
+    "$local_openai_base_url" != "http://127.0.0.1:${CODEX_SHIM_PORT:-3030}/v1" ]]; then
+    jq -cn '{enabled:false,reason:"OPENAI_BASE_URL does not target codex-shim"}'
+  elif health="$(probe_codex_shim 2>/dev/null)"; then
+    jq -cn --argjson health "$health" \
+      '{enabled:true,provider:$health.backend,models:$health.models}'
+  else
+    jq -cn '{enabled:false,reason:"codex-shim unreachable"}'
+  fi
+}
+
+print_codex_shim_capability() {
+  local capability="$1"
+
+  if [[ "$(jq -r '.enabled' <<< "$capability")" == true ]]; then
+    printf 'Extract: enabled via %s (models %s/%s)\n' \
+      "$(jq -r '.provider' <<< "$capability")" \
+      "$(jq -r '.models.small' <<< "$capability")" \
+      "$(jq -r '.models.main' <<< "$capability")"
+  else
+    printf 'Extract: disabled (%s)\n' \
+      "$(jq -r '.reason' <<< "$capability")"
+  fi
 }
 
 validate_runtime_options() {
@@ -1529,6 +1767,13 @@ show_logs() {
 
   case "$target" in
     all) services=("${diagnostic_services[@]}") ;;
+    shim)
+      [[ -f "$codex_shim_log_path" && ! -L "$codex_shim_log_path" ]] || return 0
+      tail -n 200 -- "$codex_shim_log_path" |
+        filter_correlation "$correlation" |
+        redact_local_logs
+      return
+      ;;
     api|browser-service|browser-interaction-worker|browser-interaction-egress-proxy)
       services=("$target")
       ;;
@@ -1816,6 +2061,7 @@ case "$command" in
     require_no_arguments "$@"
     validate_runtime_options
     acquire_runtime_lock exclusive
+    stop_codex_shim
     validate_compose recovery
     validate_running_project_provenance
     stop_runtime
@@ -1823,18 +2069,30 @@ case "$command" in
   restart)
     require_no_arguments "$@"
     validate_runtime_options
+    validate_codex_shim_options
     acquire_runtime_lock exclusive
+    restart_codex_shim=false
     trap remove_codex_provider_snapshots_on_failure EXIT
     validate_compose current true
     validate_browser_rollback_request
     build_runtime_images
     validate_running_project_provenance
     current_browser_container_id="$("${compose[@]}" ps -q browser-service)"
+    if codex_shim_was_running; then
+      restart_codex_shim=true
+      stop_codex_shim
+    else
+      shim_status=$?
+      (( shim_status == 1 )) || exit "$shim_status"
+    fi
     quiesce_browser_writers
     check_browser_rollback_offline
     stop_search_provider_for_transition
     "${compose[@]}" stop "${dependency_services[@]}"
     start_runtime
+    if [[ "$restart_codex_shim" == true ]]; then
+      start_codex_shim
+    fi
     trap - EXIT
     ;;
   probe-egress)
@@ -1852,16 +2110,22 @@ case "$command" in
       exit 64
     fi
     validate_runtime_options
+    validate_codex_shim_options
     acquire_runtime_lock shared
     validate_compose recovery
     validate_running_project_provenance
+    extract_capability="$(codex_shim_capability_json)"
     if [[ "${1:-}" == --json ]]; then
       "${compose[@]}" ps --all --format json \
         "${long_running_services[@]}" "${one_shot_services[@]}" |
         jq -cs --arg mode "$search_provider_mode" \
-          '{searchProviderMode:$mode, services:sort_by(.Service)}'
+          --argjson extract "$extract_capability" \
+          '{searchProviderMode:$mode, extractCapability:$extract,
+            services:sort_by(.Service)}'
     else
-      printf 'Search provider mode: %s\n\n' "$search_provider_mode"
+      printf 'Search provider mode: %s\n' "$search_provider_mode"
+      print_codex_shim_capability "$extract_capability"
+      printf '\n'
       printf '%s\n' 'Long-running services:'
       "${compose[@]}" ps --all "${long_running_services[@]}"
       printf '\n%s\n' 'Initialization and migration one-shots:'
@@ -1906,12 +2170,28 @@ case "$command" in
     fi
     validate_runtime_options
     acquire_runtime_lock shared
-    validate_compose recovery
-    validate_running_project_provenance
+    if [[ "$log_target" != shim ]]; then
+      validate_compose recovery
+      validate_running_project_provenance
+    fi
     show_logs "$log_target" "$correlation" || {
       usage
       exit 64
     }
+    ;;
+  shim-start)
+    require_no_arguments "$@"
+    validate_runtime_options
+    validate_codex_shim_options
+    acquire_runtime_lock exclusive
+    start_codex_shim
+    ;;
+  shim-stop)
+    require_no_arguments "$@"
+    validate_runtime_options
+    validate_codex_shim_options
+    acquire_runtime_lock exclusive
+    stop_codex_shim
     ;;
   *)
     usage

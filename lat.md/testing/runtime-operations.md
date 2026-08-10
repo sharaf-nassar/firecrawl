@@ -156,6 +156,12 @@ They require the provider credential, omit absent or empty optional headers, pre
 
 They clean snapshots on stop or failure, regenerate them on start, and reject unsupported provider fields or host-gateway remaps before Docker mutation.
 
+### Codex Shim lifecycle
+
+Wrapper fixtures run the real host shim server against private Codex and auth stubs to prove health-gated startup, PID ownership, teardown, restart restoration, status capability, bounded rotation, and redacted logs.
+
+The suite also holds the shim port to prove startup cannot report success without post-spawn health, rejects a PID naming another user-owned process, refuses duplicate starts, and verifies stop leaves the loopback listener unreachable.
+
 The API script `test:local-firecrawl:lifecycle` passes `--full-lifecycle`, but the test file has no argument-controlled real-Docker mode. Every current case still uses the fake runtime.
 
 Repository CI runs the deterministic local-script contracts, including this fake-runtime suite. That gate verifies orchestration rules without claiming live Compose acceptance.

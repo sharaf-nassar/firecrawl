@@ -68,7 +68,7 @@ Compose requires healthy application Postgres, Browser Interaction Worker, Brows
 
 It generates independent secrets for NuQ Postgres, application Postgres, Bull auth, Browser Service, replay ingest, Browser Interaction Worker, MinIO, and SearXNG. It also writes the canonical internal search endpoint, local owner UUID, retention, and service defaults.
 
-Fresh environments target the host Codex Shim at `http://host.docker.internal:3030/v1`, enable chat-only OpenAI requests, and select `gpt-5.6-luna`. The separately managed shim must be running before local extract can succeed.
+Fresh environments leave extract disabled. Enable it by running `scripts/local-firecrawl shim-start`, then setting `OPENAI_BASE_URL=http://host.docker.internal:3030/v1` and the nonsecret `OPENAI_API_KEY=local-codex-shim` placeholder; chat-only mode and `gpt-5.6-luna` are preselected.
 
 Interactive setup privately requires a Brave Search API key. Noninteractive setup reads only `FIRECRAWL_SEARXNG_BRAVE_API_KEY`; missing, blank, or whitespace-containing input fails before `.env` creation. Only its Base64 encoding is persisted.
 
@@ -89,6 +89,18 @@ The wrapper requires exactly one external `codex` executable on `PATH`, proves i
 It also requires a single-link regular `~/.codex/auth.json` owned by the current user with mode `0400` or `0600`, plus a readable absolute CA bundle. Missing or ambiguous host inputs stop startup.
 
 The host auth seed is mounted read-only. Refreshed state lives only in `codex-auth-state`, so the container cannot rewrite the user's host credential file.
+
+### Codex Shim supervision
+
+The wrapper supervises the host Codex Shim without placing host credentials or the Codex package inside Compose.
+
+`shim-start` reuses the host Codex preflight, refuses a live PID file, starts the shim, and reports success only after loopback `/health` confirms the provider and both model tiers. The managed PID file lives in the existing private `firecrawl-control` directory.
+
+`shim-stop` validates that the PID is user-owned and its command line names this repository's shim server before signaling it. `stop` always tears down a managed shim; `restart` restores it only when it was running before the runtime transition. Ordinary `start` never enables it.
+
+The shim has no auto-restart policy. A crash remains visible through extract capability gating instead of silently resurrecting a host process.
+
+Shim stdout and stderr use a mode-`0700` `${XDG_STATE_HOME:-$HOME/.local/state}/firecrawl` directory and mode-`0600` `codex-shim.log`. Startup and shutdown rotate content at 1 MiB into one bounded prior log.
 
 ## Local MCP capability filter
 
@@ -151,6 +163,8 @@ Provider failover and rollback never remove volumes. Switch to an external endpo
 
 One-shot timeout defaults to 300 seconds and service health wait to 180 seconds. Timeouts are configuration errors when nonpositive and operational failures when exceeded.
 
+Start deliberately leaves the host Codex Shim disabled. Restart stops and restores an already-running shim around the Compose transition so no listener remains active while its API consumers are torn down.
+
 ## Browser rollback
 
 Browser Service downgrade is opt-in because older code may not understand newer durable atomic-publication records.
@@ -165,11 +179,15 @@ Stop validates recoverable Compose provenance and shuts down writers before depe
 
 API, interaction worker, and Browser Service stop first, followed by egress proxy, bundled SearXNG when internal, then storage and queue dependencies. External mode removes only a stale SearXNG container. Volumes and one-shot records remain.
 
+The wrapper stops a managed Codex Shim before Compose recovery validation, ensuring teardown does not leave its port listener orphaned when Docker diagnostics fail.
+
 ## Status
 
 `scripts/local-firecrawl status` reports both long-running and one-shot containers under a shared lifecycle lock.
 
 Human and JSON output name `internal` or `external` mode without showing its endpoint. JSON returns `searchProviderMode` plus selected Compose services sorted by name; external inventory excludes stale bundled SearXNG.
+
+Status also reports extract capability from the configured `.env` `OPENAI_BASE_URL` and a loopback Codex Shim health check. Enabled output names `codex-shim` and both model tiers; disabled output names only a safe configuration or reachability reason and never authentication values.
 
 ## Health
 
@@ -200,6 +218,8 @@ It reads at most 200 recent lines, optionally filters by canonical UUID correlat
 Local environment initialization sets `LOGGING_LEVEL=INFO` and Compose passes it to API processes. Debug-only search phase, provider-selection, and no-op reconciler records are therefore opt-in rather than normal local output.
 
 Internal mode supports `logs searxng`; external mode rejects that target and omits it from `logs all`. Browser component targets isolate their corresponding trust boundaries. Remaining failure after wrapper recovery should be surfaced instead of hidden by repeated restarts.
+
+`logs shim` reads the last 200 host-log lines through the same redaction filter. The shim remains separate from `logs all` because it is an explicitly enabled host process rather than a Compose service.
 
 ## Local recovery procedure
 
