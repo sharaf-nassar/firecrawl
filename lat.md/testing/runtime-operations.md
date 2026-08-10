@@ -144,6 +144,10 @@ Fake health probes require exactly one redacted POST through API with fixed quer
 
 Success and provider-outage fixtures prove health reports provider mode without endpoint or query disclosure. Outage fails functional health without stopping API, so non-search scrape and crawl availability remain independent.
 
+### Structured health output
+
+Fake chatter verifies human health output contains only grouped results with distinct application and NuQ PostgreSQL rows, while JSON stays parseable. Failure fixtures preserve the command status, label, and safe diagnostic detail.
+
 ### Codex provider snapshot
 
 Wrapper fixtures prove startup copies only selected provider routing and credentials into bounded snapshots without logging secrets.

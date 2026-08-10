@@ -171,7 +171,9 @@ Checks include Redis `PONG`, RabbitMQ diagnostics, both Postgres servers, latest
 
 Health makes exactly one functional `POST /v2/search` using fixed query `SearXNG metasearch`, web source, and limit 1. Request timeout is 10 seconds inside a 15-second outer deadline; success requires HTTP 200, `success:true`, and one HTTP(S) web result.
 
-Human output groups passing checks by dependency, application, and browser runtime. Interactive terminals use restrained status color unless `NO_COLOR` is set or `TERM=dumb`; pipes, logs, and JSON remain ANSI-free. Successful probe chatter stays hidden and failed probes retain named diagnostics.
+Human output groups passing checks by dependency, application, and browser runtime. `PostgreSQL (application)` and `PostgreSQL (NuQ)` identify the two database roles. Interactive terminals use restrained status color unless `NO_COLOR` is set or `TERM=dumb`.
+
+Successful health stdout contains only the report, or one JSON object with `--json`; raw probe output stays hidden. Failed probes preserve their exit status and emit a named stderr diagnostic followed by captured command detail when safe. The search smoke never echoes secret-bearing detail.
 
 `--json` also reports provider mode and functional search health without its endpoint. Provider outage fails wrapper health but does not stop API or disable scrape and crawl.
 

@@ -477,6 +477,17 @@ if (has("up")) {
   process.exit(0);
 }
 if (has("exec")) {
+  const execIndex = args.indexOf("exec");
+  const execService = args[execIndex + 2];
+  const migrationProbe = args.join(" ").includes("SELECT concat_ws");
+  if (process.env.FAKE_HEALTH_FAILURE === execService) {
+    process.stderr.write("raw probe failure: " + execService + "\\n");
+    process.exit(23);
+  }
+  if (process.env.FAKE_HEALTH_CHATTER === "true" && !migrationProbe) {
+    process.stdout.write("raw probe stdout: " + execService + "\\n");
+    process.stderr.write("raw probe stderr: " + execService + "\\n");
+  }
   if (has("redis-cli")) process.stdout.write("PONG\\n");
   if (args.join(" ").includes("SELECT concat_ws")) {
     process.stdout.write(process.env.FAKE_MIGRATION_LEDGER + "\\n");
@@ -1275,6 +1286,36 @@ test("health makes one bounded redacted search smoke", async t => {
       service => service.Service === "api",
     ),
   );
+});
+
+// @lat: [[runtime-operations#Local wrapper suite#Structured health output]]
+test("health structures success and labels probe failures", async t => {
+  const fake = await makeFakeRuntime();
+  t.after(() => fake.cleanup());
+  const env = { ...fake.env, FAKE_HEALTH_CHATTER: "true" };
+
+  const healthy = await run(wrapper, ["health"], { env });
+  assert.equal(healthy.code, 0, healthy.stderr);
+  assert.match(healthy.stdout, /^Local Firecrawl health: PASS$/m);
+  assert.match(healthy.stdout, /^Dependencies$/m);
+  assert.match(healthy.stdout, /PostgreSQL \(application\)\s+PASS/);
+  assert.match(healthy.stdout, /PostgreSQL \(NuQ\)\s+PASS/);
+  assert.match(healthy.stdout, /^Application$/m);
+  assert.match(healthy.stdout, /^Browser runtime$/m);
+  assert.doesNotMatch(healthy.stdout + healthy.stderr, /raw probe/);
+
+  const json = await run(wrapper, ["health", "--json"], { env });
+  assert.equal(json.code, 0, json.stderr);
+  assert.equal(JSON.parse(json.stdout).status, "healthy");
+  assert.doesNotMatch(json.stdout + json.stderr, /raw probe/);
+
+  const failed = await run(wrapper, ["health"], {
+    env: { ...env, FAKE_HEALTH_FAILURE: "nuq-postgres" },
+  });
+  assert.equal(failed.code, 23);
+  assert.match(failed.stderr, /Health check failed: PostgreSQL \(NuQ\)/);
+  assert.match(failed.stderr, /raw probe failure: nuq-postgres/);
+  assert.doesNotMatch(failed.stdout, /Local Firecrawl health: PASS/);
 });
 
 test("logs remain available without current Codex or auth", async t => {

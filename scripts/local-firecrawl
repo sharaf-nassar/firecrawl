@@ -1546,21 +1546,21 @@ show_logs() {
 
 run_quiet_health_probe() {
   local label="$1"
-  local output
   local status
 
   shift
-  if output="$("$@" 2>&1)"; then
+  health_probe_output=
+  if health_probe_output="$("$@" 2>&1)"; then
     return 0
   else
     status=$?
   fi
 
   printf 'Health check failed: %s\n' "$label" >&2
-  if [[ -n "$output" ]]; then
+  if [[ -n "$health_probe_output" ]]; then
     while IFS= read -r line; do
       printf '  %s\n' "$line" >&2
-    done <<< "$output"
+    done <<< "$health_probe_output"
   fi
   return "$status"
 }
@@ -1646,25 +1646,21 @@ verify_health() {
   local latest_checked_in_checksum
   local latest_checked_in_migration
   local migration_ledger_entry
-  local redis_response
 
   [[ "$runtime_lock_held" == shared || "$runtime_lock_held" == exclusive ]] ||
     { printf '%s\n' 'Health requires the lifecycle lock' >&2; return 70; }
   validate_compose current
   require_current_api_provenance
 
-  redis_response="$("${compose[@]}" exec -T redis redis-cli ping)"
-  if [[ "$redis_response" != PONG ]]; then
-    printf 'Redis health check returned %q, expected PONG\n' \
-      "$redis_response" >&2
-    return 1
-  fi
+  run_quiet_health_probe 'Redis' \
+    "${compose[@]}" exec -T redis sh -ec \
+    'response="$(redis-cli ping)"; test "$response" = PONG || { printf "returned %s, expected PONG\n" "$response" >&2; exit 1; }'
   run_quiet_health_probe 'RabbitMQ' \
     "${compose[@]}" exec -T rabbitmq rabbitmq-diagnostics -q check_running
-  run_quiet_health_probe 'NuQ PostgreSQL' \
+  run_quiet_health_probe 'PostgreSQL (NuQ)' \
     "${compose[@]}" exec -T nuq-postgres sh -c \
     'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-  run_quiet_health_probe 'application PostgreSQL' \
+  run_quiet_health_probe 'PostgreSQL (application)' \
     "${compose[@]}" exec -T app-postgres sh -c \
     'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
@@ -1677,10 +1673,10 @@ verify_health() {
     printf '%s\n' 'No application migrations were found' >&2
     return 1
   fi
-  migration_ledger_entry="$(
+  run_quiet_health_probe 'Application migration ledger' \
     "${compose[@]}" exec -T app-postgres sh -ec \
       'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT concat_ws('"'"'|'"'"', filename, checksum) FROM application_schema_migrations ORDER BY filename DESC LIMIT 1"'
-  )"
+  migration_ledger_entry="$health_probe_output"
   IFS='|' read -r latest_applied_migration latest_applied_checksum \
     <<< "$migration_ledger_entry"
   if [[ "$latest_applied_migration" != "$latest_checked_in_migration" ]]; then
@@ -1708,16 +1704,18 @@ verify_health() {
     "${compose[@]}" exec -T minio curl --fail --silent --show-error \
     --max-time 10 --output /dev/null \
     http://127.0.0.1:9000/minio/health/live
-  run_quiet_health_probe 'artifact access policy' \
+  run_quiet_health_probe 'Artifact access policy' \
     "${compose[@]}" exec -T api sh -ec \
     'test -z "${MINIO_ROOT_USER+x}" && test -z "${MINIO_ROOT_PASSWORD+x}" && node dist/src/cli/artifact-health.js'
-  "${compose[@]}" exec -T playwright-service node -e \
+  run_quiet_health_probe 'Playwright' \
+    "${compose[@]}" exec -T playwright-service node -e \
     "fetch('http://127.0.0.1:3000/health', {
        signal: AbortSignal.timeout(10000),
      }).then(response => {
        if (!response.ok) process.exit(1);
      }).catch(() => process.exit(1))"
-  "${compose[@]}" exec -T browser-service node -e \
+  run_quiet_health_probe 'Browser Service' \
+    "${compose[@]}" exec -T browser-service node -e \
     "const headers = {
        authorization: 'Bearer ' + process.env.BROWSER_SERVICE_API_KEY,
        'x-firecrawl-correlation-id': 'local-health',
@@ -1729,7 +1727,8 @@ verify_health() {
      }).then(response => {
        if (!response.ok) process.exit(1);
      }).catch(() => process.exit(1))"
-  "${compose[@]}" exec -T browser-interaction-egress-proxy node -e \
+  run_quiet_health_probe 'Egress proxy' \
+    "${compose[@]}" exec -T browser-interaction-egress-proxy node -e \
     "const net = require('node:net');
      const socket = net.createConnection({
        path: '/run/firecrawl-model-egress/proxy.sock',
@@ -1740,7 +1739,8 @@ verify_health() {
        socket.end();
        process.exit(0);
      });"
-  "${compose[@]}" exec -T browser-interaction-worker node -e \
+  run_quiet_health_probe 'Interaction worker' \
+    "${compose[@]}" exec -T browser-interaction-worker node -e \
     "const http = require('node:http');
      const request = http.request({
        socketPath: '/run/firecrawl-interaction/worker.sock',
@@ -1754,10 +1754,11 @@ verify_health() {
      });
      request.on('error', () => process.exit(1));
      request.end();"
-  curl --fail --silent --show-error --max-time 10 \
+  run_quiet_health_probe 'Public API' \
+    curl --fail --silent --show-error --max-time 10 \
     --output /dev/null "http://127.0.0.1:${PORT:-3002}/"
   verify_search_provider_health
-  check_port_policy
+  run_quiet_health_probe 'Loopback port policy' check_port_policy
 
   health_migration="$latest_applied_migration"
 }
