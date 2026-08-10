@@ -138,8 +138,7 @@ export async function rerankLinksWithLLM_F0(
             error,
           );
           if (retry === MAX_RETRIES) {
-            // console.log(`Chunk ${chunkIndex + 1}: Max retries reached, returning empty array`);
-            return [];
+            throw error;
           }
         }
       }

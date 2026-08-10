@@ -203,6 +203,9 @@ export async function performExtraction_F0(
   });
 
   if (links.length === 0) {
+    const error =
+      urlTraces.find(trace => trace.error)?.error ??
+      "No valid URLs found to scrape. Try adjusting your search criteria or including more URLs.";
     logger.error("0 links! Bailing.", {
       linkCount: links.length,
     });
@@ -214,13 +217,12 @@ export async function performExtraction_F0(
       options: request,
       credits_cost: 0,
       is_successful: false,
-      error: "No valid URLs found to scrape",
+      error,
       model_kind: "fire-0",
     });
     return {
       success: false,
-      error:
-        "No valid URLs found to scrape. Try adjusting your search criteria or including more URLs.",
+      error,
       extractId,
       warning: providerWarning,
       urlTrace: urlTraces,
