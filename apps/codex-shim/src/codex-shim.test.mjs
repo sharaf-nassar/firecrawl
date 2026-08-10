@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -17,7 +18,12 @@ import {
   createCodexTranslator,
   normalizeChatRequest,
 } from "./translate.mjs";
-import { createCodexShimServer, readServerConfig } from "./server.mjs";
+import { mapModel } from "./model-map.mjs";
+import {
+  createCodexShimServer,
+  isCodexRuntimeReady,
+  readServerConfig,
+} from "./server.mjs";
 
 async function makeFakeCodex(t, mode = "success") {
   const root = await mkdtemp(join(tmpdir(), "codex-shim-test-"));
@@ -111,13 +117,42 @@ async function readEvents(path) {
     .map((line) => JSON.parse(line));
 }
 
-async function startShim(t, maxConcurrency = 2) {
-  const shim = createCodexShimServer({
-    host: "127.0.0.1",
-    port: 0,
-    maxConcurrency,
-    codexBin: "codex",
+async function makeCodexRuntime(t) {
+  const root = await mkdtemp(join(tmpdir(), "codex-runtime-test-"));
+  const packageDirectory = join(root, "node_modules", "@openai", "codex");
+  const bin = join(packageDirectory, "bin");
+  const pathBin = join(root, "bin");
+  const home = join(root, "home");
+  const authPath = join(home, ".codex", "auth.json");
+  await mkdir(bin, { mode: 0o700, recursive: true });
+  await mkdir(pathBin, { mode: 0o700 });
+  await mkdir(join(home, ".codex"), { mode: 0o700, recursive: true });
+  await writeFile(
+    join(packageDirectory, "package.json"),
+    JSON.stringify({
+      name: "@openai/codex",
+      bin: { codex: "bin/codex.js" },
+    }),
+    { mode: 0o600 },
+  );
+  await writeFile(join(bin, "codex.js"), "#!/usr/bin/env node\n", {
+    mode: 0o755,
   });
+  await symlink(join(bin, "codex.js"), join(pathBin, "codex"));
+  await writeFile(authPath, "AUTH_FILE_SECRET_MUST_NOT_ESCAPE\n", {
+    mode: 0o600,
+  });
+  t.after(() => rm(root, { force: true, recursive: true }));
+  return { authPath, env: { HOME: home, PATH: pathBin } };
+}
+
+async function startShim(t, { maxConcurrency = 2, runtimeReady } = {}) {
+  const config = readServerConfig({
+    CODEX_SHIM_HOST: "127.0.0.1",
+    CODEX_SHIM_PORT: "0",
+    CODEX_SHIM_MAX_CONCURRENCY: String(maxConcurrency),
+  });
+  const shim = createCodexShimServer(config, undefined, runtimeReady);
   const address = await shim.listen();
   t.after(() => shim.close());
   return `http://127.0.0.1:${address.port}`;
@@ -140,7 +175,7 @@ test("translates OpenAI messages and requested execution settings", async (t) =>
   const fake = await makeFakeCodex(t);
   const translator = createCodexTranslator();
   const result = await translator.complete({
-    model: "gpt-test-main",
+    model: "gpt-4.1",
     reasoning_effort: "high",
     messages: [
       { role: "system", content: "Follow the format." },
@@ -152,7 +187,7 @@ test("translates OpenAI messages and requested execution settings", async (t) =>
   });
 
   assert.equal(result.object, "chat.completion");
-  assert.equal(result.model, "gpt-test-main");
+  assert.equal(result.model, "gpt-4.1");
   assert.equal(result.choices[0].message.content, "stub completion");
   assert.deepEqual(result.usage, {
     prompt_tokens: 11,
@@ -165,14 +200,34 @@ test("translates OpenAI messages and requested execution settings", async (t) =>
     "--ephemeral",
     "--json",
     "-m",
-    "gpt-test-main",
+    "gpt-5.6-terra",
     "-c",
-    "model_reasoning_effort=high",
+    "model_reasoning_effort=medium",
     "-",
   ]);
   assert.equal(
     event.prompt,
     "[SYSTEM]\nFollow the format.\n\n[USER]\nReturn a greeting.",
+  );
+});
+
+// @lat: [[runtime-operations#Codex Shim suite#Model routing and health surface]]
+test("maps incoming names to the configured small and main tiers", () => {
+  assert.deepEqual(mapModel("gpt-4o-mini"), {
+    model: "gpt-5.6-luna",
+    effort: "low",
+  });
+  assert.deepEqual(mapModel("gpt-4.1"), {
+    model: "gpt-5.6-terra",
+    effort: "medium",
+  });
+  assert.deepEqual(mapModel("unknown"), {
+    model: "gpt-5.6-terra",
+    effort: "medium",
+  });
+  assert.deepEqual(
+    mapModel("vendor/nano", { small: "small-override", main: "main-override" }),
+    { model: "small-override", effort: "low" },
   );
 });
 
@@ -269,6 +324,53 @@ test("serves a chat completion and rejects embeddings", async (t) => {
   assert.equal(embeddings.body.error.code, "not_implemented");
 });
 
+test("lists both tiers and reports secret-safe runtime health", async (t) => {
+  const runtime = await makeCodexRuntime(t);
+  const runtimeReady = () =>
+    isCodexRuntimeReady({
+      codexBin: "codex",
+      env: runtime.env,
+      uid: process.getuid(),
+    });
+  const baseUrl = await startShim(t, { runtimeReady });
+
+  const modelsResponse = await fetch(`${baseUrl}/v1/models`);
+  const models = await modelsResponse.json();
+  assert.equal(modelsResponse.status, 200);
+  assert.deepEqual(
+    models.data.map(({ id }) => id),
+    ["gpt-5.6-luna", "gpt-5.6-terra"],
+  );
+
+  const healthyResponse = await fetch(`${baseUrl}/health`);
+  const healthy = await healthyResponse.json();
+  assert.equal(healthyResponse.status, 200);
+  assert.deepEqual(healthy, {
+    status: "ok",
+    backend: "codex-shim",
+    models: { small: "gpt-5.6-luna", main: "gpt-5.6-terra" },
+    concurrency: 2,
+  });
+
+  await chmod(runtime.authPath, 0o644);
+  const unsafeResponse = await fetch(`${baseUrl}/health`);
+  assert.equal(unsafeResponse.status, 503);
+  await chmod(runtime.authPath, 0o600);
+  await rm(runtime.authPath);
+  const absentResponse = await fetch(`${baseUrl}/health`);
+  const absent = await absentResponse.json();
+  assert.equal(absentResponse.status, 503);
+  assert.deepEqual(absent, {
+    status: "unavailable",
+    backend: "codex-shim",
+  });
+
+  assert.doesNotMatch(
+    JSON.stringify({ models, healthy, absent }),
+    /AUTH_FILE_SECRET_MUST_NOT_ESCAPE|\.codex/u,
+  );
+});
+
 test("maps backend failures to secret-safe OpenAI errors", async (t) => {
   await makeFakeCodex(t, "failed");
   const baseUrl = await startShim(t);
@@ -325,5 +427,13 @@ test("uses documented network and concurrency defaults", () => {
     port: 3030,
     maxConcurrency: 2,
     codexBin: "codex",
+    models: { small: "gpt-5.6-luna", main: "gpt-5.6-terra" },
   });
+  assert.deepEqual(
+    readServerConfig({
+      CODEX_SHIM_SMALL_MODEL: "small-override",
+      CODEX_SHIM_MAIN_MODEL: "main-override",
+    }).models,
+    { small: "small-override", main: "main-override" },
+  );
 });

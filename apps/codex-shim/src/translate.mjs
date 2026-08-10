@@ -4,6 +4,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { mapModel, readModelConfig } from "./model-map.mjs";
+
 const MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
 const MAX_MODEL_LENGTH = 128;
@@ -356,6 +358,7 @@ async function runCodex({ codexBin, prompt, model, effort, outputSchema }) {
 export function createCodexTranslator({
   codexBin = "codex",
   maxConcurrency = 2,
+  models = readModelConfig(),
 } = {}) {
   if (typeof codexBin !== "string" || codexBin.length === 0) {
     throw new TypeError("codexBin must be a non-empty string");
@@ -365,12 +368,13 @@ export function createCodexTranslator({
   return Object.freeze({
     async complete(value) {
       const request = normalizeChatRequest(value);
+      const target = mapModel(request.model, models);
       const result = await executor.run(() =>
         runCodex({
           codexBin,
           prompt: request.prompt,
-          model: request.model,
-          effort: request.effort,
+          model: target.model,
+          effort: target.effort,
           outputSchema: request.outputSchema,
         }),
       );

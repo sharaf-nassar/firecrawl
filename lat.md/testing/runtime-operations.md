@@ -64,6 +64,10 @@ Those behaviors are partially constrained by local Compose validation and health
 
 The suite places a recording `codex` stub first on `PATH`. It covers message and argv translation, exact schema-file creation and cleanup, final-message event parsing, FIFO concurrency, chat and embeddings routes, and secret-safe OpenAI error responses.
 
+### Model routing and health surface
+
+Focused cases prove mini and nano names select the small tier, other names select the main tier, overrides reach model discovery, and readiness rejects missing or unsafe auth without disclosing its contents.
+
 ## API LLM compatibility coverage
 
 API Vitest coverage keeps local Codex Shim compatibility opt-in while preserving hosted OpenAI defaults.

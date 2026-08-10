@@ -1,6 +1,15 @@
+import {
+  accessSync,
+  constants,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { createServer } from "node:http";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readModelConfig } from "./model-map.mjs";
 import {
   CodexExecutionError,
   CodexProtocolError,
@@ -117,7 +126,61 @@ export function readServerConfig(env = process.env) {
       1_024,
     ),
     codexBin: env.CODEX_SHIM_CODEX_BIN || "codex",
+    models: readModelConfig(env),
   });
+}
+
+function realFile(path) {
+  try {
+    accessSync(path, constants.X_OK);
+    const resolved = realpathSync(path);
+    return statSync(resolved).isFile() ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function isCodexRuntimeReady({
+  codexBin = "codex",
+  env = process.env,
+  uid = process.getuid?.(),
+} = {}) {
+  try {
+    const candidates = isAbsolute(codexBin)
+      ? [codexBin]
+      : (env.PATH ?? "")
+          .split(delimiter)
+          .filter(isAbsolute)
+          .map((directory) => join(directory, codexBin));
+    const entrypoints = new Set(candidates.map(realFile).filter(Boolean));
+    if (entrypoints.size !== 1) return false;
+
+    const [entrypoint] = entrypoints;
+    const packageDirectory = realpathSync(dirname(dirname(entrypoint)));
+    const packageJson = JSON.parse(
+      readFileSync(join(packageDirectory, "package.json"), "utf8"),
+    );
+    if (
+      packageJson.name !== "@openai/codex" ||
+      packageJson.bin?.codex !== "bin/codex.js" ||
+      realpathSync(join(packageDirectory, "bin/codex.js")) !== entrypoint
+    ) {
+      return false;
+    }
+
+    if (typeof env.HOME !== "string" || !isAbsolute(env.HOME)) return false;
+    const auth = statSync(realpathSync(join(env.HOME, ".codex/auth.json")));
+    const mode = auth.mode & 0o7777;
+    return (
+      auth.isFile() &&
+      uid !== undefined &&
+      auth.uid === uid &&
+      auth.nlink === 1 &&
+      (mode === 0o400 || mode === 0o600)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function sendExpectedFailure(response, cause) {
@@ -171,7 +234,9 @@ export function createCodexShimServer(
   translator = createCodexTranslator({
     codexBin: config.codexBin,
     maxConcurrency: config.maxConcurrency,
+    models: config.models,
   }),
+  runtimeReady = () => isCodexRuntimeReady({ codexBin: config.codexBin }),
 ) {
   const server = createServer(
     {
@@ -187,6 +252,34 @@ export function createCodexShimServer(
           404,
           openAIError("Route not found.", "invalid_request_error", "not_found"),
         );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/health") {
+        const ready = await runtimeReady();
+        sendJson(
+          response,
+          ready ? 200 : 503,
+          ready
+            ? {
+                status: "ok",
+                backend: "codex-shim",
+                models: config.models,
+                concurrency: config.maxConcurrency,
+              }
+            : { status: "unavailable", backend: "codex-shim" },
+        );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/v1/models") {
+        sendJson(response, 200, {
+          object: "list",
+          data: [config.models.small, config.models.main].map((id) => ({
+            id,
+            object: "model",
+            created: 0,
+            owned_by: "codex-shim",
+          })),
+        });
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/embeddings") {
