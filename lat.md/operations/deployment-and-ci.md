@@ -52,7 +52,9 @@ The workflow has no path filters. Every eligible event exercises the same requir
 
 CI validates the build and local-operation contracts needed by this repository's active runtime.
 
-The jobs cover repository and local-script contracts, the API Docker image build, Browser Service test and runtime Docker targets, Playwright Service install/build/test, and Test Site install/build.
+The jobs cover repository and local-script contracts, deterministic local Compose and SearXNG configuration, focused API search tests, the API package and image builds, Browser Service image targets, Playwright Service, and Test Site.
+
+Local-search validation uses the frozen root and `apps/api` commands. It runs the full fake wrapper and MCP suites, but never starts SearXNG or contacts an upstream engine.
 
 Docker builds are buildability checks only. CI does not log in to a registry, push images, create tags, or promote an artifact.
 
@@ -65,6 +67,8 @@ Repository automation intentionally stops at deterministic validation.
 There are no deployment, staging, package-publication, release, evaluation-dispatch, registry-cleanup, vulnerability-remediation, or archived workflows. CI has no custom-runner references and no secret-dependent jobs.
 
 SDKs, the legacy load suite, hosted integrations, and other optional ecosystems remain outside required CI. Their owning package commands or external release processes must supply any validation beyond the active runtime gate.
+
+SearXNG registry-manifest inspection, current-architecture boot, live wrapper health, and API snippet harnesses remain acceptance-only because they require registry, runtime, service, or credential boundaries beyond the deterministic gate.
 
 ## Dependency updates
 

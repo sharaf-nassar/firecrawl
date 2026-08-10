@@ -130,6 +130,8 @@ On 2026-08-01, official `braveapi` and Bing each passed 3/3 isolated attempts. W
 
 The overall nearest-rank p50 was 521 ms, p95 was 1,048 ms, and max was 1,961 ms. Final inspection found API and SearXNG healthy with no OOM or restart, while SearXNG used 108.2 MiB and 14 PIDs under its frozen limits.
 
+Repository CI runs only the static settings and rendered-service cases. Registry-manifest inspection and current-architecture boot remain final acceptance checks.
+
 ## Local wrapper suite
 
 `scripts/local-firecrawl.test.mjs` validates orchestration without mutating a real Docker installation.
@@ -214,9 +216,9 @@ Neither command is invoked by repository CI. They supply live local contract cov
 
 Repository CI covers deterministic active-runtime contracts that fit GitHub-hosted runners without secrets.
 
-The workflow checks repository and local scripts, builds the API image, builds Browser Service test and runtime image targets, runs Playwright Service install/build/test, and installs and builds Test Site. Container results are never published.
+The workflow renders local Compose, runs focused SearXNG plus complete fake wrapper and MCP contracts, tests versioned API search boundaries, builds the API package and image, and validates Browser Service, Playwright Service, and Test Site. Images are never published.
 
-Browser Interaction Worker tests, live Compose acceptance, API service-backed harnesses, FoundationDB, SDKs, support-service suites, and credentialed or hosted integrations remain outside the required gate.
+Registry-manifest inspection, current-architecture SearXNG boot, live Compose and wrapper health, API service-backed harnesses, FoundationDB, SDKs, support services, and credentialed or hosted integrations remain outside the required gate.
 
 Contributors must run affected excluded suites locally or in their owning external system and record any required Docker, privileged, real-browser, or credentialed acceptance separately.
 

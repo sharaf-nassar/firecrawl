@@ -48,11 +48,29 @@ jobs:
           shellcheck --exclude=SC2034,SC2178 \
             scripts/upgrade-local-env-phase1
 
-      - name: Run repository tests
+      - name: Validate local Compose
+        run: |
+          SEARXNG_SECRET=0000000000000000000000000000000000000000000000000000000000000000 \
+          LOCAL_CODEX_PACKAGE_DIR=/tmp/firecrawl-ci-codex-package \
+          LOCAL_CODEX_AUTH_FILE=/tmp/firecrawl-ci-codex-auth.json \
+          LOCAL_CODEX_CA_BUNDLE_FILE=/tmp/firecrawl-ci-ca.pem \
+          LOCAL_CODEX_WORKER_CONFIG_FILE=/tmp/firecrawl-ci-codex-worker.json \
+          LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE=/tmp/firecrawl-ci-codex-provider.env \
+          LOCAL_CODEX_EGRESS_POLICY_FILE=/tmp/firecrawl-ci-codex-egress.json \
+          docker compose --env-file .env.example.local -f compose.yaml \
+            config --quiet
+
+      - name: Validate SearXNG configuration
         run: |
           node --test \
-            scripts/local-firecrawl.test.mjs \
-            scripts/local-firecrawl-mcp.test.mjs \
+            --test-name-pattern='^(tracked SearXNG settings enforce the private engine policy|rendered local Compose keeps SearXNG private and bounded)$' \
+            scripts/searxng-config.test.mjs
+
+      - name: Run repository tests
+        run: |
+          node --test scripts/local-firecrawl.test.mjs
+          node --test scripts/local-firecrawl-mcp.test.mjs
+          node --test \
             apps/browser-interaction-worker/src/*.test.mjs \
             apps/codex-shim/src/*.test.mjs \
             apps/api/scripts/package-migrations.test.mjs
@@ -63,12 +81,39 @@ jobs:
   api-image:
     name: API image
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.1
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: |
+          npm install --global pnpm@10.16.1
+          test "$(pnpm --version)" = 10.16.1
+
+      - name: Install API dependencies
+        working-directory: apps/api
+        run: pnpm install --frozen-lockfile
+
+      - name: Test API search contracts
+        working-directory: apps/api
+        run: |
+          shopt -s nullglob
+          pnpm exec vitest run --no-file-parallelism \
+            src/search/{provider,searxng}.test.ts \
+            src/controllers/{v0,v1,v2}/search*.test.ts
+
+      - name: Build API package
+        working-directory: apps/api
+        run: pnpm run build
 
       - name: Build API image
         run: docker build -t firecrawl-api-ci apps/api

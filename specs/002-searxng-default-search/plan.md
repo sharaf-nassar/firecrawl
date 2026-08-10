@@ -158,11 +158,14 @@ SEARXNG_SECRET=0000000000000000000000000000000000000000000000000000000000000000 
 LOCAL_CODEX_PACKAGE_DIR=/tmp/firecrawl-ci-codex-package \
 LOCAL_CODEX_AUTH_FILE=/tmp/firecrawl-ci-codex-auth.json \
 LOCAL_CODEX_CA_BUNDLE_FILE=/tmp/firecrawl-ci-ca.pem \
+LOCAL_CODEX_WORKER_CONFIG_FILE=/tmp/firecrawl-ci-codex-worker.json \
+LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE=/tmp/firecrawl-ci-codex-provider.env \
+LOCAL_CODEX_EGRESS_POLICY_FILE=/tmp/firecrawl-ci-codex-egress.json \
 docker compose --env-file .env.example.local -f compose.yaml \
   config --quiet
 ```
 
-`compose.yaml` is the only file selector because it already includes both `docker-compose.yaml` and `compose.local.yaml`. Adding a second `-f compose.local.yaml` applies the overlay twice and is invalid. `.env.example.local` supplies the checked-in non-secret defaults and placeholder browser tokens; CI supplies the exact 64-character lowercase hexadecimal SearXNG placeholder because a generated secret is intentionally absent from that template. The three temporary Codex paths satisfy required bind-source interpolation without reading the files. This render gate has no build target and performs no image pull or container execution.
+`compose.yaml` is the only file selector because it already includes both `docker-compose.yaml` and `compose.local.yaml`. Adding a second `-f compose.local.yaml` applies the overlay twice and is invalid. `.env.example.local` supplies the checked-in non-secret defaults and placeholder browser tokens; CI supplies the exact 64-character lowercase hexadecimal SearXNG placeholder because a generated secret is intentionally absent from that template. The six temporary Codex paths satisfy required bind-source interpolation without reading the files. This render gate has no build target and performs no image pull or container execution.
 
 From the repository root, run exactly the deterministic SearXNG settings-loader and rendered-Compose cases:
 
