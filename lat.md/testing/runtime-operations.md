@@ -112,7 +112,7 @@ The loader runs in a one-shot, read-only container with networking disabled and 
 
 ### Rendered service hardening
 
-Rendered Compose must retain the digest, backend-only topology, read-only settings and launcher, non-root identity, dropped privileges, resource bounds, rotating logs, and local health probe. Only SearXNG receives the encoded Brave credential.
+Rendered Compose must retain the hardened SearXNG boundary and keep its Brave credential isolated. The private-network opt-in must reach API and Playwright together so their outbound checks agree.
 
 ### Immutable image architectures
 

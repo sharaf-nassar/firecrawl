@@ -19,6 +19,7 @@ const composeProject = `firecrawl-searxng-test-${process.pid}`;
 
 const composeEnv = {
   ...process.env,
+  ALLOW_LOCAL_WEBHOOKS: "true",
   APP_POSTGRES_DB: "firecrawl",
   APP_POSTGRES_PASSWORD: "a".repeat(64),
   APP_POSTGRES_USER: "firecrawl",
@@ -221,6 +222,11 @@ test("rendered local Compose keeps SearXNG private and bounded", async () => {
   assert.equal(
     rendered.services.api.environment.SEARXNG_ENGINES,
     "braveapi,bing",
+  );
+  assert.equal(rendered.services.api.environment.ALLOW_LOCAL_WEBHOOKS, "true");
+  assert.equal(
+    rendered.services["playwright-service"].environment.ALLOW_LOCAL_WEBHOOKS,
+    "true",
   );
   assert.ok(
     Object.entries(rendered.services)

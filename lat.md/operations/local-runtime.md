@@ -70,6 +70,8 @@ It generates independent secrets for NuQ Postgres, application Postgres, Bull au
 
 Fresh environments leave extract disabled. Enable it by running `scripts/local-firecrawl shim-start`, then setting `OPENAI_BASE_URL=http://host.docker.internal:3030/v1` and the nonsecret `OPENAI_API_KEY=local-codex-shim` placeholder; chat-only mode and `gpt-5.6-luna` are preselected.
 
+`ALLOW_LOCAL_WEBHOOKS` defaults to false. When explicitly enabled, Compose passes it to both API safe-fetch and Playwright so their separate private-network checks agree.
+
 Interactive setup privately requires a Brave Search API key. Noninteractive setup reads only `FIRECRAWL_SEARXNG_BRAVE_API_KEY`; missing, blank, or whitespace-containing input fails before `.env` creation. Only its Base64 encoding is persisted.
 
 `scripts/upgrade-local-env-phase1` upgrades earlier environment files under an exclusive mode-`0600` lock. It validates file type, ownership, duplicate keys, secret distinctness, and phase values, then replaces through a bounded temporary file only if the source did not change.
