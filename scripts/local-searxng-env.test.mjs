@@ -21,7 +21,9 @@ import test from "node:test";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const initEnv = join(repoRoot, "scripts", "init-local-env.sh");
+const searchKeyHelper = join(repoRoot, "scripts", "local-search-key.lib.sh");
 const upgradeEnv = join(repoRoot, "scripts", "upgrade-local-env-phase1");
+const fixtureBraveApiKey = "fixture-brave-api-key";
 
 function phaseEnvironment(overrides = {}) {
   const values = {
@@ -49,6 +51,7 @@ function phaseEnvironment(overrides = {}) {
     ARTIFACT_MINIO_BUCKET: "firecrawl-artifacts",
     ARTIFACT_MINIO_REGION: "us-east-1",
     SEARXNG_ENDPOINT: "http://searxng:8080",
+    SEARXNG_BRAVE_API_KEY_B64: Buffer.from(fixtureBraveApiKey).toString("base64"),
     SEARXNG_SECRET: "e".repeat(64),
     ...overrides,
   };
@@ -136,17 +139,26 @@ test("fresh local environment includes a private SearXNG origin and secret", asy
   const root = await mkdtemp(join(tmpdir(), "local-searxng-init-test-"));
   const scripts = join(root, "scripts");
   const copiedInit = join(scripts, "init-local-env.sh");
+  const copiedSearchKeyHelper = join(scripts, "local-search-key.lib.sh");
   const envFile = join(root, ".env");
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(scripts);
   await copyFile(initEnv, copiedInit);
+  await copyFile(searchKeyHelper, copiedSearchKeyHelper);
   await chmod(copiedInit, 0o755);
 
-  const created = await run(copiedInit, []);
+  const created = await run(copiedInit, [], {
+    env: { FIRECRAWL_SEARXNG_BRAVE_API_KEY: fixtureBraveApiKey },
+  });
   assert.equal(created.code, 0, created.stderr);
   const original = await readFile(envFile, "utf8");
   const values = parseEnvironment(original);
   assert.equal(values.SEARXNG_ENDPOINT, "http://searxng:8080");
+  assert.equal(
+    values.SEARXNG_BRAVE_API_KEY_B64,
+    Buffer.from(fixtureBraveApiKey).toString("base64"),
+  );
+  assert.doesNotMatch(original, new RegExp(`=${fixtureBraveApiKey}$`, "m"));
   assertSecretIsDistinct(values);
   assert.equal((await stat(envFile)).mode & 0o777, 0o600);
 
