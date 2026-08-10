@@ -121,6 +121,7 @@ wire_api = "responses"
   const home = join(root, "home");
   const codexPackage = join(root, "codex-package");
   const caBundle = join(root, "ca-certificates.crt");
+  const envFile = join(root, ".env");
   const log = join(root, "events.jsonl");
   const state = join(root, "provenance");
   const migrationDirectory = join(
@@ -169,6 +170,7 @@ wire_api = "responses"
   await symlink(join(codexPackage, "bin", "codex.js"), join(bin, "codex"));
   await symlink(process.execPath, join(bin, "node"));
   await writeFile(state, provenance);
+  await writeFile(envFile, "");
 
   const docker = join(bin, "docker");
   await writeFile(
@@ -583,6 +585,7 @@ process.exit(2);
       FAKE_SEARCH_PROVIDER_MODE: providerMode,
       FAKE_STALE_SEARXNG: staleSearxng ? "true" : "false",
       FAKE_SEARCH_HEALTH: searchHealth,
+      LOCAL_FIRECRAWL_ENV_FILE: envFile,
       LOCAL_FIRECRAWL_ONE_SHOT_TIMEOUT_SECONDS: "10",
       LOCAL_FIRECRAWL_CA_BUNDLE_FILE: caBundle,
       TEST_PROVIDER_API_KEY: "provider-secret-must-not-leak",
@@ -953,8 +956,10 @@ test("invalid immutable downgrade request fails before Docker", async (t) => {
   assert.equal(result.code, 64);
   assert.match(result.stderr, /immutable FIRECRAWL_BROWSER_SERVICE_IMAGE/);
   assert.deepEqual(await fake.events(), [
-    expectCompose("--profile", "maintenance", "config", "--quiet"),
-    expectCompose("--profile", "maintenance", "config", "--format", "json"),
+    expectCompose("--env-file", fake.env.LOCAL_FIRECRAWL_ENV_FILE,
+      "--profile", "maintenance", "config", "--quiet"),
+    expectCompose("--env-file", fake.env.LOCAL_FIRECRAWL_ENV_FILE,
+      "--profile", "maintenance", "config", "--format", "json"),
   ]);
 });
 
