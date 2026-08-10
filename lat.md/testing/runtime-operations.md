@@ -182,6 +182,12 @@ It also proves stale interaction and unsupported local search calls stop before 
 
 Provider-result cases cover exact 502 and 503 error JSON, one text block, call-ID correlation, valid empty success, and unrelated-error passthrough. Pinned interact and search registrations deep-compare with independent snapshots, and fixtures must match the executable package pin.
 
+### Extract capability health gating
+
+Launcher tests prove extraction follows the session-start Codex Shim health result without depending on the spawning client's working directory.
+
+The suite covers healthy, unhealthy, unreachable, timed-out, empty, and malformed configurations; `.env` syntax and host translation; dynamic discovery and stale-call errors; and a launcher spawn from a foreign working directory.
+
 ## API-managed local acceptance
 
 API harness commands provide narrower live acceptance for local persistence and Browser Service without assembling the wrapper-managed Compose stack.

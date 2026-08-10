@@ -119,7 +119,15 @@ The complete disabled-name policy contains seventeen reserved upstream names:
 - Search feedback: `firecrawl_search_feedback`.
 - Monitor and feedback storage: `firecrawl_monitor_create`, `firecrawl_monitor_get`, `firecrawl_monitor_list`, `firecrawl_monitor_update`, `firecrawl_monitor_delete`, `firecrawl_monitor_run`, `firecrawl_monitor_check`, `firecrawl_monitor_checks`, `firecrawl_feedback`.
 
-`firecrawl_extract` remains enabled. Compose forwards `OPENAI_CHAT_COMPLETIONS_ONLY` only to the API service and defaults it to `false` when unset. Fresh local configuration sets it to `true` and targets `http://host.docker.internal:3030/v1`, routing both extraction pipelines through the separately managed [[runtime/codex-shim#Codex Shim#HTTP and capacity boundary|Codex Shim chat-completions boundary]].
+`firecrawl_extract` is enabled only when the launcher can reach the configured Codex Shim. Compose forwards `OPENAI_CHAT_COMPLETIONS_ONLY` only to the API service and defaults it to `false` when unset. Fresh local configuration sets it to `true` and targets `http://host.docker.internal:3030/v1`, routing both extraction pipelines through the separately managed [[runtime/codex-shim#Codex Shim#HTTP and capacity boundary|Codex Shim chat-completions boundary]].
+
+### Extract health gate
+
+Local MCP extraction is advertised only when the configured host-side Codex Shim reports healthy at launcher session start.
+
+The launcher resolves its own real path to find the repository `.env`, independent of the MCP client's working directory. It parses `OPENAI_BASE_URL`, maps `host.docker.internal` to `127.0.0.1`, removes a trailing `/v1`, and requests `/health` with a 1.5-second timeout.
+
+An empty or malformed URL, missing environment file, failed response, connection error, or timeout adds `firecrawl_extract` to the existing disabled set. Discovery hides it and stale direct calls receive the same JSON-RPC `-32601` error as other disabled tools. Health is intentionally sampled once per session.
 
 ## Lifecycle lock
 

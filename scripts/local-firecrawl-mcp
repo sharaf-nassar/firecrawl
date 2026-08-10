@@ -7,6 +7,7 @@ import {
   interceptCodeCall,
   interceptUnsupportedSearchCall,
   isSearchToolCall,
+  probeShimHealth,
   rewriteSearchCallResult,
   unsupportedToolResponse,
 } from "./local-firecrawl-mcp.lib.mjs";
@@ -16,7 +17,9 @@ const upstreamArgs =
     ? process.argv.slice(2)
     : ["-y", "firecrawl-mcp@3.22.3"];
 
-const disabledLocalTools = createDisabledLocalTools();
+const disabledLocalTools = createDisabledLocalTools(
+  (await probeShimHealth()) ? [] : ["firecrawl_extract"],
+);
 const pendingSearchCallIds = new Set();
 
 const child = spawn("npx", upstreamArgs, {

@@ -1,3 +1,7 @@
+import { readFile, realpath } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { parseEnv } from "node:util";
+
 const disabledLocalToolNames = [
   // Disabled locally, not deleted upstream: these require Firecrawl's
   // external Agent service, which this self-hosted stack does not configure.
@@ -32,6 +36,69 @@ const disabledLocalToolNames = [
 // @lat: [[operations/local-runtime#Local Runtime Operations#Local MCP capability filter]]
 export function createDisabledLocalTools(additionalToolNames = []) {
   return new Set([...disabledLocalToolNames, ...additionalToolNames]);
+}
+
+// @lat: [[operations/local-runtime#Local Runtime Operations#Local MCP capability filter#Extract health gate]]
+export async function probeShimHealth({
+  launcherPath = process.argv[1],
+  timeoutMs = 1_500,
+} = {}) {
+  let envSource;
+  try {
+    const launcherRealPath = await realpath(launcherPath);
+    envSource = await readFile(
+      resolve(dirname(launcherRealPath), "..", ".env"),
+      "utf8",
+    );
+  } catch (error) {
+    if (["EACCES", "ENOENT", "ENOTDIR"].includes(error?.code)) {
+      return false;
+    }
+    throw error;
+  }
+
+  const configuredBaseUrl = parseEnv(envSource).OPENAI_BASE_URL?.trim();
+  if (!configuredBaseUrl) {
+    return false;
+  }
+
+  let healthUrl;
+  try {
+    healthUrl = new URL(configuredBaseUrl);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      return false;
+    }
+    throw error;
+  }
+
+  if (!["http:", "https:"].includes(healthUrl.protocol)) {
+    return false;
+  }
+  if (healthUrl.hostname === "host.docker.internal") {
+    healthUrl.hostname = "127.0.0.1";
+  }
+  healthUrl.pathname = `${healthUrl.pathname
+    .replace(/\/v1\/?$/, "")
+    .replace(/\/$/, "")}/health`;
+  healthUrl.search = "";
+  healthUrl.hash = "";
+
+  try {
+    const response = await fetch(healthUrl, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return response.ok;
+  } catch (error) {
+    if (
+      error instanceof TypeError ||
+      error?.name === "AbortError" ||
+      error?.name === "TimeoutError"
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 const defaultDisabledLocalTools = createDisabledLocalTools();

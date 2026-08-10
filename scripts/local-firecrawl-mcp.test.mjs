@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -8,6 +19,7 @@ import {
   interceptCodeCall,
   interceptUnsupportedSearchCall,
   isSearchToolCall,
+  probeShimHealth,
   rewriteInteractTool,
   rewriteSearchCallResult,
   rewriteSearchTool,
@@ -70,6 +82,242 @@ const disabledToolNames = [
   "firecrawl_monitor_checks",
   "firecrawl_feedback",
 ];
+
+async function temporaryLauncher(t, envSource, copySources = false) {
+  const root = await mkdtemp(join(tmpdir(), "local-firecrawl-mcp-"));
+  const scriptsDirectory = join(root, "scripts");
+  const launcherPath = join(scriptsDirectory, "local-firecrawl-mcp");
+  await mkdir(scriptsDirectory);
+  await writeFile(
+    launcherPath,
+    copySources
+      ? await readFile(new URL("./local-firecrawl-mcp", import.meta.url))
+      : "// probe fixture\n",
+    { mode: 0o755 },
+  );
+  if (copySources) {
+    await writeFile(
+      join(scriptsDirectory, "local-firecrawl-mcp.lib.mjs"),
+      await readFile(new URL("./local-firecrawl-mcp.lib.mjs", import.meta.url)),
+    );
+  }
+  await writeFile(join(root, ".env"), envSource);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return { root, launcherPath };
+}
+
+async function startHealthServer(t, handler) {
+  const server = createServer(handler);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  return server.address().port;
+}
+
+async function unusedPort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address();
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  return port;
+}
+
+function runLauncher(launcherPath, cwd, pathPrefix) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [launcherPath, "stub-upstream"], {
+      cwd,
+      env: {
+        ...process.env,
+        PATH: `${pathPrefix}${delimiter}${process.env.PATH}`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      reject(
+        new Error(
+          `launcher exited with ${code ?? signal}: ${stderr || stdout}`,
+        ),
+      );
+    });
+  });
+}
+
+// @lat: [[testing/runtime-operations#Runtime and Operations Testing#Local MCP launcher suite#Extract capability health gating]]
+test("probeShimHealth parses repo env and translates the shim host", async (t) => {
+  let requestedUrl;
+  const port = await startHealthServer(t, (request, response) => {
+    requestedUrl = request.url;
+    response.writeHead(200).end("ok");
+  });
+  const { launcherPath } = await temporaryLauncher(
+    t,
+    `# local shim\nexport OPENAI_BASE_URL = "http://host.docker.internal:${port}/v1" # route\n`,
+  );
+
+  assert.equal(await probeShimHealth({ launcherPath }), true);
+  assert.equal(requestedUrl, "/health");
+});
+
+test("probeShimHealth fails closed for down and timed-out shims", async (t) => {
+  const downPort = await startHealthServer(t, (_request, response) => {
+    response.writeHead(503).end("down");
+  });
+  const timeoutPort = await startHealthServer(t, (_request, response) => {
+    setTimeout(() => response.writeHead(200).end("late"), 100);
+  });
+  const down = await temporaryLauncher(
+    t,
+    `OPENAI_BASE_URL=http://127.0.0.1:${downPort}/v1\n`,
+  );
+  const timedOut = await temporaryLauncher(
+    t,
+    `OPENAI_BASE_URL=http://127.0.0.1:${timeoutPort}/v1\n`,
+  );
+
+  assert.equal(
+    await probeShimHealth({ launcherPath: down.launcherPath }),
+    false,
+  );
+  assert.equal(
+    await probeShimHealth({
+      launcherPath: timedOut.launcherPath,
+      timeoutMs: 20,
+    }),
+    false,
+  );
+});
+
+test("probeShimHealth rejects empty, malformed, and unreachable URLs", async (t) => {
+  const port = await unusedPort();
+  const empty = await temporaryLauncher(t, "OPENAI_BASE_URL=\n");
+  const malformed = await temporaryLauncher(t, "OPENAI_BASE_URL=not-a-url\n");
+  const unreachable = await temporaryLauncher(
+    t,
+    `OPENAI_BASE_URL=http://127.0.0.1:${port}/v1\n`,
+  );
+
+  assert.equal(
+    await probeShimHealth({ launcherPath: empty.launcherPath }),
+    false,
+  );
+  assert.equal(
+    await probeShimHealth({ launcherPath: malformed.launcherPath }),
+    false,
+  );
+  assert.equal(
+    await probeShimHealth({ launcherPath: unreachable.launcherPath }),
+    false,
+  );
+});
+
+test("extract capability uses the existing disabled-tool behavior", () => {
+  const disabledTools = createDisabledLocalTools(["firecrawl_extract"]);
+  const discovery = filterToolList(
+    {
+      result: {
+        tools: [{ name: "firecrawl_extract" }, { name: "firecrawl_scrape" }],
+      },
+    },
+    disabledTools,
+  );
+
+  assert.deepEqual(discovery.result.tools, [{ name: "firecrawl_scrape" }]);
+  assert.deepEqual(
+    unsupportedToolResponse(
+      {
+        jsonrpc: "2.0",
+        id: "extract",
+        method: "tools/call",
+        params: { name: "firecrawl_extract", arguments: {} },
+      },
+      disabledTools,
+    ),
+    {
+      jsonrpc: "2.0",
+      id: "extract",
+      error: {
+        code: -32601,
+        message:
+          "firecrawl_extract is disabled in the local Firecrawl MCP because its external service is not configured",
+      },
+    },
+  );
+});
+
+test("launcher discovers repo env from a foreign working directory", async (t) => {
+  const port = await startHealthServer(t, (_request, response) => {
+    response.writeHead(200).end("ok");
+  });
+  const { root, launcherPath } = await temporaryLauncher(
+    t,
+    `OPENAI_BASE_URL=http://host.docker.internal:${port}/v1\n`,
+    true,
+  );
+  const foreignCwd = await mkdtemp(join(tmpdir(), "local-firecrawl-cwd-"));
+  const foreignScripts = join(foreignCwd, "scripts");
+  const launcherLink = join(foreignScripts, "local-firecrawl-mcp");
+  const binDirectory = join(root, "bin");
+  await mkdir(foreignScripts);
+  await symlink(launcherPath, launcherLink);
+  await mkdir(binDirectory);
+  await writeFile(
+    join(binDirectory, "npx"),
+    `#!/usr/bin/env node\nprocess.stdout.write('${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        tools: [{ name: "firecrawl_extract" }, { name: "firecrawl_scrape" }],
+      },
+    }).replaceAll("'", "\\'")}\\n');\n`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(foreignCwd, ".env"),
+    "OPENAI_BASE_URL=http://127.0.0.1:1/v1\n",
+  );
+  t.after(() => rm(foreignCwd, { recursive: true, force: true }));
+
+  const healthyTools = JSON.parse(
+    (await runLauncher(launcherLink, foreignCwd, binDirectory)).trim(),
+  ).result.tools;
+  assert.deepEqual(healthyTools, [
+    { name: "firecrawl_extract" },
+    { name: "firecrawl_scrape" },
+  ]);
+
+  await writeFile(join(root, ".env"), "OPENAI_BASE_URL=not-a-url\n");
+  const disabledTools = JSON.parse(
+    (await runLauncher(launcherLink, foreignCwd, binDirectory)).trim(),
+  ).result.tools;
+  assert.deepEqual(disabledTools, [{ name: "firecrawl_scrape" }]);
+});
 
 // @lat: [[testing/runtime-operations#Runtime and Operations Testing#Local MCP launcher suite]]
 test("disabled local tools contain the seventeen unsupported capabilities", () => {
