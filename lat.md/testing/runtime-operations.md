@@ -72,9 +72,13 @@ Focused cases prove mini and nano names select the small tier, other names selec
 
 API Vitest coverage keeps local Codex Shim compatibility opt-in while preserving hosted OpenAI defaults.
 
-`apps/api/src/config.test.ts` verifies empty OpenAI and Ollama base URLs become unset, non-empty URLs survive parsing, and chat-completions compatibility defaults off. `apps/api/src/lib/generic-ai.test.ts` proves opt-in traffic reaches `/chat/completions` while default traffic reaches `/responses`.
+`apps/api/src/config.test.ts` verifies the five LLM settings normalize empty values without changing unrelated optional settings, non-empty URLs survive parsing, and chat-completions compatibility defaults off. `apps/api/src/lib/generic-ai.test.ts` proves opt-in traffic reaches `/chat/completions` while default traffic reaches `/responses`.
 
 See [[api/tests#API Test Organization#Unit and component tests]] and [[api/tests#API Test Organization#Unit and component tests#OpenAI endpoint selection]] for the API-owned test contract.
+
+### Extract LLM admission
+
+Focused Vitest coverage proves exact empty-value coercion, provider probe URLs and authorization, any-response liveness, fail-closed timeout behavior, actionable failure reasons, and the approximately 15-second cache.
 
 ## Playwright service suite
 

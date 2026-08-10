@@ -14,6 +14,7 @@ import { logger as _logger } from "../../lib/logger";
 import { logRequest } from "../../services/logging/log_job";
 import { config } from "../../config";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { getExtractLlmPreconditionError } from "../../lib/extract/llm-precondition";
 
 /**
  * Extracts data from the provided URLs based on the request parameters.
@@ -72,6 +73,14 @@ export async function extractController(
         error: UNSUPPORTED_SITE_MESSAGE,
       });
     }
+  }
+
+  const llmPreconditionError = await getExtractLlmPreconditionError();
+  if (llmPreconditionError) {
+    return res.status(400).json({
+      success: false,
+      error: llmPreconditionError,
+    });
   }
 
   await logRequest({

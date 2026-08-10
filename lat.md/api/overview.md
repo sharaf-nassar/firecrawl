@@ -60,7 +60,11 @@ Configuration is parsed once through a strict Zod schema, making malformed envir
 
 Most integrations are capability-gated by configuration. Missing optional engines reduce the available fallback set; missing core dependencies needed by a selected runtime mode fail startup or the owning worker.
 
-Optional OpenAI and Ollama base URLs normalize empty environment values to unset. This prevents blank Compose interpolation from becoming a configured provider URL while preserving non-empty custom endpoints.
+Exactly `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `MODEL_NAME`, `MODEL_EMBEDDING_NAME`, and `OLLAMA_BASE_URL` normalize empty values to unset. Other optional values keep their existing parsing behavior.
+
+Extract admission requires a configured, reachable LLM backend. [[apps/api/src/lib/extract/llm-precondition.ts#getExtractLlmPreconditionError]] probes the selected provider, caches the result for about 15 seconds, and rejects before persistence or queueing.
+
+OpenAI-compatible backends use `GET <base>/models` with the configured bearer key; Ollama uses `GET <base>/api/tags`. Any HTTP response proves liveness. Network errors and the 1.5-second timeout fail closed with an actionable HTTP 400.
 
 OpenAI language models use the Responses API by default. `OPENAI_CHAT_COMPLETIONS_ONLY=true` explicitly switches all OpenAI language models to Chat Completions for compatible endpoints, while the existing o3-mini exception remains chat-only.
 

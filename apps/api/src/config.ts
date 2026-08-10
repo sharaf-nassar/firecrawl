@@ -67,7 +67,7 @@ export const configSchema = z.object({
 
   // API Keys & Authentication
   BULL_AUTH_KEY: z.string().optional(),
-  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: emptyStringAsUndefined(z.string()),
   OPENAI_BASE_URL: emptyStringAsUndefined(z.string()),
   OPENAI_CHAT_COMPLETIONS_ONLY: z.stringbool().default(false),
   OPENROUTER_API_KEY: z.string().optional(),
@@ -321,8 +321,8 @@ export const configSchema = z.object({
   DEBUG_BRANDING: z.stringbool().optional(),
 
   // AI/ML
-  MODEL_NAME: z.string().optional(),
-  MODEL_EMBEDDING_NAME: z.string().optional(),
+  MODEL_NAME: emptyStringAsUndefined(z.string()),
+  MODEL_EMBEDDING_NAME: emptyStringAsUndefined(z.string()),
   OLLAMA_BASE_URL: emptyStringAsUndefined(z.string()),
   VERTEX_CREDENTIALS: z.string().optional(),
 
