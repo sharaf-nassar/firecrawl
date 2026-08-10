@@ -426,6 +426,18 @@ if (has("config")) {
       rendered.services.api.environment.BROWSER_SERVICE_API_KEY =
         process.env.FAKE_COMPOSE_SECRET;
     }
+    if (process.env.FAKE_COMPOSE_INVALID === "searxng_key_missing") {
+      rendered.services.searxng.environment.SEARXNG_BRAVE_API_KEY_B64 = "";
+    } else if (
+      process.env.FAKE_COMPOSE_INVALID === "searxng_wrong_engines"
+    ) {
+      rendered.services.api.environment.SEARXNG_ENGINES = "bing";
+    } else if (
+      process.env.FAKE_COMPOSE_INVALID === "searxng_credential_leak"
+    ) {
+      rendered.services.api.environment.SEARXNG_BRAVE_API_KEY_B64 =
+        process.env.FAKE_COMPOSE_SECRET;
+    }
     const workerVolumes =
       rendered.services["browser-interaction-worker"].volumes;
     const caMount = workerVolumes.find(
@@ -856,6 +868,38 @@ test("local environment templates generate Docker browser settings", async () =>
   );
 });
 
+test("configure-search recovery command updates an isolated environment", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "local-search-recovery-test-"));
+  const envFile = join(root, ".env");
+  const key = "wrapper-recovery-fixture-key";
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    envFile,
+    phaseEnvironment({
+      SEARXNG_ENDPOINT: "https://search.example",
+      SEARXNG_ENGINES: "bing",
+      SEARXNG_BRAVE_API_KEY_B64: undefined,
+    }),
+    { mode: 0o600 },
+  );
+
+  const configured = await run(wrapper, ["configure-search"], {
+    env: {
+      FIRECRAWL_SEARXNG_BRAVE_API_KEY: key,
+      LOCAL_FIRECRAWL_ENV_FILE: envFile,
+    },
+  });
+  assert.equal(configured.code, 0, configured.stderr);
+  assert.match(configured.stdout, /local-firecrawl restart/);
+  const values = parseEnvironment(await readFile(envFile, "utf8"));
+  assert.equal(
+    values.SEARXNG_BRAVE_API_KEY_B64,
+    Buffer.from(key).toString("base64"),
+  );
+  assert.equal(values.SEARXNG_ENDPOINT, "https://search.example");
+  assert.equal(values.SEARXNG_ENGINES, "bing");
+});
+
 test("environment upgrade rotates legacy browser settings", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "local-firecrawl-env-test-"));
   const envFile = join(root, ".env");
@@ -932,6 +976,50 @@ test("compose validation names failures without exposing secrets", async (t) => 
   );
   assert.doesNotMatch(result.stderr, new RegExp(secret));
   assert.doesNotMatch(result.stdout, new RegExp(secret));
+});
+
+test("bundled search fails closed with a recovery command", async (t) => {
+  for (const [invalid, message] of [
+    ["searxng_key_missing", /Brave Search API key is required/],
+    ["searxng_wrong_engines", /requires SEARXNG_ENGINES=braveapi,bing/],
+  ]) {
+    await t.test(invalid, async () => {
+      const fake = await makeFakeRuntime();
+      try {
+        const result = await run(wrapper, ["start"], {
+          env: { ...fake.env, FAKE_COMPOSE_INVALID: invalid },
+        });
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, message);
+        assert.match(result.stderr, /local-firecrawl configure-search/);
+        assert.ok(
+          (await fake.events()).every((event) => event.includes("config")),
+        );
+      } finally {
+        await fake.cleanup();
+      }
+    });
+  }
+});
+
+test("compose validation rejects a leaked SearXNG credential", async (t) => {
+  const fake = await makeFakeRuntime();
+  const secret = "searxng-credential-must-not-leak";
+  t.after(() => fake.cleanup());
+  const result = await run(wrapper, ["start"], {
+    env: {
+      ...fake.env,
+      FAKE_COMPOSE_INVALID: "searxng_credential_leak",
+      FAKE_COMPOSE_SECRET: secret,
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.match(
+    result.stderr,
+    /invariant failed: searxng_brave_credential_isolation/,
+  );
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(secret));
+  assert.ok((await fake.events()).every((event) => event.includes("config")));
 });
 
 test("compose validation rejects unsafe CA mount shapes", async (t) => {

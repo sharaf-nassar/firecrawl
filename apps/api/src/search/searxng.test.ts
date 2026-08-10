@@ -42,7 +42,10 @@ describe("SearXNG client", () => {
     const search = createSearxngClient({ fetch: fetchMock as typeof fetch });
 
     await expect(
-      search("private query", options({ engines: " Brave, qwant,brave " })),
+      search(
+        "private query",
+        options({ engines: " BraveAPI, bing,braveapi " }),
+      ),
     ).resolves.toEqual({
       web: [
         {
@@ -62,7 +65,7 @@ describe("SearXNG client", () => {
     });
     const body = init?.body as URLSearchParams;
     expect(body.get("q")).toBe("private query");
-    expect(body.get("engines")).toBe("brave,qwant");
+    expect(body.get("engines")).toBe("braveapi,bing");
     expect(body.get("pageno")).toBe("1");
     expect(body.get("format")).toBe("json");
   });
@@ -165,13 +168,13 @@ describe("SearXNG client", () => {
       .mockResolvedValueOnce(
         jsonResponse({
           results: [result(), { title: "invalid" }],
-          unresponsive_engines: [["brave", "secret provider detail"]],
+          unresponsive_engines: [["braveapi", "secret provider detail"]],
         }),
       )
       .mockResolvedValueOnce(
         jsonResponse({
           results: [],
-          unresponsive_engines: [["qwant", "another secret"]],
+          unresponsive_engines: [["bing", "another secret"]],
         }),
       );
     const search = createSearxngClient({ fetch: fetchMock as typeof fetch });
@@ -193,23 +196,23 @@ describe("SearXNG client", () => {
   });
 
   it("strictly validates selected and unresponsive engines", async () => {
-    expect(selectedSearxngEngines("brave, BRAVE, qwant")).toEqual([
-      "brave",
-      "qwant",
+    expect(selectedSearxngEngines("braveapi, BRAVEAPI, Bing")).toEqual([
+      "braveapi",
+      "bing",
     ]);
     expect(() => selectedSearxngEngines("unknown")).toThrow(
       SearchProviderBadResponseError,
     );
 
     for (const unresponsive_engines of [
-      "brave",
-      [["brave"]],
+      "braveapi",
+      [["braveapi"]],
       [
-        ["brave", "timeout"],
-        ["brave", "again"],
+        ["braveapi", "timeout"],
+        ["braveapi", "again"],
       ],
       [["bing", "timeout"]],
-      [["brave", ""]],
+      [["braveapi", ""]],
     ]) {
       const search = createSearxngClient({
         fetch: (async () =>
@@ -219,7 +222,7 @@ describe("SearXNG client", () => {
           })) as typeof fetch,
       });
       await expect(
-        search("strict", options({ engines: "brave,qwant" })),
+        search("strict", options({ engines: "braveapi" })),
       ).rejects.toBeInstanceOf(SearchProviderBadResponseError);
     }
   });
@@ -230,14 +233,14 @@ describe("SearXNG client", () => {
         jsonResponse({
           results: [],
           unresponsive_engines: [
-            ["brave", "failed"],
-            ["qwant", "failed"],
+            ["braveapi", "failed"],
+            ["bing", "failed"],
           ],
         })) as typeof fetch,
     });
 
     await expect(
-      search("all failed", options({ engines: "brave,qwant" })),
+      search("all failed", options({ engines: "braveapi,bing" })),
     ).rejects.toBeInstanceOf(SearchProviderUnavailableError);
   });
 

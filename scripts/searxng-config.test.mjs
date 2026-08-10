@@ -7,10 +7,14 @@ import test from "node:test";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const settingsPath = join(repoRoot, "config", "searxng", "settings.yml");
+const entrypointPath = join(repoRoot, "config", "searxng", "entrypoint.py");
 const image =
   "ghcr.io/searxng/searxng:2026.7.31-6bfd82705@" +
   "sha256:79c2be18a18367484474bae9b18a8cd9085114ab3dcd49cac091cad8c548a0a9";
-const expectedEngines = ["bing", "brave", "qwant", "startpage"];
+const expectedEngines = ["bing", "braveapi"];
+const fixtureBraveApiKey = "fixture-brave-api-key+/=";
+const encodedFixtureBraveApiKey =
+  Buffer.from(fixtureBraveApiKey).toString("base64");
 const composeProject = `firecrawl-searxng-test-${process.pid}`;
 
 const composeEnv = {
@@ -31,7 +35,10 @@ const composeEnv = {
   LOCAL_BROWSER_STATE_ROOT: "/var/lib/firecrawl-browser-volume/state",
   LOCAL_CODEX_AUTH_FILE: settingsPath,
   LOCAL_CODEX_CA_BUNDLE_FILE: settingsPath,
+  LOCAL_CODEX_EGRESS_POLICY_FILE: settingsPath,
   LOCAL_CODEX_PACKAGE_DIR: repoRoot,
+  LOCAL_CODEX_PROVIDER_ENVIRONMENT_FILE: settingsPath,
+  LOCAL_CODEX_WORKER_CONFIG_FILE: settingsPath,
   LOCAL_OWNER_ID: "11111111-1111-4111-8111-111111111111",
   LOCAL_PERSISTENCE_ENABLED: "true",
   LOCAL_RECORD_RETENTION_DAYS: "30",
@@ -39,6 +46,9 @@ const composeEnv = {
   MINIO_ROOT_USER: "firecrawl-root",
   POSTGRES_DB: "postgres",
   POSTGRES_USER: "firecrawl",
+  SEARXNG_BRAVE_API_KEY_B64: encodedFixtureBraveApiKey,
+  SEARXNG_ENDPOINT: "http://searxng:8080",
+  SEARXNG_ENGINES: "braveapi,bing",
   SEARXNG_SECRET: "0".repeat(64),
 };
 
@@ -89,6 +99,7 @@ function composeArgs(...args) {
 test("tracked SearXNG settings enforce the private engine policy", async () => {
   const settingsSource = await readFile(settingsPath, "utf8");
   assert.doesNotMatch(settingsSource, /duckduckgo/i);
+  assert.doesNotMatch(settingsSource, /^\s*api_key:/m);
 
   const inspectSettings = `
 import json
@@ -153,6 +164,10 @@ print(json.dumps({
     expectedEngines,
   );
   assert.ok(engines.every(engine => engine.disabled === false));
+  assert.equal(
+    engines.find(engine => engine.name === "braveapi").inactive,
+    true,
+  );
   assert.ok(
     engines.every(
       engine =>
@@ -193,8 +208,28 @@ test("rendered local Compose keeps SearXNG private and bounded", async () => {
   assert.equal(settingsMount.read_only, true);
   assert.equal(settingsMount.bind.create_host_path, false);
   assert.equal(service.environment.FORCE_OWNERSHIP, "false");
+  assert.equal(
+    service.environment.SEARXNG_BRAVE_API_KEY_B64,
+    encodedFixtureBraveApiKey,
+  );
   assert.equal(service.environment.SEARXNG_SECRET, "0".repeat(64));
   assert.equal(rendered.services.api.environment.SEARXNG_SECRET, undefined);
+  assert.equal(
+    rendered.services.api.environment.SEARXNG_BRAVE_API_KEY_B64,
+    undefined,
+  );
+  assert.equal(
+    rendered.services.api.environment.SEARXNG_ENGINES,
+    "braveapi,bing",
+  );
+  assert.ok(
+    Object.entries(rendered.services)
+      .filter(([name]) => name !== "searxng")
+      .every(
+        ([, candidate]) =>
+          candidate.environment?.SEARXNG_BRAVE_API_KEY_B64 === undefined,
+      ),
+  );
   assert.equal(service.logging.driver, "json-file");
   assert.deepEqual(service.logging.options, {
     compress: "true",
@@ -239,6 +274,21 @@ test(
     t.after(async () => {
       await runDocker(composeArgs("down", "--timeout", "10"));
     });
+
+    const keyless = await runDocker([
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--mount",
+      `type=bind,source=${entrypointPath},target=/opt/firecrawl/searxng-entrypoint.py,readonly`,
+      "--entrypoint",
+      "/usr/local/searxng/.venv/bin/python",
+      image,
+      "/opt/firecrawl/searxng-entrypoint.py",
+    ]);
+    assert.equal(keyless.code, 78);
+    assert.match(keyless.stderr, /local-firecrawl configure-search/);
 
     await mustRunDocker(
       composeArgs(

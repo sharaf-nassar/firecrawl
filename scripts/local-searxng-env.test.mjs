@@ -52,6 +52,7 @@ function phaseEnvironment(overrides = {}) {
     ARTIFACT_MINIO_REGION: "us-east-1",
     SEARXNG_ENDPOINT: "http://searxng:8080",
     SEARXNG_BRAVE_API_KEY_B64: Buffer.from(fixtureBraveApiKey).toString("base64"),
+    SEARXNG_ENGINES: "braveapi,bing",
     SEARXNG_SECRET: "e".repeat(64),
     ...overrides,
   };
@@ -100,6 +101,19 @@ async function temporaryEnvironment(t, source = phaseEnvironment()) {
   return { root, envFile };
 }
 
+async function temporaryInit(t) {
+  const root = await mkdtemp(join(tmpdir(), "local-searxng-init-test-"));
+  const scripts = join(root, "scripts");
+  const copiedInit = join(scripts, "init-local-env.sh");
+  const envFile = join(root, ".env");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(scripts);
+  await copyFile(initEnv, copiedInit);
+  await copyFile(searchKeyHelper, join(scripts, "local-search-key.lib.sh"));
+  await chmod(copiedInit, 0o755);
+  return { copiedInit, envFile };
+}
+
 async function waitForFile(path) {
   for (let attempt = 0; attempt < 500; attempt += 1) {
     try {
@@ -136,16 +150,7 @@ function assertSecretIsDistinct(values) {
 
 // @lat: [[testing/runtime-operations#Runtime and Operations Testing#Local wrapper suite#SearXNG environment migration]]
 test("fresh local environment includes a private SearXNG origin and secret", async t => {
-  const root = await mkdtemp(join(tmpdir(), "local-searxng-init-test-"));
-  const scripts = join(root, "scripts");
-  const copiedInit = join(scripts, "init-local-env.sh");
-  const copiedSearchKeyHelper = join(scripts, "local-search-key.lib.sh");
-  const envFile = join(root, ".env");
-  t.after(() => rm(root, { recursive: true, force: true }));
-  await mkdir(scripts);
-  await copyFile(initEnv, copiedInit);
-  await copyFile(searchKeyHelper, copiedSearchKeyHelper);
-  await chmod(copiedInit, 0o755);
+  const { copiedInit, envFile } = await temporaryInit(t);
 
   const created = await run(copiedInit, [], {
     env: { FIRECRAWL_SEARXNG_BRAVE_API_KEY: fixtureBraveApiKey },
@@ -158,6 +163,7 @@ test("fresh local environment includes a private SearXNG origin and secret", asy
     values.SEARXNG_BRAVE_API_KEY_B64,
     Buffer.from(fixtureBraveApiKey).toString("base64"),
   );
+  assert.equal(values.SEARXNG_ENGINES, "braveapi,bing");
   assert.doesNotMatch(original, new RegExp(`=${fixtureBraveApiKey}$`, "m"));
   assertSecretIsDistinct(values);
   assert.equal((await stat(envFile)).mode & 0o777, 0o600);
@@ -167,13 +173,38 @@ test("fresh local environment includes a private SearXNG origin and secret", asy
   assert.equal(await readFile(envFile, "utf8"), original);
 });
 
+test("fresh setup requires a nonblank whitespace-free Brave key", async t => {
+  for (const [name, value, error] of [
+    ["missing", undefined, /Brave Search API key is required/],
+    ["blank", "", /Brave Search API key is required/],
+    ["whitespace", "fixture key", /invalid format/],
+  ]) {
+    await t.test(name, async t => {
+      const { copiedInit, envFile } = await temporaryInit(t);
+      const env =
+        value === undefined ? {} : { FIRECRAWL_SEARXNG_BRAVE_API_KEY: value };
+      const rejected = await run(copiedInit, [], { env });
+      assert.equal(rejected.code, 1);
+      assert.match(rejected.stderr, error);
+      await assert.rejects(readFile(envFile), { code: "ENOENT" });
+    });
+  }
+});
+
 test("upgrade fills missing and blank SearXNG values", async t => {
   for (const [name, overrides] of [
     [
       "missing",
-      { SEARXNG_ENDPOINT: undefined, SEARXNG_SECRET: undefined },
+      {
+        SEARXNG_ENDPOINT: undefined,
+        SEARXNG_ENGINES: undefined,
+        SEARXNG_SECRET: undefined,
+      },
     ],
-    ["blank", { SEARXNG_ENDPOINT: "", SEARXNG_SECRET: "" }],
+    [
+      "blank",
+      { SEARXNG_ENDPOINT: "", SEARXNG_ENGINES: "", SEARXNG_SECRET: "" },
+    ],
   ]) {
     await t.test(name, async t => {
       const { envFile } = await temporaryEnvironment(
@@ -184,11 +215,71 @@ test("upgrade fills missing and blank SearXNG values", async t => {
       assert.equal(upgraded.code, 0, upgraded.stderr);
       const values = parseEnvironment(await readFile(envFile, "utf8"));
       assert.equal(values.SEARXNG_ENDPOINT, "http://searxng:8080");
+      assert.equal(values.SEARXNG_ENGINES, "braveapi,bing");
       assertSecretIsDistinct(values);
       assert.equal((await stat(envFile)).mode & 0o777, 0o600);
       const checked = await run(upgradeEnv, ["--check", "--env-file", envFile]);
       assert.equal(checked.code, 0, checked.stderr);
     });
+  }
+});
+
+test("bundled upgrade fails closed without a valid Brave key", async t => {
+  for (const [name, value, error] of [
+    ["missing", undefined, /Brave Search API key is required/],
+    ["blank", "", /Brave Search API key is required/],
+    [
+      "whitespace",
+      Buffer.from("fixture key").toString("base64"),
+      /Invalid Phase 1 environment field: SEARXNG_BRAVE_API_KEY_B64/,
+    ],
+  ]) {
+    await t.test(name, async t => {
+      const original = phaseEnvironment({ SEARXNG_BRAVE_API_KEY_B64: value });
+      const { envFile } = await temporaryEnvironment(t, original);
+      const rejected = await run(upgradeEnv, ["--env-file", envFile]);
+      assert.equal(rejected.code, 1);
+      assert.match(rejected.stderr, error);
+      if (name !== "whitespace") {
+        assert.match(rejected.stderr, /local-firecrawl configure-search/);
+      }
+      assert.equal(await readFile(envFile, "utf8"), original);
+    });
+  }
+});
+
+test("configure-search adds and rotates an external credential", async t => {
+  const external = {
+    SEARXNG_ENDPOINT: "https://search.example",
+    SEARXNG_ENGINES: "bing",
+  };
+  const { envFile } = await temporaryEnvironment(
+    t,
+    phaseEnvironment({
+      ...external,
+      SEARXNG_BRAVE_API_KEY_B64: undefined,
+      UNRELATED_SETTING: "preserved",
+    }),
+  );
+
+  for (const key of ["added-fixture-key", "rotated-fixture-key"]) {
+    const configured = await run(
+      upgradeEnv,
+      ["--configure-search", "--env-file", envFile],
+      { env: { FIRECRAWL_SEARXNG_BRAVE_API_KEY: key } },
+    );
+    assert.equal(configured.code, 0, configured.stderr);
+    assert.match(configured.stdout, /local-firecrawl restart/);
+    const source = await readFile(envFile, "utf8");
+    const values = parseEnvironment(source);
+    assert.equal(
+      values.SEARXNG_BRAVE_API_KEY_B64,
+      Buffer.from(key).toString("base64"),
+    );
+    assert.equal(values.SEARXNG_ENDPOINT, external.SEARXNG_ENDPOINT);
+    assert.equal(values.SEARXNG_ENGINES, external.SEARXNG_ENGINES);
+    assert.equal(values.UNRELATED_SETTING, "preserved");
+    assert.doesNotMatch(source, new RegExp(`=${key}$`, "m"));
   }
 });
 
