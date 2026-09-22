@@ -447,7 +447,7 @@ test("pinned upstream interact rewrite matches the prompt-only snapshot", () => 
   );
 });
 
-test("initialize instructions advertise local web search only", () => {
+test("initialize instructions advertise local web search as a native-search fallback", () => {
   const message = {
     jsonrpc: "2.0",
     id: 1,
@@ -534,6 +534,29 @@ test("rewriteSearchTool exposes only supported web search arguments", () => {
   );
   const otherTool = { name: "firecrawl_scrape" };
   assert.equal(rewriteSearchTool(otherTool), otherTool);
+});
+
+test("search guidance prefers native search in instructions and tool discovery", () => {
+  const initialized = filterToolList({
+    result: { instructions: upstreamSearchFixture.instructions },
+  });
+  const discovery = filterToolList({
+    result: { tools: [upstreamSearchFixture.tool] },
+  });
+
+  for (const text of [
+    initialized.result.instructions,
+    discovery.result.tools[0].description,
+  ]) {
+    const guidance = text.replace(/\s+/g, " ");
+    assert.match(guidance, /use your native or built-in web search first/i);
+    assert.match(
+      guidance,
+      /Use firecrawl_search only as a fallback when native search is unavailable, fails, or returns insufficient results/,
+    );
+    assert.match(guidance, /user explicitly requests Firecrawl search/);
+    assert.doesNotMatch(guidance, /primary search tool|instead of built-in/i);
+  }
 });
 
 test("tool discovery publishes web search and hides search feedback", () => {

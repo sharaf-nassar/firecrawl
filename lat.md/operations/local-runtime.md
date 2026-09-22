@@ -116,6 +116,8 @@ The same launcher disables paper search, paper inspection, related-paper lookup,
 
 Local discovery removes `firecrawl_search_feedback` and replaces upstream search instructions and schema with the web-only contract. Search keeps query, limit, filter, domain, category, and scrape controls while exposing only the `web` source.
 
+Server instructions and the search tool description tell agents to use native or built-in web search first. `firecrawl_search` is a fallback when native search is unavailable, fails, or returns insufficient results, or when the user explicitly requests Firecrawl search. This is agent guidance, not a call restriction; scraping, crawling, and extraction behavior stays unchanged. Reconnect MCP clients to refresh the advertised guidance.
+
 Local discovery also removes all eight `firecrawl_monitor_*` tools and `firecrawl_feedback`. The local stack does not configure monitor scheduling, persistence, artifacts, or feedback storage, so direct calls receive the standard JSON-RPC `-32601` disabled-tool error.
 
 Direct calls that bypass discovery cannot request non-web sources, geo or recency controls, enterprise mode, or feedback. The launcher rejects them as JSON-RPC `-32602 Invalid params` with data code `LOCAL_SEARCH_WEB_ONLY` before the upstream package or API sees them.

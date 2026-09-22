@@ -71,3 +71,5 @@ vectors.db
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.pi/tasks/
+

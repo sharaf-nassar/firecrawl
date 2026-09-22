@@ -112,19 +112,22 @@ const unsupportedLocalSearchOptionNames = [
 ];
 
 const localSearchInstructions =
-  "The user has installed the local Firecrawl stack as their web data " +
-  "provider. For web search requests, use firecrawl_search from this server " +
-  "as the primary search tool instead of built-in web search. " +
+  "For web search requests, use your native or built-in web search first. " +
+  "Use firecrawl_search only as a fallback when native search is unavailable, " +
+  "fails, or returns insufficient results, or when the user explicitly " +
+  "requests Firecrawl search. " +
   "firecrawl_search returns web results and can optionally extract content " +
   "from those pages. Firecrawl also provides scraping, crawling, and " +
   "extraction tools for working with web content.";
 
 const webOnlySearchDescription = `
-Search web pages and optionally extract content from the returned pages.
+Search web pages as a fallback and optionally extract content from the returned pages.
 
-Use this tool for open-ended web discovery when the relevant page URL is not
-already known. Use firecrawl_scrape when the URL is known, or firecrawl_map to
-discover pages within one website.
+Use your native or built-in web search first. Use firecrawl_search only as a
+fallback when native search is unavailable, fails, or returns insufficient
+results, or when the user explicitly requests Firecrawl search.
+Use firecrawl_scrape when the URL is known, or firecrawl_map to discover pages
+within one website.
 
 **Arguments:**
 - query: Required web search query; standard operators such as site: are allowed

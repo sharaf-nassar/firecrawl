@@ -192,6 +192,8 @@ Live acceptance should use `scripts/local-firecrawl start`, one `health` pass, t
 
 The Node test suite verifies seventeen disabled tools, including all monitor and feedback capabilities, plus discovery filtering, prompt-only interaction, and web-only search instructions and schema. Direct monitor calls are locked to the standard `-32601` disabled-tool error.
 
+Search-guidance assertions cover both initialize instructions and tool discovery: native search comes first, Firecrawl search remains a fallback for unavailable, failed, or insufficient native results, and explicit user requests are honored. Neither advertised text may retain upstream primary-search steering.
+
 It also proves stale interaction and unsupported local search calls stop before upstream execution with their exact protocol errors.
 
 Provider-result cases cover exact 502 and 503 error JSON, one text block, call-ID correlation, valid empty success, and unrelated-error passthrough. Pinned interact and search registrations deep-compare with independent snapshots, and fixtures must match the executable package pin.
